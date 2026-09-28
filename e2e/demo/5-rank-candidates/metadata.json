@@ -1,0 +1,45 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Rank the candidates"
+  },
+  "description": {
+    "default": "Four members are running to chair the cooperative's board. Rank all four, from 1 for your first choice to 4 for your last; the lowest total wins. Membership is recorded on-chain, and members who join while the vote is open can take part."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "How do you rank the candidates for chair?"
+      },
+      "description": {
+        "default": "Give each candidate a different rank, from 1 (first choice) to 4."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Clara Soler"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "David Mensah"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Irene Costa"
+          },
+          "value": 2
+        },
+        {
+          "title": {
+            "default": "Oriol Puig"
+          },
+          "value": 3
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Rate the proposals"
+  },
+  "description": {
+    "default": "Three proposals came out of the spring assembly. Rate each from 0 (reject) to 10 (strongly support). The ratings stay sealed until the organizers publish their key after the vote closes."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "How do you rate each proposal?"
+      },
+      "description": {
+        "default": "0 means reject, 10 means strong support."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Open the library on Sundays"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Car-free main street on the first Sunday of each month"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Solar panels on the primary school roof"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Council election: approve up to 3"
+  },
+  "description": {
+    "default": "Three seats on the coordination council are up for renewal and five members are standing. Approve up to three candidates; the three with the most approvals take the seats for the next two years."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Which candidates do you approve?"
+      },
+      "description": {
+        "default": "Approve at least one and at most three candidates."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Marta Vidal"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Joan Ferrer"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Aisha Rahman"
+          },
+          "value": 2
+        },
+        {
+          "title": {
+            "default": "Tomás Oliveira"
+          },
+          "value": 3
+        },
+        {
+          "title": {
+            "default": "Lena Krüger"
+          },
+          "value": 4
+        }
+      ]
+    }
+  ]
+}

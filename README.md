@@ -907,6 +907,26 @@ The sibling checkouts default to the directories next to this one.
 `DAVINCI_ZKVM_DIR`, `DAVINCI_CONTRACTS_DIR`, `DAVINCI_CENSUS_CONTRACT_DIR`
 and `CIRCOM_ARTIFACTS` point the script elsewhere.
 
+**Demo elections.** `e2e/tests/demo.rs`, gated by `DAVINCI_E2E_DEMO`, fills a
+live deployment with eight elections, one of every ballot kind, census origin,
+key mode and lifecycle (`davinci_e2e::demo::elections`), through nodes that
+already run (`DAVINCI_DEMO_NODES`, default ports 9090 and 9091). `prepare` draws
+the voter keys into `~/.davinci-gnosis/demo` (mode 0700, never the repository)
+and writes the public census and metadata files into `e2e/demo/`. `check`
+proves every planned ballot against the circuit, offline. Once the files are
+pushed, `run` checks they are served unchanged, creates the elections with
+their URIs under `DAVINCI_DEMO_BASE_URL`, casts the votes, ends, reveals and
+cancels, and prints a table with explorer links. It records its progress in
+`state.json` next to the keys and resumes from it.
+
+```bash
+DAVINCI_E2E_DEMO=prepare e2e/bench.sh
+DAVINCI_E2E_DEMO=check e2e/bench.sh
+DAVINCI_E2E_DEMO=run \
+  DAVINCI_DEMO_BASE_URL=https://raw.githubusercontent.com/vocdoni/davinci-sequencer/<commit>/e2e/demo \
+  e2e/bench.sh    # organizer key: DAVINCI_DEMO_ORGANIZER_KEY, default ~/gnosis-chain-privkey.txt
+```
+
 Without `DAVINCI_SEQUENCER_BIN`, the test builds the node with
 `cargo build --release -p davinci-sequencer`. On failure it keeps the node logs,
 anvil log and datadirs and prints their paths. `DAVINCI_E2E_NODE_LOG` sets the

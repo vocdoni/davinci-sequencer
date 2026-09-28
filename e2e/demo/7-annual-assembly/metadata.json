@@ -1,0 +1,33 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Annual assembly: 2026 accounts"
+  },
+  "description": {
+    "default": "The annual assembly votes on the 2026 accounts presented by the treasurer. Voting opens on the day of the assembly and stays open for 24 hours."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Do you approve the 2026 accounts?"
+      },
+      "description": {
+        "default": "Pick one option."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Approve"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Reject"
+          },
+          "value": 1
+        }
+      ]
+    }
+  ]
+}

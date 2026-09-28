@@ -1,0 +1,39 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Autumn clean-up day: pick a date"
+  },
+  "description": {
+    "default": "Which Saturday should we hold the neighbourhood clean-up day? Pick the one that suits you best."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Which Saturday works for you?"
+      },
+      "description": {
+        "default": "Pick one option."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Saturday 17 October"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Saturday 24 October"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Saturday 31 October"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ]
+}

@@ -95,6 +95,15 @@ impl Census {
         })
     }
 
+    /// An `OwnedCensus` deployed earlier, driven from `provider`'s account.
+    pub fn at(address: Address, provider: DynProvider) -> Census {
+        Census {
+            address,
+            c: OwnedCensus::new(address, provider),
+            receipts: Mutex::new(Vec::new()),
+        }
+    }
+
     /// `(label, receipt)` of every transaction mined so far.
     pub fn receipts(&self) -> Vec<(String, TransactionReceipt)> {
         self.receipts.lock().map(|r| r.clone()).unwrap_or_default()
