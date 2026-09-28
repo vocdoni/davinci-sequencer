@@ -3,6 +3,7 @@
 //! the Groth16 randomness is a function of `SEED`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use davinci_client::api::{CensusFile, Fr, VoteRequest};
@@ -283,11 +284,39 @@ pub fn prove_all(prover: &BallotProver, jobs: &[Job]) -> Result<Vec<VoteRequest>
         .map(|n| n.get())
         .unwrap_or(4)
         .clamp(1, 8);
-    let chunk = jobs.len().div_ceil(threads).max(1);
-    let parts: Vec<Result<Vec<VoteRequest>>> = std::thread::scope(|s| {
-        let hs: Vec<_> = jobs
-            .chunks(chunk)
-            .map(|c| s.spawn(move || c.iter().map(|j| build(prover, j)).collect()))
+    prove_all_on(prover, jobs, threads, &AtomicUsize::new(0))
+}
+
+/// Proves every job on `threads` threads, each taking the next job as it
+/// frees up; `done` counts finished proofs. Results keep the job order; the
+/// first error stops the rest.
+pub fn prove_all_on(
+    prover: &BallotProver,
+    jobs: &[Job],
+    threads: usize,
+    done: &AtomicUsize,
+) -> Result<Vec<VoteRequest>> {
+    let next = AtomicUsize::new(0);
+    let worker = || -> Result<Vec<(usize, VoteRequest)>> {
+        let mut out = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(j) = jobs.get(i) else {
+                return Ok(out);
+            };
+            match build(prover, j) {
+                Ok(r) => out.push((i, r)),
+                Err(e) => {
+                    next.store(jobs.len(), Ordering::Relaxed);
+                    return Err(e);
+                }
+            }
+            done.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    let parts: Vec<Result<Vec<(usize, VoteRequest)>>> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads.clamp(1, jobs.len().max(1)))
+            .map(|_| s.spawn(worker))
             .collect();
         hs.into_iter()
             .map(|h| {
@@ -300,7 +329,8 @@ pub fn prove_all(prover: &BallotProver, jobs: &[Job]) -> Result<Vec<VoteRequest>
     for p in parts {
         out.extend(p?);
     }
-    Ok(out)
+    out.sort_unstable_by_key(|(i, _)| *i);
+    Ok(out.into_iter().map(|(_, r)| r).collect())
 }
 
 /// `CIRCOM_ARTIFACTS` (default `../davinci-circom/artifacts` next to the

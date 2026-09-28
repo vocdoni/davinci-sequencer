@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+
+# Runs the e2e benchmarks (tests/throughput.rs, tests/bench.rs) with nothing
+# native on the host: the nodes are the published image's binary, anvil and
+# forge come from foundry, and the harness is built at run time from the
+# mounted source trees. Nothing is copied from a build context:
+#
+#   docker build -t davinci-sequencer-bench - < e2e/Dockerfile.bench
+#
+# e2e/bench.sh builds it and has the full `docker run` invocation.
+
+ARG NODE_IMAGE=ghcr.io/vocdoni/davinci-sequencer:main
+ARG FOUNDRY_IMAGE=ghcr.io/foundry-rs/foundry:v1.8.3
+
+FROM ${NODE_IMAGE} AS node
+FROM ${FOUNDRY_IMAGE} AS foundry
+
+FROM rust:1.95-bookworm
+COPY --from=node /usr/local/bin/davinci-sequencer /usr/local/bin/davinci-sequencer
+COPY --from=foundry /usr/local/bin/anvil /usr/local/bin/forge /usr/local/bin/cast /usr/local/bin/
+# /cache is one named volume (cargo registry, target dir, HOME for forge's
+# solc downloads); /runs is a host directory for logs, datadirs and reports.
+# World-writable so the container can run as the host user.
+RUN install -d -m 1777 /cache /cache/cargo /cache/target /cache/home /runs /work
+ENV DAVINCI_SEQUENCER_BIN=/usr/local/bin/davinci-sequencer \
+    CARGO_HOME=/cache/cargo \
+    CARGO_TARGET_DIR=/cache/target \
+    HOME=/cache/home \
+    TMPDIR=/runs
+WORKDIR /work/davinci-sequencer
+CMD ["cargo", "test", "--locked", "-p", "davinci-e2e", "--test", "throughput", "--", "--nocapture"]

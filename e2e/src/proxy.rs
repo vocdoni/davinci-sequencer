@@ -1,10 +1,11 @@
-//! A loopback HTTP/1.1 forwarder that can be taken down, for outage tests.
-//! One request per connection, `Content-Length` bodies only; https upstreams
-//! go through reqwest.
+//! A loopback HTTP/1.1 forwarder that can be taken down, for outage tests,
+//! or tapped, to see what a node asks its prover. One request per
+//! connection, `Content-Length` bodies only; https upstreams go through
+//! reqwest.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,6 +14,20 @@ use tokio::task::JoinHandle;
 
 /// Largest request or response head accepted.
 const MAX_HEAD: usize = 64 * 1024;
+
+/// One forwarded request and the upstream's answer.
+pub struct Exchange<'a> {
+    /// When the connection was accepted.
+    pub at: Instant,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub request: &'a [u8],
+    pub status: u16,
+    pub response: &'a [u8],
+}
+
+/// Called with every exchange after its response went back to the client.
+pub type Tap = Arc<dyn Fn(&Exchange<'_>) + Send + Sync>;
 
 /// A running proxy; the listener stops when this drops.
 pub struct Proxy {
@@ -32,6 +47,15 @@ impl Drop for Proxy {
 
 impl Proxy {
     pub async fn start(upstream: &str) -> Result<Proxy> {
+        Proxy::spawn(upstream, None).await
+    }
+
+    /// [`Proxy::start`], handing every exchange to `tap`.
+    pub async fn tapped(upstream: &str, tap: Tap) -> Result<Proxy> {
+        Proxy::spawn(upstream, Some(tap)).await
+    }
+
+    async fn spawn(upstream: &str, tap: Option<Tap>) -> Result<Proxy> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}", listener.local_addr()?);
         let base = upstream.trim_end_matches('/').to_string();
@@ -49,9 +73,9 @@ impl Proxy {
                     drop(sock); // the client sees a reset connection
                     continue;
                 }
-                let (client, base) = (client.clone(), base.clone());
+                let (client, base, tap) = (client.clone(), base.clone(), tap.clone());
                 tokio::spawn(async move {
-                    let _ = serve(sock, &client, &base).await;
+                    let _ = serve(sock, &client, &base, tap.as_ref()).await;
                 });
             }
         });
@@ -84,7 +108,13 @@ impl Proxy {
     }
 }
 
-async fn serve(mut sock: TcpStream, client: &reqwest::Client, base: &str) -> Result<()> {
+async fn serve(
+    mut sock: TcpStream,
+    client: &reqwest::Client,
+    base: &str,
+    tap: Option<&Tap>,
+) -> Result<()> {
+    let at = Instant::now();
     let mut buf = Vec::new();
     let head_end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -140,6 +170,8 @@ async fn serve(mut sock: TcpStream, client: &reqwest::Client, base: &str) -> Res
     for (k, v) in headers {
         req = req.header(k, v);
     }
+    // A copy for the tap only.
+    let sent = tap.map(|_| body.clone()).unwrap_or_default();
     let resp = match req.body(body).send().await {
         Ok(r) => r,
         Err(_) => {
@@ -170,6 +202,16 @@ async fn serve(mut sock: TcpStream, client: &reqwest::Client, base: &str) -> Res
     sock.write_all(out.as_bytes()).await?;
     sock.write_all(&body).await?;
     sock.shutdown().await?;
+    if let Some(t) = tap {
+        t(&Exchange {
+            at,
+            method,
+            path,
+            request: &sent,
+            status: status.as_u16(),
+            response: &body,
+        });
+    }
     Ok(())
 }
 
@@ -236,6 +278,47 @@ mod tests {
         back.await?;
         let r = c.get(format!("{}/x", p.url)).send().await?;
         assert_eq!(r.text().await?, "GET /x HTTP/1.1|");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taps_every_exchange() -> Result<()> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let tap: Tap = Arc::new(move |x: &Exchange<'_>| {
+            s.lock().unwrap().push((
+                x.method.to_string(),
+                x.path.to_string(),
+                x.request.to_vec(),
+                x.status,
+                x.response.to_vec(),
+            ));
+        });
+        let p = Proxy::tapped(&echo().await?, tap).await?;
+        let r = reqwest::Client::new()
+            .post(format!("{}/prove", p.url))
+            .body("{}")
+            .send()
+            .await?;
+        assert_eq!(r.text().await?, "POST /prove HTTP/1.1|{}");
+        // The tap runs after the response is written.
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            [(
+                "POST".to_string(),
+                "/prove".to_string(),
+                b"{}".to_vec(),
+                200,
+                b"POST /prove HTTP/1.1|{}".to_vec()
+            )]
+        );
         Ok(())
     }
 }

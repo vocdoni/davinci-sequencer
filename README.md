@@ -25,7 +25,7 @@ The guests are specified in davinci-zkvm: `circuit/CIRCUIT.md` (vote batch) and
 | `state/` (`davinci-state`) | Per-process state: vote validation (mirrors every per-vote guest check), transition builder, blob sync, results request. No IO besides arbo storage. |
 | `sequencer/` (`davinci-sequencer`) | The node: config, redb storage, election keys, census, web3 (alloy), monitor, process actors, HTTP API. |
 | `client/` (`davinci-client`) | API wire types and client, organizer and voter helpers, the circom ballot prover (feature `prover`, on by default). See [client/README.md](client/README.md). |
-| `e2e/` (`davinci-e2e`) | Test-only crate: the end-to-end acceptance test and the batch-size benchmark. |
+| `e2e/` (`davinci-e2e`) | Test-only crate: the end-to-end acceptance test, the batch-size and throughput benchmarks, and their Docker runner (`e2e/bench.sh`). |
 
 External pieces:
 
@@ -795,6 +795,43 @@ proxies. `DAVINCI_E2E_NEGATIVE=1` replays settled transactions, tampered, throug
 --nocapture` proves a first and a steady batch per size on one node (sizes from
 `DAVINCI_E2E_BENCH_SIZES`, fields from `DAVINCI_E2E_BENCH_NF`), on anvil or live.
 `DAVINCI_E2E_BENCH_OUT` names a file for the Markdown table.
+
+**Throughput.** `DAVINCI_E2E_BENCH=throughput cargo test -p davinci-e2e --test
+throughput -- --nocapture` measures sustained votes per second with several
+provers. It starts one node per URL in `DAVINCI_E2E_BENCH_PROVERS` (comma
+separated), and each node sequences its own origin-1 process, so the provers
+never race on one root chain. Every ballot is proved first
+(`DAVINCI_E2E_BENCH_VOTES` per process, default 2048, at
+`DAVINCI_E2E_BENCH_NF`, default 2). The clock then runs from the first submit
+to the last settlement, with `--batch-max` set by `DAVINCI_E2E_BENCH_BATCH`
+(default 512). Each node reaches its prover through a loopback proxy that
+records its `/prove` jobs. The report has per-batch queue and proving times
+from the prover's job API, overall and steady-state votes/s, each prover's
+share and its GPU busy fraction. The run fails if a vote errors or goes
+missing. It then ends the processes and checks the tally on-chain
+(`DAVINCI_E2E_BENCH_RESULTS=0` skips that). The other knobs are listed at the
+top of `e2e/tests/throughput.rs`. A steady batch of N votes carries up to N
+refreshes, and 1024 + 1024 needs about 41 GB of RAM in the prover, so stay at
+512 on a 64 GB prover host.
+
+`e2e/bench.sh` runs either benchmark in the `e2e/Dockerfile.bench` image, with
+nothing native on the host. The nodes are the binary from
+`ghcr.io/vocdoni/davinci-sequencer:main` (`NODE_IMAGE` overrides it), anvil
+and forge come from foundry v1.8.3, and the harness is built in the container
+from the mounted checkouts. The container uses the host network, so provers
+on loopback or a private network are reachable. It runs as your user and
+keeps cargo's registry and target dir in the `davinci-bench-cache` volume.
+Reports, logs and the datadirs of a failed run go to `~/.cache/davinci-bench`
+(`BENCH_RUNS`).
+
+```bash
+DAVINCI_E2E_BENCH_PROVERS=http://127.0.0.1:8080,http://10.200.0.27:8080 e2e/bench.sh
+DAVINCI_E2E_BENCH=sizes e2e/bench.sh    # the batch-size benchmark
+```
+
+The sibling checkouts default to the directories next to this one.
+`DAVINCI_ZKVM_DIR`, `DAVINCI_CONTRACTS_DIR`, `DAVINCI_CENSUS_CONTRACT_DIR`
+and `CIRCOM_ARTIFACTS` point the script elsewhere.
 
 Without `DAVINCI_SEQUENCER_BIN`, the test builds the node with
 `cargo build --release -p davinci-sequencer`. On failure it keeps the node logs,
