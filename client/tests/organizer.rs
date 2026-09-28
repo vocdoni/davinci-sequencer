@@ -8,13 +8,14 @@ use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::node_bindings::Anvil;
 use alloy::primitives::{Address, B256, Bytes, FixedBytes};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolValue;
+use alloy::sol_types::{SolEvent, SolValue};
 use davinci_client::Error;
 use davinci_client::api::{CensusView, ProcessId, ProcessStatus, ProcessView};
 use davinci_client::organizer::{
-    KeyMode, NewProcess, Organizer, OrganizerSecret, RegistryReader, verify_registry,
+    KeyMode, NewProcess, Organizer, OrganizerSecret, ProcessRegistry, RegistryReader,
+    metadata_hash, verify_registry,
 };
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
@@ -48,6 +49,9 @@ fn bytecode(artifact: &str) -> Vec<u8> {
     let hex = j["bytecode"]["object"].as_str().unwrap();
     hex::decode(hex.trim_start_matches("0x")).unwrap()
 }
+
+/// A metadata document nobody fetches: the tests only need its hash.
+const DOC: &[u8] = br#"{"title":{"default":"organizer test"}}"#;
 
 fn registry_bytecode() -> Vec<u8> {
     bytecode("ProcessRegistry.sol/ProcessRegistry.json")
@@ -181,7 +185,8 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
         census_root: Fr::from(123456789u64),
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
-        metadata: String::new(),
+        metadata: "ipfs://metadata".into(),
+        metadata_hash: metadata_hash(DOC),
         key_mode: KeyMode::Sequencer(pk),
     };
     let created = org.create_process(&params).await?;
@@ -196,6 +201,8 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
     assert_eq!(p.census_root, params.census_root);
     assert_eq!(p.census_origin, 1);
     assert_eq!(p.max_voters, 24);
+    assert_eq!(p.metadata_uri, "ipfs://metadata");
+    assert_eq!(p.metadata_hash, metadata_hash(DOC));
     assert_ne!(p.state_root, [0u8; 32], "genesis root computed on-chain");
     assert_eq!(org.results(&pid).await?, None);
 
@@ -335,6 +342,174 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every `ProcessMetadataUpdated` of `pid` on `registry`, oldest first.
+async fn metadata_log(
+    p: &impl Provider,
+    registry: Address,
+    pid: &[u8; 31],
+) -> anyhow::Result<Vec<(String, [u8; 32])>> {
+    use ProcessRegistry::ProcessMetadataUpdated as Ev;
+    let filter = Filter::new()
+        .address(registry)
+        .event_signature(Ev::SIGNATURE_HASH)
+        .from_block(0);
+    let mut out = Vec::new();
+    for log in p.get_logs(&filter).await? {
+        let e = log.log_decode::<Ev>()?.inner.data;
+        if e.processId.0 == *pid {
+            out.push((e.metadataURI, e.metadataHash.0));
+        }
+    }
+    Ok(out)
+}
+
+// setProcessMetadata: the organizer replaces the metadata while the process
+// is open, getProcess and the event log agree, and it is frozen after the end.
+#[tokio::test]
+async fn process_metadata() -> anyhow::Result<()> {
+    if std::env::var("ANVIL").as_deref() != Ok("1") {
+        eprintln!("ANVIL not set, skipping");
+        return Ok(());
+    }
+    let anvil = Anvil::at(anvil_bin()).try_spawn()?;
+    let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let url = anvil.endpoint();
+    let p = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer.clone()))
+        .connect_http(url.parse()?);
+    // The verifier is never called: any non-zero address passes.
+    let vk = release::BATCH_PROGRAM_VK;
+    let registry = deploy_registry(&p, 31337, Address::repeat_byte(0x11), vk).await?;
+    let org = Organizer::connect(&url, signer, registry)?;
+    let reader = RegistryReader::connect(&url, registry)?;
+
+    let doc2 = br#"{"title":{"default":"organizer test, v2"}}"#;
+    let doc3 = br#"{"title":{"default":"organizer test, v3"}}"#;
+    let (h1, h2, h3) = (metadata_hash(DOC), metadata_hash(doc2), metadata_hash(doc3));
+    let mut params = NewProcess {
+        process_id: org.next_process_id().await?,
+        start_time: 0,
+        duration: 600,
+        max_voters: 24,
+        ballot_mode: BallotMode {
+            num_fields: 4,
+            group_size: 1,
+            unique_values: false,
+            cost_exponent: 1,
+            max_value: 5,
+            min_value: 0,
+            max_value_sum: 0,
+            min_value_sum: 0,
+        },
+        census_origin: 1,
+        census_root: Fr::from(123456789u64),
+        census_contract: [0; 20],
+        census_uri: "file:///tmp/census.json".into(),
+        metadata: "ipfs://v1".into(),
+        metadata_hash: h1,
+        key_mode: KeyMode::Sequencer(Point::generator().mul(&U256::from(4242u64))),
+    };
+    // No process without a URI and a hash.
+    let mut bad = params.clone();
+    bad.metadata = String::new();
+    let e = org.create_process(&bad).await.unwrap_err();
+    assert!(
+        matches!(&e, Error::Reverted(n) if n == "InvalidMetadata"),
+        "{e}"
+    );
+    bad.metadata = "ipfs://v1".into();
+    bad.metadata_hash = [0; 32];
+    let e = org.create_process(&bad).await.unwrap_err();
+    assert!(
+        matches!(&e, Error::Reverted(n) if n == "InvalidMetadata"),
+        "{e}"
+    );
+
+    // Creation stores the metadata and logs it.
+    let pid = org.create_process(&params).await?.pid;
+    let got = |p: davinci_client::organizer::OnchainProcess| (p.metadata_uri, p.metadata_hash);
+    assert_eq!(got(reader.process(&pid).await?), ("ipfs://v1".into(), h1));
+    assert_eq!(
+        metadata_log(&p, registry, &pid).await?,
+        [("ipfs://v1".into(), h1)]
+    );
+
+    // READY, then PAUSED: the organizer replaces it.
+    org.set_process_metadata(&pid, "ipfs://v2", h2).await?;
+    assert_eq!(got(reader.process(&pid).await?), ("ipfs://v2".into(), h2));
+    ProcessRegistry::new(registry, org.provider())
+        .setProcessStatus(FixedBytes(pid), 3)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    assert_eq!(reader.process(&pid).await?.status, ProcessStatus::Paused);
+    org.set_process_metadata(&pid, "https://example.com/v3.json", h3)
+        .await?;
+    assert_eq!(
+        got(reader.process(&pid).await?),
+        ("https://example.com/v3.json".into(), h3)
+    );
+
+    // Nobody else, and never empty.
+    let other = Organizer::connect(&url, anvil.keys()[1].clone().into(), registry)?;
+    let e = other
+        .set_process_metadata(&pid, "ipfs://x", h2)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, Error::Reverted(n) if n == "Unauthorized"),
+        "{e}"
+    );
+    for (uri, hash) in [("", h2), ("ipfs://x", [0; 32])] {
+        let e = org.set_process_metadata(&pid, uri, hash).await.unwrap_err();
+        assert!(
+            matches!(&e, Error::Reverted(n) if n == "InvalidMetadata"),
+            "{e}"
+        );
+    }
+
+    // Past the end the metadata is frozen.
+    let rpc = ProviderBuilder::new().connect_http(url.parse()?);
+    let _: serde_json::Value = rpc.raw_request("evm_increaseTime".into(), (601,)).await?;
+    let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await?;
+    let e = org
+        .set_process_metadata(&pid, "ipfs://late", h1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, Error::Reverted(n) if n == "InvalidTimeBounds"),
+        "{e}"
+    );
+
+    // The log alone is the history, and its last entry is what getProcess says.
+    let log = metadata_log(&p, registry, &pid).await?;
+    assert_eq!(
+        log,
+        [
+            ("ipfs://v1".into(), h1),
+            ("ipfs://v2".into(), h2),
+            ("https://example.com/v3.json".into(), h3),
+        ]
+    );
+    assert_eq!(log.last().cloned(), Some(got(reader.process(&pid).await?)));
+
+    // A second process: an ended one is frozen too.
+    params.process_id = org.next_process_id().await?;
+    let pid2 = org.create_process(&params).await?.pid;
+    org.end_process(&pid2).await?;
+    let e = org
+        .set_process_metadata(&pid2, "ipfs://v2", h2)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, Error::Reverted(n) if n == "InvalidStatus"),
+        "{e}"
+    );
+    assert_eq!(got(reader.process(&pid2).await?), ("ipfs://v1".into(), h1));
+    Ok(())
+}
+
 #[test]
 fn organizer_secret_is_range_checked() {
     use davinci_zkvm_sdk::crypto::babyjubjub::SUBGROUP_ORDER;
@@ -426,7 +601,8 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
         census_root: Fr::from(123456789u64),
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
-        metadata: String::new(),
+        metadata: "ipfs://metadata".into(),
+        metadata_hash: metadata_hash(DOC),
         key_mode: KeyMode::DkgAutomatic,
     };
 

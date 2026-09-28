@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::web3::OnchainProcess;
 
 /// Bump on any incompatible change to a table layout or record encoding.
-pub const SCHEMA_VERSION: u64 = 6;
+pub const SCHEMA_VERSION: u64 = 7;
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The database file inside its directory.
 pub const DB_FILE: &str = "sequencer.redb";

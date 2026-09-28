@@ -313,6 +313,7 @@ impl FakeChain {
             creation_block: 1,
             batch_number: 0,
             metadata_uri: String::new(),
+            metadata_hash: [0u8; 32],
             ballot_mode: env.cfg.ballot_mode,
             census: OnchainCensus {
                 origin: env.cfg.census_origin as u8,

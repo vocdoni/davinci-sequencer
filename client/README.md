@@ -71,6 +71,15 @@ with `SequencerClient::new_key` first; for a DKG key, pick
 `organizer_secret` a locked process returns, since `reveal_process_key` needs it
 to unlock the results. See [Key modes](../README.md#key-modes).
 
+`NewProcess::metadata` is the URI of the metadata document (title, question,
+what each ballot field stands for) and `metadata_hash` is
+`organizer::metadata_hash(&document)`, the SHA-256 of the exact bytes served at
+that URI, with no JSON canonicalisation. The registry refuses an empty URI or a
+zero hash. Serve the document byte for byte: reformatting it changes the hash.
+Until the process ends, `Organizer::set_process_metadata(pid, uri, hash)` points
+it at a new document (organizer only, while READY or PAUSED). A client checks a
+fetched document against `OnchainProcess::metadata_hash`.
+
 ## Tests
 
 `cargo test -p davinci-client` runs the offline tests. `ANVIL=1` adds the

@@ -1,6 +1,7 @@
 //! Organizer helper: the census file and the process lifecycle on the zkVM
-//! ProcessRegistry (create in any key mode, end, reveal a DKG organizer key,
-//! read results), and the registry pin check.
+//! ProcessRegistry (create in any key mode, replace the census or the
+//! metadata, end, reveal a DKG organizer key, read results), and the registry
+//! pin check.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +24,7 @@ use davinci_zkvm_sdk::crypto::field::{
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::{dkg, release};
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 
 use crate::api::{CensusFile, CensusParticipant, Fr, ProcessId, ProcessStatus};
 use crate::{Error, Result};
@@ -213,6 +215,12 @@ pub fn merkle_census(file: &CensusFile) -> Result<LeanImt> {
     Ok(t)
 }
 
+/// SHA-256 of a metadata document: the hash of the exact bytes served at its
+/// URI, with no JSON canonicalisation.
+pub fn metadata_hash(document: &[u8]) -> [u8; 32] {
+    Sha256::digest(document).into()
+}
+
 /// `newProcess` parameters. `start_time = 0` means now; the process starts READY.
 #[derive(Clone, Debug)]
 pub struct NewProcess {
@@ -233,7 +241,10 @@ pub struct NewProcess {
     /// registry reverts `InvalidCensusAddress` otherwise).
     pub census_contract: [u8; 20],
     pub census_uri: String,
+    /// Where the metadata document is served; must not be empty.
     pub metadata: String,
+    /// [`metadata_hash`] of the document at `metadata`.
+    pub metadata_hash: [u8; 32],
     pub key_mode: KeyMode,
 }
 
@@ -259,6 +270,8 @@ pub struct OnchainProcess {
     pub census_contract: [u8; 20],
     pub census_uri: String,
     pub metadata_uri: String,
+    /// SHA-256 of the exact bytes served at `metadata_uri`.
+    pub metadata_hash: [u8; 32],
     /// `None` for a sequencer-key process.
     pub dkg: Option<DkgProcess>,
 }
@@ -526,6 +539,7 @@ impl Organizer {
             mode,
             census,
             p.metadata.clone(),
+            B256::from(p.metadata_hash),
             key,
             dkg,
         );
@@ -675,6 +689,22 @@ impl Organizer {
             onchainAllowAnyValidRoot: false,
         };
         let call = self.registry.setProcessCensus(FixedBytes(*pid), census);
+        call.call().await.map_err(chain_err)?;
+        self.mined(call.send().await.map_err(chain_err)?).await?;
+        Ok(())
+    }
+
+    /// Replaces the metadata URI and hash (`setProcessMetadata`, organizer
+    /// only, while READY or PAUSED and before the end) and waits for the
+    /// receipt. `hash` is [`metadata_hash`] of the document at `uri`.
+    pub async fn set_process_metadata(
+        &self,
+        pid: &[u8; 31],
+        uri: &str,
+        hash: [u8; 32],
+    ) -> Result<()> {
+        let (pid, hash) = (FixedBytes(*pid), B256::from(hash));
+        let call = self.registry.setProcessMetadata(pid, uri.to_string(), hash);
         call.call().await.map_err(chain_err)?;
         self.mined(call.send().await.map_err(chain_err)?).await?;
         Ok(())
@@ -901,6 +931,7 @@ async fn read_process(
         census_contract: p.census.contractAddress.0.0,
         census_uri: p.census.censusURI.clone(),
         metadata_uri: p.metadataURI.clone(),
+        metadata_hash: p.metadataHash.0,
         dkg,
     })
 }

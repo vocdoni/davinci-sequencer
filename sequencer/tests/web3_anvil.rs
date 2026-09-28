@@ -16,6 +16,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
+use davinci_client::organizer::metadata_hash;
 use davinci_sequencer::config::SecretString;
 use davinci_sequencer::web3::{
     AnvilBlobs, BlobSource, Contracts, EventKind, NewProcess, OnchainCensus, ProcessStatus,
@@ -33,6 +34,8 @@ const RESULTS_VK: [u8; 32] = [0x22; 32];
 const ROOT_C: [u8; 32] = [0x33; 32];
 const BALLOT_VK_HASH: [u8; 32] = [0x44; 32];
 const NF: u8 = 4;
+/// The metadata document behind the `ipfs://` URIs, which nothing fetches.
+const META_DOC: &[u8] = br#"{"title":{"default":"web3 test"}}"#;
 
 fn enabled() -> bool {
     std::env::var("ANVIL").is_ok_and(|v| v == "1")
@@ -235,6 +238,7 @@ async fn registry_on_anvil() {
             contract_address: [0u8; 20],
         },
         metadata: "ipfs://meta".into(),
+        metadata_hash: metadata_hash(META_DOC),
         enc_key: pk,
     };
     let err = observer.create_process(&np).await.err().unwrap();
@@ -256,9 +260,29 @@ async fn registry_on_anvil() {
     assert_eq!(ev.tx_hash, created.tx_hash);
     assert_eq!(ev.block, created.block);
     assert_eq!(ev.kind, EventKind::ProcessCreated { pid, creator: me });
+    // The same transaction logs the initial metadata right after.
+    let meta: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::MetadataUpdated { .. }))
+        .collect();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(
+        (meta[0].tx_hash, meta[0].log_index),
+        (ev.tx_hash, ev.log_index + 1)
+    );
+    assert_eq!(
+        meta[0].kind,
+        EventKind::MetadataUpdated {
+            pid,
+            uri: "ipfs://meta".into(),
+            hash: metadata_hash(META_DOC),
+        }
+    );
 
     let p = c.process(&pid).await.unwrap();
     assert_eq!(p.status, ProcessStatus::Ready);
+    assert_eq!(p.metadata_uri, "ipfs://meta");
+    assert_eq!(p.metadata_hash, metadata_hash(META_DOC));
     assert_eq!(p.organizer, me.0.0);
     assert_eq!(p.enc_key, pk);
     assert_eq!(p.ballot_mode, mode);
@@ -472,6 +496,106 @@ async fn registry_on_anvil() {
     assert_eq!(c.process(&pid3).await.unwrap().metadata_uri, "ipfs://third");
     // The node keeps sending after it.
     c.end_process(&pid2).await.unwrap();
+}
+
+// An organizer replaces the metadata: the node reads each value from
+// getProcess and as a typed event, creation first, in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_updates_on_anvil() {
+    use davinci_client::organizer::{KeyMode as OrgKeyMode, NewProcess as OrgProcess, Organizer};
+
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(BALLOT_VK_HASH),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    let registry = deploy(&deployer, code).await;
+    let node = Contracts::new(std::slice::from_ref(&url), registry, None)
+        .await
+        .unwrap();
+
+    // Account 1 organizes through the client.
+    let org = Organizer::connect(url.as_str(), anvil.keys()[1].clone().into(), registry).unwrap();
+    let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+    let pid = org
+        .create_process(&OrgProcess {
+            process_id: org.next_process_id().await.unwrap(),
+            start_time: 0,
+            duration: 3600,
+            max_voters: 100,
+            ballot_mode: BallotMode {
+                num_fields: NF,
+                group_size: 1,
+                unique_values: false,
+                cost_exponent: 1,
+                max_value: 5,
+                min_value: 0,
+                max_value_sum: 20,
+                min_value_sum: 0,
+            },
+            census_origin: 1,
+            census_root: Fr::from(42u64),
+            census_contract: [0; 20],
+            census_uri: "file:///tmp/census.json".into(),
+            metadata: "ipfs://meta".into(),
+            metadata_hash: metadata_hash(META_DOC),
+            key_mode: OrgKeyMode::Sequencer(pk),
+        })
+        .await
+        .unwrap()
+        .pid;
+    let doc2: &[u8] = br#"{"title":{"default":"web3 test, v2"}}"#;
+    org.set_process_metadata(&pid, "ipfs://meta-2", metadata_hash(doc2))
+        .await
+        .unwrap();
+
+    let p = node.process(&pid).await.unwrap();
+    assert_eq!(p.metadata_uri, "ipfs://meta-2");
+    assert_eq!(p.metadata_hash, metadata_hash(doc2));
+    let (head, _) = node.head().await.unwrap();
+    let got: Vec<_> = node
+        .events(0, head)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::MetadataUpdated { pid: at, uri, hash } if at == pid => Some((uri, hash)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("ipfs://meta".to_string(), metadata_hash(META_DOC)),
+            ("ipfs://meta-2".to_string(), metadata_hash(doc2)),
+        ]
+    );
 }
 
 // The boot check: only a registry carrying the release pins, on this chain,
@@ -693,6 +817,7 @@ async fn send_that_failed_over_is_maybe_sent() {
             contract_address: [0u8; 20],
         },
         metadata: "ipfs://meta".into(),
+        metadata_hash: metadata_hash(META_DOC),
         enc_key: pk,
     };
     let (pid, r) = c.create_process(&np).await.unwrap();
@@ -826,7 +951,8 @@ async fn dkg_results_on_anvil() {
         census_root,
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
-        metadata: String::new(),
+        metadata: "ipfs://meta".into(),
+        metadata_hash: metadata_hash(META_DOC),
         key_mode: OrgKeyMode::DkgAutomatic,
     };
     let pid = org

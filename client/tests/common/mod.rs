@@ -54,6 +54,7 @@ pub fn election(nf: u8, origin: u8, census_root: Fr, rng: &mut StdRng) -> Electi
             census_contract: [0; 20],
             census_uri: String::new(),
             metadata_uri: String::new(),
+            metadata_hash: [0; 32],
             dkg: None,
         },
         sk,

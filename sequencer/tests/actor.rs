@@ -613,6 +613,40 @@ async fn census_transient_failure_retries_not_ignores() {
     shutdown.cancel();
 }
 
+/// `ProcessMetadataUpdated` reaches the stored record, which mirrors
+/// `getProcess`.
+#[tokio::test]
+async fn metadata_update_reaches_the_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let _h = handle(&node).await;
+    s.chain.advance_time(0);
+    s.chain.push_event(EventKind::MetadataUpdated {
+        pid: pid31(),
+        uri: "ipfs://metadata-2".into(),
+        hash: [0x5a; 32],
+    });
+    wait_until("metadata stored", async || {
+        node.db.process(&pid_fr()).unwrap().is_some_and(|r| {
+            r.onchain.metadata_uri == "ipfs://metadata-2" && r.onchain.metadata_hash == [0x5a; 32]
+        })
+    })
+    .await;
+    shutdown.cancel();
+}
+
 /// A failed blob fetch during sync must not wedge the actor; the
 /// heartbeat replays the gap and the pending votes settle.
 #[tokio::test]

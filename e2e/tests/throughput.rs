@@ -409,6 +409,8 @@ async fn run(
     let voters = fx::bench_voters(cfg.votes);
     let (census, tree) = fx::merkle_census_of(&voters)?;
     let uri = fx::write_census(census_dir, "throughput.json", &census)?;
+    let (metadata, metadata_hash) =
+        fx::write_metadata(census_dir, "throughput-metadata.json", "throughput")?;
     let mut procs = Vec::new();
     for (n, node) in nodes.iter().enumerate() {
         for _ in 0..cfg.procs {
@@ -425,7 +427,8 @@ async fn run(
                     census_root: tree.root(),
                     census_contract: [0; 20],
                     census_uri: uri.clone(),
-                    metadata: String::new(),
+                    metadata: metadata.clone(),
+                    metadata_hash,
                     key_mode: KeyMode::Sequencer(pk),
                 })
                 .await?

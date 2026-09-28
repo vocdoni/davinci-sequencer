@@ -338,6 +338,11 @@
             "internalType": "string"
           },
           {
+            "name": "metadataHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
             "name": "ballotMode",
             "type": "tuple",
             "internalType": "struct DAVINCITypes.BallotMode",
@@ -605,9 +610,14 @@
         ]
       },
       {
-        "name": "metadata",
+        "name": "metadataURI",
         "type": "string",
         "internalType": "string"
+      },
+      {
+        "name": "metadataHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
       },
       {
         "name": "encryptionKey",
@@ -805,6 +815,11 @@
         "name": "metadataURI",
         "type": "string",
         "internalType": "string"
+      },
+      {
+        "name": "metadataHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
       },
       {
         "name": "ballotMode",
@@ -1073,6 +1088,29 @@
   },
   {
     "type": "function",
+    "name": "setProcessMetadata",
+    "inputs": [
+      {
+        "name": "processId",
+        "type": "bytes31",
+        "internalType": "bytes31"
+      },
+      {
+        "name": "metadataURI",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "metadataHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "setProcessResults",
     "inputs": [
       {
@@ -1241,6 +1279,31 @@
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ProcessMetadataUpdated",
+    "inputs": [
+      {
+        "name": "processId",
+        "type": "bytes31",
+        "indexed": true,
+        "internalType": "bytes31"
+      },
+      {
+        "name": "metadataURI",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
+      },
+      {
+        "name": "metadataHash",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
       }
     ],
     "anonymous": false
@@ -1535,6 +1598,11 @@
   {
     "type": "error",
     "name": "InvalidMaxVoters",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidMetadata",
     "inputs": []
   },
   {

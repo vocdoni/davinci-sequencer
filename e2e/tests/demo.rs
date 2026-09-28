@@ -8,7 +8,8 @@
 //!   `e2e/demo/`. Run again, it reuses the keys and rewrites the same files.
 //! - `run` creates the elections of `davinci_e2e::demo::elections`, their
 //!   census and metadata URIs under `DAVINCI_DEMO_BASE_URL` (the committed
-//!   `e2e/demo`, e.g. on raw.githubusercontent.com at a pinned commit). It
+//!   `e2e/demo`, e.g. on raw.githubusercontent.com at a pinned commit) and
+//!   the SHA-256 of each `metadata.json` as its metadata hash. It
 //!   casts the votes through the nodes in `DAVINCI_DEMO_NODES` (default
 //!   `http://127.0.0.1:9090,http://127.0.0.1:9091`), runs each lifecycle and
 //!   prints a table. It spawns nothing: the nodes, their provers and the DKG
@@ -36,7 +37,7 @@ use davinci_client::Error as ClientError;
 use davinci_client::SequencerClient;
 use davinci_client::api::{Fr, ProcessId, ProcessStatus, VoteRequest, VoteStatus, vote_id_hex};
 use davinci_client::organizer::{
-    KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret, verify_registry,
+    KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret, metadata_hash, verify_registry,
 };
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::random_k;
@@ -210,6 +211,7 @@ fn check_ballots(specs: &[Spec], secrets: &Secrets, prover: &BallotProver) -> Re
             census_contract: [0; 20],
             census_uri: String::new(),
             metadata_uri: String::new(),
+            metadata_hash: [0; 32],
             dkg: None,
         };
         let witness = match spec.census {
@@ -757,7 +759,9 @@ impl Run {
             census_root,
             census_contract,
             census_uri,
+            // The bytes check_published found at that URL.
             metadata: self.url(&spec.metadata_path()),
+            metadata_hash: metadata_hash(&demo::metadata(spec)?),
             key_mode,
         })
     }

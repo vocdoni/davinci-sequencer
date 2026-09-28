@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use davinci_client::api::{CensusFile, Fr, VoteRequest};
-use davinci_client::organizer::{OnchainProcess, census_file, merkle_census};
+use davinci_client::organizer::{OnchainProcess, census_file, merkle_census, metadata_hash};
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::{Voter, random_k};
 use davinci_zkvm_sdk::ballot::BallotMode;
@@ -223,6 +223,29 @@ pub fn write_census_jsonl(dir: &Path, name: &str, parts: &[([u8; 20], u128)]) ->
         ));
     }
     write_file(dir, name, body.as_bytes())
+}
+
+/// Writes a small metadata document titled `title` into `dir`, next to the
+/// censuses; returns its `file://` URI and the SHA-256 of the bytes written.
+pub fn write_metadata(dir: &Path, name: &str, title: &str) -> Result<(String, [u8; 32])> {
+    let body = serde_json::to_vec(&serde_json::json!({ "title": { "default": title } }))?;
+    Ok((write_file(dir, name, &body)?, metadata_hash(&body)))
+}
+
+/// Fails unless `p`'s metadata hash is the SHA-256 of the file behind its
+/// `file://` metadata URI.
+pub fn check_metadata(p: &OnchainProcess) -> Result<()> {
+    let path = p
+        .metadata_uri
+        .strip_prefix("file://")
+        .context("metadata URI is not file://")?;
+    let body = std::fs::read(path).with_context(|| p.metadata_uri.clone())?;
+    ensure!(
+        p.metadata_hash == metadata_hash(&body),
+        "metadata hash is not the SHA-256 of {}",
+        p.metadata_uri
+    );
+    Ok(())
 }
 
 fn write_file(dir: &Path, name: &str, body: &[u8]) -> Result<String> {
@@ -530,6 +553,16 @@ mod tests {
             format!("0x{}", hex::encode(parts[1].0))
         );
         assert_eq!(lines[1]["weight"], 10);
+    }
+
+    #[test]
+    fn metadata_hash_is_of_the_served_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (uri, hash) = write_metadata(dir.path(), "m.json", "a process").unwrap();
+        let body = std::fs::read(uri.trim_start_matches("file://")).unwrap();
+        assert_eq!(hash, metadata_hash(&body));
+        let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(j["title"]["default"], "a process");
     }
 
     #[test]

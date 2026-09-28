@@ -334,6 +334,7 @@ async fn setup_checks(
         format!("{e:#}").contains("AlreadyRegisteredAddress"),
         "{e:#}"
     );
+    let (metadata, metadata_hash) = fx::write_metadata(dir, "metadata-dyn.json", "dynamic census")?;
     let mk = |process_id, census_origin, census_root, census_contract, census_uri| NewProcess {
         process_id,
         start_time: 0,
@@ -344,7 +345,8 @@ async fn setup_checks(
         census_root,
         census_contract,
         census_uri,
-        metadata: String::new(),
+        metadata: metadata.clone(),
+        metadata_hash,
         key_mode: KeyMode::Sequencer(pk1),
     };
     let next = org.next_process_id().await?;
@@ -757,6 +759,7 @@ async fn create_processes(
 ) -> Result<Elections> {
     let (census, tree) = fx::merkle_census_of(&fx::merkle_voters())?;
     let uri = fx::write_census(census_dir, "census-1.json", &census)?;
+    let (meta1, hash1) = fx::write_metadata(census_dir, "metadata-1.json", "process 1")?;
     let next = org.next_process_id().await?;
     let pk1 = key1(next).await.context("key for process 1")?;
     let pid1 = org
@@ -770,13 +773,15 @@ async fn create_processes(
             census_root: tree.root(),
             census_contract: [0; 20],
             census_uri: uri,
-            metadata: String::new(),
+            metadata: meta1,
+            metadata_hash: hash1,
             key_mode: KeyMode::Sequencer(pk1),
         })
         .await
         .context("create process 1")?
         .pid;
     let csp = fx::csp_key();
+    let (meta2, hash2) = fx::write_metadata(census_dir, "metadata-2.json", "process 2")?;
     let next = org.next_process_id().await?;
     let pk2 = key2(next).await.context("key for process 2")?;
     let pid2 = org
@@ -790,7 +795,8 @@ async fn create_processes(
             census_root: fx::csp_root(&csp)?,
             census_contract: [0; 20],
             census_uri: "csp://davinci-e2e".into(),
-            metadata: String::new(),
+            metadata: meta2,
+            metadata_hash: hash2,
             key_mode: KeyMode::Sequencer(pk2),
         })
         .await
@@ -801,11 +807,14 @@ async fn create_processes(
         ProcessId(pid1),
         ProcessId(pid2)
     );
+    let (p1, p2) = (reader.process(&pid1).await?, reader.process(&pid2).await?);
+    fx::check_metadata(&p1)?;
+    fx::check_metadata(&p2)?;
     Ok(Elections {
         pid1,
         pid2,
-        p1: reader.process(&pid1).await?,
-        p2: reader.process(&pid2).await?,
+        p1,
+        p2,
         tree,
         csp,
     })
@@ -1670,6 +1679,8 @@ async fn onchain_votes(
         Ok(())
     };
     add(0, ONCHAIN_SIZES[0]).await?;
+    let (metadata, metadata_hash) =
+        fx::write_metadata(&node_b.census_dir, "metadata-3.json", "origin-3 process")?;
 
     // A key is a function of the pid, so asking again gives the same one.
     let next = org.next_process_id().await?;
@@ -1690,7 +1701,8 @@ async fn onchain_votes(
             census_root: Fr::from(0u64),
             census_contract: census.address.0.0,
             census_uri: "onchain://davinci-e2e".into(),
-            metadata: String::new(),
+            metadata,
+            metadata_hash,
             key_mode: KeyMode::Sequencer(pk),
         })
         .await
@@ -1845,6 +1857,8 @@ async fn offchain_dynamic_census(
     let (t1, t2) = (fx::tree_of(&v1)?, fx::tree_of(&v2)?);
     let uri1 = fx::write_census_dump(census_dir, "census-dyn-v1.json", &v1)?;
     let uri2 = fx::write_census_jsonl(census_dir, "census-dyn-v2.jsonl", &v2)?;
+    let (metadata, metadata_hash) =
+        fx::write_metadata(census_dir, "metadata-4.json", "origin-2 process")?;
 
     let next = org.next_process_id().await?;
     let pk = nodes[C].api.new_key(&next).await?;
@@ -1859,7 +1873,8 @@ async fn offchain_dynamic_census(
             census_root: t1.root(),
             census_contract: [0; 20],
             census_uri: uri1,
-            metadata: String::new(),
+            metadata,
+            metadata_hash,
             key_mode: KeyMode::Sequencer(pk),
         })
         .await
@@ -1973,7 +1988,8 @@ const DKG_OTHER_KEY_VOTER: usize = 12;
 /// request is what ends it. Its votes must settle before (scaled live).
 const DKG_LOCKED_DURATION: Duration = Duration::from_secs(300);
 
-/// A DKG_AUTOMATIC process on process 1's census (`p1`), `duration` s long.
+/// A DKG_AUTOMATIC process on process 1's census and metadata (`p1`),
+/// `duration` s long.
 fn dkg_new_process(process_id: [u8; 31], p1: &OnchainProcess, duration: u64) -> NewProcess {
     NewProcess {
         process_id,
@@ -1985,7 +2001,8 @@ fn dkg_new_process(process_id: [u8; 31], p1: &OnchainProcess, duration: u64) -> 
         census_root: p1.census_root,
         census_contract: [0; 20],
         census_uri: p1.census_uri.clone(),
-        metadata: String::new(),
+        metadata: p1.metadata_uri.clone(),
+        metadata_hash: p1.metadata_hash,
         key_mode: KeyMode::DkgAutomatic,
     }
 }

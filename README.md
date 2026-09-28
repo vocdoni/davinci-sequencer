@@ -670,6 +670,8 @@ The Rust client API (`davinci_client::organizer`):
 let next = org.next_process_id().await?;
 let created = org.create_process(&NewProcess {
     process_id: next,
+    metadata: uri,                            // where the document is served
+    metadata_hash: metadata_hash(&document),  // SHA-256 of its exact bytes
     key_mode: KeyMode::DkgLocked,
     ..
 }).await?;
@@ -915,7 +917,8 @@ the voter keys into `~/.davinci-gnosis/demo` (mode 0700, never the repository)
 and writes the public census and metadata files into `e2e/demo/`. `check`
 proves every planned ballot against the circuit, offline. Once the files are
 pushed, `run` checks they are served unchanged, creates the elections with
-their URIs under `DAVINCI_DEMO_BASE_URL`, casts the votes, ends, reveals and
+their URIs under `DAVINCI_DEMO_BASE_URL` and the SHA-256 of each
+`metadata.json` as its metadata hash, casts the votes, ends, reveals and
 cancels, and prints a table (with links when `DAVINCI_DEMO_EXPLORER_URL`
 names an explorer). It records its progress in
 `state.json` next to the keys and resumes from it.

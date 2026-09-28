@@ -230,6 +230,8 @@ async fn case(
     let voters = fx::bench_voters(2 * n);
     let (census, tree) = fx::merkle_census_of(&voters)?;
     let uri = fx::write_census(census_dir, &format!("{name}.json"), &census)?;
+    let (metadata, metadata_hash) =
+        fx::write_metadata(census_dir, &format!("{name}-metadata.json"), &name)?;
     let next = org.next_process_id().await?;
     let pk = node.api.new_key(&next).await?;
     let pid = org
@@ -243,7 +245,8 @@ async fn case(
             census_root: tree.root(),
             census_contract: [0; 20],
             census_uri: uri,
-            metadata: String::new(),
+            metadata,
+            metadata_hash,
             key_mode: KeyMode::Sequencer(pk),
         })
         .await?

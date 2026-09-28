@@ -1873,6 +1873,13 @@ impl Actor {
                 self.record.onchain.max_voters = max_voters;
                 self.put_record();
             }
+            // Followed like the duration and the census, so the stored copy
+            // catches up with getProcess; nothing here reads it.
+            EventKind::MetadataUpdated { uri, hash, .. } => {
+                self.record.onchain.metadata_uri = uri;
+                self.record.onchain.metadata_hash = hash;
+                self.put_record();
+            }
             EventKind::ResultsDecryptionRequested {
                 epoch_id,
                 aid,

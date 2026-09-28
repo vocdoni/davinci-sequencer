@@ -536,6 +536,7 @@ fn onchain(v: &ProcessView) -> OnchainProcess {
         census_contract: [0; 20],
         census_uri: v.census.census_uri.clone(),
         metadata_uri: String::new(),
+        metadata_hash: [0; 32],
         dkg: None,
     }
 }

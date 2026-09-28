@@ -32,6 +32,7 @@ fn onchain(root: u8) -> OnchainProcess {
         creation_block: 9,
         batch_number: 0,
         metadata_uri: "ipfs://m".into(),
+        metadata_hash: [6u8; 32],
         ballot_mode: BallotMode {
             num_fields: 4,
             group_size: 1,

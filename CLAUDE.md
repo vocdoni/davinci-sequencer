@@ -249,7 +249,7 @@ results PLONK is needed in DKG modes; the committee's Groth16 proofs replace it.
   `--registry` is explicit.
 
 **Storage.**
-- Records are JSON in redb. Bump `storage.rs::SCHEMA_VERSION` (now 6) on any
+- Records are JSON in redb. Bump `storage.rs::SCHEMA_VERSION` (now 7) on any
   record-shape change; the node refuses a mismatched file.
 - One database per deployment: `<datadir>/<chain id>-0x<registry>/sequencer.redb`
   (`Db::open_deployment`), bound to it by the `meta_bytes` key `deployment`. A new

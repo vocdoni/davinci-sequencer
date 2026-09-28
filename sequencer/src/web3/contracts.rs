@@ -325,6 +325,7 @@ fn process_from_abi(p: &T::Process) -> Result<OnchainProcess> {
         creation_block: sat_u64(p.creationBlock),
         batch_number: sat_u64(p.batchNumber),
         metadata_uri: p.metadataURI.clone(),
+        metadata_hash: p.metadataHash.0,
         ballot_mode: mode_from_abi(&p.ballotMode)?,
         census: OnchainCensus {
             origin: p.census.censusOrigin,
@@ -416,6 +417,14 @@ fn event_from_log(log: &Log) -> Result<Option<RegistryEvent>> {
                 pid: e.processId.0,
                 root: e.censusRoot.0,
                 uri: e.censusURI.clone(),
+            }
+        }
+        PR::ProcessMetadataUpdated::SIGNATURE_HASH => {
+            let e = PR::ProcessMetadataUpdated::decode_log(&log.inner).map_err(bad)?;
+            EventKind::MetadataUpdated {
+                pid: e.processId.0,
+                uri: e.metadataURI.clone(),
+                hash: e.metadataHash.0,
             }
         }
         PR::ResultsDecryptionRequested::SIGNATURE_HASH => {
@@ -582,6 +591,7 @@ impl Contracts {
             PR::ProcessStateTransitioned::SIGNATURE_HASH,
             PR::ProcessResultsSet::SIGNATURE_HASH,
             PR::CensusUpdated::SIGNATURE_HASH,
+            PR::ProcessMetadataUpdated::SIGNATURE_HASH,
             PR::ResultsDecryptionRequested::SIGNATURE_HASH,
         ];
         // A failover mid-page could land on a lagging endpoint that answers an
@@ -663,7 +673,8 @@ impl Contracts {
                 censusURI: p.census.uri.clone(),
                 onchainAllowAnyValidRoot: false,
             },
-            metadata: p.metadata.clone(),
+            metadataURI: p.metadata.clone(),
+            metadataHash: FixedBytes(p.metadata_hash),
             encryptionKey: point_to_abi(&p.enc_key),
             // SEQUENCER mode: every DKG field zero.
             dkg: T::DKGParams {

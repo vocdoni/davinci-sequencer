@@ -191,6 +191,9 @@ pub struct OnchainProcess {
     pub creation_block: u64,
     pub batch_number: u64,
     pub metadata_uri: String,
+    /// SHA-256 of the exact bytes served at `metadata_uri`.
+    #[serde(with = "hex::serde")]
+    pub metadata_hash: [u8; 32],
     pub ballot_mode: BallotMode,
     pub census: OnchainCensus,
     pub key_mode: KeyMode,
@@ -215,6 +218,8 @@ pub struct NewProcess {
     pub ballot_mode: BallotMode,
     pub census: OnchainCensus,
     pub metadata: String,
+    /// SHA-256 of the exact bytes served at `metadata`.
+    pub metadata_hash: [u8; 32],
     pub enc_key: Point,
 }
 
@@ -258,6 +263,12 @@ pub enum EventKind {
         root: [u8; 32],
         uri: String,
     },
+    /// The metadata at creation, or the organizer replaced it.
+    MetadataUpdated {
+        pid: [u8; 31],
+        uri: String,
+        hash: [u8; 32],
+    },
     /// DKG modes: the final accumulator went to the committee.
     ResultsDecryptionRequested {
         pid: [u8; 31],
@@ -278,6 +289,7 @@ impl EventKind {
             | EventKind::StateTransitioned { pid, .. }
             | EventKind::ResultsSet { pid, .. }
             | EventKind::CensusUpdated { pid, .. }
+            | EventKind::MetadataUpdated { pid, .. }
             | EventKind::ResultsDecryptionRequested { pid, .. } => pid,
         }
     }

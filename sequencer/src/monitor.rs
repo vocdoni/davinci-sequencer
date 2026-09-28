@@ -686,6 +686,7 @@ fn placeholder_process() -> crate::web3::OnchainProcess {
         creation_block: 0,
         batch_number: 0,
         metadata_uri: String::new(),
+        metadata_hash: [0u8; 32],
         ballot_mode: davinci_zkvm_sdk::ballot::BallotMode {
             num_fields: 0,
             group_size: 0,
