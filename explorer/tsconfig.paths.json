@@ -1,0 +1,55 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "~app/*": [
+        "src/app/*"
+      ],
+      "~components": [
+        "src/components/index.ts"
+      ],
+      "~components/*": [
+        "src/components/*"
+      ],
+      "~config/*": [
+        "src/config/*"
+      ],
+      "~contracts/*": [
+        "src/contracts/*"
+      ],
+      "~data/*": [
+        "src/data/*"
+      ],
+      "~fixtures/*": [
+        "src/fixtures/*"
+      ],
+      "~hooks/*": [
+        "src/hooks/*"
+      ],
+      "~indexer/*": [
+        "src/indexer/*"
+      ],
+      "~kit": [
+        "src/kit/index.ts"
+      ],
+      "~kit/*": [
+        "src/kit/*"
+      ],
+      "~lib/*": [
+        "src/lib/*"
+      ],
+      "~pages/*": [
+        "src/pages/*"
+      ],
+      "~protocol/*": [
+        "src/protocol/*"
+      ],
+      "~routes/*": [
+        "src/routes/*"
+      ],
+      "~theme/*": [
+        "src/theme/*"
+      ]
+    }
+  }
+}

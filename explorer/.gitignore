@@ -1,0 +1,30 @@
+# Build output
+dist/
+.vite/
+
+# Dependencies
+node_modules/
+
+# Tests
+coverage/
+test-results/
+playwright-report/
+blob-report/
+.vitest-cache/
+
+# TypeScript
+*.tsbuildinfo
+
+# Local config: the dev server serves public/config.local.json as
+# /config.json when it exists.
+public/config.local.json
+
+# Logs, editors, env
+*.log
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.env
+.env.local
+.env.*.local

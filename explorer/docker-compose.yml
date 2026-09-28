@@ -1,0 +1,40 @@
+# The explorer on its own, at http://127.0.0.1:8080 (EXPLORER_PORT moves it).
+#
+#   docker compose up            # the published image (built here if missing)
+#   docker compose up --build    # build from this directory
+#   docker compose --profile watchtower up -d   # follow new releases
+#
+# The variables are passed through only when set in the shell or in .env;
+# unset ones keep the defaults of public/config.json (the Gnosis Chain
+# deployment). See README.md for what each one does.
+services:
+  explorer:
+    build: .
+    image: ${EXPLORER_IMAGE:-ghcr.io/vocdoni/davinci-explorer:latest}
+    ports:
+      - "${EXPLORER_PORT:-8080}:8080"
+    environment:
+      - NETWORK_NAME
+      - CHAIN_ID
+      - RPC_URL
+      - BEACON_URL
+      - REGISTRY_ADDRESS
+      - START_BLOCK
+      - SEQUENCER_URLS
+      - BLOCK_EXPLORER_URL
+      - DKG_EXPLORER_URL
+      - BEACON_PROXY
+      - SEQUENCER_PROXY
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    restart: unless-stopped
+
+  # Pulls the image again when a release moves :latest and restarts the
+  # explorer; a release that changes the default deployment switches it too.
+  watchtower:
+    profiles: [watchtower]
+    image: nickfedor/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 --label-enable --include-stopped --revive-stopped
+    restart: unless-stopped

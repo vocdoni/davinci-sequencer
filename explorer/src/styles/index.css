@@ -1,0 +1,207 @@
+/* Tailwind v4 entry and the explorer's design tokens.
+ *
+ * The palette is the davinci-dkg explorer's (VoltAgent-derived): obsidian
+ * canvas, carbon cards, onyx hover, charcoal hairlines, one emerald accent,
+ * one amber and one red. Token names are surface *levels*, not colours: in the
+ * light theme "obsidian" is the page canvas and "ghost" the primary text, so a
+ * component styled once reads correctly in both themes.
+ *
+ * `@theme` holds the dark values (the default). `html[data-theme='light']`
+ * overrides the same custom properties; utilities reference them through
+ * `var()`, so switching themes is one attribute on <html>, set before first
+ * paint by the inline script in index.html.
+ */
+@import 'tailwindcss';
+
+@theme static {
+  /* ── Surface levels ─────────────────────────────────────────────────── */
+  --color-obsidian: #050507; /* level 0: page canvas */
+  --color-carbon: #101010; /* level 1: cards, panels */
+  --color-onyx: #1a1a1a; /* level 2: hover, active, table stripes */
+  --color-translucent: rgba(255, 255, 255, 0.06); /* level 3: overlays */
+
+  /* ── Lines and text ─────────────────────────────────────────────────── */
+  --color-charcoal: #3d3a39; /* every border */
+  --color-warm-gray: #5c5855; /* hover border, inactive marks */
+  --color-field: #6b6663; /* form-field outline; 3.3:1 on carbon */
+  --color-ghost: #ffffff; /* primary text */
+  --color-silver: #dcdcdc; /* secondary UI text */
+  --color-pewter: #b8b3b0; /* labels */
+  --color-ash: #948d8a; /* descriptions; 5.2:1 on onyx */
+
+  /* ── Accent ─────────────────────────────────────────────────────────── */
+  --color-emerald: #00d992;
+  --color-emerald-soft: #10b981;
+  --color-on-accent: #050507; /* text on an emerald fill */
+  --color-volt-glow: rgba(0, 217, 146, 0.15);
+
+  /* ── The two semantic colours beyond emerald ────────────────────────── */
+  --color-amber: #e3b341;
+  --color-red: #f85149;
+
+  /* ── Chart companions: emerald plus two desaturated hues, then greys ── */
+  --color-series-1: #00d992;
+  --color-series-2: #4f9d8a;
+  --color-series-3: #7a8fa6;
+  --color-series-4: #8a8380;
+  --color-series-5: #b8b3b0;
+
+  /* ── Elevation: popovers and tooltips only; cards never cast shadows ── */
+  --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.6);
+
+  /* ── Radii (design package: xs 4, sm 6, md 8, pill) ─────────────────── */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-pill: 9999px;
+
+  /* ── Fonts (self-hosted; see src/main.tsx) ──────────────────────────── */
+  --font-sans: 'Inter Variable', Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+
+  --container-page: 1400px;
+}
+
+/* Light theme. Warm neutrals from the same family as the dark greys, and a
+ * deeper emerald: #00d992 on white is 1.8:1, #047857 is 5.5:1, so the accent
+ * stays legible as text and as a fill under white text. */
+html[data-theme='light'] {
+  --color-obsidian: #f6f5f3;
+  --color-carbon: #ffffff;
+  --color-onyx: #efedea;
+  --color-translucent: rgba(20, 16, 12, 0.04);
+
+  --color-charcoal: #dcd8d3;
+  --color-warm-gray: #a9a29c;
+  --color-field: #8f8882;
+  --color-ghost: #171513;
+  --color-silver: #2f2c2a;
+  --color-pewter: #504b48;
+  --color-ash: #67615d;
+
+  --color-emerald: #047857;
+  --color-emerald-soft: #059669;
+  --color-on-accent: #ffffff;
+  --color-volt-glow: rgba(4, 120, 87, 0.18);
+
+  --color-amber: #8a5a00;
+  --color-red: #c9252d;
+
+  --color-series-1: #059669;
+  --color-series-2: #2f7d6d;
+  --color-series-3: #56708c;
+  --color-series-4: #8c8580;
+  --color-series-5: #bdb6b0;
+
+  --shadow-pop: 0 10px 28px rgba(28, 22, 16, 0.14);
+
+  color-scheme: light;
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  html[data-theme='light'] {
+    color-scheme: light;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-obsidian);
+    color: var(--color-ghost);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-emerald) 25%, transparent);
+    color: var(--color-ghost);
+  }
+
+  /* Borders default to charcoal so `border` alone is always on-palette. */
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-charcoal);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-emerald);
+    outline-offset: 2px;
+  }
+
+  /* Numbers must never jitter in a table. */
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* The one repeated composite: a 13px uppercase label. */
+  .label-caps {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    line-height: 1.2;
+  }
+}
+
+@layer utilities {
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Thin scrollbars for panels that scroll inside themselves. */
+  .scroll-slim {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-charcoal) transparent;
+  }
+  .scroll-slim::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-slim::-webkit-scrollbar-thumb {
+    background: var(--color-charcoal);
+    border-radius: 9999px;
+  }
+  .scroll-slim::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  @keyframes explorer-pulse {
+    0%,
+    100% {
+      opacity: 0.45;
+    }
+    50% {
+      opacity: 0.9;
+    }
+  }
+  .animate-skeleton {
+    animation: explorer-pulse 1.6s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-skeleton {
+      animation: none;
+    }
+  }
+}

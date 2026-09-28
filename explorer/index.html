@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang='en' data-theme='dark'>
+  <head>
+    <meta charset='UTF-8' />
+    <link rel='icon' type='image/svg+xml' href='/favicon.svg' />
+    <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+    <meta
+      name='description'
+      content='DAVINCI explorer: processes, state transitions, blobs and results of a DAVINCI voting deployment, with the checks to verify them yourself'
+    />
+    <meta name='color-scheme' content='dark light' />
+    <meta name='theme-color' content='#050507' />
+    <title>DAVINCI explorer</title>
+    <!--
+      Theme before first paint. Mirrors src/theme/theme.ts (storage key,
+      resolution rule and the two canvas colours); keep them in sync.
+    -->
+    <script>
+      ;(function () {
+        var pref = 'system'
+        try {
+          pref = localStorage.getItem('davinci-explorer:theme') || 'system'
+        } catch (e) {}
+        var dark =
+          pref === 'dark' ||
+          (pref !== 'light' && !(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches))
+        var root = document.documentElement
+        root.setAttribute('data-theme', dark ? 'dark' : 'light')
+        root.style.colorScheme = dark ? 'dark' : 'light'
+        var meta = document.querySelector('meta[name="theme-color"]')
+        if (meta) meta.setAttribute('content', dark ? '#050507' : '#f6f5f3')
+      })()
+    </script>
+    <!-- Fonts are self-hosted (src/main.tsx): no third-party CDN. -->
+  </head>
+  <body>
+    <div id='root'></div>
+    <script type='module' src='/src/main.tsx'></script>
+  </body>
+</html>

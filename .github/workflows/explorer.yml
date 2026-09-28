@@ -1,0 +1,161 @@
+name: Explorer
+
+# The web explorer in explorer/: lint, typecheck, unit tests, the Playwright
+# smoke suite (demo mode) and the production build on every PR and push that
+# touches it, then the nginx image. Branch pushes publish the image to GHCR
+# and Docker Hub under the branch name; a release tag vX.Y.Z publishes
+# :vX.Y.Z and moves :latest to it (prereleases don't). Pull requests build
+# the image only.
+
+on:
+  push:
+    branches:
+      - dev
+      - stage
+      - main
+      - release**
+    tags:
+      - "v*"
+    paths:
+      - "explorer/**"
+      - ".github/workflows/explorer.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "explorer/**"
+      - ".github/workflows/explorer.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-push-{1}-{2}', github.workflow, github.ref, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: explorer
+
+jobs:
+  checks:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: explorer/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: explorer/pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Config renderer
+        run: sh docker/render.test.sh
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Format
+        run: pnpm format:check
+      - name: Unit tests
+        run: pnpm test
+      - name: Build
+        run: pnpm build
+        env:
+          VITE_BUILD_VERSION: ${{ github.sha }}
+
+  e2e:
+    name: Playwright (demo mode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: explorer/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: explorer/pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Smoke suite
+        run: pnpm test:e2e
+        env:
+          CI: "1"
+      - name: Report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            explorer/playwright-report
+            explorer/test-results
+          retention-days: 7
+
+  docker:
+    name: ${{ github.event_name == 'push' && 'Image (build and publish)' || 'Image (build)' }}
+    needs: [checks, e2e]
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Compose tag list
+        id: tags
+        shell: bash
+        working-directory: .
+        env:
+          IMAGE_TAG: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
+        run: |
+          # Refs with slashes (feature/foo) are not valid Docker tags.
+          primary=${IMAGE_TAG//\//-}
+          tags="vocdoni/davinci-explorer:${primary}"
+          tags+=$'\n'"ghcr.io/vocdoni/davinci-explorer:${primary}"
+          if [[ "${primary}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tags+=$'\n'"vocdoni/davinci-explorer:latest"
+            tags+=$'\n'"ghcr.io/vocdoni/davinci-explorer:latest"
+          fi
+          {
+            echo 'list<<EOF'
+            echo "${tags}"
+            echo 'EOF'
+            echo "version=${primary}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: ${{ github.event_name == 'push' && 'Build and publish' || 'Build' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: explorer
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            VITE_BUILD_VERSION=${{ steps.tags.outputs.version }}
+          cache-from: type=gha,scope=explorer
+          cache-to: type=gha,mode=max,scope=explorer
