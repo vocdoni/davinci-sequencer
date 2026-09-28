@@ -73,11 +73,15 @@ jobs:
         working-directory: davinci-sequencer
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  # Test and Emulator are the heavy jobs: they run on the self-hosted boxes,
-  # without GitHub caches.
+  # Test and Emulator are the heavy jobs: they run on the self-hosted boxes
+  # in a job container, without GitHub caches.
   test:
     name: Test
     runs-on: [self-hosted]
+    container: ubuntu:24.04
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 90
     env:
       ANVIL: "1"
@@ -85,10 +89,13 @@ jobs:
       DAVINCI_CENSUS_CONTRACT_DIR: ${{ github.workspace }}/davinci-onchain-census-contract
       CIRCOM_ARTIFACTS: ${{ github.workspace }}/davinci-circom/artifacts
     steps:
-      # Self-hosted runners may export no HOME (they run under systemd); give
-      # each job a fresh one for rustup, cargo and foundry.
-      - name: Give the run a home
-        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+      # The self-hosted boxes have no sudo: the job runs in a container.
+      - name: Base packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config clang cmake libssl-dev
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v6
         with:
           path: davinci-sequencer
@@ -142,16 +149,23 @@ jobs:
   emulator:
     name: Emulator
     runs-on: [self-hosted]
+    container: ubuntu:24.04
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 90
     env:
       ZISKEMU: "1"
       CIRCUIT_ELF_PATH: ${{ github.workspace }}/davinci-zkvm/circuit/elf/circuit.elf
       CIRCOM_ARTIFACTS: ${{ github.workspace }}/davinci-circom/artifacts
     steps:
-      # Self-hosted runners may export no HOME (they run under systemd); give
-      # each job a fresh one for rustup, cargo and foundry.
-      - name: Give the run a home
-        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+      # The self-hosted boxes have no sudo: the job runs in a container.
+      - name: Base packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config clang cmake libssl-dev
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v6
         with:
           path: davinci-sequencer
