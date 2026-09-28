@@ -989,16 +989,17 @@ On anvil with one RTX 5090 prover (2026-09-27), processes 1 and 2 take about
 
 ### Gnosis chain
 
-Chain 100, deployed 2026-09-28 with the DKG key modes. All contracts are
-source-verified on gnosisscan.io. Earlier registries on Gnosis are retired.
+Chain 100. The registry was deployed on 2026-09-28 with metadata hashes, on
+the DKG stack deployed the same day. All contracts are source-verified on
+gnosisscan.io. Earlier registries on Gnosis are retired.
 
 DAVINCI contracts:
 
 | Contract | Address | Block |
 |---|---|---|
-| ZiskVerifier | `0x0DBeF559Cccb2A085D9D9Ac3a13b67148bdB9936` | 48483866 |
-| ProcessRegistry | `0x48a5091B64434a6690AeA32455712Bd2b7EE3E77` | 48483867 |
-| DavinciDKGAdapter | `0xd79B9B55830Bf6C277850c56B29Fe9b75cF2543b` | 48483867 |
+| ZiskVerifier | `0x6D804CC99BfdA4E3F6413C3310803D2D2e0A3E3A` | 48489492 |
+| ProcessRegistry | `0x7e79660dE04b8fC1FFAfB9d09f3B0770Bdb0D831` | 48489493 |
+| DavinciDKGAdapter | `0xfcB637FbC34Db90Da9B151dCCfF27838d45114D6` | 48489493 |
 
 DKG contracts:
 
@@ -1030,7 +1031,7 @@ every pin:
 
 ```bash
 python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \
-  --registry 0x48a5091B64434a6690AeA32455712Bd2b7EE3E77 --chain-id 100 \
+  --registry 0x7e79660dE04b8fC1FFAfB9d09f3B0770Bdb0D831 --chain-id 100 \
   --batch-vk  0x6cfc89d562d0b22f04478a5c15b390433eb52f1b03147030b183076260da7a10 \
   --results-vk 0x7bc8c5e9235548386a44b1885732a2a7ffb1badddc8c7fba599d07ece47be794 \
   --root-c 0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80 \
