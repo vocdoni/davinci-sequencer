@@ -1,0 +1,194 @@
+name: Build and Test
+
+on:
+  push:
+    branches:
+      - dev
+      - stage
+      - main
+      - release**
+  pull_request:
+      types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "0 1 * * *" # 02:00 UTC+1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-push-{1}-{2}', github.workflow, github.ref, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The workspace path-depends on ../davinci-zkvm and the tests read the other
+# siblings, so each job checks out the ones it needs side by side:
+#
+#   davinci-sequencer/                this repo
+#   davinci-zkvm/                     vocdoni/davinci-zkvm@main
+#   davinci-contracts/                vocdoni/davinci-contracts@zkvm (submodules)
+#   davinci-onchain-census-contract/  vocdoni/davinci-onchain-census-contract@davinci-zkvm (submodules)
+#   davinci-circom/                   vocdoni/davinci-circom@a39a9f9 (ballot wasm/zkey in artifacts/)
+#
+# docker-build.yml checks out davinci-zkvm@main too; keep it in sync.
+#
+# No GPU here: nothing talks to a prover service. The full e2e
+# (DAVINCI_E2E=1), the live runs and the bench stay local.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # file:line in backtraces without full debuginfo, which would take
+  # most of the runner's disk and the cache.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  ZKVM_REF: main
+  CONTRACTS_REF: zkvm
+  CENSUS_CONTRACT_REF: davinci-zkvm
+  CIRCOM_REF: a39a9f9867bb70726ad2137ed536d75670e042b9
+  ZISK_VERSION: 1.3.0-alpha
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: davinci-sequencer
+      - uses: actions/checkout@v6
+        with:
+          repository: vocdoni/davinci-zkvm
+          ref: ${{ env.ZKVM_REF }}
+          path: davinci-zkvm
+
+      - uses: dtolnay/rust-toolchain@1.95
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: davinci-sequencer
+
+      - name: Run cargo fmt
+        working-directory: davinci-sequencer
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        working-directory: davinci-sequencer
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Test and Emulator are the heavy jobs: they run on the self-hosted boxes,
+  # without GitHub caches.
+  test:
+    name: Test
+    runs-on: [self-hosted]
+    timeout-minutes: 90
+    env:
+      ANVIL: "1"
+      DAVINCI_CONTRACTS_DIR: ${{ github.workspace }}/davinci-contracts
+      DAVINCI_CENSUS_CONTRACT_DIR: ${{ github.workspace }}/davinci-onchain-census-contract
+      CIRCOM_ARTIFACTS: ${{ github.workspace }}/davinci-circom/artifacts
+    steps:
+      # Self-hosted runners may export no HOME (they run under systemd); give
+      # each job a fresh one for rustup, cargo and foundry.
+      - name: Give the run a home
+        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          path: davinci-sequencer
+      - uses: actions/checkout@v6
+        with:
+          repository: vocdoni/davinci-zkvm
+          ref: ${{ env.ZKVM_REF }}
+          path: davinci-zkvm
+      - uses: actions/checkout@v6
+        with:
+          repository: vocdoni/davinci-contracts
+          ref: ${{ env.CONTRACTS_REF }}
+          path: davinci-contracts
+          submodules: recursive
+      - uses: actions/checkout@v6
+        with:
+          repository: vocdoni/davinci-onchain-census-contract
+          ref: ${{ env.CENSUS_CONTRACT_REF }}
+          path: davinci-onchain-census-contract
+          submodules: recursive
+      - uses: actions/checkout@v6
+        with:
+          repository: vocdoni/davinci-circom
+          ref: ${{ env.CIRCOM_REF }}
+          path: davinci-circom
+
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.3
+
+      - name: Build the contracts
+        run: |
+          (cd davinci-contracts && forge build)
+          (cd davinci-onchain-census-contract && forge build)
+
+      # ANVIL=1 turns on the registry and census tests; the circom proofs
+      # behind the state and API tests are generated from CIRCOM_ARTIFACTS.
+      - name: Run cargo test
+        working-directory: davinci-sequencer
+        run: cargo test --workspace --locked
+
+      # The e2e up to the nodes: anvil, both contracts, the processes and
+      # every ballot. Needs neither the prover nor the node binary.
+      - name: Run e2e setup
+        working-directory: davinci-sequencer
+        env:
+          DAVINCI_E2E_SETUP: "1"
+        run: cargo test -p davinci-e2e --test e2e --locked setup_without_nodes -- --nocapture
+
+  emulator:
+    name: Emulator
+    runs-on: [self-hosted]
+    timeout-minutes: 90
+    env:
+      ZISKEMU: "1"
+      CIRCUIT_ELF_PATH: ${{ github.workspace }}/davinci-zkvm/circuit/elf/circuit.elf
+      CIRCOM_ARTIFACTS: ${{ github.workspace }}/davinci-circom/artifacts
+    steps:
+      # Self-hosted runners may export no HOME (they run under systemd); give
+      # each job a fresh one for rustup, cargo and foundry.
+      - name: Give the run a home
+        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          path: davinci-sequencer
+      - uses: actions/checkout@v6
+        with:
+          repository: vocdoni/davinci-zkvm
+          ref: ${{ env.ZKVM_REF }}
+          path: davinci-zkvm
+      - uses: actions/checkout@v6
+        with:
+          repository: vocdoni/davinci-circom
+          ref: ${{ env.CIRCOM_REF }}
+          path: davinci-circom
+
+      - uses: dtolnay/rust-toolchain@1.95
+      # davinci-zkvm's action: the CPU binaries and the guest toolchain,
+      # kept in the runner tool cache on self-hosted boxes.
+      - uses: vocdoni/davinci-zkvm/.github/actions/setup-zisk@main
+        with:
+          version: ${{ env.ZISK_VERSION }}
+
+      # Rust-built transitions through the real guest, all 64 registers
+      # compared.
+      - name: Run the ziskemu dry runs
+        working-directory: davinci-sequencer
+        run: cargo test -p davinci-state --test dryrun --locked -- --test-threads=1
+
+  docker:
+    name: Docker
+    needs: [checks, test]
+    permissions:
+      contents: read
+      packages: write
+    if: github.event.pull_request.draft != true
+    uses: ./.github/workflows/docker-build.yml
+    secrets: inherit
+    with:
+      image-tag: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
+      # docker releases are triggered only on push to the selected branches at the beginning of this file
+      push: ${{ github.event_name == 'push' }}

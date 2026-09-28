@@ -1,0 +1,23 @@
+[package]
+name = "davinci-state"
+description = "DAVINCI per-process state and state-transition builder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arbo.workspace = true
+davinci-zkvm-sdk.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+davinci-client = { workspace = true, features = ["prover"] }
+davinci-zkvm-input-gen.workspace = true
+k256.workspace = true
+sha2.workspace = true
+tempfile.workspace = true

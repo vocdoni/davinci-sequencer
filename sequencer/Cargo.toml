@@ -1,0 +1,69 @@
+[package]
+name = "davinci-sequencer"
+description = "DAVINCI sequencer node on the davinci-zkvm prover"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "davinci-sequencer"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+arbo.workspace = true
+davinci-state.workspace = true
+davinci-client.workspace = true
+davinci-zkvm-sdk.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+redb.workspace = true
+hex.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+url.workspace = true
+async-trait.workspace = true
+zeroize.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+num-bigint.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+tower = { workspace = true }
+alloy = { workspace = true, features = [
+    "std",
+    "contract",
+    "provider-http",
+    "rpc-types",
+    "signer-local",
+    "network",
+    "consensus",
+    "eips",
+    "kzg",
+    "sol-types",
+    "json",
+    "json-abi",
+    "json-rpc",
+    "reqwest",
+    "reqwest-rustls-tls",
+] }
+
+[features]
+# Fault-injection hooks for the integration tests; never in a release build.
+test-hooks = []
+
+[dev-dependencies]
+davinci-sequencer = { path = ".", features = ["test-hooks"] }
+# start_paused backoff tests
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
+k256.workspace = true
+# Real circom ballot proofs for the API tests (cached under tests/cache).
+davinci-client = { workspace = true, features = ["prover"] }
+alloy = { workspace = true, features = ["node-bindings"] }

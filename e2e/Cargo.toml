@@ -1,0 +1,31 @@
+[package]
+name = "davinci-e2e"
+description = "End-to-end acceptance test: anvil, the zkVM contracts, three sequencer nodes and the prover"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+davinci-client = { workspace = true, features = ["prover"] }
+davinci-zkvm-sdk.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+k256.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+alloy = { workspace = true, features = [
+    "std",
+    "contract",
+    "network",
+    "provider-http",
+    "rpc-types",
+    "signer-local",
+    "sol-types",
+    "reqwest",
+    "reqwest-rustls-tls",
+] }

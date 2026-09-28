@@ -1,0 +1,59 @@
+[package]
+name = "davinci-client"
+description = "DAVINCI sequencer API client, organizer and voter tooling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["prover"]
+# Circom ballot prover (ark-circom, arkworks 0.6, wasmer). Kept out of the
+# sequencer, which only needs the wire types.
+prover = [
+    "dep:ark-circom",
+    "dep:wasmer",
+    "dep:ark-bn254-06",
+    "dep:ark-ff-06",
+    "dep:ark-ec-06",
+    "dep:ark-groth16-06",
+]
+
+[dependencies]
+davinci-zkvm-sdk.workspace = true
+ark-bn254.workspace = true
+ark-ff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+sha2.workspace = true
+num-bigint.workspace = true
+rand.workspace = true
+k256.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+alloy = { workspace = true, features = [
+    "std",
+    "contract",
+    "provider-http",
+    "signer-local",
+    "rpc-types",
+    "reqwest",
+    "reqwest-rustls-tls",
+] }
+
+ark-circom = { workspace = true, optional = true }
+wasmer = { workspace = true, optional = true }
+ark-bn254-06 = { workspace = true, optional = true }
+ark-ff-06 = { workspace = true, optional = true }
+ark-ec-06 = { workspace = true, optional = true }
+ark-groth16-06 = { workspace = true, optional = true }
+
+[dev-dependencies]
+arbo.workspace = true
+davinci-state.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+axum.workspace = true
+alloy = { workspace = true, features = ["node-bindings"] }

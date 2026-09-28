@@ -1,0 +1,36 @@
+[package]
+name = "arbo"
+description = "Sparse Merkle tree compatible with vocdoni/arbo and circomlib SMT proofs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["redb"]
+redb = ["dep:redb"]
+# Poseidon circom-vector test; pulls in davinci-zkvm-sdk's Poseidon.
+sdk-poseidon = ["dep:davinci-zkvm-sdk", "dep:ark-bn254", "dep:ark-ff", "dep:num-bigint"]
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+redb = { workspace = true, optional = true }
+davinci-zkvm-sdk = { workspace = true, optional = true }
+ark-bn254 = { workspace = true, optional = true }
+ark-ff = { workspace = true, optional = true }
+num-bigint = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "tree"
+harness = false
+required-features = ["redb"]

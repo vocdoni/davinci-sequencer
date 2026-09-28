@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.redb
+/arbo/fuzz/target
+/arbo/fuzz/corpus
+/arbo/fuzz/artifacts
+/state/tests/cache/
+/sequencer/tests/cache/
+/arbo/testdata/gen/gen
+/.env
+/sequencer.key
+/letsencrypt/

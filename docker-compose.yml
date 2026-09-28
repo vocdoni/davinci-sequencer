@@ -1,0 +1,171 @@
+# Docker Compose profiles:
+# - prod:      Sequencer, Traefik (HTTPS) and Watchtower (auto-updates). The prover runs elsewhere.
+# - prod-gpu:  prod plus a davinci-zkvm GPU prover on this host.
+# - dev:       Sequencer and Watchtower, no TLS. The prover runs elsewhere.
+# - gpu:       Sequencer and a davinci-zkvm GPU prover on this host, no TLS.
+#
+# Configuration goes in .env (see .env.example). The signing key is read from
+# the file SEQUENCER_KEY_FILE (default ./sequencer.key) and mounted as a
+# secret; it never goes in .env. The image runs as uid 10001, which must be
+# able to read that file. An empty file runs the node as an observer.
+#
+# The image builds from the parent directory, which must hold davinci-sequencer/
+# and davinci-zkvm/ side by side. The GPU profiles also build the prover image
+# from ../davinci-zkvm and mount its proving keys (see the davinci-zkvm README).
+
+x-sequencer-common: &sequencer-common
+  build:
+    context: ..
+    dockerfile: davinci-sequencer/Dockerfile
+  image: "ghcr.io/vocdoni/davinci-sequencer:${DAVINCI_SEQUENCER_TAG:-main}"
+  env_file: .env
+  secrets:
+    - sequencer_key
+  volumes:
+    - data:/data
+  ports:
+    - "${DAVINCI_API_PORT:-9090}:${DAVINCI_API_PORT:-9090}"
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  sysctls:
+    net.core.somaxconn: 8128
+  restart: ${RESTART:-unless-stopped}
+  labels:
+    - "traefik.enable=true"
+    - "traefik.http.routers.sequencer.rule=PathPrefix(`/`)"
+    - "traefik.http.routers.sequencer.entrypoints=websecure"
+    - "traefik.http.routers.sequencer.tls=true"
+    - "traefik.http.routers.sequencer.tls.certresolver=le"
+    - "traefik.http.services.sequencer.loadbalancer.server.port=${DAVINCI_API_PORT:-9090}"
+    - "traefik.http.routers.sequencer.tls.domains[0].main=${DOMAIN:-localhost}"
+    - "com.centurylinklabs.watchtower.enable=true"
+
+x-sequencer-env: &sequencer-env
+  DAVINCI_DATADIR: /data
+  DAVINCI_PRIVKEY_FILE: /run/secrets/sequencer_key
+
+x-traefik-common: &traefik-common
+  image: "traefik:${TRAEFIK_TAG:-v3}"
+  ports:
+    - "80:80"
+    - "443:443"
+  volumes:
+    - "./letsencrypt:/letsencrypt"
+    - "/var/run/docker.sock:/var/run/docker.sock:ro"
+  command:
+    - "--log.level=INFO"
+    - "--providers.docker=true"
+    - "--providers.docker.exposedbydefault=false"
+    - "--entrypoints.web.address=:80"
+    - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+    - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+    - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+    - "--entrypoints.websecure.address=:443"
+    - "--certificatesresolvers.le.acme.httpchallenge=true"
+    - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+    - "--certificatesresolvers.le.acme.email=root@vocdoni.io"
+    - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+  labels:
+    - "com.centurylinklabs.watchtower.enable=true"
+  restart: ${RESTART:-unless-stopped}
+
+services:
+  # ---------------------------------------------------------------------------
+  # Core Services
+  # ---------------------------------------------------------------------------
+
+  # Talks to the prover at DAVINCI_PROVER_URL from .env.
+  sequencer:
+    profiles: ["prod", "dev"]
+    <<: *sequencer-common
+    environment: *sequencer-env
+
+  # Talks to the prover service below.
+  sequencer-gpu:
+    profiles: ["gpu", "prod-gpu"]
+    <<: *sequencer-common
+    environment:
+      <<: *sequencer-env
+      DAVINCI_PROVER_URL: http://prover:8080
+    depends_on:
+      prover:
+        condition: service_healthy
+
+  # davinci-zkvm GPU prover, built from the sibling checkout (the same image
+  # its own compose builds). Its API is not published: only the sequencer
+  # reaches it. input.bin holds each batch's re-encryption seed, so it is
+  # always deleted after proving.
+  prover:
+    profiles: ["gpu", "prod-gpu"]
+    build:
+      context: ../davinci-zkvm
+      dockerfile: Dockerfile.cuda
+      args:
+        ZISK_VERSION: ${ZISK_TAG:-v1.3.0-alpha}
+    image: davinci-zkvm-cuda:latest
+    volumes:
+      - ${ZISK_KEYS_DIR:-../davinci-zkvm/zisk-keys}/provingKey:/proving-key
+      - ${ZISK_KEYS_DIR:-../davinci-zkvm/zisk-keys}/provingKeySnark:/proving-key-plonk
+      - proofs:/proofs
+    environment:
+      MAX_QUEUE_SIZE: ${MAX_QUEUE_SIZE:-100}
+      ZISK_MPI_PROCS: ${ZISK_MPI_PROCS:-1}
+      ZISK_MPI_THREADS: ${ZISK_MPI_THREADS:-0}
+      ZISK_MPI_BIND_TO: ${ZISK_MPI_BIND_TO:-none}
+      ZISK_MINIMAL_MEMORY: ${ZISK_MINIMAL_MEMORY:-0}
+      ZISK_MINIMAL_MEMORY_FROM: ${ZISK_MINIMAL_MEMORY_FROM:-512}
+      DAVINCI_KEEP_INPUTS: "0"
+    restart: ${RESTART:-unless-stopped}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Network & Maintenance Services
+  # ---------------------------------------------------------------------------
+
+  traefik:
+    profiles: ["prod"]
+    <<: *traefik-common
+    depends_on:
+      - sequencer
+
+  traefik-gpu:
+    profiles: ["prod-gpu"]
+    <<: *traefik-common
+    depends_on:
+      - sequencer-gpu
+
+  # Updates the containers labelled for it (the sequencer and Traefik) when a
+  # new image is published. The prover image is built locally and left alone.
+  watchtower:
+    profiles: ["prod", "prod-gpu", "dev"]
+    image: nickfedor/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 --label-enable --include-stopped --revive-stopped
+    restart: ${RESTART:-unless-stopped}
+
+secrets:
+  sequencer_key:
+    file: ${SEQUENCER_KEY_FILE:-./sequencer.key}
+
+volumes:
+  data:
+    driver: local
+  proofs:
+    driver: local

@@ -1,0 +1,45 @@
+[package]
+name = "arbo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.arbo]
+path = ".."
+
+[[bin]]
+name = "unpack_siblings"
+path = "fuzz_targets/unpack_siblings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "check_proof"
+path = "fuzz_targets/check_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_dump"
+path = "fuzz_targets/import_dump.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node_decoding"
+path = "fuzz_targets/node_decoding.rs"
+test = false
+doc = false
+bench = false
+

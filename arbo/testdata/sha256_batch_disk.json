@@ -1,0 +1,11 @@
+{
+ "max_levels": 64,
+ "base_seed": 7,
+ "base_n": 70000,
+ "batch_seed": 8,
+ "batch_n": 1000,
+ "base_root": "1acca4eb2e5413db0f46d1a9ffa88f0747b454a8d35215277e26c4e5d2e53301",
+ "final_root": "63d3dc2d7cdbe965e680364a7ff4a716b81c50ff351831fe6bbc6b44c2672b8e",
+ "base_invalid": 0,
+ "batch_invalid": 0
+}

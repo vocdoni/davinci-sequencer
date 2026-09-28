@@ -1,0 +1,23 @@
+# Applies to `docker build -f davinci-sequencer/Dockerfile .` run from the
+# parent directory (BuildKit reads <Dockerfile>.dockerignore beside the
+# Dockerfile). Paths are relative to that parent. Only the sequencer
+# workspace and the davinci-zkvm crates it path-depends on are sent.
+*
+!davinci-sequencer
+!davinci-zkvm/Cargo.toml
+!davinci-zkvm/rust-sdk
+!davinci-zkvm/input-gen
+
+**/target
+**/.git
+**/.github
+**/tests/cache
+**/*.redb
+davinci-sequencer/arbo/fuzz/corpus
+davinci-sequencer/arbo/fuzz/artifacts
+davinci-sequencer/Dockerfile*
+davinci-sequencer/docker-compose.yml
+# Compose configuration and secrets.
+**/.env*
+**/*.key
+davinci-sequencer/letsencrypt

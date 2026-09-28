@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["arbo", "state", "sequencer", "client", "e2e"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/vocdoni/davinci-sequencer"
+
+[workspace.dependencies]
+arbo = { path = "arbo" }
+davinci-state = { path = "state" }
+davinci-client = { path = "client", default-features = false }
+davinci-zkvm-sdk = { path = "../davinci-zkvm/rust-sdk" }
+davinci-zkvm-input-gen = { path = "../davinci-zkvm/input-gen" }
+
+ark-bn254 = { version = "0.4", default-features = false, features = ["curve"] }
+ark-ff = { version = "0.4", default-features = false }
+ark-ec = { version = "0.4", default-features = false }
+sha2 = "0.10"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+num-bigint = "0.4"
+thiserror = "2"
+anyhow = "1"
+rand = "0.8"
+rayon = "1"
+redb = "4.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+axum = "0.7"
+tower = { version = "0.5", features = ["timeout", "util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+alloy = { version = "2.5", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+url = "2"
+zeroize = "1"
+proptest = "1"
+tempfile = "3"
+criterion = "0.8"
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# arkworks 0.6 circom prover: davinci-client only (feature `prover`).
+ark-circom = { version = "0.6", default-features = false }
+wasmer = "=6.1.0"
+ark-bn254-06 = { package = "ark-bn254", version = "0.6" }
+ark-ff-06 = { package = "ark-ff", version = "0.6", default-features = false }
+ark-ec-06 = { package = "ark-ec", version = "0.6", default-features = false }
+ark-groth16-06 = { package = "ark-groth16", version = "0.6", default-features = false, features = ["parallel"] }
+
+[profile.release]
+debug = 1
+
+[profile.test]
+opt-level = 2
