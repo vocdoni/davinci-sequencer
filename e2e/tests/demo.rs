@@ -1255,11 +1255,19 @@ impl Run {
     /// The table, and each tally against the settled ballots.
     async fn report(&self) -> Result<()> {
         let now = unix_now();
+        // An explorer to link each process to, when one is given.
+        let explorer = std::env::var("DAVINCI_DEMO_EXPLORER_URL")
+            .ok()
+            .map(|u| u.trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
         let mut rows = vec![
-            "| # | process id | kind | status | voters | overwrites | transitions | explorer |"
-                .to_string(),
-            "|---:|---|---|---|---:|---:|---:|---|".to_string(),
+            "| # | process id | kind | status | voters | overwrites | transitions |".to_string(),
+            "|---:|---|---|---|---:|---:|---:|".to_string(),
         ];
+        if explorer.is_some() {
+            rows[0].push_str(" explorer |");
+            rows[1].push_str("---|");
+        }
         let mut bad = Vec::new();
         let mut notes = Vec::new();
         for spec in &self.specs {
@@ -1283,15 +1291,17 @@ impl Run {
                 ),
                 s => status_name(s).to_string(),
             };
-            rows.push(format!(
-                "| {n} | {} | {} | {status} | {} | {} | {transitions} | {}/processes/{} |",
+            let mut row = format!(
+                "| {n} | {} | {} | {status} | {} | {} | {transitions} |",
                 ProcessId(pid),
                 spec.kind(),
                 p.voters_count,
                 p.overwritten_votes_count,
-                demo::EXPLORER,
-                ProcessId(pid)
-            ));
+            );
+            if let Some(url) = &explorer {
+                row.push_str(&format!(" {url}/processes/{} |", ProcessId(pid)));
+            }
+            rows.push(row);
             let e = &self.state.elections[&n];
             let errored = e
                 .votes

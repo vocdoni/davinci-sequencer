@@ -30,8 +30,6 @@ use serde::{Deserialize, Serialize};
 pub const SECRETS_FILE: &str = "voters.json";
 /// Run progress, in the private directory.
 pub const STATE_FILE: &str = "state.json";
-/// The public explorer of the Gnosis deployment.
-pub const EXPLORER: &str = "https://davinci-explorer-yb2p9.ondigitalocean.app";
 /// Lifetime of an election the organizer ends once its votes settle.
 pub const TALLY_SECS: u64 = 6 * 3600;
 const DAY: u64 = 24 * 3600;

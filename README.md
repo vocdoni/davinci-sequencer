@@ -916,7 +916,8 @@ and writes the public census and metadata files into `e2e/demo/`. `check`
 proves every planned ballot against the circuit, offline. Once the files are
 pushed, `run` checks they are served unchanged, creates the elections with
 their URIs under `DAVINCI_DEMO_BASE_URL`, casts the votes, ends, reveals and
-cancels, and prints a table with explorer links. It records its progress in
+cancels, and prints a table (with links when `DAVINCI_DEMO_EXPLORER_URL`
+names an explorer). It records its progress in
 `state.json` next to the keys and resumes from it.
 
 ```bash
