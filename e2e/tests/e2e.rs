@@ -34,7 +34,8 @@
 //! `eth_call`; also a standalone test). Every run ends with its gas bill.
 //! `DAVINCI_E2E_DKG=1` adds the DKG key modes (`davinci_e2e::dkg`): on anvil
 //! a davinci-dkg committee of three nodes with a Live epoch, deployed before
-//! the registry; live the committee named by `DAVINCI_E2E_DKG_MANAGER`. Then,
+//! the registry; live the committee of the registry adapter's manager
+//! (`DAVINCI_E2E_DKG_MANAGER` overrides it). Then,
 //! after the sequencer-key processes, an automatic, a locked and a zero-vote
 //! DKG process and the eth_call negatives around their requests.
 
@@ -387,7 +388,7 @@ async fn setup_checks(
     bill.extend(c.receipts().iter().map(|(l, r)| TxCost::of(l.clone(), r)));
 
     // DKG: both modes take the committee's key (the locked one through the
-    // real PoP check), and only the registry's adapter may register.
+    // real PoP check), and registration stays open to any account.
     if let Some(w) = &net.dkg {
         for mode in [KeyMode::DkgAutomatic, KeyMode::DkgLocked] {
             let next = org.next_process_id().await?;
@@ -403,18 +404,28 @@ async fn setup_checks(
                 .await
                 .with_context(|| format!("{mode:?} key"))?;
         }
-        let got = negative::simulate(
-            &net.rpc,
-            org.address(),
-            w.app_manager,
-            dkg::register_app_call(w.epoch),
-        )
-        .await?;
-        ensure!(
-            got == negative::Outcome::Reverted("NotRegistrar".into()),
-            "registerApplication from the organizer: {got}"
-        );
-        say!("DKG setup ok: both key modes, registrar gate");
+        // An unrelated application from an EOA, simulated only: a random
+        // 248-bit aid is nonzero and below the field.
+        match dkg::registration_epoch(&net.rpc, w.adapter).await {
+            Ok(epoch) => {
+                let mut aid = [0u8; 32];
+                aid[1..].copy_from_slice(&rand::random::<[u8; 31]>());
+                let got = negative::simulate(
+                    &net.rpc,
+                    org.address(),
+                    w.app_manager,
+                    dkg::register_app_call(epoch, aid.into()),
+                )
+                .await?;
+                ensure!(
+                    got == negative::Outcome::Ok,
+                    "registerApplication from the organizer: {got}"
+                );
+                say!("DKG setup ok: both key modes, open registration");
+            }
+            // The two creates may have spent the epoch's last pool key.
+            Err(e) => say!("DKG setup ok: both key modes; open registration not checked: {e:#}"),
+        }
     }
     Ok(())
 }
@@ -2277,15 +2288,8 @@ async fn dkg_processes(
         partials.len()
     );
 
-    negative::dkg(
-        &net.rpc,
-        net.registry,
-        w.app_manager,
-        org.address(),
-        &req_a,
-        &req_l,
-    )
-    .await
-    .context("DKG negative checks")?;
+    negative::dkg(&net.rpc, net.registry, org.address(), &req_a, &req_l)
+        .await
+        .context("DKG negative checks")?;
     Ok(())
 }

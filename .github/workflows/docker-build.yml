@@ -1,5 +1,10 @@
 name: Docker
 
+# Builds the node image and optionally publishes it to Docker Hub and GHCR
+# under `image-tag` (the branch or tag name). A release tag (v1.2.3) is also
+# published as `latest`, which Watchtower deployments follow; prereleases
+# (v1.2.3-rc1) are not.
+
 on:
   workflow_call:
     inputs:
@@ -49,12 +54,25 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Prepare vars
-        id: vars
+      - name: Compose tag list
+        id: tags
         shell: bash
         env:
           IMAGE_TAG: ${{ inputs.image-tag }}
-        run: echo "IMAGE_TAG_CLEAN=${IMAGE_TAG//\//-}" >> "$GITHUB_OUTPUT"
+        run: |
+          # Refs with slashes (feature/foo) are not valid Docker tags.
+          primary=${IMAGE_TAG//\//-}
+          tags="vocdoni/davinci-sequencer:${primary}"
+          tags+=$'\n'"ghcr.io/vocdoni/davinci-sequencer:${primary}"
+          if [[ "${primary}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tags+=$'\n'"vocdoni/davinci-sequencer:latest"
+            tags+=$'\n'"ghcr.io/vocdoni/davinci-sequencer:latest"
+          fi
+          {
+            echo 'list<<EOF'
+            echo "${tags}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name:  ${{ inputs.push && 'Build and Publish' || 'Build' }}
         uses: docker/build-push-action@v7
@@ -62,6 +80,4 @@ jobs:
           context: .
           file: davinci-sequencer/Dockerfile
           push: ${{ inputs.push }}
-          tags: |
-            vocdoni/davinci-sequencer:${{ steps.vars.outputs.IMAGE_TAG_CLEAN }}
-            ghcr.io/vocdoni/davinci-sequencer:${{ steps.vars.outputs.IMAGE_TAG_CLEAN }}
+          tags: ${{ steps.tags.outputs.list }}

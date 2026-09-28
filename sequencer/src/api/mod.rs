@@ -140,14 +140,12 @@ pub fn router(node: Node) -> Router {
 /// Builds the real dependencies, spawns the node and serves the API until
 /// `shutdown` fires; then waits for the actor and monitor tasks.
 pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&cfg.datadir)?;
-    let db = Db::open(&cfg.db_path())?;
     let tasks = tokio_util::task::TaskTracker::new();
     // Startup talks to the chain (release check, probes, respawns); a signal
     // during it stops the node too.
     let started = tokio::select! {
         _ = shutdown.cancelled() => None,
-        r = start(cfg, db, tasks.clone(), shutdown.clone()) => Some(r?),
+        r = start(cfg, tasks.clone(), shutdown.clone()) => Some(r?),
     };
     if let Some((listener, node)) = started {
         tracing::info!(addr = %listener.local_addr()?, "API listening");
@@ -165,19 +163,31 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Connects, checks the chain and spawns the node; [`run`] serves it.
+/// Connects, checks the chain, opens the deployment's database and spawns
+/// the node; [`run`] serves it.
 async fn start(
     cfg: Config,
-    db: Db,
     tasks: tokio_util::task::TaskTracker,
     shutdown: CancellationToken,
 ) -> anyhow::Result<(tokio::net::TcpListener, Node)> {
+    cfg.check_chain_id(crate::web3::rpc_chain_id(&cfg.rpc_url).await?)?;
     let contracts = Arc::new(Contracts::connect(&cfg).await?);
     if contracts.signer().is_none() {
         tracing::info!("no signing key: running as an observer (never settles)");
     }
     let vk_hash = crate::monitor::ballot_verifier(&cfg)?.vk_hash();
     contracts.check_release(&vk_hash).await?;
+    let registry = cfg.registry.into_array();
+    let dir = crate::storage::deployment_dir(&cfg.datadir, contracts.chain_id(), &registry);
+    tracing::info!(
+        network = %cfg.network,
+        chain_id = contracts.chain_id(),
+        registry = %cfg.registry,
+        start_block = ?cfg.start_block,
+        datadir = %dir.display(),
+        "deployment"
+    );
+    let db = Db::open_deployment(&cfg.datadir, contracts.chain_id(), &registry)?;
     let mut cfg = cfg;
     let cap = crate::web3::resolve_blob_cap(
         cfg.max_blobs_per_tx,
@@ -226,10 +236,12 @@ mod tests {
         let rpc = format!("http://{}/", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app).await });
         let dir = tempfile::TempDir::new().unwrap();
-        let cfg = <Config as clap::Parser>::try_parse_from([
+        let cfg = Config::parse_args([
             "davinci-sequencer",
             "--datadir",
             dir.path().to_str().unwrap(),
+            "--network",
+            "custom",
             "--rpc-url",
             &rpc,
             "--registry",

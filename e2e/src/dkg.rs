@@ -1,7 +1,8 @@
 //! A davinci-dkg committee on the run's anvil (`DAVINCI_E2E_DKG=1`): the DKG
 //! contracts, three `davinci-dkg-node` operators and one Live epoch. Live,
-//! the committee is external: `DAVINCI_E2E_DKG_MANAGER` names its manager
-//! and [`check_wiring`] checks it serves the registry.
+//! the committee is external: the manager of the registry's adapter, or
+//! `DAVINCI_E2E_DKG_MANAGER`, and [`check_wiring`] checks it serves the
+//! registry.
 //!
 //! Env: `DAVINCI_DKG_DIR` (the davinci-dkg checkout, default
 //! `../davinci-dkg`), `DAVINCI_E2E_DKG_NODE_BIN` (a prebuilt node; else `go
@@ -87,9 +88,6 @@ sol! {
             uint64 decryptNotBefore;
             uint64 decryptNotAfter;
         }
-        function registrarAdmin() external view returns (address);
-        function registrar() external view returns (address);
-        function setRegistrar(address r) external;
         function registerApplication(bytes12 epochId, bytes32 aid, AppPolicy calldata policy, uint256 pkOrgX, uint256 pkOrgY, uint256 schnorrAx, uint256 schnorrAy, uint256 schnorrZ) external;
         function getApplicationKey(bytes12 epochId, bytes32 aid) external view returns (uint256 x, uint256 y);
         function getOrganizerPK(bytes12 epochId, bytes32 aid) external view returns (uint256, uint256);
@@ -226,17 +224,11 @@ pub struct DkgDeployment {
     pub manager: Address,
     pub app_manager: Address,
     pub registry: Address,
-    /// `registrarAdmin` of the app manager: only it may `setRegistrar`.
-    pub deployer: Address,
 }
 
-/// Deploys the DKG like `DeployAll.s.sol` from `deployer`, from the forge
-/// artifacts in `forge_dir`, and checks the links.
-pub async fn deploy(
-    provider: &DynProvider,
-    deployer: Address,
-    forge_dir: &Path,
-) -> Result<DkgDeployment> {
+/// Deploys the DKG like `DeployAll.s.sol` from `provider`'s account, from the
+/// forge artifacts in `forge_dir`, and checks the links.
+pub async fn deploy(provider: &DynProvider, forge_dir: &Path) -> Result<DkgDeployment> {
     let chain_id = u32::try_from(provider.get_chain_id().await?)?;
     let code = |name: &str| chain::bytecode(forge_dir, &format!("{name}.sol/{name}.json"));
     let mut verifiers = Vec::new();
@@ -298,17 +290,10 @@ pub async fn deploy(
         .await?;
     ensure!(r.status(), "DKGManager.setAppManager reverted");
     ensure!(m.appManager().call().await? == app_manager);
-    let am = IDKGAppManager::new(app_manager, provider);
-    ensure!(
-        am.registrarAdmin().call().await? == deployer,
-        "DKGAppManager.registrarAdmin is not the deployer (old DKG tree without the registrar gate?)"
-    );
-    ensure!(am.registrar().call().await? == Address::ZERO);
     Ok(DkgDeployment {
         manager,
         app_manager,
         registry,
-        deployer,
     })
 }
 
@@ -409,12 +394,11 @@ impl DkgStack {
         let bin = tokio::task::spawn_blocking(node_bin).await??;
         let forge = tokio::task::spawn_blocking(forge_build).await??;
         let signer: PrivateKeySigner = chain::signer(DEPLOYER)?;
-        let deployer = signer.address();
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
             .connect_client(chain::rpc(rpc)?)
             .erased();
-        let deployment = deploy(&provider, deployer, &forge).await?;
+        let deployment = deploy(&provider, &forge).await?;
         eprintln!(
             "dkg: manager {} app manager {} registry {} ({:.1} s)",
             deployment.manager,
@@ -477,15 +461,6 @@ impl DkgStack {
             active == n as u64,
             "{active} active DKG operators, expected {n}"
         );
-        Ok(())
-    }
-
-    /// `DKGAppManager.setRegistrar(adapter)` from the deployer: only the
-    /// registry's adapter may register applications from then on.
-    pub async fn set_registrar(&self, adapter: Address) -> Result<()> {
-        let am = IDKGAppManager::new(self.deployment.app_manager, &self.provider);
-        let r = am.setRegistrar(adapter).send().await?.get_receipt().await?;
-        ensure!(r.status(), "setRegistrar reverted");
         Ok(())
     }
 
@@ -598,11 +573,9 @@ pub struct DkgWiring {
     pub epoch: EpochId,
 }
 
-/// Fails unless `registry` has an adapter on `manager` that is the app
-/// manager's registrar, and the adapter has a Live epoch to register in.
-pub async fn check_wiring(rpc: &str, registry: Address, manager: Address) -> Result<DkgWiring> {
-    let p = ProviderBuilder::new().connect_client(chain::rpc(rpc)?);
-    let adapter = davinci_client::organizer::ProcessRegistry::new(registry, &p)
+/// The registry's DKG adapter; an error if it has none.
+async fn registry_adapter<P: Provider>(p: &P, registry: Address) -> Result<Address> {
+    let adapter = davinci_client::organizer::ProcessRegistry::new(registry, p)
         .dkgAdapter()
         .call()
         .await?;
@@ -610,6 +583,33 @@ pub async fn check_wiring(rpc: &str, registry: Address, manager: Address) -> Res
         adapter != Address::ZERO,
         "registry {registry} has no DKG adapter (deployed without dkgManager)"
     );
+    Ok(adapter)
+}
+
+/// The DKGManager the registry's adapter registers on.
+pub async fn registry_manager(rpc: &str, registry: Address) -> Result<Address> {
+    let p = ProviderBuilder::new().connect_client(chain::rpc(rpc)?);
+    let adapter = registry_adapter(&p, registry).await?;
+    Ok(IDavinciDKGAdapter::new(adapter, &p)
+        .manager()
+        .call()
+        .await?)
+}
+
+/// The Live epoch with a free pool key a new application would take now.
+pub async fn registration_epoch(rpc: &str, adapter: Address) -> Result<EpochId> {
+    let p = ProviderBuilder::new().connect_client(chain::rpc(rpc)?);
+    Ok(IDavinciDKGAdapter::new(adapter, &p)
+        .registrationEpoch()
+        .call()
+        .await?)
+}
+
+/// Fails unless `registry` has an adapter on `manager` wired to its app
+/// manager, and the adapter has a Live epoch to register in.
+pub async fn check_wiring(rpc: &str, registry: Address, manager: Address) -> Result<DkgWiring> {
+    let p = ProviderBuilder::new().connect_client(chain::rpc(rpc)?);
+    let adapter = registry_adapter(&p, registry).await?;
     let a = IDavinciDKGAdapter::new(adapter, &p);
     ensure!(a.registry().call().await? == registry, "adapter.registry");
     ensure!(
@@ -620,14 +620,6 @@ pub async fn check_wiring(rpc: &str, registry: Address, manager: Address) -> Res
     ensure!(
         a.appManager().call().await? == app_manager,
         "adapter.appManager"
-    );
-    let registrar = IDKGAppManager::new(app_manager, &p)
-        .registrar()
-        .call()
-        .await?;
-    ensure!(
-        registrar == adapter,
-        "DKGAppManager.registrar is {registrar}, not the registry's adapter {adapter}"
     );
     let epoch = a
         .registrationEpoch()
@@ -676,14 +668,13 @@ pub async fn check_process_key(
     Ok(())
 }
 
-/// `registerApplication` calldata an EOA would send; the registrar gate
-/// reverts before the arguments matter.
-pub fn register_app_call(epoch: EpochId) -> Vec<u8> {
-    use alloy::primitives::B256;
+/// `registerApplication` calldata for an automatic-mode application `aid`
+/// (nonzero, below the BN254 scalar field) in `epoch`.
+pub fn register_app_call(epoch: EpochId, aid: FixedBytes<32>) -> Vec<u8> {
     use alloy::sol_types::SolCall;
     IDKGAppManager::registerApplicationCall {
         epochId: epoch,
-        aid: B256::with_last_byte(1),
+        aid,
         policy: IDKGAppManager::AppPolicy {
             mode: 1,
             openSubmission: true,

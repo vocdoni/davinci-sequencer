@@ -240,6 +240,11 @@ async fn registry_on_anvil() {
     let err = observer.create_process(&np).await.err().unwrap();
     assert!(matches!(err, Web3Error::NoSigner), "{err}");
     let (pid, created) = c.create_process(&np).await.unwrap();
+    // The id prefix the datadir migration matches processes on.
+    assert_eq!(
+        pid[20..24],
+        davinci_sequencer::storage::pid_prefix(c.chain_id(), &registry.into_array()).unwrap()
+    );
 
     let (head, ts) = c.head().await.unwrap();
     assert!(head >= created.block && ts > 0);
@@ -721,7 +726,6 @@ alloy::sol! {
     interface IMockDKG {
         function newEpoch(bool live, uint256[2][] memory keys) external returns (bytes12 eid);
         function setPlaintext(bytes12 eid, bytes32 aid, uint16 index, uint256 plaintext) external;
-        function setRegistrar(address r) external;
         function ctCount(bytes12 eid, bytes32 aid) external view returns (uint16);
     }
 }
@@ -789,14 +793,7 @@ async fn dkg_results_on_anvil() {
         .await
         .unwrap();
     let dkg = IMockDKG::new(mock, &admin);
-    let adapter = c.dkg_adapter().await.unwrap();
-    dkg.setRegistrar(adapter)
-        .send()
-        .await
-        .unwrap()
-        .get_receipt()
-        .await
-        .unwrap();
+    assert_ne!(c.dkg_adapter().await.unwrap(), Address::ZERO);
     // Two pool keys k·G in the DKG's reduced form; P_0 = 1000003·B8 in TE.
     let pool: Vec<[AU256; 2]> = [1_000_003u64, 1_000_004]
         .iter()

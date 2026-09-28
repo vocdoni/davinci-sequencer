@@ -12,3 +12,5 @@ pub mod metrics;
 pub mod monitor;
 pub mod storage;
 pub mod web3;
+
+pub use davinci_client::networks;

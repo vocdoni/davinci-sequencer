@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 pub use blobs::{
     AnvilBlobs, BeaconBlobs, BlobSource, blob_source, match_blobs, match_blobs_blocking,
 };
-pub use contracts::{Contracts, MAX_LOG_RANGE, probe_osaka, resolve_blob_cap};
+pub use contracts::{
+    Contracts, MAX_LOG_RANGE, endpoints_chain_id as rpc_chain_id, probe_osaka, resolve_blob_cap,
+};
 use failover::Failover;
 pub(crate) use failover::host;
 pub use release::{DeployedRelease, Mismatch};

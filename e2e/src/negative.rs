@@ -13,7 +13,6 @@ use anyhow::{Context, Result, bail};
 use davinci_client::organizer::{DAVINCITypes, ProcessRegistry as PR, RegistryReader, revert_name};
 
 use crate::chain;
-use crate::dkg;
 
 /// Byte of word 10 in the 512-byte publics: the batch guest's root after,
 /// the results guest's first tally word. Only the verifier reads it.
@@ -356,13 +355,12 @@ const Q: &str = "218882428718392752222464057452572750885483644004160343436982041
 
 /// The DKG results path, replayed and tampered with around the two settled
 /// requests: `auto` (a process ended by its organizer) and `locked` (one that
-/// ran out its duration, so its request is what ended it). Also the
-/// registrar gate on `app_manager`, the zkVM results path on a DKG process,
-/// and the organizer's cancel on either side of `locked`'s request.
+/// ran out its duration, so its request is what ended it). Also the zkVM
+/// results path on a DKG process and the organizer's cancel on either side of
+/// `locked`'s request.
 pub async fn dkg(
     rpc: &str,
     registry: Address,
-    app_manager: Address,
     organizer: Address,
     auto: &chain::RegistryTx,
     locked: &chain::RegistryTx,
@@ -471,23 +469,6 @@ pub async fn dkg(
         "setProcessResults on a DKG process",
         got,
         &["InvalidKeyMode"],
-    ));
-    let am = Sim {
-        p: ProviderBuilder::new().connect_client(chain::rpc(rpc)?),
-        to: app_manager,
-    };
-    let got = am
-        .call(
-            organizer,
-            dkg::register_app_call(FixedBytes::ZERO),
-            None,
-            BlockId::latest(),
-        )
-        .await;
-    out.push(judge(
-        "registerApplication from an EOA",
-        got,
-        &["NotRegistrar"],
     ));
     eprintln!(
         "DKG negative checks (requests {} at {}, {} at {}):",

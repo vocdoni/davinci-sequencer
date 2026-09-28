@@ -26,6 +26,7 @@ The guests are specified in davinci-zkvm: `circuit/CIRCUIT.md` (vote batch) and
 | `sequencer/` (`davinci-sequencer`) | The node: config, redb storage, election keys, census, web3 (alloy), monitor, process actors, HTTP API. |
 | `client/` (`davinci-client`) | API wire types and client, organizer and voter helpers, the circom ballot prover (feature `prover`, on by default). See [client/README.md](client/README.md). |
 | `e2e/` (`davinci-e2e`) | Test-only crate: the end-to-end acceptance test, the batch-size and throughput benchmarks, and their Docker runner (`e2e/bench.sh`). |
+| `explorer/` | The web explorer: processes, transitions, blobs, votes, results and the deployment's pins, read from the chain in the browser and explained for voters, organizers and auditors. Its own Docker image (`ghcr.io/vocdoni/davinci-explorer`), configured by environment. See [explorer/README.md](explorer/README.md). |
 
 External pieces:
 
@@ -80,9 +81,12 @@ CI (`.github/workflows/main.yml`) checks the sibling repos out next to this
 one, at the refs listed at the top of the workflow, and runs on
 `ubuntu-latest`: fmt and clippy, `cargo test --workspace` with `ANVIL=1` and
 then the `DAVINCI_E2E_SETUP=1` run, the ziskemu dry runs on a CPU-only ZisK
-without a proving key, and the Docker build (pushed to Docker Hub and GHCR on
-branch pushes). No job needs the GPU prover, so `DAVINCI_E2E=1`, the live runs
-and the bench stay local.
+without a proving key, and the Docker build. Branch pushes publish the image to
+Docker Hub and GHCR under the branch name. A release tag `vX.Y.Z` publishes
+`:vX.Y.Z` and moves `:latest` to it; prerelease tags (`v1.2.3-rc1`) don't
+move it. The explorer has its own workflow (`explorer.yml`) with the same
+tagging. No job needs the GPU prover, so
+`DAVINCI_E2E=1`, the live runs and the bench stay local.
 
 The path dependencies put the Docker build context one level up, in the
 directory holding `davinci-sequencer/` and `davinci-zkvm/`:
@@ -96,8 +100,9 @@ The image runs as a non-root user (uid 10001) with the datadir at `/data`
 (`DAVINCI_DATADIR`).
 
 `docker-compose.yml` runs the published image
-(`ghcr.io/vocdoni/davinci-sequencer:${DAVINCI_SEQUENCER_TAG:-main}`) or builds it
-from the parent directory. Profiles:
+(`ghcr.io/vocdoni/davinci-sequencer:${DAVINCI_SEQUENCER_TAG:-latest}`), so
+Watchtower moves the node to each release. When the tag is not published,
+compose builds it from the parent directory. Profiles:
 
 | Profile | Services |
 |---|---|
@@ -115,13 +120,23 @@ docker compose --profile prod up -d
 The key never goes in `.env`: compose mounts `SEQUENCER_KEY_FILE` (default
 `./sequencer.key`) as a secret for `--privkey-file`. It must be readable by uid
 10001; an empty file runs an observer. The datadir is the named volume `data`.
+The node follows `DAVINCI_NETWORK` (default `gnosis`), so a Gnosis `.env` sets
+no registry, RPC or start block. A release that points the network at a new
+registry needs no action: after Watchtower restarts the node, it opens a fresh
+database for the new deployment (see [the datadir](#running-a-node)).
 
 `prod` and `dev` use `DAVINCI_PROVER_URL` (`http://host.docker.internal:8080`
-for a prover published on the same host). The GPU profiles build the prover from
-`../davinci-zkvm/Dockerfile.cuda` as `davinci-zkvm-cuda:latest`, the image that
-repo's compose uses, with the proving keys from `ZISK_KEYS_DIR` (default
+for a prover published on the same host). The GPU profiles run the published
+prover, `ghcr.io/vocdoni/davinci-zkvm:${DAVINCI_ZKVM_TAG:-latest}`, which
+Watchtower updates too, with the proving keys from `ZISK_KEYS_DIR` (default
 `../davinci-zkvm/zisk-keys`, see `make keys` there). Its port stays unpublished
-and `DAVINCI_KEEP_INPUTS` is pinned to 0.
+and `DAVINCI_KEEP_INPUTS` is pinned to 0. To build both images from the sibling
+checkouts instead, give them a tag Watchtower cannot find upstream:
+
+```bash
+printf 'DAVINCI_SEQUENCER_TAG=local\nDAVINCI_ZKVM_TAG=local\n' >> .env
+docker compose --profile gpu build
+```
 
 ## Running a node
 
@@ -130,6 +145,40 @@ A node needs:
 - a blob source: a beacon API, or anvil for local chains;
 - a `ProcessRegistry` deployed from the davinci-contracts `zkvm` branch;
 - a davinci-zkvm prover.
+
+The first three come from the network (`--network`, default `gnosis`), so a
+Gnosis operator gives only the key file and the prover:
+
+```bash
+cargo build --release -p davinci-sequencer
+DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
+DAVINCI_PROVER_URL=http://127.0.0.1:8080 \
+./target/release/davinci-sequencer
+```
+
+**Networks.** The known deployments live in `davinci_client::networks`, which the
+organizer and voter tooling share. A network sets the chain id, the
+`ProcessRegistry` and its deployment block, the RPC list, the blob source and the
+confirmations:
+
+| Network | Chain | RPCs | Blob source | Confirmations |
+|---|---|---|---|---|
+| `gnosis` | 100 | `https://gnosis-rpc.publicnode.com`, `https://gnosis-rpc.blockreq.com/v1/rpc/public`, `https://rpc.gnosischain.com` | `beacon:https://rpc-gbc.gnosischain.com` | 3 |
+
+The registry and its block are under [Deployments](#deployments).
+
+- Every explicit setting (`--registry`, `--start-block`, `--rpc-url`,
+  `--blob-source`, `--confirmations`, or its `DAVINCI_*` variable) replaces the
+  network's value, so a custom deployment works on any chain.
+- The network's start block belongs to its registry: with another `--registry`
+  it does not apply, and the node scans from `--start-block` or block 0.
+- An explicit registry pins the node to it. Only a node that takes the registry
+  from the network follows it to a new one on upgrade.
+- `--network custom` uses explicit settings only and needs `--registry`,
+  `--rpc-url` and `--blob-source`; `--confirmations` defaults to 2.
+- At boot the RPC's `eth_chainId` must be the network's. A mismatch stops the
+  node unless `--registry` was given, which only warns. The node logs the
+  network, chain id, registry, start block and deployment directory it uses.
 
 The prover's ELFs and the registry's pinned vks must match the SDK release pins
 (`BATCH_PROGRAM_VK`, `RESULTS_PROGRAM_VK`, `ROOT_C_VADCOP_FINAL`). The node checks
@@ -179,10 +228,12 @@ Every outgoing HTTP request (RPC, beacon API, prover, census downloads) carries
 `User-Agent: davinci-sequencer/<version>`; some public RPCs refuse requests
 without one.
 
-```bash
-cargo build --release -p davinci-sequencer
+A custom deployment:
 
+```bash
+DAVINCI_NETWORK=custom \
 DAVINCI_REGISTRY=0x... \
+DAVINCI_START_BLOCK=123456 \
 DAVINCI_RPC_URL=https://el.example:8545 \
 DAVINCI_BLOB_SOURCE=beacon:http://127.0.0.1:5052 \
 DAVINCI_PROVER_URL=http://127.0.0.1:8080 \
@@ -195,21 +246,22 @@ Every flag has a `DAVINCI_*` environment variable. Durations take `90`, `90s`,
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--registry` | `DAVINCI_REGISTRY` | required | `ProcessRegistry` address. |
-| `--blob-source` | `DAVINCI_BLOB_SOURCE` | required | `beacon:<url>[,<url>...]` (consensus-layer beacon APIs) or `anvil` (`anvil_getBlobsByTransactionHash` on the RPC). |
-| `--rpc-url` | `DAVINCI_RPC_URL` | `http://127.0.0.1:8545` | Execution-layer JSON-RPC; a comma-separated list for failover. |
+| `--network` | `DAVINCI_NETWORK` | `gnosis` | Known deployment that fills every chain setting not given, or `custom`. |
+| `--registry` | `DAVINCI_REGISTRY` | network | `ProcessRegistry` address. |
+| `--blob-source` | `DAVINCI_BLOB_SOURCE` | network | `beacon:<url>[,<url>...]` (consensus-layer beacon APIs) or `anvil` (`anvil_getBlobsByTransactionHash` on the RPC). |
+| `--rpc-url` | `DAVINCI_RPC_URL` | network | Execution-layer JSON-RPC; a comma-separated list for failover. |
 | `--prover-url` | `DAVINCI_PROVER_URL` | `http://127.0.0.1:8080` | davinci-zkvm prover service. |
 | `--privkey-file` | `DAVINCI_PRIVKEY_FILE` | unset | File with the hex secp256k1 key that signs settlement transactions. |
 | (env only) | `DAVINCI_PRIVKEY` | unset | The same key, from the environment. |
-| `--datadir` | `DAVINCI_DATADIR` | `~/.davinci-sequencer` | Holds the node's single redb file, `sequencer.redb`. |
+| `--datadir` | `DAVINCI_DATADIR` | `~/.davinci-sequencer` | Holds one `<chain id>-<registry>/sequencer.redb` per deployment. |
 | `--api-host` | `DAVINCI_API_HOST` | `0.0.0.0` | API listen address. |
 | `--api-port` | `DAVINCI_API_PORT` | `9090` | API port. |
 | `--batch-max` | `DAVINCI_BATCH_MAX` | `1024` | Pending votes that seal a batch without waiting (1 to 1024). |
 | `--max-blobs-per-tx` | `DAVINCI_MAX_BLOBS_PER_TX` | from `eth_config` | Most blobs one settlement transaction carries (1 to 6). Unset: the chain's `eth_config` `current.blobSchedule.max`, at most 6. Without `eth_config` (most Gnosis RPCs): 2 on Gnosis (100) and Chiado (10200), else 6, with a warning. A value above what `eth_config` advertises is kept, with a warning. |
 | `--batch-time` | `DAVINCI_BATCH_TIME` | `5m` | Longest a pending vote waits before its batch is sealed. |
 | `--settle-margin` | `DAVINCI_SETTLE_MARGIN` | `120s` | No batch is sealed when the election ends within this margin. |
-| `--confirmations` | `DAVINCI_CONFIRMATIONS` | `2` | Blocks behind head the monitor treats as final. Use `3` on Gnosis, and with load-balanced RPCs whose backends lag. |
-| `--start-block` | `DAVINCI_START_BLOCK` | unset | First block a fresh datadir scans for registry events; set it to the registry deployment block. Ignored once the datadir has scanned. Unset: block 0, with a warning (about 9,700 `eth_getLogs` pages on Gnosis). Progress is saved after every 5,000-block page. |
+| `--confirmations` | `DAVINCI_CONFIRMATIONS` | network, else `2` | Blocks behind head the monitor treats as final. Raise it with load-balanced RPCs whose backends lag. |
+| `--start-block` | `DAVINCI_START_BLOCK` | network | First block a fresh deployment scans for registry events: the registry deployment block. Ignored once the deployment has scanned. The network's applies to its own registry only; otherwise unset scans from block 0, with a warning (about 9,700 `eth_getLogs` pages on Gnosis). Progress is saved after every 5,000-block page. |
 | `--poll-interval` | `DAVINCI_POLL_INTERVAL` | `5s` | Chain polling interval. |
 | `--heartbeat` | `DAVINCI_HEARTBEAT` | poll interval | Actor heartbeat: drives batch timing, window close-out and finalization. |
 | `--prover-poll` | `DAVINCI_PROVER_POLL` | `2s` | Prover job polling interval. |
@@ -236,10 +288,32 @@ settles or finalizes, even if it holds an election key. It refuses
 `POST /votes` and `POST /processes/keys` with 412/41203, and `/info` reports
 `"observer": true`.
 
-**The datadir** holds one redb file (mode 0600, directory 0700). It includes the
-node master secret, drawn on first boot, from which every election key this node
-hands out is derived. Losing it loses the ability to publish results for those
-elections, so back it up and protect it like a key.
+**The datadir** holds one directory per deployment, named after the chain id and
+the registry in lowercase hex, each with one redb file (mode 0600, directories
+0700):
+
+```
+~/.davinci-sequencer/
+  100-0x3cde68c39e26ecf94bd029b6ed3b9f945441daf3/sequencer.redb
+```
+
+A node that meets a new registry (a release moved the network, or another
+`--registry`) creates its directory and starts there from an empty store at the
+registry's start block; the previous deployment's directory stays untouched, and
+a node pointed back at it resumes where it stopped. Each file records its
+deployment and refuses to open under another. The key file lives outside the
+datadir and does not move.
+
+A datadir of the earlier flat layout (`<datadir>/sequencer.redb`) is adopted
+once: when its processes carry this deployment's process-id prefix (bytes
+20..24, from the chain id and the registry) it moves into the deployment's
+directory. Otherwise, or when it holds no process, it stays in place and the
+node logs why; delete it once that deployment is no longer needed.
+
+Each database includes that deployment's node master secret, drawn on first
+boot, from which every election key the node hands out there is derived. Losing
+it loses the ability to publish results for those elections, so back it up and
+protect it like a key.
 
 ## HTTP API
 
@@ -443,7 +517,9 @@ secrets; it settles only proofs that match what it computed itself.
   batch by design; its votes go back to pending.
 - **Silent revoting.** Every batch also re-randomizes occupied slots it did not
   write, a uniform sample that nothing public determines, so an observer cannot
-  tell an overwrite from a routine refresh.
+  tell an overwrite from a routine refresh. Participation is not hidden: a
+  refresh only touches an occupied slot, so a slot's first write is a new vote,
+  and with a Merkle census the slot follows from the voter's address.
 - **Re-sealing a batch reveals nothing.** A sealed batch may reach the chain even
   if the node later drops it (a lost race, a prover failure, a restart). Once a
   batch is sealed, every ballot slot it changed, writes and refreshes as one
@@ -543,8 +619,8 @@ talks only to the `ProcessRegistry`; the DKG sits behind it.
   who accept that trust.
 - **DKG_AUTOMATIC** (`KeyMode::DkgAutomatic`). The process key comes from a
   davinci-dkg committee epoch: `PK_aid = P_j`, and the committee threshold-decrypts
-  the final accumulator once the process ends. No node and no organizer holds any
-  share of the secret.
+  the final accumulator once the process ends. No sequencer and no organizer
+  holds the secret; each committee member holds one share.
 - **DKG_LOCKED** (`KeyMode::DkgLocked`). The key is `P_j + PK_org`, where `sk_org`
   is an organizer secret returned as `CreatedProcess.organizer_secret` at creation
   and never stored by the registry. The committee's partials do not begin until the
@@ -614,10 +690,11 @@ org.reveal_process_key(&created.pid, &sk).await?;
   lost. Operators must keep a committee up for the life of every process on it.
 - The committee's discrete-log search stops at 2^50 per field. DAVINCI caps
   results well below that; a larger tally would taint the application.
-- Anyone can create DKG-mode processes, and each takes a pool key, so sixteen
-  cheap creates spend an epoch. The nodes then create the next epoch at once
-  (`createEpoch` is allowed early once the newest pool is spent), and DKG-mode
-  creation pauses for one epoch setup, about 2 minutes with the Gnosis windows.
+- Anyone can create DKG-mode processes, or register applications on the DKG
+  directly, and each takes a pool key, so sixteen cheap calls spend an epoch.
+  The nodes then create the next epoch at once (`createEpoch` is allowed early
+  once the newest pool is spent), and DKG-mode creation pauses for one epoch
+  setup, about 2 minutes with the Gnosis windows.
   The attacker pays more gas than the committee. A fee or an allowlist is the
   answer if that stops being enough.
 - Between the end and the first `requestResultsDecryption`, the organizer can
@@ -629,14 +706,6 @@ org.reveal_process_key(&created.pid, &sk).await?;
 - `registrationEpoch` looks back 8 epochs. If all 8 are spent or dead, automatic
   mode reverts `NoLiveEpoch` until a new epoch is Live. Locked mode names its
   epoch and is unaffected.
-- davinci-dkg's `DKGAppManager` has an optional registrar: when set, only it may
-  register applications. The deployer (`registrarAdmin`) sets it and may rotate
-  it later, never back to zero. Rotation only gates new registrations, so a
-  redeployed registry's adapter can take over the same committee, and the
-  registrar admin can stall new DKG-mode processes but cannot touch existing
-  ones. Registration is open until the registrar is set, so a deployment must
-  call `setRegistrar(adapter)` right after deploying the registry, before any
-  epoch goes Live.
 
 Not supported: key resharing across epochs, fees against pool draining, and
 chained (folded) mode with DKG keys.
@@ -777,13 +846,14 @@ the harness builds and runs three `davinci-dkg-node` processes (dev accounts 5�
 8 as the DKG deployer) and waits for an epoch to go Live before the registry is deployed.
 The node binary is built from `DAVINCI_DKG_DIR` (default `../davinci-dkg`) unless
 `DAVINCI_E2E_DKG_NODE_BIN` is set; artifacts go to `~/.cache/davinci-dkg-artifacts` (~1.1 GB
-on first download). For a live run, set `DAVINCI_E2E_DKG_MANAGER` to the deployed
-`DKGManager` address instead; the harness uses the external committee and starts no nodes.
+on first download). A live run uses the external committee of the registry
+adapter's `DKGManager` (`DAVINCI_E2E_DKG_MANAGER` overrides it) and starts no nodes.
 
 **Live runs.** `DAVINCI_E2E_LIVE=1` runs the same scenario on an existing
-deployment, the Gnosis one by default (`e2e/src/net.rs` lists the
-`DAVINCI_E2E_RPC`, `DAVINCI_E2E_NODE_RPCS`, `DAVINCI_E2E_BEACON`,
-`DAVINCI_E2E_REGISTRY` and `DAVINCI_E2E_FROM_BLOCK` overrides). It needs key
+deployment, by default the `gnosis` network of `davinci_client::networks`
+(`e2e/src/net.rs` lists the `DAVINCI_E2E_RPC`, `DAVINCI_E2E_NODE_RPCS`,
+`DAVINCI_E2E_BEACON`, `DAVINCI_E2E_REGISTRY` and `DAVINCI_E2E_FROM_BLOCK`
+overrides). It needs key
 files in `DAVINCI_E2E_ORGANIZER_KEY` and `DAVINCI_E2E_SEQUENCER_KEYS` (comma
 separated), prints only addresses, checks the registry pins first and wants 0.05
 of the native token in every account. `DAVINCI_E2E_RESILIENCE=1` adds full RPC,
@@ -904,27 +974,21 @@ DAVINCI contracts:
 
 | Contract | Address | Block |
 |---|---|---|
-| ZiskVerifier | `0xAe7b632A72cf474039E4128354576770beA33f34` | 48476747 |
-| ProcessRegistry | `0x3CDE68c39E26ecf94bD029b6ED3b9F945441daf3` | 48476748 |
-| DavinciDKGAdapter | `0x21FDE45181d31CcefAA722CE648b4BB37dd7645c` | 48476748 |
-
-The registry was deployed in tx
-`0x6da9a2afb3c0f4bc7414c3a460bc46b814273dcac8be7b7c06b48614eaccaa25`, and
-`setRegistrar(adapter)` followed in tx
-`0x3e88a90d20a412d91c54a285543566f16ea97382e936d93190cc660b1e1ae2cf`
-(block 48476749); `appManager.registrar()` returns the adapter.
+| ZiskVerifier | `0x0DBeF559Cccb2A085D9D9Ac3a13b67148bdB9936` | 48483866 |
+| ProcessRegistry | `0x48a5091B64434a6690AeA32455712Bd2b7EE3E77` | 48483867 |
+| DavinciDKGAdapter | `0xd79B9B55830Bf6C277850c56B29Fe9b75cF2543b` | 48483867 |
 
 DKG contracts:
 
 | Contract | Address | Block |
 |---|---|---|
-| DKGManager | `0x6fa82ffe5dfadce7f9d538fdab648bd01d2e15e6` | 48476742 |
-| DKGAppManager | `0x1c673318d91016e292ea18031b3f80a7a2e790e5` | 48476744 |
-| DKGRegistry | `0x272a91c149df48b21960c89cc6cf9596f7a65990` | 48476741 |
-| ContributionVerifier | `0x518aa569c554531ea29a3ac4930cfc8cd0debedf` | 48476737 |
-| FinalizeVerifier | `0xb1d2f3777b1798b36260bed5dd5c6780c82aa733` | 48476738 |
-| PartialDecryptVerifier | `0x40dde04d5176095e427ec246f8a7ecc27c6bbb76` | 48476739 |
-| DecryptCombineVerifier | `0xa4bb18a9c0b5400470101cf7f6e1da6a1cc54910` | 48476740 |
+| DKGManager | `0x9999f38ff8bf959e98ddd5d4551f82775219c01b` | 48483860 |
+| DKGAppManager | `0xd4d8f9708c380d81aec294b199081c5d2c782087` | 48483862 |
+| DKGRegistry | `0x45ab8b64633076ddc020b12d1f1325fa55f629c5` | 48483859 |
+| ContributionVerifier | `0x6d198bc613205957444b53a09bb22ed7bc650912` | 48483855 |
+| FinalizeVerifier | `0xc354ea7f3ef6db4ca0b89a1a5a6395c2d6126b38` | 48483856 |
+| PartialDecryptVerifier | `0x0f19886ee73fd74e3f88ce3a061490facd7561db` | 48483857 |
+| DecryptCombineVerifier | `0x2980e664edef91f554cc75b15cb8eeea61586644` | 48483858 |
 
 Pinned values, equal to the SDK release pins:
 
@@ -939,12 +1003,12 @@ Pinned values, equal to the SDK release pins:
 Rebuilding a guest changes its program vk, which needs a new registry. Three
 checks refuse a mismatch: the node's boot check, `davinci_client::verify_registry`
 for clients, and davinci-contracts' `script/verify_deployment.py`, which compares
-the deployed runtime code with a local build (immutables masked), reads back every
-pin and requires `appManager.registrar() == adapter`:
+the deployed runtime code with a local build (immutables masked) and reads back
+every pin:
 
 ```bash
 python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \
-  --registry 0x3CDE68c39E26ecf94bD029b6ED3b9F945441daf3 --chain-id 100 \
+  --registry 0x48a5091B64434a6690AeA32455712Bd2b7EE3E77 --chain-id 100 \
   --batch-vk  0x6cfc89d562d0b22f04478a5c15b390433eb52f1b03147030b183076260da7a10 \
   --results-vk 0x7bc8c5e9235548386a44b1885732a2a7ffb1badddc8c7fba599d07ece47be794 \
   --root-c 0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80 \
@@ -953,31 +1017,25 @@ python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \
 
 Deploy order: the DKG contracts (`DeployAll.s.sol` in davinci-dkg), then the
 `ProcessRegistry` (constructor: verifier, vks, `dkgManager`), which creates the
-adapter, then `DKGAppManager.setRegistrar(adapter)` straight after, before any
-epoch goes Live.
+adapter.
 
-**Node configuration:**
+**Node configuration.** The `gnosis` network (the default) carries the
+registry, its start block, the RPCs, the beacon API and 3 confirmations:
 
 ```bash
-davinci-sequencer \
-  --registry 0x3CDE68c39E26ecf94bD029b6ED3b9F945441daf3 \
-  --start-block 48476748 \
-  --rpc-url https://gnosis-rpc.publicnode.com,https://gnosis-rpc.blockreq.com/v1/rpc/public,https://rpc.gnosischain.com \
-  --blob-source beacon:https://rpc-gbc.gnosischain.com \
-  --confirmations 3 \
-  --privkey-file /path/to/key \
-  --prover-url http://127.0.0.1:8080
+davinci-sequencer --privkey-file /path/to/key --prover-url http://127.0.0.1:8080
 ```
 
-**The DKG committee.** Three operators run `davinci-dkg-node`, each as its own
-systemd service capped at 8 GB, with its key (`DAVINCI_DKG_PRIVKEY`) and
-`ARTIFACTS_DIR` in a mode-0600 environment file. Auto-create is on with the
+**The DKG committee.** Three operators run the `davinci-dkg` image, each in its
+own container with its key (`DAVINCI_DKG_PRIVKEY`) in a mode-0600 environment
+file. Auto-create is on with the
 epoch policy threshold 2, committee 3, minimum valid 2, alpha 10000, so the
 nodes open a new epoch when the current pool is spent. The DKG runs a fast
 configuration: epochs of 17280 blocks (a day at 5 s), committee selection 8
-blocks, key assembly 12, finalize gap 1, floors t=2, n=3, α=20000. The first
-epoch, `379447f10000000000000001`, went Live about 2 minutes after
-`createEpoch`.
+blocks, key assembly 12, finalize gap 1, policy bounds t ≥ 2, n ≥ 3, α ≤ 20000 (basis points). The first
+epoch, `aab5fe7d0000000000000001`, went Live about 2 minutes after
+`createEpoch`. Application registration on the DKGAppManager is open to
+any contract, so other applications can share the committee.
 
 **Chain facts.**
 - Gnosis runs Fusaka: blob transactions carry EIP-7594 cell-proof sidecars. The
@@ -1037,8 +1095,7 @@ as expected, and their controls passed:
 - a second request: `ResultsAlreadyRequested`;
 - finalize before the combines: `ResultsNotReady`;
 - a cancel after the request: `InvalidStatus`;
-- `setProcessResults` on a DKG process: `InvalidKeyMode`;
-- `registerApplication` from an EOA: `NotRegistrar`.
+- `setProcessResults` on a DKG process: `InvalidKeyMode`.
 
 **Batch-size benchmark.** Measured on Gnosis on 2026-09-27, against the
 previous registry, with one RTX 5090 prover and one node per case

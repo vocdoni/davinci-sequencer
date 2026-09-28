@@ -1,9 +1,11 @@
 //! redb storage: every table round-trips, pending is FIFO, statuses move,
-//! data survives a reopen and a schema mismatch is refused.
+//! data survives a reopen, a schema mismatch is refused, and each deployment
+//! keeps its own database under the datadir.
 
+use davinci_sequencer::keys::KeyStore;
 use davinci_sequencer::storage::{
-    Db, ExposedRecord, LocalStatus, ProcessRecord, SCHEMA_VERSION_KEY, StorageError, StoredVote,
-    TransitionRecord, VoteStatus,
+    DB_FILE, Db, ExposedRecord, LocalStatus, ProcessRecord, SCHEMA_VERSION_KEY, StorageError,
+    StoredVote, TransitionRecord, VoteStatus, deployment_dir, pid_prefix,
 };
 use davinci_sequencer::web3::{DkgState, KeyMode, OnchainCensus, OnchainProcess, ProcessStatus};
 use davinci_zkvm_sdk::ballot::BallotMode;
@@ -465,4 +467,121 @@ fn exposed_record_roundtrips_as_one_union_list() {
     assert_eq!(db.exposed(&pid(1)).unwrap(), None);
     // Clearing a missing record is a no-op.
     db.clear_exposed(&pid(1)).unwrap();
+}
+
+const REG_A: [u8; 20] = [0xaa; 20];
+const REG_B: [u8; 20] = [0xbb; 20];
+
+/// A process of registry `reg` on chain 100: creator, id prefix, nonce.
+fn process_of(reg: &[u8; 20], nonce: u8) -> ProcessRecord {
+    let mut be = [0u8; 32];
+    be[1..21].copy_from_slice(&[7u8; 20]);
+    be[21..25].copy_from_slice(&pid_prefix(100, reg).unwrap());
+    be[31] = nonce;
+    ProcessRecord {
+        pid: davinci_zkvm_sdk::crypto::field::fr_from_be(&be).unwrap(),
+        ..process(1)
+    }
+}
+
+// A new registry on the same datadir starts empty; the old deployment's
+// file stays as it was.
+#[test]
+fn another_registry_starts_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = process_of(&REG_A, 1);
+    {
+        let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+        db.put_process(&a).unwrap();
+        db.set_meta_u64("monitor_last_block", 500).unwrap();
+        KeyStore::open(&db, 100, REG_A).unwrap();
+        assert_eq!(db.enc_key_count().unwrap(), 1);
+    }
+    let path_a = deployment_dir(dir.path(), 100, &REG_A).join(DB_FILE);
+    let before = std::fs::read(&path_a).unwrap();
+    assert!(path_a.ends_with(format!("100-0x{}/sequencer.redb", "aa".repeat(20))));
+
+    let db = Db::open_deployment(dir.path(), 100, &REG_B).unwrap();
+    assert!(db.processes().unwrap().is_empty());
+    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), None);
+    assert_eq!(db.enc_key_count().unwrap(), 0);
+    drop(db);
+    assert_eq!(std::fs::read(&path_a).unwrap(), before);
+
+    // Back on the first registry, everything is where it was.
+    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    assert_eq!(db.processes().unwrap(), vec![a]);
+    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), Some(500));
+    let mode = |p: &std::path::Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode(&deployment_dir(dir.path(), 100, &REG_B)), 0o700);
+    assert_eq!(mode(&path_a), 0o600);
+}
+
+// A database copied into another deployment's directory is refused.
+#[test]
+fn a_database_is_bound_to_its_deployment() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Db::open_deployment(dir.path(), 100, &REG_A).unwrap());
+    std::fs::rename(
+        deployment_dir(dir.path(), 100, &REG_A),
+        deployment_dir(dir.path(), 100, &REG_B),
+    )
+    .unwrap();
+    let err = Db::open_deployment(dir.path(), 100, &REG_B).err().unwrap();
+    assert!(matches!(err, StorageError::Deployment { .. }), "{err}");
+}
+
+// The flat layout (`<datadir>/sequencer.redb`) moves into the deployment
+// its processes belong to.
+#[test]
+fn flat_layout_moves_into_its_deployment() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = process_of(&REG_A, 1);
+    {
+        let db = Db::open_in(dir.path()).unwrap();
+        db.put_process(&a).unwrap();
+        db.put_process(&process_of(&REG_A, 2)).unwrap();
+        db.set_meta_u64("monitor_last_block", 900).unwrap();
+    }
+    // Another registry's node leaves it alone.
+    let db = Db::open_deployment(dir.path(), 100, &REG_B).unwrap();
+    assert!(db.processes().unwrap().is_empty());
+    drop(db);
+    assert!(dir.path().join(DB_FILE).exists());
+
+    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    assert!(!dir.path().join(DB_FILE).exists());
+    assert_eq!(db.processes().unwrap().len(), 2);
+    assert_eq!(db.process(&a.pid).unwrap(), Some(a));
+    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), Some(900));
+}
+
+// Without processes the flat database's deployment is unknown: it stays.
+#[test]
+fn flat_layout_without_processes_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Db::open_in(dir.path()).unwrap();
+        db.set_meta_u64("monitor_last_block", 900).unwrap();
+    }
+    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), None);
+    assert!(dir.path().join(DB_FILE).exists());
+}
+
+// A flat database of another schema is not moved: it would be refused.
+#[test]
+fn flat_layout_of_another_schema_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Db::open_in(dir.path()).unwrap();
+        db.put_process(&process_of(&REG_A, 1)).unwrap();
+        db.set_meta_u64(SCHEMA_VERSION_KEY, 999).unwrap();
+    }
+    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    assert!(db.processes().unwrap().is_empty());
+    assert!(dir.path().join(DB_FILE).exists());
 }

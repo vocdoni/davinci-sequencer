@@ -353,7 +353,6 @@ alloy::sol! {
     #[sol(rpc)]
     interface IMockDKG {
         function newEpoch(bool live, uint256[2][] memory keys) external returns (bytes12 eid);
-        function setRegistrar(address r) external;
         function revealed(bytes12 eid, bytes32 aid) external view returns (bool);
     }
 }
@@ -394,13 +393,8 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
     );
     let registry = deploy(&p, code).await?;
     let info = verify_registry(&url, registry).await?;
-    let adapter = info.dkg_adapter.expect("registry has a DKG adapter");
+    assert!(info.dkg_adapter.is_some(), "registry has a DKG adapter");
     let dkg = IMockDKG::new(mock, &p);
-    dkg.setRegistrar(adapter)
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
     let key = |k: u64| Point::generator().mul(&U256::from(k));
     let pool: Vec<[AU256; 2]> = [1_000_003u64, 1_000_004]
         .iter()
