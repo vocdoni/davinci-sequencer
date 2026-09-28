@@ -814,6 +814,12 @@ top of `e2e/tests/throughput.rs`. A steady batch of N votes carries up to N
 refreshes, and 1024 + 1024 needs about 41 GB of RAM in the prover, so stay at
 512 on a 64 GB prover host.
 
+On two RTX 5090 provers, each serving a node with two processes of 2048 voters
+at nf=2 and batches of 512, the system sustained **12.07 votes/s** (8192 votes
+settled in 678.7 s; 12.45 votes/s in steady state), with both GPUs busy the
+whole time. The full report, hardware and image versions are in davinci-zkvm's
+`BENCHMARK.md`.
+
 `e2e/bench.sh` runs either benchmark in the `e2e/Dockerfile.bench` image, with
 nothing native on the host. The nodes are the binary from
 `ghcr.io/vocdoni/davinci-sequencer:main` (`NODE_IMAGE` overrides it), anvil
