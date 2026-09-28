@@ -1369,10 +1369,18 @@ pub fn test_config_with(
     extra: &[&str],
 ) -> Config {
     let bm = batch_max.to_string();
+    // The fake chain's RPC, unless the test brings its own.
+    let rpc: &[&str] = if extra.contains(&"--rpc-url") {
+        &[]
+    } else {
+        &["--rpc-url", "http://127.0.0.1:8545"]
+    };
     let base = [
         "davinci-sequencer",
         "--datadir",
         datadir.to_str().unwrap(),
+        "--network",
+        "custom",
         "--registry",
         "0x0000000000000000000000000000000000000001",
         "--blob-source",
@@ -1390,7 +1398,7 @@ pub fn test_config_with(
         "--census-dir",
         census_dir.to_str().unwrap(),
     ];
-    Config::try_parse_from(base.iter().copied().chain(extra.iter().copied())).unwrap()
+    Config::parse_args(base.iter().chain(rpc).chain(extra).copied()).unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]

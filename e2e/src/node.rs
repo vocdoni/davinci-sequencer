@@ -200,6 +200,7 @@ impl Node {
             .env("HOME", &cfg.dir)
             .env("RUST_BACKTRACE", "1")
             .env("NO_COLOR", "1")
+            .env("DAVINCI_NETWORK", "custom")
             .env("DAVINCI_DATADIR", &datadir)
             .env("DAVINCI_API_HOST", "127.0.0.1")
             .env("DAVINCI_API_PORT", port.to_string())

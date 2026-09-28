@@ -7,9 +7,13 @@ use std::time::Duration;
 
 use alloy::primitives::Address;
 use clap::Parser;
+use davinci_client::networks::{self, Network};
 use davinci_zkvm_sdk::limits::{MAX_BATCH_SIZE, TX_BLOB_CAP};
 use url::Url;
 use zeroize::Zeroize;
+
+/// `--confirmations` when neither the flag nor a network sets it.
+pub const DEFAULT_CONFIRMATIONS: u64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -47,6 +51,49 @@ impl fmt::Debug for SecretString {
 impl fmt::Display for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("***")
+    }
+}
+
+/// `--network`: a known deployment, or `custom` for explicit settings only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkChoice {
+    Known(&'static Network),
+    Custom,
+}
+
+impl NetworkChoice {
+    pub fn preset(&self) -> Option<&'static Network> {
+        match self {
+            NetworkChoice::Known(n) => Some(n),
+            NetworkChoice::Custom => None,
+        }
+    }
+}
+
+impl FromStr for NetworkChoice {
+    type Err = ConfigError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.trim().eq_ignore_ascii_case("custom") {
+            return Ok(NetworkChoice::Custom);
+        }
+        networks::by_name(s)
+            .map(NetworkChoice::Known)
+            .ok_or_else(|| {
+                let known: Vec<&str> = networks::NETWORKS.iter().map(|n| n.name).collect();
+                ConfigError::Invalid(
+                    "network",
+                    format!("{s}: want {} or custom", known.join(", ")),
+                )
+            })
+    }
+}
+
+impl fmt::Display for NetworkChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NetworkChoice::Known(n) => f.write_str(n.name),
+            NetworkChoice::Custom => f.write_str("custom"),
+        }
     }
 }
 
@@ -169,10 +216,20 @@ fn parse_blob_cap(s: &str) -> Result<usize, ConfigError> {
     Ok(n)
 }
 
+/// The node's settings. Parse with [`Config::load`] or [`Config::parse_args`]:
+/// both resolve `--network` into `registry`, `rpc_url`, `blob_source`,
+/// `confirmations` and `start_block`, which a bare `try_parse_from` leaves
+/// unset.
 #[derive(Clone, Parser)]
 #[command(name = "davinci-sequencer", version, about = "DAVINCI sequencer node")]
 pub struct Config {
-    /// Data directory; the node keeps one redb file in it.
+    /// Known deployment that supplies every chain setting not given
+    /// explicitly (registry, start block, RPCs, blob source, confirmations),
+    /// or `custom` to use only explicit settings.
+    #[arg(long, env = "DAVINCI_NETWORK", default_value = networks::DEFAULT.name)]
+    pub network: NetworkChoice,
+    /// Data directory; each deployment keeps its redb file in a
+    /// `<chain id>-<registry>` subdirectory.
     #[arg(long, env = "DAVINCI_DATADIR", default_value = "~/.davinci-sequencer")]
     pub datadir: PathBuf,
     #[arg(long, env = "DAVINCI_API_HOST", default_value = "0.0.0.0")]
@@ -181,8 +238,12 @@ pub struct Config {
     pub api_port: u16,
     /// Execution-layer JSON-RPC endpoints, comma-separated, in order of
     /// preference; the node sticks to one and fails over on node-side errors.
-    #[arg(long, env = "DAVINCI_RPC_URL", default_value = "http://127.0.0.1:8545",
+    /// Default: the network's.
+    #[arg(long = "rpc-url", env = "DAVINCI_RPC_URL", value_name = "URL",
         value_parser = parse_http_url, value_delimiter = ',')]
+    rpc_url_arg: Vec<Url>,
+    /// Resolved RPC endpoints.
+    #[arg(skip)]
     pub rpc_url: Vec<Url>,
     /// Hex secp256k1 key that signs settlement transactions, from the
     /// `DAVINCI_PRIVKEY` environment variable or `--privkey-file` (never a
@@ -194,11 +255,21 @@ pub struct Config {
     /// variable is the alternative. Unset: observer mode.
     #[arg(long, env = "DAVINCI_PRIVKEY_FILE")]
     pub privkey_file: Option<PathBuf>,
-    /// ProcessRegistry address.
-    #[arg(long, env = "DAVINCI_REGISTRY")]
+    /// ProcessRegistry address. Default: the network's.
+    #[arg(long = "registry", env = "DAVINCI_REGISTRY", value_name = "ADDRESS")]
+    registry_arg: Option<Address>,
+    /// Resolved registry.
+    #[arg(skip = Address::ZERO)]
     pub registry: Address,
-    /// `beacon:<url>` or `anvil`.
-    #[arg(long, env = "DAVINCI_BLOB_SOURCE")]
+    /// `beacon:<url>[,<url>...]` or `anvil`. Default: the network's.
+    #[arg(
+        long = "blob-source",
+        env = "DAVINCI_BLOB_SOURCE",
+        value_name = "SOURCE"
+    )]
+    blob_source_arg: Option<BlobSourceKind>,
+    /// Resolved blob source.
+    #[arg(skip = BlobSourceKind::Anvil)]
     pub blob_source: BlobSourceKind,
     /// davinci-zkvm prover service.
     #[arg(long, env = "DAVINCI_PROVER_URL", default_value = "http://127.0.0.1:8080", value_parser = parse_http_url)]
@@ -219,12 +290,27 @@ pub struct Config {
     #[arg(long, env = "DAVINCI_SETTLE_MARGIN", default_value = "120s", value_parser = parse_duration)]
     pub settle_margin: Duration,
     /// Blocks behind head the monitor treats as final (reorg margin).
-    #[arg(long, env = "DAVINCI_CONFIRMATIONS", default_value_t = 2)]
+    /// Default: the network's, else 2.
+    #[arg(
+        long = "confirmations",
+        env = "DAVINCI_CONFIRMATIONS",
+        value_name = "N"
+    )]
+    confirmations_arg: Option<u64>,
+    /// Resolved confirmations.
+    #[arg(skip = DEFAULT_CONFIRMATIONS)]
     pub confirmations: u64,
-    /// First block a fresh datadir scans for registry events (the registry's
-    /// deployment block). Ignored once the datadir has scanned; unset scans
-    /// from block 0.
-    #[arg(long, env = "DAVINCI_START_BLOCK")]
+    /// First block a fresh deployment directory scans for registry events
+    /// (the registry's deployment block). Ignored once it has scanned.
+    /// Default: the network's when its registry is in use, else block 0.
+    #[arg(
+        long = "start-block",
+        env = "DAVINCI_START_BLOCK",
+        value_name = "BLOCK"
+    )]
+    start_block_arg: Option<u64>,
+    /// Resolved start block.
+    #[arg(skip)]
     pub start_block: Option<u64>,
     /// Directory `file://` census URIs may read from. Unset: `file://` is refused.
     #[arg(long, env = "DAVINCI_CENSUS_DIR")]
@@ -260,6 +346,7 @@ pub struct Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
+            .field("network", &self.network.to_string())
             .field("datadir", &self.datadir)
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
@@ -290,15 +377,99 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-    /// Parses flags and environment, expands a leading `~/` in paths and
-    /// reads the signing key.
+    /// Parses flags and environment, resolves the network, expands a leading
+    /// `~/` in paths and reads the signing key.
     pub fn load() -> Result<Self, ConfigError> {
         let mut c = Config::parse();
+        c.resolve_network()?;
         c.datadir = expand_home(&c.datadir);
         c.census_dir = c.census_dir.as_deref().map(expand_home);
         c.privkey_file = c.privkey_file.as_deref().map(expand_home);
         c.resolve_privkey(std::env::var("DAVINCI_PRIVKEY").ok().map(SecretString::new))?;
         Ok(c)
+    }
+
+    /// Parses `args` (and the environment) and resolves the network; the
+    /// signing key is left to [`Config::resolve_privkey`].
+    pub fn parse_args<I, T>(args: I) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut c = Config::try_parse_from(args)
+            .map_err(|e| ConfigError::Invalid("arguments", e.to_string()))?;
+        c.resolve_network()?;
+        Ok(c)
+    }
+
+    /// Fills the chain settings: an explicit value wins, then the network's.
+    /// `custom` needs the registry, the RPC and the blob source. The
+    /// network's start block applies only to its own registry.
+    pub fn resolve_network(&mut self) -> Result<(), ConfigError> {
+        let preset = self.network.preset();
+        let need = |what: &'static str, flag: &str| {
+            ConfigError::Invalid(what, format!("--network custom needs {flag}"))
+        };
+        self.registry = match (self.registry_arg, preset) {
+            (Some(a), _) => a,
+            (None, Some(n)) => n.registry,
+            (None, None) => return Err(need("registry", "--registry")),
+        };
+        self.rpc_url = match (self.rpc_url_arg.is_empty(), preset) {
+            (false, _) => self.rpc_url_arg.clone(),
+            (true, Some(n)) => n
+                .rpc_urls
+                .iter()
+                .map(|u| parse_http_url(u))
+                .collect::<Result<_, _>>()?,
+            (true, None) => return Err(need("rpc url", "--rpc-url")),
+        };
+        self.blob_source = match (&self.blob_source_arg, preset) {
+            (Some(b), _) => b.clone(),
+            (None, Some(n)) => n.blob_source.parse()?,
+            (None, None) => return Err(need("blob source", "--blob-source")),
+        };
+        self.confirmations = self
+            .confirmations_arg
+            .or(preset.map(|n| n.confirmations))
+            .unwrap_or(DEFAULT_CONFIRMATIONS);
+        self.start_block = self.start_block_arg.or(preset
+            .filter(|n| n.registry == self.registry)
+            .map(|n| n.start_block));
+        Ok(())
+    }
+
+    /// Whether `--registry` was given (not taken from the network).
+    pub fn registry_explicit(&self) -> bool {
+        self.registry_arg.is_some()
+    }
+
+    /// Checks the RPC's chain id against the network's. A mismatch is fatal
+    /// unless the registry was given explicitly, then only a warning.
+    pub fn check_chain_id(&self, chain_id: u64) -> Result<(), ConfigError> {
+        let Some(n) = self.network.preset() else {
+            return Ok(());
+        };
+        if n.chain_id == chain_id {
+            return Ok(());
+        }
+        if self.registry_explicit() {
+            tracing::warn!(
+                network = n.name,
+                expected = n.chain_id,
+                chain_id,
+                "the RPC is not on the network's chain; following the explicit --registry"
+            );
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(
+            "chain",
+            format!(
+                "the RPC is on chain {chain_id}, network {} is chain {}; fix --rpc-url, or \
+                 use --network custom for another chain",
+                n.name, n.chain_id
+            ),
+        ))
     }
 
     /// Sets `privkey` from the environment value or `privkey_file`; both
@@ -327,11 +498,6 @@ impl Config {
         Ok(())
     }
 
-    /// The node's redb file.
-    pub fn db_path(&self) -> PathBuf {
-        self.datadir.join("sequencer.redb")
-    }
-
     /// Heartbeat cadence: `--heartbeat` or the poll interval.
     pub fn heartbeat(&self) -> Duration {
         self.heartbeat.unwrap_or(self.poll_interval)
@@ -349,19 +515,30 @@ fn expand_home(p: &std::path::Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    const REG: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+
     fn base() -> Vec<&'static str> {
         vec![
             "davinci-sequencer",
+            "--network",
+            "custom",
             "--registry",
-            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            REG,
             "--blob-source",
             "anvil",
         ]
     }
 
+    fn with_rpc() -> Vec<&'static str> {
+        let mut args = base();
+        args.extend(["--rpc-url", "http://127.0.0.1:8545"]);
+        args
+    }
+
     #[test]
     fn defaults_and_overrides() {
-        let c = Config::try_parse_from(base()).unwrap();
+        let c = Config::parse_args(with_rpc()).unwrap();
+        assert_eq!(c.network, NetworkChoice::Custom);
         assert_eq!(c.api_port, 9090);
         assert_eq!(c.batch_max, 1024);
         assert_eq!(c.max_blobs_per_tx, None);
@@ -373,7 +550,7 @@ mod tests {
         assert_eq!(c.rpc_url, [Url::parse("http://127.0.0.1:8545").unwrap()]);
         assert_eq!(c.start_block, None);
         assert!(c.census_dir.is_none() && !c.census_allow_private);
-        let mut args = base();
+        let mut args = with_rpc();
         args.extend([
             "--batch-max",
             "8",
@@ -386,7 +563,7 @@ mod tests {
             "--start-block",
             "41000000",
         ]);
-        let c = Config::try_parse_from(args).unwrap();
+        let c = Config::parse_args(args).unwrap();
         assert_eq!(c.start_block, Some(41_000_000));
         assert_eq!(c.batch_max, 8);
         assert_eq!(c.max_blobs_per_tx, Some(2));
@@ -397,7 +574,7 @@ mod tests {
     fn rpc_url_list() {
         let mut args = base();
         args.extend(["--rpc-url", "http://a:8545,https://b/key"]);
-        let c = Config::try_parse_from(args).unwrap();
+        let c = Config::parse_args(args).unwrap();
         assert_eq!(c.rpc_url.len(), 2);
         assert_eq!(c.rpc_url[1].as_str(), "https://b/key");
         let mut args = base();
@@ -412,7 +589,7 @@ mod tests {
         args.extend(["--privkey", "deadbeef"]);
         assert!(Config::try_parse_from(args).is_err());
 
-        let mut c = Config::try_parse_from(base()).unwrap();
+        let mut c = Config::parse_args(with_rpc()).unwrap();
         c.resolve_privkey(Some(SecretString::new("deadbeef")))
             .unwrap();
         assert_eq!(c.privkey.as_ref().map(|s| s.expose()), Some("deadbeef"));
@@ -429,7 +606,7 @@ mod tests {
             "--prover-url",
             "https://prover.example.org/proverkey",
         ];
-        let d = format!("{:?}", Config::try_parse_from(args).unwrap());
+        let d = format!("{:?}", Config::parse_args(args).unwrap());
         for key in ["rpckey", "rpc2", "beaconkey", "proverkey"] {
             assert!(!d.contains(key), "{key} in {d}");
         }
@@ -440,10 +617,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("key");
         std::fs::write(&f, "  c0ffee\n").unwrap();
-        let mut args = base();
+        let mut args = with_rpc();
         let fs = f.display().to_string();
         args.extend(["--privkey-file", &fs]);
-        let mut c = Config::try_parse_from(args).unwrap();
+        let mut c = Config::parse_args(args).unwrap();
         c.resolve_privkey(None).unwrap();
         assert_eq!(c.privkey.as_ref().map(|s| s.expose()), Some("c0ffee"));
         assert!(c.resolve_privkey(Some(SecretString::new("x"))).is_err());
@@ -463,11 +640,98 @@ mod tests {
             ("--rpc-url", "ftp://x"),
             ("--blob-source", "beacon:not a url"),
             ("--blob-source", "ipfs"),
+            ("--network", "mainnet"),
         ] {
             let mut args = base();
             args.extend([flag, v]);
             assert!(Config::try_parse_from(args).is_err(), "{flag} {v}");
         }
+    }
+
+    #[test]
+    fn gnosis_is_the_default_network() {
+        let g = &networks::GNOSIS;
+        let c = Config::parse_args(["davinci-sequencer"]).unwrap();
+        assert_eq!(c.network, NetworkChoice::Known(g));
+        assert_eq!(c.registry, g.registry);
+        assert!(!c.registry_explicit());
+        assert_eq!(c.start_block, Some(g.start_block));
+        assert_eq!(c.confirmations, 3);
+        let rpcs: Vec<&str> = c.rpc_url.iter().map(|u| u.as_str()).collect();
+        assert_eq!(
+            rpcs,
+            [
+                "https://gnosis-rpc.publicnode.com/",
+                "https://gnosis-rpc.blockreq.com/v1/rpc/public",
+                "https://rpc.gnosischain.com/",
+            ]
+        );
+        assert_eq!(c.blob_source, g.blob_source.parse().unwrap());
+        assert_eq!(
+            Config::parse_args(["davinci-sequencer", "--network", "GNOSIS"])
+                .unwrap()
+                .network,
+            NetworkChoice::Known(g)
+        );
+    }
+
+    // Each explicit setting replaces the network's; the network's start
+    // block goes with its registry only.
+    #[test]
+    fn explicit_settings_override_the_network() {
+        let c = Config::parse_args(["davinci-sequencer", "--registry", REG]).unwrap();
+        assert!(c.registry_explicit());
+        assert_eq!(c.registry, REG.parse::<Address>().unwrap());
+        assert_eq!(c.start_block, None);
+        assert_eq!(c.rpc_url.len(), networks::GNOSIS.rpc_urls.len());
+        assert_eq!(c.confirmations, 3);
+        let c = Config::parse_args([
+            "davinci-sequencer",
+            "--start-block",
+            "7",
+            "--confirmations",
+            "0",
+            "--rpc-url",
+            "http://a:8545",
+            "--blob-source",
+            "anvil",
+        ])
+        .unwrap();
+        assert_eq!(c.registry, networks::GNOSIS.registry);
+        assert_eq!(c.start_block, Some(7));
+        assert_eq!(c.confirmations, 0);
+        assert_eq!(c.rpc_url, [Url::parse("http://a:8545").unwrap()]);
+        assert_eq!(c.blob_source, BlobSourceKind::Anvil);
+    }
+
+    #[test]
+    fn custom_needs_explicit_settings() {
+        let custom = ["davinci-sequencer", "--network", "custom"];
+        for extra in [
+            &[][..],
+            &["--registry", REG][..],
+            &["--registry", REG, "--rpc-url", "http://a"][..],
+            &["--rpc-url", "http://a", "--blob-source", "anvil"][..],
+        ] {
+            let args = custom.iter().chain(extra);
+            assert!(Config::parse_args(args).is_err(), "{extra:?}");
+        }
+        let c = Config::parse_args(with_rpc()).unwrap();
+        assert_eq!(c.confirmations, DEFAULT_CONFIRMATIONS);
+        assert_eq!(c.start_block, None);
+    }
+
+    #[test]
+    fn chain_id_must_match_the_network() {
+        let c = Config::parse_args(["davinci-sequencer"]).unwrap();
+        assert!(c.check_chain_id(100).is_ok());
+        let e = c.check_chain_id(31337).unwrap_err().to_string();
+        assert!(e.contains("31337") && e.contains("gnosis"), "{e}");
+        // An explicit registry may live on another chain.
+        let c = Config::parse_args(["davinci-sequencer", "--registry", REG]).unwrap();
+        assert!(c.check_chain_id(31337).is_ok());
+        let c = Config::parse_args(with_rpc()).unwrap();
+        assert!(c.check_chain_id(31337).is_ok());
     }
 
     #[test]

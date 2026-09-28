@@ -436,15 +436,15 @@ fn save_retries(db: &Db, retries: &[BootRetry]) {
 }
 
 async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
-    // The last scanned block; --start-block only seeds a fresh datadir.
+    // The last scanned block; the start block only seeds a fresh database.
     let mut last = match ctx.deps.db.meta_u64(LAST_BLOCK_KEY).ok().flatten() {
         Some(b) => b,
         None => match ctx.cfg.start_block {
             Some(n) => n.saturating_sub(1),
             None => {
                 warn!(
-                    "fresh datadir without --start-block: scanning registry events from block 0; \
-                     set it to the registry deployment block"
+                    "fresh deployment without a start block: scanning registry events from \
+                     block 0; set --start-block to the registry deployment block"
                 );
                 0
             }

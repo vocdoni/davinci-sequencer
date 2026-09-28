@@ -59,6 +59,8 @@ CI (`.github/workflows/main.yml`, `ubuntu-latest`, no GPU) checks the siblings o
 beside the repo at the refs listed in the workflow header and runs fmt/clippy,
 `cargo test --workspace` with `ANVIL=1`, the `DAVINCI_E2E_SETUP=1` run, the ziskemu dry
 runs (CPU ZisK, `--nokey`) and the Docker build. Never add a job that needs the prover.
+Branch pushes publish the image under the branch name; a `vX.Y.Z` tag publishes
+`:vX.Y.Z` and `:latest`, which `docker-compose.yml` and Watchtower follow.
 
 Gated tests (they print a skip line and PASS when the variable is unset, so check the
 output before claiming they ran):
@@ -180,16 +182,13 @@ DKG modes no node holds a key: after the end any signing node sends
 ENDED), polls, then `finalizeResultsFromDKG` (`finalize.rs::run_finalize_dkg`). No
 results PLONK is needed in DKG modes; the committee's Groth16 proofs replace it.
 
-- The e2e flag is `DAVINCI_E2E_DKG=1`; for live runs also set
-  `DAVINCI_E2E_DKG_MANAGER` to the deployed `DKGManager`. On anvil, dev accounts 5–7
-  are DKG operators and 8 is the DKG deployer; the harness builds the node from
-  `DAVINCI_DKG_DIR` (default `../davinci-dkg`) and needs ~1.1 GB of circuit artifacts
-  in `~/.cache/davinci-dkg-artifacts`.
-- The DKG `registrar` is rotatable: `setRegistrar` may be called again by
-  `registrarAdmin` (the deployer), never back to zero. Rotation only gates new
-  registrations, so an existing committee is unaffected. The Gnosis deployment sets
-  the registrar to the adapter right after deploying the registry; do the same in
-  any new deployment before the first epoch goes Live.
+- The e2e flag is `DAVINCI_E2E_DKG=1`; live runs use the `DKGManager` of the
+  registry's adapter (`DAVINCI_E2E_DKG_MANAGER` overrides it). On anvil, dev
+  accounts 5–7 are DKG operators and 8 is the DKG deployer; the harness builds the
+  node from `DAVINCI_DKG_DIR` (default `../davinci-dkg`) and needs ~1.1 GB of
+  circuit artifacts in `~/.cache/davinci-dkg-artifacts`.
+- DKG application registration is open to any account; the harness checks it
+  with a simulated `registerApplication` from the organizer.
 - Schema version 6 added `OnchainProcess.key_mode` and `OnchainProcess.dkg`; bump it
   on any record-shape change.
 
@@ -236,11 +235,29 @@ results PLONK is needed in DKG modes; the committee's Groth16 proofs replace it.
 - A late bootstrap scans the registry logs from `creation_block` and replays every
   transition from blobs, so the blob source must still hold them.
 
+**Networks.**
+- `client/src/networks.rs` is the one table of known deployments (`gnosis`: chain,
+  registry, start block, RPCs, blob source, confirmations). The node's `--network`
+  presets, the e2e live defaults and the tooling read it. The registry and start
+  block are updated there on every redeploy.
+- `Config::load`/`Config::parse_args` resolve the network; a bare
+  `Config::try_parse_from` leaves `registry`, `rpc_url`, `blob_source`,
+  `confirmations` and `start_block` unset. Tests build configs with
+  `--network custom`.
+- Explicit settings win over the preset. The preset's start block applies only
+  with its own registry. The RPC chain id must match the preset's unless
+  `--registry` is explicit.
+
 **Storage.**
 - Records are JSON in redb. Bump `storage.rs::SCHEMA_VERSION` (now 6) on any
   record-shape change; the node refuses a mismatched file.
-- redb holds a file lock: a second process can't open the same datadir, and restart
-  tests reopen with a retry loop.
+- One database per deployment: `<datadir>/<chain id>-0x<registry>/sequencer.redb`
+  (`Db::open_deployment`), bound to it by the `meta_bytes` key `deployment`. A new
+  registry starts empty and leaves the old directory alone. A flat-layout
+  `<datadir>/sequencer.redb` moves in once when its process ids carry the
+  deployment's prefix (`storage::pid_prefix`), else it stays.
+- redb holds a file lock: a second process can't open the same database, and
+  restart tests reopen with a retry loop.
 - The fault-injection hook `Db::fail_next_arbo_writes` exists only with feature
   `test-hooks`. The crate enables it for its own tests through a self
   dev-dependency, so release builds can't inject faults.

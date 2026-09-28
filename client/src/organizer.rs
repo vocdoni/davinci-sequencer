@@ -66,7 +66,6 @@ sol! {
         error InvalidPolicy();
         error AlreadyRevealed();
         error PoolExhausted();
-        error NotRegistrar();
         error InvalidProofInput();
         error InvalidCiphertext();
         error CiphertextAlreadySubmitted();

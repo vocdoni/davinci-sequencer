@@ -7,9 +7,9 @@
 //! handed to the node as is; seq1, seq2, seq3, observer), `DAVINCI_E2E_BEACON`
 //! (a `,` list), `DAVINCI_E2E_REGISTRY`, `DAVINCI_E2E_FROM_BLOCK`,
 //! `DAVINCI_E2E_CONFIRMATIONS`, `DAVINCI_E2E_POLL`, `DAVINCI_E2E_TIMEOUT_SCALE`.
-//! Unset, they default to the Gnosis lists below. With `DAVINCI_E2E_DKG=1`,
-//! `DAVINCI_E2E_DKG_MANAGER` names the external committee's DKGManager.
-//! Unset, it defaults to the Gnosis one.
+//! Unset, they default to the Gnosis deployment of `davinci_client::networks`.
+//! With `DAVINCI_E2E_DKG=1`, `DAVINCI_E2E_DKG_MANAGER` names the external
+//! committee's DKGManager. Unset, it is the manager of the registry's adapter.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,6 +19,7 @@ use alloy::primitives::{Address, U256, utils::format_ether};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail, ensure};
+use davinci_client::networks::GNOSIS;
 use davinci_client::organizer::{Organizer, verify_registry};
 
 use crate::chain::{self, Anvil, DEV_KEYS};
@@ -28,18 +29,19 @@ use crate::node::NodeConfig;
 /// Least balance each funded account needs for a live run (0.05 xDAI).
 pub const MIN_BALANCE: u128 = 50_000_000_000_000_000;
 
-/// Organizer and harness RPC (publicnode rate-limits organizer bursts).
-const GNOSIS_RPC: &str = "https://rpc.gnosischain.com";
-const GNOSIS_BEACON: &str = "https://rpc-gbc.gnosischain.com";
-/// Live node RPC lists (seq1, seq2, seq3, observer), each with failover.
-const GNOSIS_NODE_RPCS: &str = "https://gnosis-rpc.publicnode.com,https://gnosis-rpc.blockreq.com/v1/rpc/public;\
-    https://gnosis-rpc.blockreq.com/v1/rpc/public,https://rpc.gnosischain.com;\
-    https://rpc.gnosischain.com,https://gnosis-rpc.publicnode.com;\
-    https://gnosis.api.pocket.network,https://rpc.gnosischain.com";
-const GNOSIS_REGISTRY: &str = "0x3CDE68c39E26ecf94bD029b6ED3b9F945441daf3";
-const GNOSIS_FROM_BLOCK: u64 = 48_476_748;
-/// The DKGManager whose app manager has the Gnosis registry's adapter as registrar.
-const GNOSIS_DKG_MANAGER: &str = "0x6fa82ffe5dfadce7f9d538fdab648bd01d2e15e6";
+/// Organizer and harness RPC: the network's last (publicnode, its first,
+/// rate-limits organizer bursts).
+const GNOSIS_RPC: &str = GNOSIS.rpc_urls[GNOSIS.rpc_urls.len() - 1];
+
+/// Live node RPC lists (seq1, seq2, seq3, observer): the network's RPCs
+/// rotated, so each node starts on another endpoint and fails over to the next.
+fn gnosis_node_rpcs() -> String {
+    let u = GNOSIS.rpc_urls;
+    (0..4)
+        .map(|i| format!("{},{}", u[i % u.len()], u[(i + 1) % u.len()]))
+        .collect::<Vec<_>>()
+        .join(";")
+}
 
 pub fn is_live() -> bool {
     std::env::var("DAVINCI_E2E_LIVE").as_deref() == Ok("1")
@@ -105,10 +107,10 @@ pub fn read_key(path: &Path) -> Result<PrivateKeySigner> {
 
 /// RPC, registry and first log block of the live chain, from the env.
 pub fn live_target() -> Result<(String, Address, u64)> {
-    let registry = env_or("DAVINCI_E2E_REGISTRY", GNOSIS_REGISTRY)
+    let registry = env_or("DAVINCI_E2E_REGISTRY", &GNOSIS.registry.to_string())
         .parse()
         .context("DAVINCI_E2E_REGISTRY")?;
-    let from_block = env_or("DAVINCI_E2E_FROM_BLOCK", &GNOSIS_FROM_BLOCK.to_string())
+    let from_block = env_or("DAVINCI_E2E_FROM_BLOCK", &GNOSIS.start_block.to_string())
         .parse()
         .context("DAVINCI_E2E_FROM_BLOCK")?;
     Ok((env_or("DAVINCI_E2E_RPC", GNOSIS_RPC), registry, from_block))
@@ -164,11 +166,12 @@ impl Net {
             net.chain_id, net.registry, info.verifier
         );
         if dkg::enabled() {
-            let manager = match &net.dkg_stack {
-                Some(s) => s.deployment.manager,
-                None => env_or("DAVINCI_E2E_DKG_MANAGER", GNOSIS_DKG_MANAGER)
-                    .parse()
-                    .context("DAVINCI_E2E_DKG_MANAGER")?,
+            let manager = match (&net.dkg_stack, std::env::var("DAVINCI_E2E_DKG_MANAGER")) {
+                (Some(s), _) => s.deployment.manager,
+                (None, Ok(m)) if !m.is_empty() => m.parse().context("DAVINCI_E2E_DKG_MANAGER")?,
+                (None, _) => dkg::registry_manager(&net.rpc, net.registry)
+                    .await
+                    .context("the registry adapter's DKG manager")?,
             };
             let w = dkg::check_wiring(&net.rpc, net.registry, manager)
                 .await
@@ -185,7 +188,7 @@ impl Net {
 
     async fn live() -> Result<Net> {
         let (rpc, registry, from_block) = live_target()?;
-        let node_rpcs = node_lists(&env_or("DAVINCI_E2E_NODE_RPCS", GNOSIS_NODE_RPCS));
+        let node_rpcs = node_lists(&env_or("DAVINCI_E2E_NODE_RPCS", &gnosis_node_rpcs()));
         let org_path = std::env::var_os("DAVINCI_E2E_ORGANIZER_KEY")
             .context("DAVINCI_E2E_ORGANIZER_KEY (a key file) is required live")?;
         let organizer = read_key(Path::new(&org_path))?;
@@ -208,7 +211,13 @@ impl Net {
             live: true,
             rpc,
             node_rpcs,
-            beacon: Some(node_lists(&env_or("DAVINCI_E2E_BEACON", GNOSIS_BEACON)).join(",")),
+            beacon: Some(
+                node_lists(&env_or(
+                    "DAVINCI_E2E_BEACON",
+                    &GNOSIS.beacon_urls().join(","),
+                ))
+                .join(","),
+            ),
             registry,
             chain_id,
             from_block,
@@ -241,9 +250,6 @@ impl Net {
             .as_ref()
             .map_or(Address::ZERO, |d| d.deployment.manager);
         let dep = chain::deploy(&anvil.url, &contracts, manager).await?;
-        if let Some(d) = &dkg_stack {
-            d.set_registrar(dep.dkg_adapter).await?;
-        }
         let keys = dir.join("keys");
         std::fs::create_dir_all(&keys)?;
         let mut sequencers = Vec::new();
@@ -374,12 +380,17 @@ mod tests {
             node_lists(" a, b ;c;; d,"),
             ["a,b", "c", "d"].map(String::from)
         );
-        let live = node_lists(GNOSIS_NODE_RPCS);
+        let live = node_lists(&gnosis_node_rpcs());
         assert_eq!(live.len(), 4);
         assert!(
             live.iter()
                 .all(|l| l.split(',').count() == 2 && !l.contains(' '))
         );
+        // The three signing sequencers start on different endpoints.
+        let first: std::collections::HashSet<_> =
+            live[..3].iter().map(|l| l.split(',').next()).collect();
+        assert_eq!(first.len(), 3);
+        assert!(GNOSIS.rpc_urls.contains(&GNOSIS_RPC));
     }
 
     #[test]

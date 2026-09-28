@@ -1,10 +1,11 @@
 //! DAVINCI sequencer client: the HTTP wire types (`api`), an API client, the
-//! organizer helper (process lifecycle on the ProcessRegistry) and the voter
-//! helper that builds and proves ballots.
+//! known deployments (`networks`), the organizer helper (process lifecycle on
+//! the ProcessRegistry) and the voter helper that builds and proves ballots.
 #![forbid(unsafe_code)]
 
 pub mod api;
 mod client;
+pub mod networks;
 pub mod organizer;
 #[cfg(feature = "prover")]
 pub mod prover;

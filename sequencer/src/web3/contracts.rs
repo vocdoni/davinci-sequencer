@@ -38,7 +38,7 @@ const VERIFIER_ABI_JSON: &str = include_str!("../../abi/ZiskVerifier.json");
 const ADAPTER_ABI_JSON: &str = include_str!("../../abi/DavinciDKGAdapter.json");
 /// davinci-dkg manager and app-manager errors (all argument-less) the
 /// adapter bubbles up through the registry.
-const DKG_ERRORS: [&str; 16] = [
+const DKG_ERRORS: [&str; 15] = [
     "InvalidApplication",
     "ApplicationAlreadyExists",
     "InvalidSchnorrProof",
@@ -49,7 +49,6 @@ const DKG_ERRORS: [&str; 16] = [
     "InvalidPolicy",
     "AlreadyRevealed",
     "PoolExhausted",
-    "NotRegistrar",
     "InvalidProofInput",
     "InvalidCiphertext",
     "CiphertextAlreadySubmitted",
@@ -191,7 +190,7 @@ fn known_chain_cell_proofs(chain_id: u64) -> Option<bool> {
 
 /// `eth_chainId` of every endpoint: another chain is fatal and named, an
 /// unreachable endpoint is kept with a warning, and one must answer.
-async fn endpoints_chain_id(rpcs: &[Url]) -> Result<u64> {
+pub async fn endpoints_chain_id(rpcs: &[Url]) -> Result<u64> {
     let mut first: Option<(u64, String)> = None;
     for u in rpcs {
         let h = super::failover::host(u);
