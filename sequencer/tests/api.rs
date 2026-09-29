@@ -337,7 +337,14 @@ async fn vote_flow_settles_with_proof_ballot_and_archive() {
 
 #[tokio::test]
 async fn vote_submission_error_codes() {
-    let t = serve(FakeProver::gated(), 100).await;
+    // Slot depth 2: the second queued vote of a slot fills it.
+    let t = serve_with(
+        setup(2, 4, None),
+        FakeProver::gated(),
+        100,
+        &["--slot-depth", "2"],
+    )
+    .await;
     handle(&t.node).await;
 
     // Malformed JSON.
@@ -372,18 +379,19 @@ async fn vote_submission_error_codes() {
     assert_eq!(api_code(e), (400, 40002));
 
     // The valid vote is accepted; while it is queued, a resubmission (same
-    // vote id, so the same slot) is refused as slot-busy.
+    // vote id) is a duplicate.
     let req = wire_vote(&real_vote(&t.s.env, 0, &[1, 2], 5));
     let vid = req.vote_id;
     t.client.submit_vote(&req).await.unwrap();
     let e = t.client.submit_vote(&req).await.unwrap_err();
-    assert_eq!(api_code(e), (409, 40902));
-    // A second pending vote for the same slot is refused too.
-    let e = t
-        .client
+    assert_eq!(api_code(e), (409, 40901));
+    // A second vote for the same slot queues behind it; the slot is then
+    // full and refuses a third as slot-busy.
+    t.client
         .submit_vote(&wire_vote(&real_vote(&t.s.env, 0, &[1, 2], 6)))
         .await
-        .unwrap_err();
+        .unwrap();
+    let e = t.client.submit_vote(&req).await.unwrap_err();
     assert_eq!(api_code(e), (409, 40902));
 
     // Status: pending vote, unknown vote id, unknown process.

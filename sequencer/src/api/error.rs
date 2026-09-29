@@ -28,8 +28,8 @@ pub enum ApiError {
     /// 409 40901.
     #[error("vote {0:#x} already submitted")]
     Duplicate(u64),
-    /// 409 40902: the slot has a queued vote; retry once it settles.
-    #[error("slot {0} already has a queued vote")]
+    /// 409 40902: the slot holds `slot_depth` queued votes; retry once one settles.
+    #[error("slot {0} has too many queued votes")]
     SlotBusy(u64),
     /// 408 40801: the per-request deadline fired. The request may still
     /// have taken effect (a timed-out `POST /votes` can have admitted the

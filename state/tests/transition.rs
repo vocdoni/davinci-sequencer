@@ -315,7 +315,7 @@ fn select_batch_dedups_and_respects_max_voters() {
     ];
     // max_voters 3: one already voted, so 2 new voters fit; the overwrite
     // always fits.
-    let sel = st.select_batch(&pending, 3, &none()).unwrap();
+    let sel = st.select_batch(&pending, 3, &none(), usize::MAX).unwrap().0;
     let slots: Vec<u64> = sel.iter().map(|v| v.slot).collect();
     assert_eq!(
         slots,
@@ -323,8 +323,17 @@ fn select_batch_dedups_and_respects_max_voters() {
     );
 
     // Unlimited: everything but the duplicates.
-    let sel = st.select_batch(&pending, 1_000, &none()).unwrap();
+    let (sel, blocked) = st
+        .select_batch(&pending, 1_000, &none(), usize::MAX)
+        .unwrap();
     assert_eq!(sel.len(), 5);
+    assert!(!blocked);
+
+    // A cap takes the oldest and does not count as a full transaction.
+    let (sel, blocked) = st.select_batch(&pending, 1_000, &none(), 2).unwrap();
+    let slots: Vec<u64> = sel.iter().map(|v| v.slot).collect();
+    assert_eq!(slots, vec![pending[0].slot, pending[2].slot]);
+    assert!(!blocked);
 }
 
 #[test]
@@ -342,9 +351,11 @@ fn select_batch_respects_blob_cap() {
     let pending: Vec<_> = (0..400)
         .map(|i| fake_vote(&env, i, &[2], 10_000 + i as u64))
         .collect();
-    let sel = st.select_batch(&pending, 1_000_000, &none()).unwrap();
+    let (sel, blocked) = st
+        .select_batch(&pending, 1_000_000, &none(), usize::MAX)
+        .unwrap();
     let n = sel.len();
-    assert!(n < 400, "cap never hit");
+    assert!(n < 400 && blocked, "cap never hit");
     let r = |n: usize| required_refresh(n, n, 900);
     assert!(blob_count(n, n + r(n), 16) <= TX_BLOB_CAP);
     assert!(
@@ -369,12 +380,17 @@ fn select_batch_respects_a_lower_blob_cap() {
     let pending: Vec<VerifiedVote> = (0..400)
         .map(|i| fake_vote(&env, i, &[1], 30_000 + i as u64))
         .collect();
-    let six = st.select_batch(&pending, u64::MAX, &none()).unwrap().len();
+    let six = st
+        .select_batch(&pending, u64::MAX, &none(), usize::MAX)
+        .unwrap()
+        .0
+        .len();
     assert_eq!(six, 400);
     st.set_blob_cap(2).unwrap();
     let sel: Vec<VerifiedVote> = st
-        .select_batch(&pending, u64::MAX, &none())
+        .select_batch(&pending, u64::MAX, &none(), usize::MAX)
         .unwrap()
+        .0
         .into_iter()
         .cloned()
         .collect();
@@ -403,7 +419,9 @@ fn exposed_refreshes_above_a_lower_blob_cap_are_refused() {
     st.rollback(&b).unwrap();
 
     st.set_blob_cap(2).unwrap();
-    let err = st.select_batch(&vote, u64::MAX, &must).unwrap_err();
+    let err = st
+        .select_batch(&vote, u64::MAX, &must, usize::MAX)
+        .unwrap_err();
     assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
     let g = st.root();
     let err = st
@@ -424,7 +442,10 @@ fn select_batch_never_repeats_a_slot() {
     b.slot = a.slot;
     let c = fake_vote(&env, 3, &[1], 22);
     let pending = vec![a.clone(), b, c.clone()];
-    let sel = st.select_batch(&pending, 1_000, &none()).unwrap();
+    let sel = st
+        .select_batch(&pending, 1_000, &none(), usize::MAX)
+        .unwrap()
+        .0;
     let got: Vec<u64> = sel.iter().map(|v| v.pkg.vote_id).collect();
     assert_eq!(got, vec![a.pkg.vote_id, c.pkg.vote_id]);
 }
@@ -562,13 +583,18 @@ fn select_batch_shrinks_for_exposed_refreshes() {
         .collect();
     let fits = |n: usize, r: usize| blob_count(n, n + r, 16) <= TX_BLOB_CAP;
 
-    let free = st.select_batch(&pending, u64::MAX, &none()).unwrap().len();
+    let free = st
+        .select_batch(&pending, u64::MAX, &none(), usize::MAX)
+        .unwrap()
+        .0
+        .len();
     // 500 exposed slots outweigh the n refreshes a batch of new votes needs,
     // so the batch shrinks until votes plus exposed slots fit.
     let must = slots_of(0..500);
     let sel: Vec<VerifiedVote> = st
-        .select_batch(&pending, u64::MAX, &must)
+        .select_batch(&pending, u64::MAX, &must, usize::MAX)
         .unwrap()
+        .0
         .into_iter()
         .cloned()
         .collect();
@@ -584,7 +610,9 @@ fn select_batch_shrinks_for_exposed_refreshes() {
 
     // Exposed slots no single vote can carry: a typed error, from both.
     let must = slots_of(0..900);
-    let err = st.select_batch(&pending, u64::MAX, &must).unwrap_err();
+    let err = st
+        .select_batch(&pending, u64::MAX, &must, usize::MAX)
+        .unwrap_err();
     assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
     let g = st.root();
     let err = st
@@ -602,7 +630,9 @@ fn exposed_refreshes_above_max_refresh_are_refused() {
     let vote = vec![fake_vote(&env, MAX_REFRESH + 2, &[1], 900_000)];
     let must = slots_of(0..MAX_REFRESH + 1);
     assert!(blob_count(1, 1 + must.len(), 1) <= TX_BLOB_CAP);
-    let err = st.select_batch(&vote, u64::MAX, &must).unwrap_err();
+    let err = st
+        .select_batch(&vote, u64::MAX, &must, usize::MAX)
+        .unwrap_err();
     assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
     let err = st
         .prepare(&vote, &mut StdRng::seed_from_u64(12), &must)
@@ -610,7 +640,13 @@ fn exposed_refreshes_above_max_refresh_are_refused() {
     assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
     // Exactly MAX_REFRESH still goes through.
     let must = slots_of(0..MAX_REFRESH);
-    assert_eq!(st.select_batch(&vote, u64::MAX, &must).unwrap().len(), 1);
+    assert_eq!(
+        st.select_batch(&vote, u64::MAX, &must, usize::MAX)
+            .unwrap()
+            .0
+            .len(),
+        1
+    );
     let b = st
         .prepare(&vote, &mut StdRng::seed_from_u64(13), &must)
         .unwrap();

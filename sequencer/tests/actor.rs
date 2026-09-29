@@ -335,7 +335,8 @@ async fn deadline_margin_blocks_sealing() {
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
     let prover = FakeProver::open();
-    // Margin larger than the whole election: nothing ever seals.
+    // Landing margin larger than the whole election: the time budget fits
+    // no vote, so nothing ever seals.
     let node = start_node(
         Db::open_in(dir.path()).unwrap(),
         dir.path(),
@@ -1281,28 +1282,43 @@ async fn finalize_rearms_after_transient_failure() {
     shutdown.cancel();
 }
 
-/// A slot with a pending vote refuses a second one until it settles.
+/// A slot holds at most `slot_depth` (3) queued votes, in flight included;
+/// a fourth is refused, and the three settle.
 #[tokio::test]
-async fn second_pending_vote_for_slot_rejected() {
+async fn slot_depth_cap_refuses_fourth() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
     let node = start_node(
         Db::open_in(dir.path()).unwrap(),
         dir.path(),
         &s,
         s.chain.clone(),
-        FakeProver::open(),
-        10, // nothing seals: the queue stays pending
+        prover.clone(),
+        1,
         "0s",
         shutdown.clone(),
     )
     .await;
     let h = handle(&node).await;
-    let v1 = fake_vote(&s.env, 0, &[1, 2], 70);
-    let v2 = fake_vote(&s.env, 0, &[2, 1], 71); // same voter, new vote id
-    h.submit(v1).await.unwrap();
-    assert!(matches!(h.submit(v2).await, Err(ActorError::SlotBusy(_))));
+    // Same voter, new vote ids.
+    let votes: Vec<VerifiedVote> = (0..4)
+        .map(|i| fake_vote(&s.env, 0, &[1 + i as u64, 1], 70 + i as u64))
+        .collect();
+    h.submit(votes[0].clone()).await.unwrap();
+    wait_until("first in flight", async || prover.calls() == 1).await;
+    h.submit(votes[1].clone()).await.unwrap();
+    h.submit(votes[2].clone()).await.unwrap();
+    assert!(matches!(
+        h.submit(votes[3].clone()).await,
+        Err(ActorError::SlotBusy(_))
+    ));
+    prover.release(3);
+    let vids: Vec<u64> = votes[..3].iter().map(|v| v.pkg.vote_id).collect();
+    wait_until("three settled", async || all_settled(&h, &vids).await).await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!((snap.occupied, snap.overwrites), (1, 2));
     shutdown.cancel();
 }
 
@@ -3227,5 +3243,521 @@ async fn dkg_lagging_root_holds_the_request() {
     })
     .await;
     assert_eq!(s.chain.results(), tally(3, 5));
+    shutdown.cancel();
+}
+
+// ------------------------------------------------------ batching policy
+
+/// A node with the given batching flags; `batch_max` 10 and a zero landing
+/// margin unless the flags say otherwise.
+async fn batching_node(
+    db: Db,
+    dir: &Path,
+    s: &TestSetup,
+    prover: Arc<FakeProver>,
+    batch_max: usize,
+    extra: &[&str],
+    shutdown: CancellationToken,
+) -> (Node, ActorHandle) {
+    let cfg = test_config_with(dir, &s.census_dir, batch_max, "0s", extra);
+    let node = start_node_cfg(db, s.chain.clone(), prover, cfg, shutdown).await;
+    let h = handle(&node).await;
+    (node, h)
+}
+
+/// Lets the actor run a few heartbeats.
+async fn beats() {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+const TIMERS: &[&str] = &["--batch-time", "100s", "--solo-wait", "300s"];
+
+/// A lone vote has no company: past batch_time it still waits, and seals
+/// alone once it is solo_wait old (both jittered by ±10%).
+#[tokio::test]
+async fn solo_vote_waits_past_batch_time_seals_at_solo_wait() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    s.chain.advance_time(115);
+    beats().await;
+    assert_eq!(prover.calls(), 0, "no seal past batch_time without company");
+    s.chain.advance_time(150); // 265 s
+    beats().await;
+    assert_eq!(prover.calls(), 0, "no seal before solo_wait");
+    s.chain.advance_time(70); // 335 s
+    wait_until("solo seal", async || all_settled(&h, &[vid]).await).await;
+    assert_eq!(prover.sizes(), vec![1]);
+    shutdown.cancel();
+}
+
+/// A second arrival gives the old vote company: the pair is past
+/// batch_time and seals at once.
+#[tokio::test]
+async fn second_arrival_makes_the_pair_due() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 5);
+    let b = fake_vote(&s.env, 1, &[2, 1], 6);
+    let vids = [a.pkg.vote_id, b.pkg.vote_id];
+    h.submit(a).await.unwrap();
+    s.chain.advance_time(115);
+    beats().await;
+    assert_eq!(prover.calls(), 0);
+    h.submit(b).await.unwrap();
+    wait_until("pair settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![2]);
+    shutdown.cancel();
+}
+
+/// A queue that no longer fits one transaction seals the largest batch
+/// that does, without waiting for any timer.
+#[tokio::test]
+async fn capacity_full_seals_without_timer() {
+    let nf = 16u8;
+    // New slots only (no refreshes): n vote ids and n slot updates.
+    let n_fit = (1..)
+        .take_while(|&n| davinci_zkvm_sdk::blob::blob_count(n, n, nf) <= 1)
+        .last()
+        .unwrap();
+    let s = setup(nf, n_fit + 1, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        1024,
+        &["--max-blobs-per-tx", "1"],
+        shutdown.clone(),
+    )
+    .await;
+    for i in 0..=n_fit {
+        h.submit(fake_vote(&s.env, i, &[1, 2], 1000 + i as u64))
+            .await
+            .unwrap();
+    }
+    wait_until("capacity seal", async || s.chain.voters() == n_fit as u64).await;
+    beats().await;
+    assert_eq!(
+        prover.sizes(),
+        vec![n_fit],
+        "one full batch, the rest waits"
+    );
+    assert_eq!(h.snapshot().await.unwrap().pending, 1);
+    shutdown.cancel();
+}
+
+/// The seal jitter stays within ±10% and spreads over the band.
+#[test]
+fn jitter_within_bounds() {
+    use davinci_sequencer::actor::seal_jitter;
+    let mut rng = StdRng::seed_from_u64(7);
+    let js: Vec<f64> = (0..10_000).map(|_| seal_jitter(&mut rng)).collect();
+    assert!(js.iter().all(|j| (0.9..=1.1).contains(j)));
+    let lo = js.iter().copied().fold(f64::MAX, f64::min);
+    let hi = js.iter().copied().fold(f64::MIN, f64::max);
+    assert!(lo < 0.91 && hi > 1.09, "spread {lo}..{hi}");
+}
+
+/// Company counts distinct admissible slots, not queue length: two votes
+/// of one slot are a solo batch each, in cast order.
+#[tokio::test]
+async fn min_mix_counts_trial_not_pending() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 5);
+    let b = fake_vote(&s.env, 0, &[2, 1], 6);
+    let (va, vb) = (a.pkg.vote_id, b.pkg.vote_id);
+    h.submit(a).await.unwrap();
+    h.submit(b).await.unwrap();
+    s.chain.advance_time(115);
+    beats().await;
+    assert_eq!(prover.calls(), 0, "two votes of one slot are no company");
+    s.chain.advance_time(220); // 335 s
+    wait_until("solo seal", async || prover.calls() == 1).await;
+    prover.release(1);
+    wait_until("first settled", async || all_settled(&h, &[va]).await).await;
+    assert_ne!(vote_status(&h, vb).await, Some(VoteStatus::Settled));
+    prover.release(1);
+    wait_until("second settled", async || all_settled(&h, &[vb]).await).await;
+    assert_eq!(prover.sizes(), vec![1, 1]);
+    shutdown.cancel();
+}
+
+/// Two queued votes of one slot settle one after the other, oldest first.
+#[tokio::test]
+async fn slot_fifo_settles_both_in_order() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    // Another voter's batch holds the prover while the slot's votes queue.
+    h.submit(fake_vote(&s.env, 1, &[1, 1], 4)).await.unwrap();
+    wait_until("first in flight", async || prover.calls() == 1).await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 5);
+    let b = fake_vote(&s.env, 0, &[2, 1], 6);
+    let (va, vb) = (a.pkg.vote_id, b.pkg.vote_id);
+    h.submit(a).await.unwrap();
+    h.submit(b).await.unwrap();
+    prover.release(2);
+    wait_until("older settled", async || all_settled(&h, &[va]).await).await;
+    assert_ne!(vote_status(&h, vb).await, Some(VoteStatus::Settled));
+    prover.release(1);
+    wait_until("newer settled", async || all_settled(&h, &[vb]).await).await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!((snap.occupied, snap.overwrites), (2, 1));
+    shutdown.cancel();
+}
+
+/// A lost race puts the flight back ahead of the later votes of its slots
+/// with its original age: the older vote re-seals first.
+#[tokio::test]
+async fn requeue_preserves_age_and_order() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let theirs = [
+        fake_vote(&s.env, 2, &[1, 1], 60),
+        fake_vote(&s.env, 3, &[2, 1], 61),
+    ];
+    let b = other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(5), &Default::default())
+        .unwrap();
+    s.chain.race_next_submit(b);
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 5);
+    let a2 = fake_vote(&s.env, 0, &[2, 1], 6);
+    let (va, va2) = (a.pkg.vote_id, a2.pkg.vote_id);
+    h.submit(a).await.unwrap();
+    wait_until("a in flight", async || prover.calls() == 1).await;
+    s.chain.advance_time(50);
+    h.submit(a2).await.unwrap();
+    // Requeued at a later clock: an age reset would sort a behind a2.
+    s.chain.advance_time(50);
+    prover.release(1);
+    wait_until("re-sealed", async || prover.calls() == 2).await;
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 1);
+    assert_eq!(vote_status(&h, va).await, Some(VoteStatus::Aggregated));
+    assert_eq!(vote_status(&h, va2).await, Some(VoteStatus::Pending));
+    assert_eq!(h.status(va).await.unwrap().unwrap().created_at, T0);
+    prover.release(2);
+    wait_until("both settled", async || all_settled(&h, &[va, va2]).await).await;
+    assert_eq!(prover.sizes(), vec![1, 1, 1]);
+    shutdown.cancel();
+}
+
+/// Restart variant: recovery requeues the in-flight vote ahead of the
+/// later vote of its slot, with its original age.
+#[tokio::test]
+async fn requeue_preserves_age_and_order_across_restart() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 5);
+    let a2 = fake_vote(&s.env, 0, &[2, 1], 6);
+    let (va, va2) = (a.pkg.vote_id, a2.pkg.vote_id);
+    h.submit(a).await.unwrap();
+    wait_until("a in flight", async || prover.calls() == 1).await;
+    s.chain.advance_time(50);
+    h.submit(a2).await.unwrap();
+    s.chain.advance_time(50);
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    let db = reopen_db(dir.path()).await;
+    let shutdown2 = CancellationToken::new();
+    let prover2 = FakeProver::gated();
+    let (_node2, h2) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover2.clone(),
+        1,
+        &[],
+        shutdown2.clone(),
+    )
+    .await;
+    wait_until("re-sealed", async || prover2.calls() == 1).await;
+    assert_eq!(vote_status(&h2, va).await, Some(VoteStatus::Aggregated));
+    assert_eq!(vote_status(&h2, va2).await, Some(VoteStatus::Pending));
+    prover2.release(1);
+    wait_until("older settled", async || all_settled(&h2, &[va]).await).await;
+    assert_ne!(vote_status(&h2, va2).await, Some(VoteStatus::Settled));
+    prover2.release(1);
+    wait_until("newer settled", async || all_settled(&h2, &[va2]).await).await;
+    shutdown2.cancel();
+}
+
+/// Near the end the proving-time budget caps the batch below the queue;
+/// once not even one vote fits, nothing seals and the end errors the rest.
+#[tokio::test]
+async fn budget_shrinks_flush_batches() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let votes: Vec<VerifiedVote> = (0..5)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    // ~30 s per vote (prove_base 30 s).
+    let slow = || {
+        for _ in 0..60 {
+            node.metrics.prove.observe(2, 1, 60.0, 30.0);
+        }
+    };
+    slow();
+    beats().await;
+    assert_eq!(prover.calls(), 0);
+    // 100 s left: 100 - 30 base = 70 s, two votes fit.
+    s.chain.advance_time(DURATION - 100);
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    let sizes = prover.sizes();
+    assert_eq!(sizes[0], 2, "budget-capped first batch: {sizes:?}");
+    assert!(sizes.iter().all(|&n| n >= 1));
+    // 40 s left: 10 s after the base, no vote fits.
+    slow();
+    s.chain.advance_time(60);
+    let v = fake_vote(&s.env, 5, &[1, 2], 200);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    beats().await;
+    assert_eq!(prover.sizes(), sizes);
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    s.chain.advance_time(41);
+    wait_until("errored at end", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    assert_eq!(prover.sizes(), sizes);
+    shutdown.cancel();
+}
+
+/// `spv ← 0.7·spv + 0.3·max(0.05, (secs − base)/n)`, seeded at
+/// `max(0.2, 0.05·nf)`, fed by every finished proving job.
+#[tokio::test]
+async fn ewma_update_rule() {
+    use davinci_sequencer::metrics::ProveModel;
+    assert_eq!(ProveModel::seed(2), 0.2);
+    assert_eq!(ProveModel::seed(16), 0.8);
+    let m = ProveModel::default();
+    assert_eq!(m.spv(4), 0.2);
+    m.observe(4, 10, 130.0, 30.0); // 10 s/vote
+    assert!((m.spv(4) - (0.7 * 0.2 + 0.3 * 10.0)).abs() < 1e-12);
+    let before = m.spv(4);
+    m.observe(4, 10, 1.0, 30.0); // faster than the base: floored
+    assert!((m.spv(4) - (0.7 * before + 0.3 * ProveModel::FLOOR)).abs() < 1e-12);
+    assert_eq!(m.spv(8), 0.4, "per field count");
+    assert!((m.estimate(4, 3, 30.0) - (30.0 + 3.0 * m.spv(4))).abs() < 1e-12);
+
+    // Wiring: a job's proving seconds, on the node clock, update the model.
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("proving", async || prover.calls() == 1).await;
+    s.chain.advance_time(130);
+    prover.release(1);
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    let spv = node.metrics.prove.spv(2);
+    assert!((spv - (0.7 * 0.2 + 0.3 * 100.0)).abs() < 1e-9, "spv {spv}");
+    shutdown.cancel();
+}
+
+/// Within flush_horizon of the end a lone, young vote seals at once.
+#[tokio::test]
+async fn flush_mode_ignores_min_mix() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.advance_time(DURATION - 400);
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    beats().await;
+    assert_eq!(prover.calls(), 0, "outside the flush horizon");
+    s.chain.advance_time(300); // 100 s left, horizon 180 s
+    wait_until("flushed", async || all_settled(&h, &[vid]).await).await;
+    assert_eq!(prover.sizes(), vec![1]);
+    shutdown.cancel();
+}
+
+/// Another sequencer fills max_voters: this node's queued new-slot vote
+/// errors as soon as it syncs, while its overwrite stays and settles.
+#[tokio::test]
+async fn max_voters_loser_errors_promptly() {
+    let s = setup(2, 8, None);
+    s.chain.set_max_voters(2);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let keep = fake_vote(&s.env, 0, &[1, 2], 90);
+    let lose = fake_vote(&s.env, 1, &[1, 2], 91);
+    let (vk, vl) = (keep.pkg.vote_id, lose.pkg.vote_id);
+    h.submit(keep).await.unwrap();
+    h.submit(lose).await.unwrap();
+    // The winner occupies voter 0's slot (ours becomes an overwrite) and a
+    // second one: the process is full.
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let theirs = [
+        fake_vote(&s.env, 0, &[2, 2], 92),
+        fake_vote(&s.env, 2, &[2, 1], 93),
+    ];
+    let b = other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(9), &Default::default())
+        .unwrap();
+    s.chain.settle_externally(&b);
+    wait_until("loser errored", async || {
+        vote_status(&h, vl).await == Some(VoteStatus::Error)
+    })
+    .await;
+    let e = h.status(vl).await.unwrap().unwrap().error.unwrap();
+    assert_eq!(e, "max voters reached");
+    assert_eq!(prover.calls(), 0, "errored before any seal");
+    assert_eq!(vote_status(&h, vk).await, Some(VoteStatus::Pending));
+    // The overwrite seals on its solo timer (3 h ±10%).
+    s.chain.advance_time(4 * 3600);
+    wait_until("overwrite settled", async || all_settled(&h, &[vk]).await).await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!((snap.occupied, snap.overwrites), (2, 1));
+    shutdown.cancel();
+}
+
+/// Idle heartbeats with a queue below the capacity estimate and no
+/// deadline due read no storage; a due timer does.
+#[tokio::test]
+async fn capacity_trial_skipped_below_estimate() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let votes: Vec<VerifiedVote> = (0..3)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    beats().await;
+    let reads = db.arbo_reads();
+    beats().await;
+    assert_eq!(db.arbo_reads(), reads, "idle heartbeats read storage");
+    s.chain.advance_time(115);
+    wait_until("timer seal", async || all_settled(&h, &vids).await).await;
+    assert!(db.arbo_reads() > reads);
+    assert_eq!(prover.sizes(), vec![3]);
     shutdown.cancel();
 }

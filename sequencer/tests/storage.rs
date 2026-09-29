@@ -185,6 +185,25 @@ fn pending_is_fifo() {
         vec![base + 9, base + 5, base + 2]
     );
     assert_eq!(db.pending(&pid(2)).unwrap(), vec![base + 100]);
+
+    // A requeue goes to the head; a vid still queued keeps its place.
+    for i in [7, 8] {
+        db.put_vote(&vote(1, base + i)).unwrap();
+    }
+    db.put_vote(&vote(1, base + 5)).unwrap();
+    db.requeue(&pid(1), &[base + 7, base + 5, base + 8])
+        .unwrap();
+    assert_eq!(
+        db.pending(&pid(1)).unwrap(),
+        vec![base + 7, base + 8, base + 9, base + 5, base + 2]
+    );
+    db.remove_pending(&pid(1), &[base + 7]).unwrap();
+    db.push_pending(&pid(1), base + 7).unwrap();
+    assert_eq!(
+        db.pending(&pid(1)).unwrap(),
+        vec![base + 8, base + 9, base + 5, base + 2, base + 7]
+    );
+    assert_eq!(db.pending(&pid(2)).unwrap(), vec![base + 100]);
 }
 
 #[test]
@@ -380,8 +399,8 @@ fn vote_lifecycle_is_atomic_and_durable() {
     db.requeue(&pid(1), &[a, c]).unwrap();
     drop(db);
     let db = open(&dir);
-    // c was still queued and keeps its place; a goes to the tail.
-    assert_eq!(db.pending(&pid(1)).unwrap(), vec![c, a]);
+    // c was still queued and keeps its place; a goes back to the head.
+    assert_eq!(db.pending(&pid(1)).unwrap(), vec![a, c]);
     let va = db.vote(&pid(1), a).unwrap().unwrap();
     assert_eq!((va.status, va.error), (VoteStatus::Pending, None));
 

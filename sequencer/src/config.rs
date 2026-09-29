@@ -274,21 +274,41 @@ pub struct Config {
     /// davinci-zkvm prover service.
     #[arg(long, env = "DAVINCI_PROVER_URL", default_value = "http://127.0.0.1:8080", value_parser = parse_http_url)]
     pub prover_url: Url,
-    /// Votes that seal a batch without waiting for `batch_time`.
+    /// Hard cap on a batch; pending votes past it seal one without waiting.
     #[arg(long, env = "DAVINCI_BATCH_MAX", default_value = "1024", value_parser = parse_batch_max)]
     pub batch_max: usize,
     /// Most blobs one settlement transaction may carry. Unset: the chain's
     /// `eth_config` blob schedule, capped at the protocol's six.
     #[arg(long, env = "DAVINCI_MAX_BLOBS_PER_TX", value_parser = parse_blob_cap)]
     pub max_blobs_per_tx: Option<usize>,
-    /// Longest a pending vote waits before its batch is sealed.
-    #[arg(long, env = "DAVINCI_BATCH_TIME", default_value = "5m", value_parser = parse_duration)]
+    /// Timer: the oldest pending vote's wait before a batch of at least
+    /// `min_mix` votes seals (jittered by 10%).
+    #[arg(long, env = "DAVINCI_BATCH_TIME", default_value = "15m", value_parser = parse_duration)]
     pub batch_time: Duration,
-    /// Never seal a batch when the election ends within this margin: a
-    /// proof landing after the window closes would revert and lose its
-    /// votes' place in line.
-    #[arg(long, env = "DAVINCI_SETTLE_MARGIN", default_value = "120s", value_parser = parse_duration)]
+    /// Fewest distinct slots the timer seals; smaller batches wait `solo_wait`.
+    #[arg(long, env = "DAVINCI_MIN_MIX", default_value = "2", value_parser = clap::value_parser!(u32).range(1..))]
+    pub min_mix: u32,
+    /// Longest wait for a batch below `min_mix` (jittered by 10%). Default:
+    /// three times `batch_time`; never below it.
+    #[arg(long = "solo-wait", env = "DAVINCI_SOLO_WAIT", value_name = "DURATION", value_parser = parse_duration)]
+    solo_wait_arg: Option<Duration>,
+    /// Resolved solo wait.
+    #[arg(skip)]
+    pub solo_wait: Duration,
+    /// Seal whatever is pending, any size, from this long before the end.
+    #[arg(long, env = "DAVINCI_FLUSH_HORIZON", default_value = "3m", value_parser = parse_duration)]
+    pub flush_horizon: Duration,
+    /// Landing margin reserved after proving (submit, inclusion,
+    /// confirmations): a batch is sized so its estimated proving time plus
+    /// this margin ends before the window closes.
+    #[arg(long, env = "DAVINCI_SETTLE_MARGIN", default_value = "60s", value_parser = parse_duration)]
     pub settle_margin: Duration,
+    /// Queued votes one ballot slot may hold at once (settled in order).
+    #[arg(long, env = "DAVINCI_SLOT_DEPTH", default_value = "3", value_parser = clap::value_parser!(u32).range(1..))]
+    pub slot_depth: u32,
+    /// Fixed term of the proving-time estimate.
+    #[arg(long, env = "DAVINCI_PROVE_BASE", default_value = "30s", value_parser = parse_duration)]
+    pub prove_base: Duration,
     /// Blocks behind head the monitor treats as final (reorg margin).
     /// Default: the network's, else 2.
     #[arg(
@@ -359,7 +379,12 @@ impl fmt::Debug for Config {
             .field("batch_max", &self.batch_max)
             .field("max_blobs_per_tx", &self.max_blobs_per_tx)
             .field("batch_time", &self.batch_time)
+            .field("min_mix", &self.min_mix)
+            .field("solo_wait", &self.solo_wait)
+            .field("flush_horizon", &self.flush_horizon)
             .field("settle_margin", &self.settle_margin)
+            .field("slot_depth", &self.slot_depth)
+            .field("prove_base", &self.prove_base)
             .field("confirmations", &self.confirmations)
             .field("start_block", &self.start_block)
             .field("census_dir", &self.census_dir)
@@ -382,6 +407,7 @@ impl Config {
     pub fn load() -> Result<Self, ConfigError> {
         let mut c = Config::parse();
         c.resolve_network()?;
+        c.resolve_batching()?;
         c.datadir = expand_home(&c.datadir);
         c.census_dir = c.census_dir.as_deref().map(expand_home);
         c.privkey_file = c.privkey_file.as_deref().map(expand_home);
@@ -399,7 +425,26 @@ impl Config {
         let mut c = Config::try_parse_from(args)
             .map_err(|e| ConfigError::Invalid("arguments", e.to_string()))?;
         c.resolve_network()?;
+        c.resolve_batching()?;
         Ok(c)
+    }
+
+    // Solo wait defaults to three batch times and never undercuts the timer.
+    fn resolve_batching(&mut self) -> Result<(), ConfigError> {
+        self.solo_wait = match self.solo_wait_arg {
+            Some(d) => d,
+            None => self.batch_time.saturating_mul(3),
+        };
+        if self.solo_wait < self.batch_time {
+            return Err(ConfigError::Invalid(
+                "solo wait",
+                format!(
+                    "{:?} below batch time {:?}",
+                    self.solo_wait, self.batch_time
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Fills the chain settings: an explicit value wins, then the network's.
@@ -542,7 +587,13 @@ mod tests {
         assert_eq!(c.api_port, 9090);
         assert_eq!(c.batch_max, 1024);
         assert_eq!(c.max_blobs_per_tx, None);
-        assert_eq!(c.batch_time, Duration::from_secs(300));
+        assert_eq!(c.batch_time, Duration::from_secs(900));
+        assert_eq!(c.min_mix, 2);
+        assert_eq!(c.solo_wait, Duration::from_secs(2700));
+        assert_eq!(c.flush_horizon, Duration::from_secs(180));
+        assert_eq!(c.settle_margin, Duration::from_secs(60));
+        assert_eq!(c.slot_depth, 3);
+        assert_eq!(c.prove_base, Duration::from_secs(30));
         assert_eq!(c.blob_source, BlobSourceKind::Anvil);
         assert!(c.privkey.is_none());
 
@@ -568,6 +619,23 @@ mod tests {
         assert_eq!(c.batch_max, 8);
         assert_eq!(c.max_blobs_per_tx, Some(2));
         assert_eq!(c.poll_interval, Duration::from_millis(500));
+        assert_eq!(c.solo_wait, Duration::from_secs(9));
+        let mut args = with_rpc();
+        args.extend([
+            "--batch-time",
+            "3s",
+            "--solo-wait",
+            "3s",
+            "--min-mix",
+            "1",
+            "--slot-depth",
+            "1",
+        ]);
+        let c = Config::parse_args(args).unwrap();
+        assert_eq!(
+            (c.solo_wait, c.min_mix, c.slot_depth),
+            (Duration::from_secs(3), 1, 1)
+        );
     }
 
     #[test]
@@ -641,11 +709,18 @@ mod tests {
             ("--blob-source", "beacon:not a url"),
             ("--blob-source", "ipfs"),
             ("--network", "mainnet"),
+            ("--min-mix", "0"),
+            ("--slot-depth", "0"),
+            ("--prove-base", "-1s"),
         ] {
             let mut args = base();
             args.extend([flag, v]);
             assert!(Config::try_parse_from(args).is_err(), "{flag} {v}");
         }
+        // The solo wait never undercuts the timer.
+        let mut args = with_rpc();
+        args.extend(["--batch-time", "10s", "--solo-wait", "9s"]);
+        assert!(Config::parse_args(args).is_err());
     }
 
     #[test]

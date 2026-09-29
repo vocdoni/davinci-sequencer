@@ -1271,6 +1271,8 @@ pub struct FakeProver {
     /// When each batch proof was requested (virtual time under a paused
     /// runtime), for backoff tests.
     pub call_times: Mutex<Vec<tokio::time::Instant>>,
+    /// Vote count of each batch proof requested, in order.
+    pub sizes: Mutex<Vec<usize>>,
 }
 
 impl FakeProver {
@@ -1288,6 +1290,7 @@ impl FakeProver {
             fail_batches: Mutex::new(0),
             fail_batches_permanent: Mutex::new(0),
             call_times: Mutex::new(Vec::new()),
+            sizes: Mutex::new(Vec::new()),
         })
     }
 
@@ -1315,6 +1318,10 @@ impl FakeProver {
         self.calls.load(Ordering::SeqCst)
     }
 
+    pub fn sizes(&self) -> Vec<usize> {
+        self.sizes.lock().unwrap().clone()
+    }
+
     pub fn results_calls(&self) -> u64 {
         self.results_calls.load(Ordering::SeqCst)
     }
@@ -1324,10 +1331,11 @@ impl FakeProver {
 impl Prover for FakeProver {
     async fn prove_batch(
         &self,
-        _request: &ProveRequest,
+        request: &ProveRequest,
         expected: &BatchPublics,
     ) -> Result<(BatchPublics, PlonkSnark), ProverError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.sizes.lock().unwrap().push(request.proofs.len());
         self.call_times
             .lock()
             .unwrap()
@@ -1450,6 +1458,11 @@ pub fn test_config_with(
     } else {
         &["--rpc-url", "http://127.0.0.1:8545"]
     };
+    let bt: &[&str] = if extra.contains(&"--batch-time") {
+        &[]
+    } else {
+        &["--batch-time", "1h"]
+    };
     let base = [
         "davinci-sequencer",
         "--datadir",
@@ -1462,8 +1475,6 @@ pub fn test_config_with(
         "anvil",
         "--batch-max",
         &bm,
-        "--batch-time",
-        "1h",
         "--poll-interval",
         "20ms",
         "--confirmations",
@@ -1473,7 +1484,7 @@ pub fn test_config_with(
         "--census-dir",
         census_dir.to_str().unwrap(),
     ];
-    Config::parse_args(base.iter().chain(rpc).chain(extra).copied()).unwrap()
+    Config::parse_args(base.iter().chain(rpc).chain(bt).chain(extra).copied()).unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]

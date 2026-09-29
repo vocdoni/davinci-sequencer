@@ -18,9 +18,10 @@ use davinci_zkvm_sdk::blob::{TransitionBlobs, decode_blobs};
 use davinci_zkvm_sdk::census::{CensusProof, CensusWitness, CspProof, EcdsaSignature};
 use davinci_zkvm_sdk::client::PlonkSnark;
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be};
+use davinci_zkvm_sdk::limits::{MAX_BATCH_SIZE, MAX_REFRESH, refresh_target};
 use davinci_zkvm_sdk::publics::{BatchPublics, ResultsPublics, fail_bits};
-use davinci_zkvm_sdk::release;
 use davinci_zkvm_sdk::types::{ProveRequest, ResultsRequest, SnarkJsProof};
+use davinci_zkvm_sdk::{blob, release};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -345,8 +346,8 @@ pub enum ActorError {
     MaxVoters,
     #[error("vote {0} already submitted")]
     Duplicate(u64),
-    /// The slot already has a pending or in-flight vote; retry once it settles.
-    #[error("slot {0} already has a queued vote")]
+    /// The slot holds `slot_depth` pending or in-flight votes; retry once one settles.
+    #[error("slot {0} has too many queued votes")]
     SlotBusy(u64),
     #[error("vote is for another process")]
     WrongProcess,
@@ -641,6 +642,8 @@ struct Flight {
     generation: u64,
     prepared: davinci_state::PreparedBatch,
     votes: Vec<VerifiedVote>,
+    /// Admission times of `votes`, for an age-preserving requeue.
+    votes_at: Vec<u64>,
     /// Set when the settlement tx landed but the receipt read failed: if the
     /// confirmed chain never shows our root by this instant, roll back.
     landed_deadline: Option<tokio::time::Instant>,
@@ -655,7 +658,18 @@ struct Actor {
     metrics: Arc<Metrics>,
     batch_max: usize,
     batch_time: u64,
+    min_mix: usize,
+    solo_wait: u64,
+    flush_horizon: u64,
+    /// Landing margin reserved after proving.
     settle_margin: u64,
+    slot_depth: usize,
+    prove_base: f64,
+    /// Seal jitter of the current window, drawn once per window.
+    jitter: Option<f64>,
+    /// Pending size below which no transaction can be full, keyed by the
+    /// (occupied, exposed) counts it was computed for.
+    cap_est: Option<((usize, usize), usize)>,
     state: ProcessState<crate::storage::ArboStore>,
     record: ProcessRecord,
     pending: Vec<VerifiedVote>,
@@ -702,6 +716,12 @@ struct Actor {
     /// seal before this instant or the next status event.
     pause_hold: Option<tokio::time::Instant>,
     tx: mpsc::Sender<Msg>,
+}
+
+/// Seal jitter factor, uniform in [0.9, 1.1]: one draw per batch window
+/// scales the timer and solo deadlines.
+pub fn seal_jitter(rng: &mut impl rand::Rng) -> f64 {
+    rng.gen_range(0.9..=1.1)
 }
 
 fn pid31_of(pid: &Fr) -> [u8; 31] {
@@ -792,7 +812,14 @@ pub(crate) fn spawn_actor(
         metrics,
         batch_max: cfg.batch_max,
         batch_time: cfg.batch_time.as_secs(),
+        min_mix: cfg.min_mix as usize,
+        solo_wait: cfg.solo_wait.as_secs(),
+        flush_horizon: cfg.flush_horizon.as_secs(),
         settle_margin: cfg.settle_margin.as_secs(),
+        slot_depth: cfg.slot_depth as usize,
+        prove_base: cfg.prove_base.as_secs_f64(),
+        jitter: None,
+        cap_est: None,
         state,
         record,
         pending: Vec::new(),
@@ -850,7 +877,6 @@ impl Actor {
         if !stale.is_empty() {
             db.requeue(&self.pid, &stale).map_err(ierr)?;
         }
-        let now = self.deps.clock.now();
         for vid in db.pending(&self.pid).map_err(ierr)? {
             let Some(sv) = db.vote(&self.pid, vid).map_err(ierr)? else {
                 continue;
@@ -864,7 +890,7 @@ impl Actor {
             match unpack_vote(&sv.package) {
                 Ok(v) => {
                     self.pending.push(v);
-                    self.pending_at.push(now);
+                    self.pending_at.push(sv.created_at);
                 }
                 Err(e) => {
                     warn!(pid = %hex::encode(self.pid31), vid, %e, "unreadable stored vote");
@@ -879,7 +905,19 @@ impl Actor {
                 }
             }
         }
+        self.sort_pending();
         Ok(())
+    }
+
+    /// Restores cast order: a stable sort by admission time over the queue
+    /// order, where requeued votes sit ahead of the later votes of their slot.
+    fn sort_pending(&mut self) {
+        let mut q: Vec<(u64, VerifiedVote)> = std::mem::take(&mut self.pending_at)
+            .into_iter()
+            .zip(std::mem::take(&mut self.pending))
+            .collect();
+        q.sort_by_key(|(at, _)| *at);
+        (self.pending_at, self.pending) = q.into_iter().unzip();
     }
 
     async fn run(&mut self, mut rx: mpsc::Receiver<Msg>, shutdown: CancellationToken) {
@@ -1009,6 +1047,17 @@ impl Actor {
         self.record.onchain.end_time()
     }
 
+    /// Last instant a transition can land; becomes the on-chain grace end.
+    fn grace_end(&self) -> u64 {
+        self.end_time()
+    }
+
+    /// Flush mode: seal whatever is pending, from `flush_horizon` before the end.
+    fn flush(&self) -> bool {
+        self.chain_time != 0
+            && self.chain_time >= self.end_time().saturating_sub(self.flush_horizon)
+    }
+
     fn accepting(&self) -> bool {
         self.not_closed()
             && self.chain_time >= self.record.onchain.start_time
@@ -1050,13 +1099,14 @@ impl Actor {
         if self.state.has_vote_id(v.pkg.vote_id).map_err(ierr)? {
             return Err(ActorError::Duplicate(v.pkg.vote_id));
         }
-        // One queued (pending or in-flight) vote per slot.
-        if self.pending.iter().any(|q| q.slot == v.slot)
-            || self
+        // At most slot_depth queued (pending or in-flight) votes per slot;
+        // they settle in admission order.
+        let queued = self.pending.iter().filter(|q| q.slot == v.slot).count()
+            + self
                 .in_flight
                 .as_ref()
-                .is_some_and(|f| f.votes.iter().any(|q| q.slot == v.slot))
-        {
+                .map_or(0, |f| f.votes.iter().filter(|q| q.slot == v.slot).count());
+        if queued >= self.slot_depth {
             return Err(ActorError::SlotBusy(v.slot));
         }
         // A new-slot vote must fit under max_voters with the queued new slots.
@@ -1066,7 +1116,16 @@ impl Actor {
                 return Err(ActorError::MaxVoters);
             }
         }
-        let now = self.deps.clock.now();
+        // Admission times never step back within the queue (clock steps),
+        // so sorting by them keeps each slot's order.
+        let floor = self
+            .in_flight
+            .iter()
+            .flat_map(|f| f.votes_at.iter().copied())
+            .chain(self.pending_at.last().copied())
+            .max()
+            .unwrap_or(0);
+        let now = self.deps.clock.now().max(floor);
         let sv = StoredVote {
             pid: self.pid,
             vote_id: v.pkg.vote_id,
@@ -1246,19 +1305,50 @@ impl Actor {
         }
     }
 
+    /// Smallest selection that could fill a transaction, taking every vote
+    /// as an overwrite and the whole exposed set as live. A shorter queue
+    /// can never trip the blob cap, so its trial is skipped. In memory only.
+    fn capacity_estimate(&mut self) -> usize {
+        let key = (self.state.occupied(), self.exposed.len());
+        if let Some((k, n)) = self.cap_est
+            && k == key
+        {
+            return n;
+        }
+        let (occ, e) = key;
+        let nf = self.state.config().ballot_mode.num_fields;
+        let cap = self.state.blob_cap();
+        let n = (1..=MAX_BATCH_SIZE)
+            .find(|&n| {
+                let r = refresh_target(n, n).min(occ).max(e);
+                r > MAX_REFRESH || blob::blob_count(n, n + r, nf) > cap
+            })
+            .unwrap_or(MAX_BATCH_SIZE + 1);
+        self.cap_est = Some((key, n));
+        n
+    }
+
     async fn maybe_seal(&mut self) {
+        if self.pending.is_empty() {
+            self.jitter = None;
+        }
         if self.in_flight.is_some()
             || self.finalizing
             || self.await_sync
             || self.pending.is_empty()
             || self.record.local != LocalStatus::Active
-            || self.record.onchain.status != ProcessStatus::Ready
             || self.deps.contracts.signer().is_none()
             // Never seal off a stale root: wait until the committed tree
             // matches the pinned on-chain root (resync closes the gap).
             || self.state.committed().root != self.record.onchain.state_root
         {
             return;
+        }
+        let flush = self.flush();
+        match self.record.onchain.status {
+            ProcessStatus::Ready => {}
+            ProcessStatus::Ended if flush => {}
+            _ => return,
         }
         // Cooling down after transient prover/RPC trouble, or holding for
         // a pause the events have not shown yet?
@@ -1267,20 +1357,25 @@ impl Actor {
         {
             return;
         }
-        // Never seal into a closing window: the proof would land after the
-        // end, revert, and strand its votes.
-        if self.chain_time.saturating_add(self.settle_margin) >= self.end_time() {
-            return;
-        }
         // Nor before the start, where the settlement reverts: admission
         // waits for it, but a lagging head read can step back past it.
         if self.chain_time < self.record.onchain.start_time {
             return;
         }
-        let oldest = self.pending_at.first().copied().unwrap_or(u64::MAX);
-        let due = self.pending.len() >= self.batch_max
-            || self.deps.clock.now().saturating_sub(oldest) >= self.batch_time;
-        if !due {
+        // Triggers. The trial selection reads storage, so it runs only when
+        // a trigger can fire: the queue could fill a transaction, a
+        // deadline passed, or flush mode.
+        let j = *self.jitter.get_or_insert_with(|| seal_jitter(&mut OsRng));
+        let age = self
+            .deps
+            .clock
+            .now()
+            .saturating_sub(self.pending_at.first().copied().unwrap_or(u64::MAX))
+            as f64;
+        let timer_due = age >= self.batch_time as f64 * j;
+        let solo_due = age >= self.solo_wait as f64 * j;
+        let at_max = self.pending.len() >= self.batch_max;
+        if !(at_max || timer_due || flush || self.pending.len() >= self.capacity_estimate()) {
             return;
         }
         self.settle_pending_in_tree();
@@ -1294,23 +1389,60 @@ impl Actor {
         if self.state.config().census_root != census_root {
             self.state.set_census_root(census_root);
         }
+        let max_voters = self.record.onchain.max_voters;
+        let k = match self
+            .state
+            .select_batch(&self.pending, max_voters, &self.exposed, usize::MAX)
+        {
+            Ok((refs, blocked)) => {
+                let k = refs.len();
+                // Company is the trial size (distinct admissible slots),
+                // not the queue length.
+                let seal = k >= 1
+                    && (blocked
+                        || at_max
+                        || (k >= self.min_mix && timer_due)
+                        || (k < self.min_mix && solo_due)
+                        || flush);
+                if !seal {
+                    return;
+                }
+                k
+            }
+            Err(StateError::RefreshOverflow { .. }) => {
+                self.refresh_overflow();
+                return;
+            }
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "select_batch");
+                return;
+            }
+        };
+        // Time budget: the largest batch whose estimated proof plus the
+        // landing margin ends before the window closes.
+        let nf = self.state.config().ballot_mode.num_fields;
+        let now = self.chain_time.max(self.deps.clock.now());
+        let left =
+            self.grace_end() as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
+        let n_max = (left / self.metrics.prove.spv(nf)).floor();
+        if n_max < 1.0 {
+            return; // nothing fits; the window closes on these votes
+        }
+        let cap = k
+            .min(self.batch_max)
+            .min(n_max.min(MAX_BATCH_SIZE as f64) as usize);
         // Selection and seal-time re-proof. prepare must only ever see a
-        // set select_batch sized: shedding a vote after sizing (the
-        // batch_max trim, a re-proof drop) can put an overwritten exposed
-        // slot back into the must-include refreshes unaccounted. So a trim
-        // is re-sized, and a drop re-runs selection over what is left.
+        // set select_batch sized: shedding a vote after sizing can put an
+        // overwritten exposed slot back into the must-include refreshes
+        // unaccounted. So the batch_max and budget caps go into the
+        // selection, and a re-proof drop re-runs it over what is left.
         let selected: Vec<VerifiedVote> = loop {
-            let mut sized: Vec<VerifiedVote> = Vec::new();
-            // Two passes when the batch_max trim sheds votes: the second
-            // sizes exactly the set prepare will get.
-            for pass in 0..2 {
-                let pool = if pass == 0 { &self.pending } else { &sized };
-                let refs = match self.state.select_batch(
-                    pool,
-                    self.record.onchain.max_voters,
-                    &self.exposed,
-                ) {
-                    Ok(refs) => refs,
+            let sized: Vec<VerifiedVote> =
+                match self
+                    .state
+                    .select_batch(&self.pending, max_voters, &self.exposed, cap)
+                {
+                    Ok((refs, _)) => refs.into_iter().cloned().collect(),
                     Err(StateError::RefreshOverflow { .. }) => {
                         self.refresh_overflow();
                         return;
@@ -1320,12 +1452,6 @@ impl Actor {
                         return;
                     }
                 };
-                let full = pass == 1 || refs.len() <= self.batch_max;
-                sized = refs.into_iter().take(self.batch_max).cloned().collect();
-                if full {
-                    break;
-                }
-            }
             if sized.is_empty() {
                 return;
             }
@@ -1396,7 +1522,18 @@ impl Actor {
             }
             return;
         }
+        let at: std::collections::HashMap<u64, u64> = self
+            .pending
+            .iter()
+            .zip(&self.pending_at)
+            .map(|(v, t)| (v.pkg.vote_id, *t))
+            .collect();
+        let votes_at: Vec<u64> = vids
+            .iter()
+            .map(|v| at.get(v).copied().unwrap_or(now))
+            .collect();
         self.drop_pending(&vids);
+        self.jitter = None;
         self.generation += 1;
         info!(
             pid = %hex::encode(self.pid31),
@@ -1413,11 +1550,17 @@ impl Actor {
             prover: self.deps.prover.clone(),
             chain: self.deps.contracts.clone(),
             tx: self.tx.clone(),
+            clock: self.deps.clock.clone(),
+            metrics: self.metrics.clone(),
+            nf,
+            n: vids.len(),
+            prove_base: self.prove_base,
         };
         self.in_flight = Some(Flight {
             generation: self.generation,
             prepared,
             votes: selected,
+            votes_at,
             landed_deadline: None,
         });
         tokio::spawn(run_job(job));
@@ -1692,17 +1835,48 @@ impl Actor {
         secs
     }
 
-    /// Puts a flight's votes back at the queue tail.
+    /// Puts a flight's votes back in the queue with their original age,
+    /// ahead of the later votes of their slots.
     fn requeue_flight(&mut self, f: Flight) {
         let vids = f.prepared.vote_ids.clone();
         if let Err(e) = self.deps.db.requeue(&self.pid, &vids) {
             error!(pid = %hex::encode(self.pid31), %e, "requeue");
         }
-        let now = self.deps.clock.now();
-        for v in f.votes {
-            self.pending.push(v);
-            self.pending_at.push(now);
+        self.pending.splice(0..0, f.votes);
+        self.pending_at.splice(0..0, f.votes_at);
+        self.sort_pending();
+    }
+
+    /// maxVoters reached: queued new-slot votes can never settle, so they
+    /// error now rather than at the end. Overwrites stay.
+    fn error_new_slots_if_full(&mut self) {
+        if (self.state.occupied() as u64) < self.record.onchain.max_voters {
+            return;
         }
+        let mut full = Vec::new();
+        for v in &self.pending {
+            match self.state.slot_ballot(v.slot) {
+                Ok(None) => full.push(v.pkg.vote_id),
+                Ok(Some(_)) => {}
+                Err(e) => {
+                    error!(pid = %hex::encode(self.pid31), %e, "slot_ballot");
+                    return;
+                }
+            }
+        }
+        if full.is_empty() {
+            return;
+        }
+        info!(pid = %hex::encode(self.pid31), n = full.len(), "max voters reached; erroring new-slot votes");
+        self.set_status(
+            &full,
+            VoteStatus::Error,
+            Some(&ActorError::MaxVoters.to_string()),
+        );
+        if let Err(e) = self.deps.db.remove_pending(&self.pid, &full) {
+            error!(pid = %hex::encode(self.pid31), %e, "remove_pending");
+        }
+        self.drop_pending(&full);
     }
 
     fn persist_committed(&self) {
@@ -1923,6 +2097,7 @@ impl Actor {
             root = %hex::encode(p.new_root),
             "transition settled"
         );
+        self.error_new_slots_if_full();
     }
 
     async fn on_event(&mut self, ev: RegistryEvent) {
@@ -2166,6 +2341,7 @@ impl Actor {
         // Pending votes another sequencer settled for us are done. Votes
         // whose slot got overwritten stay pending: their id is not in the tree.
         self.settle_pending_in_tree();
+        self.error_new_slots_if_full();
         info!(
             pid = %hex::encode(self.pid31),
             votes = rec.n_votes,
@@ -2329,6 +2505,11 @@ struct JobInput {
     prover: Arc<dyn Prover>,
     chain: Arc<dyn Chain>,
     tx: mpsc::Sender<Msg>,
+    clock: Arc<dyn Clock>,
+    metrics: Arc<Metrics>,
+    nf: u8,
+    n: usize,
+    prove_base: f64,
 }
 
 async fn run_job(job: JobInput) {
@@ -2344,8 +2525,15 @@ async fn run_job(job: JobInput) {
 }
 
 async fn job_inner(job: JobInput) -> JobOutcome {
+    let t0 = job.clock.now();
     let (got, snark) = match job.prover.prove_batch(&job.request, &job.expected).await {
-        Ok(x) => x,
+        Ok(x) => {
+            let secs = job.clock.now().saturating_sub(t0) as f64;
+            job.metrics
+                .prove
+                .observe(job.nf, job.n, secs, job.prove_base);
+            x
+        }
         // Transport/queue trouble is retried; a failed job never is.
         Err(e) if !e.permanent => return JobOutcome::Transient(e.to_string()),
         Err(e) => return JobOutcome::Failed(e.to_string()),

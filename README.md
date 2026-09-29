@@ -262,10 +262,15 @@ Every flag has a `DAVINCI_*` environment variable. Durations take `90`, `90s`,
 | `--datadir` | `DAVINCI_DATADIR` | `~/.davinci-sequencer` | Holds one `<chain id>-<registry>/sequencer.redb` per deployment. |
 | `--api-host` | `DAVINCI_API_HOST` | `0.0.0.0` | API listen address. |
 | `--api-port` | `DAVINCI_API_PORT` | `9090` | API port. |
-| `--batch-max` | `DAVINCI_BATCH_MAX` | `1024` | Pending votes that seal a batch without waiting (1 to 1024). |
+| `--batch-max` | `DAVINCI_BATCH_MAX` | `1024` | Pending votes that seal a batch without waiting, and the largest batch (1 to 1024). |
 | `--max-blobs-per-tx` | `DAVINCI_MAX_BLOBS_PER_TX` | from `eth_config` | Most blobs one settlement transaction carries (1 to 6). Unset: the chain's `eth_config` `current.blobSchedule.max`, at most 6. Without `eth_config` (most Gnosis RPCs): 2 on Gnosis (100) and Chiado (10200), else 6, with a warning. A value above what `eth_config` advertises is kept, with a warning. |
-| `--batch-time` | `DAVINCI_BATCH_TIME` | `5m` | Longest a pending vote waits before its batch is sealed. |
-| `--settle-margin` | `DAVINCI_SETTLE_MARGIN` | `120s` | No batch is sealed when the election ends within this margin. |
+| `--batch-time` | `DAVINCI_BATCH_TIME` | `15m` | Age of the oldest pending vote at which a batch of at least `--min-mix` slots seals (±10% jitter). |
+| `--min-mix` | `DAVINCI_MIN_MIX` | `2` | Distinct slots a timer batch needs; fewer wait for `--solo-wait` (at least 1). |
+| `--solo-wait` | `DAVINCI_SOLO_WAIT` | 3 × batch time | Age at which a batch below `--min-mix` seals anyway (±10% jitter). Not below `--batch-time`. |
+| `--flush-horizon` | `DAVINCI_FLUSH_HORIZON` | `3m` | From this long before the election end, every pending vote seals without waiting. |
+| `--settle-margin` | `DAVINCI_SETTLE_MARGIN` | `60s` | Landing margin after proving: a batch is sized so its estimated proof plus this margin ends before the window closes. |
+| `--slot-depth` | `DAVINCI_SLOT_DEPTH` | `3` | Queued votes one slot may hold, in flight included (at least 1). |
+| `--prove-base` | `DAVINCI_PROVE_BASE` | `30s` | Fixed part of the proving-time estimate the batch budget uses. |
 | `--confirmations` | `DAVINCI_CONFIRMATIONS` | network, else `2` | Blocks behind head the monitor treats as final. Raise it with load-balanced RPCs whose backends lag. |
 | `--start-block` | `DAVINCI_START_BLOCK` | network | First block a fresh deployment scans for registry events: the registry deployment block. Ignored once the deployment has scanned. The network's applies to its own registry only; otherwise unset scans from block 0, with a warning (about 9,700 `eth_getLogs` pages on Gnosis). Progress is saved after every 5,000-block page. |
 | `--poll-interval` | `DAVINCI_POLL_INTERVAL` | `5s` | Chain polling interval. |
@@ -389,7 +394,7 @@ detail goes to the node log. A request that runs longer than 60 s gets a 408.
 | 408 | 40801 | The 60 s request deadline fired. The handler may still have finished: a timed-out `POST /votes` can have admitted the vote, in which case a retry answers 409. |
 | 404 | 40402 | Unknown process (or one this node does not serve). |
 | 409 | 40901 | Vote id already submitted or already in the tree. |
-| 409 | 40902 | The slot already has a queued vote; retry once it settles. A resubmission of a vote id that is still queued also gets this code. |
+| 409 | 40902 | The slot already holds `--slot-depth` queued votes; retry once one settles. |
 | 412 | 41201 | The process does not accept votes. |
 | 412 | 41202 | Max voters reached. |
 | 412 | 41203 | Observer node. |
@@ -429,16 +434,28 @@ vote then goes to the process actor. The actor is the single writer of that
 process's tree, accumulator, counters and vote rows, and it checks the stateful
 rules before queueing the vote:
 - the vote id is not in the tree or the queue;
-- the slot has no other queued vote;
+- the slot holds fewer than `--slot-depth` queued votes (they settle in the
+  order they were cast);
 - max voters is not exceeded;
 - the process is accepting.
 
-**Batches.** The actor seals a batch when `--batch-max` votes are pending or the
-oldest has waited `--batch-time`. It does not seal when the election ends within
-`--settle-margin`. It then:
-1. takes votes in FIFO order, at most one per slot, within `maxVoters` and
-   within the per-transaction blob cap (`--max-blobs-per-tx`, counting the
-   refreshes the guest will require);
+**Batches.** The actor seals a batch when one of these holds:
+- capacity: the queue no longer fits one transaction, or `--batch-max` votes
+  are pending;
+- timer: the batch would hold at least `--min-mix` distinct slots and the
+  oldest vote has waited `--batch-time`;
+- solo: fewer than `--min-mix` slots and the oldest has waited `--solo-wait`;
+- flush: the election ends within `--flush-horizon`.
+
+Both waits carry a ±10% jitter, drawn once per batch. A batch is also sized to
+the time left: proving is estimated as `--prove-base` plus a per-vote cost
+(an average over the node's finished proofs, per field count, seeded high), and
+the batch holds at most the votes whose estimated proof plus `--settle-margin`
+ends before the window closes. When not even one vote fits, nothing seals and
+the votes close out with the window. The actor then:
+1. takes votes in FIFO order, the oldest per slot, within `maxVoters`, the
+   size above and the per-transaction blob cap (`--max-blobs-per-tx`,
+   counting the refreshes the guest will require);
 2. draws a fresh seed and a refresh selection from the OS RNG;
 3. re-encrypts every ballot along the seed chain and re-randomizes the refreshed
    slots (silent revoting);
@@ -797,10 +814,11 @@ chained (folded) mode with DKG keys.
   no rewind path: the node's copy of that process stays ahead of the chain and
   stops following it. Confirmation-gated own commits are future work.
 - **Settle margin.** A transition that lands after the election window closes
-  reverts, and its votes end in `error: process closed`. Set `--settle-margin`
-  above the time it takes to prove and settle a full batch. The default of 120 s
-  covers small batches only: a 1024-vote batch at nf=2 takes about 3 minutes to
-  prove on an RTX 5090 (davinci-zkvm `BENCHMARK.md` has the table).
+  reverts, and its votes end in `error: process closed`. Near the end the actor
+  shrinks batches so the estimated proof plus `--settle-margin` (the time to
+  send and mine the transaction) still fits. The estimate starts high (about
+  twice an RTX 5090, davinci-zkvm `BENCHMARK.md` has the table) and follows
+  the node's measured proofs; raise `--prove-base` on a slower prover.
 - **Prover failures.** Transient prover errors back off (up to about 5 minutes)
   with the votes still `pending`; they end in `error` only if the election closes
   first. A prover refusal (a rejected request or a failed job) or a guest

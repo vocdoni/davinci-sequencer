@@ -181,6 +181,8 @@ pub struct Db {
     db: Arc<Database>,
     /// Scripted arbo write failures (tests only; always 0 in production).
     arbo_faults: Arc<std::sync::atomic::AtomicU32>,
+    /// Arbo reads (any process), counted in test builds only.
+    arbo_reads: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Db {
@@ -265,6 +267,7 @@ impl Db {
         let this = Db {
             db: Arc::new(db),
             arbo_faults: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            arbo_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         this.init()?;
         Ok(this)
@@ -361,6 +364,7 @@ impl Db {
         Ok(ArboStore {
             inner,
             faults: self.arbo_faults.clone(),
+            reads: self.arbo_reads.clone(),
         })
     }
 
@@ -371,6 +375,12 @@ impl Db {
     pub fn fail_next_arbo_writes(&self, n: u32) {
         self.arbo_faults
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Arbo tree and slot-store reads so far (any process). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn arbo_reads(&self) -> u64 {
+        self.arbo_reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn get(&self, table: Bytes, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -547,12 +557,13 @@ impl Db {
         })
     }
 
-    /// Votes go back to `pending` (error cleared) and to the queue tail.
-    /// Votes still queued keep their place.
+    /// Votes go back to `pending` (error cleared) at the queue head: they
+    /// were sealed ahead of every queued vote of their slot, so the head
+    /// keeps each slot's cast order. Votes still queued keep their place.
     pub fn requeue(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
-            vids.iter().try_for_each(|v| tx_push(tx, pid, *v))
+            tx_prepend(tx, pid, vids)
         })
     }
 
@@ -902,6 +913,35 @@ fn tx_push(tx: &WriteTransaction, pid: &Fr, vid: u64) -> Result<()> {
     Ok(())
 }
 
+// Renumbers the process's queue as `vids` (those not queued yet) followed
+// by the current queue. ponytail: O(queue) rewrite, fine for the rare requeue.
+fn tx_prepend(tx: &WriteTransaction, pid: &Fr, vids: &[u64]) -> Result<()> {
+    let mut idx = tx.open_table(PENDING_IDX).map_err(db_err)?;
+    let mut t = tx.open_table(PENDING).map_err(db_err)?;
+    let (lo, hi) = prefix_range(&pid_key(pid), 40);
+    let mut queue = Vec::new();
+    for row in t.range(lo.as_slice()..=hi.as_slice()).map_err(db_err)? {
+        let (_, v) = row.map_err(db_err)?;
+        queue.push(u64_value("pending", v.value())?);
+    }
+    let mut seen: HashSet<u64> = queue.iter().copied().collect();
+    let mut order: Vec<u64> = vids.iter().copied().filter(|v| seen.insert(*v)).collect();
+    if order.is_empty() {
+        return Ok(());
+    }
+    order.extend(queue);
+    t.retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
+        .map_err(db_err)?;
+    for (seq, vid) in order.iter().enumerate() {
+        let seq = seq as u64;
+        t.insert(key_u64(pid, seq).as_slice(), vid.to_be_bytes().as_slice())
+            .map_err(db_err)?;
+        idx.insert(key_u64(pid, *vid).as_slice(), seq.to_be_bytes().as_slice())
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 fn tx_remove(tx: &WriteTransaction, pid: &Fr, vids: &[u64]) -> Result<()> {
     let mut idx = tx.open_table(PENDING_IDX).map_err(db_err)?;
     let mut t = tx.open_table(PENDING).map_err(db_err)?;
@@ -973,10 +1013,15 @@ fn tx_put_transition(
 pub struct ArboStore {
     inner: arbo::RedbStorage,
     faults: Arc<std::sync::atomic::AtomicU32>,
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    reads: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl arbo::Storage for ArboStore {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, arbo::Error> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         arbo::Storage::get(&self.inner, key)
     }
 

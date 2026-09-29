@@ -281,10 +281,12 @@ impl<S: Storage> ProcessState<S> {
     }
 
     /// FIFO batch selection: at most one vote per slot, no reused vote id,
-    /// the on-chain `max_voters` cap on distinct voters, `MAX_BATCH_SIZE`,
-    /// and the whole transition (refreshes included) within the blob cap
-    /// (`TX_BLOB_CAP` unless [`Self::set_blob_cap`] lowered it). Votes that
-    /// don't fit are left for a later batch.
+    /// the on-chain `max_voters` cap on distinct voters, at most `max_votes`
+    /// (and `MAX_BATCH_SIZE`) votes, and the whole transition (refreshes
+    /// included) within the blob cap (`TX_BLOB_CAP` unless
+    /// [`Self::set_blob_cap`] lowered it). Votes that don't fit are left for
+    /// a later batch; the flag is true when the blob or refresh cap turned
+    /// one away (the transaction is full).
     ///
     /// The refresh count is at least the live `must_include` slots (the
     /// exposed set `prepare` will keep), so a large exposed set shrinks the
@@ -295,7 +297,8 @@ impl<S: Storage> ProcessState<S> {
         pending: &'a [VerifiedVote],
         max_voters: u64,
         must_include: &BTreeSet<u64>,
-    ) -> Result<Vec<&'a VerifiedVote>, Error> {
+        max_votes: usize,
+    ) -> Result<(Vec<&'a VerifiedVote>, bool), Error> {
         let nf = self.cfg.ballot_mode.num_fields;
         let occupied_before = self.occupied.len();
         let mut out: Vec<&VerifiedVote> = Vec::new();
@@ -310,7 +313,7 @@ impl<S: Storage> ProcessState<S> {
             .count();
         let mut blocked = false;
         for v in pending {
-            if out.len() == MAX_BATCH_SIZE {
+            if out.len() >= max_votes.min(MAX_BATCH_SIZE) {
                 break;
             }
             if slots.contains(&v.slot) || vids.contains(&v.pkg.vote_id) {
@@ -350,7 +353,7 @@ impl<S: Storage> ProcessState<S> {
         if out.is_empty() && blocked {
             return Err(Error::RefreshOverflow { exposed, votes: 1 });
         }
-        Ok(out)
+        Ok((out, blocked))
     }
 
     /// Applies a prepared batch after its proof was accepted: slot store,

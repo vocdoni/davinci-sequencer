@@ -387,8 +387,9 @@ fn two_blob_cap_batch_accepted() {
         .map(|i| real_vote(&env, i, &fields, 60 + i as u64))
         .collect();
     let sel: Vec<VerifiedVote> = st
-        .select_batch(&pending, u64::MAX, &none())
+        .select_batch(&pending, u64::MAX, &none(), usize::MAX)
         .unwrap()
+        .0
         .into_iter()
         .cloned()
         .collect();
