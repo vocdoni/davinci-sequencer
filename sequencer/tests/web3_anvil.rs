@@ -15,12 +15,12 @@ use alloy::primitives::{Address, B256, Bytes, FixedBytes};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolValue;
+use alloy::sol_types::{SolCall, SolValue};
 use davinci_client::organizer::metadata_hash;
 use davinci_sequencer::config::SecretString;
 use davinci_sequencer::web3::{
-    AnvilBlobs, BlobSource, Contracts, EventKind, NewProcess, OnchainCensus, ProcessStatus,
-    RevertReason, Web3Error,
+    AnvilBlobs, BlobSource, Contracts, EventKind, GraceParams, NewProcess, OnchainCensus,
+    ProcessStatus, RevertReason, Web3Error,
 };
 use davinci_zkvm_sdk::ballot::{Ballot, BallotMode};
 use davinci_zkvm_sdk::blob::{TransitionBlobs, TransitionData, build_blobs, decode_blobs};
@@ -34,8 +34,14 @@ const RESULTS_VK: [u8; 32] = [0x22; 32];
 const ROOT_C: [u8; 32] = [0x33; 32];
 const BALLOT_VK_HASH: [u8; 32] = [0x44; 32];
 const NF: u8 = 4;
+/// Registry grace constructor args: default, floor, ceil, max total, notice.
+const GRACE_ARGS: (u32, u32, u32, u32, u32) = (10, 2, 60, 60, 5);
 /// The metadata document behind the `ipfs://` URIs, which nothing fetches.
 const META_DOC: &[u8] = br#"{"title":{"default":"web3 test"}}"#;
+
+alloy::sol! {
+    function setProcessGrace(bytes31 processId, uint32 grace) external;
+}
 
 fn enabled() -> bool {
     std::env::var("ANVIL").is_ok_and(|v| v == "1")
@@ -68,6 +74,15 @@ fn bytecode(artifact: &str) -> Vec<u8> {
     .unwrap();
     let hex_code = json["bytecode"]["object"].as_str().unwrap();
     hex::decode(hex_code.trim_start_matches("0x")).unwrap()
+}
+
+/// Moves anvil's clock `secs` forward and mines a block.
+async fn advance<P: Provider>(rpc: &P, secs: u64) {
+    let _: serde_json::Value = rpc
+        .raw_request("evm_increaseTime".into(), (secs,))
+        .await
+        .unwrap();
+    let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await.unwrap();
 }
 
 async fn deploy<P: Provider>(p: &P, code: Vec<u8>) -> Address {
@@ -193,6 +208,7 @@ async fn registry_on_anvil() {
         )
             .abi_encode_params(),
     );
+    code.extend(GRACE_ARGS.abi_encode_params());
     let registry = deploy(&deployer, code).await;
 
     // An observer cannot send.
@@ -291,6 +307,20 @@ async fn registry_on_anvil() {
     assert_eq!(p.max_voters, 1000);
     assert_eq!(p.voters_count, 0);
     assert_ne!(p.state_root, [0u8; 32], "genesis root computed on-chain");
+    // The grace immutables and the process's window.
+    let gp = c.grace_params().await.unwrap();
+    assert_eq!(
+        gp,
+        GraceParams {
+            default_grace: 10,
+            grace_floor: 2,
+            grace_ceil: 60,
+            grace_max_total: 60,
+            notice_min: 5,
+        }
+    );
+    assert_eq!((p.grace, p.last_vote_at), (10, 0));
+    assert_eq!(c.grace_end(&pid).await.unwrap(), p.end_time() + 10);
 
     // First transition: one blob, real KZG data over real ciphertexts.
     let t1 = TransitionData {
@@ -334,6 +364,14 @@ async fn registry_on_anvil() {
         .err()
         .unwrap();
     assert_eq!(reason.name(), Some("InvalidCensusRoot"), "{reason}");
+    // A transition without a vote would only move the grace end.
+    let empty = batch_snark(&Batch { voters: 0, ..b1 }, &census_root, &blobs1);
+    let reason = c
+        .simulate_transition(&pid, &empty, &blobs1)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(reason.name(), Some("EmptyTransition"), "{reason}");
 
     let r1 = c.submit_transition(&pid, &snark1, &blobs1).await.unwrap();
     let blobs = AnvilBlobs::new(std::slice::from_ref(&url));
@@ -408,6 +446,19 @@ async fn registry_on_anvil() {
     assert_eq!(p.state_root, root2);
     assert_eq!(p.voters_count, 2 + n);
     assert_eq!(p.batch_number, 2);
+    // Each landing stamps its block time; the node's formula matches.
+    let t2 = deployer
+        .get_block_by_number(r2.block.into())
+        .await
+        .unwrap()
+        .unwrap()
+        .header
+        .timestamp;
+    assert_eq!(p.last_vote_at, t2);
+    assert_eq!(
+        c.grace_end(&pid).await.unwrap(),
+        p.grace_end(gp.grace_max_total)
+    );
 
     // Both transitions show up as typed events with their tx and block.
     let (head, _) = c.head().await.unwrap();
@@ -432,13 +483,52 @@ async fn registry_on_anvil() {
         }
     );
 
-    // Results: end the process and settle the tally.
-    c.end_process(&pid).await.unwrap();
-    let values = [7u64, (1 << 32) + 5, 0, 3];
-    let r = c
-        .submit_results(&pid, &results_snark(&root2, &values))
+    // The organizer widens the grace while open: a typed event and the
+    // stored value; below the floor is refused.
+    let set_grace = |grace: u32| {
+        TransactionRequest::default().with_to(registry).with_input(
+            setProcessGraceCall {
+                processId: FixedBytes(pid),
+                grace,
+            }
+            .abi_encode(),
+        )
+    };
+    // A fresh provider: `c` sent from this key since the deployer cached its nonce.
+    let organizer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(PrivateKeySigner::from(
+            anvil.keys()[0].clone(),
+        )))
+        .connect_http(url.clone());
+    let g = organizer
+        .send_transaction(set_grace(30))
+        .await
+        .unwrap()
+        .get_receipt()
         .await
         .unwrap();
+    assert!(g.status());
+    let b = g.block_number.unwrap();
+    let evs = c.events(b, b).await.unwrap();
+    assert!(
+        evs.iter()
+            .any(|e| e.kind == EventKind::GraceChanged { pid, grace: 30 })
+    );
+    assert_eq!(c.process(&pid).await.unwrap().grace, 30);
+    assert!(organizer.send_transaction(set_grace(1)).await.is_err());
+
+    // Results: end the process, wait out the grace, settle the tally.
+    c.end_process(&pid).await.unwrap();
+    let values = [7u64, (1 << 32) + 5, 0, 3];
+    let snark = results_snark(&root2, &values);
+    match c.submit_results(&pid, &snark).await.err().unwrap() {
+        Web3Error::Revert(r) => assert_eq!(r.name(), Some("GraceOpen"), "{r}"),
+        e => panic!("want a revert, got {e}"),
+    }
+    let p = c.process(&pid).await.unwrap();
+    assert_eq!(p.grace_end(gp.grace_max_total), p.end_time() + 30);
+    advance(&ProviderBuilder::new().connect_http(url.clone()), 30).await;
+    let r = c.submit_results(&pid, &snark).await.unwrap();
     let evs = c.events(r.block, r.block).await.unwrap();
     assert!(evs.iter().any(|e| e.kind
         == EventKind::ResultsSet {
@@ -535,6 +625,7 @@ async fn metadata_updates_on_anvil() {
         )
             .abi_encode_params(),
     );
+    code.extend(GRACE_ARGS.abi_encode_params());
     let registry = deploy(&deployer, code).await;
     let node = Contracts::new(std::slice::from_ref(&url), registry, None)
         .await
@@ -641,6 +732,7 @@ async fn registry_must_be_the_pinned_release() {
             )
                 .abi_encode_params(),
         );
+        code.extend(GRACE_ARGS.abi_encode_params());
         let r = deploy(&deployer, code).await;
         Contracts::new(std::slice::from_ref(&url), r, None)
             .await
@@ -744,6 +836,7 @@ async fn send_that_failed_over_is_maybe_sent() {
         )
             .abi_encode_params(),
     );
+    code.extend(GRACE_ARGS.abi_encode_params());
     let registry = deploy(&deployer, code).await;
 
     let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -944,6 +1037,7 @@ async fn same_block_race_names_the_loser() {
         )
             .abi_encode_params(),
     );
+    code.extend(GRACE_ARGS.abi_encode_params());
     let registry = deploy(&deployer, code).await;
     let lag = std::sync::Arc::new(Lag::default());
     let proxy = lagging_proxy(url.clone(), lag.clone()).await;
@@ -1121,6 +1215,7 @@ async fn receipt_wait_rides_out_a_rate_limit() {
         )
             .abi_encode_params(),
     );
+    code.extend(GRACE_ARGS.abi_encode_params());
     let registry = deploy(&deployer, code).await;
 
     // Forwards everything to anvil but answers the first receipt read 429,
@@ -1269,6 +1364,7 @@ async fn dkg_results_on_anvil() {
         )
             .abi_encode_params(),
     );
+    code.extend(GRACE_ARGS.abi_encode_params());
     let registry = deploy(&deployer, code).await;
     let c = Contracts::new(std::slice::from_ref(&url), registry, Some(&secret))
         .await
@@ -1384,6 +1480,13 @@ async fn dkg_results_on_anvil() {
         .unwrap();
     let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await.unwrap();
     assert_eq!(c.process(&pid).await.unwrap().status, ProcessStatus::Ready);
+    // Past the end, inside the grace window.
+    let e = c
+        .request_results_decryption(&pid, &acc, &sibs)
+        .await
+        .unwrap_err();
+    assert_eq!(name(e), "GraceOpen");
+    advance(&rpc, 60).await;
     // Observers never send.
     let e = observer
         .request_results_decryption(&pid, &acc, &sibs)
@@ -1516,6 +1619,7 @@ async fn dkg_results_on_anvil() {
     .unwrap();
     assert_eq!(st2.committed().root, p2.state_root);
     org.end_process(&pid2).await.unwrap();
+    advance(&rpc, u64::from(GRACE_ARGS.0)).await;
     let (acc2, sibs2) = st2.dkg_results_inputs().unwrap();
     c.request_results_decryption(&pid2, &acc2.map(|x| u256_to_be(&x)), &sibs2)
         .await

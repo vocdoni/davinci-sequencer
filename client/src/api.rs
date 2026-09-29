@@ -697,6 +697,9 @@ pub struct ProcessView {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_state_root: Option<[u8; 32]>,
+    /// This node's committed root equals the on-chain root. Absent on old nodes.
+    #[serde(default)]
+    pub synced: bool,
     pub voters_count: u64,
     pub overwritten_votes_count: u64,
     pub max_voters: u64,

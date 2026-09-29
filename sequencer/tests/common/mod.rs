@@ -25,8 +25,8 @@ pub use davinci_sequencer::keys::KeyStore;
 pub use davinci_sequencer::monitor::{Node, spawn_node};
 pub use davinci_sequencer::storage::{Db, LocalStatus, VoteStatus};
 pub use davinci_sequencer::web3::{
-    BlobSource, DkgState, EventKind, KeyMode, OnchainCensus, OnchainProcess, ProcessStatus,
-    RegistryEvent, RevertReason, TxReceipt, Web3Error,
+    BlobSource, DkgState, EventKind, GraceParams, KeyMode, OnchainCensus, OnchainProcess,
+    ProcessStatus, RegistryEvent, RevertReason, TxReceipt, Web3Error,
 };
 pub use davinci_state::{CensusOrigin, ProcessConfig, VerifiedVote, VotePackage, genesis_root};
 pub use davinci_zkvm_sdk::ballot::{
@@ -53,6 +53,14 @@ pub use tokio_util::sync::CancellationToken;
 
 pub const T0: u64 = 1_700_000_000;
 pub const DURATION: u64 = 100_000;
+/// The fake registry's grace immutables (the production floor and default).
+pub const GRACE: GraceParams = GraceParams {
+    default_grace: 150,
+    grace_floor: 150,
+    grace_ceil: 600,
+    grace_max_total: 1800,
+    notice_min: 60,
+};
 
 // ---------------------------------------------------------------- harness
 
@@ -238,6 +246,7 @@ type DkgRequest = ([[u8; 32]; 64], Vec<[u8; 32]>);
 
 pub struct Inner {
     proc: OnchainProcess,
+    grace: GraceParams,
     events: Vec<RegistryEvent>,
     block: u64,
     time: u64,
@@ -331,9 +340,12 @@ impl FakeChain {
             },
             key_mode: KeyMode::Sequencer,
             dkg: DkgState::default(),
+            grace: GRACE.default_grace,
+            last_vote_at: 0,
         };
         let inner = Inner {
             proc,
+            grace: GRACE,
             events: vec![RegistryEvent {
                 block: 2,
                 tx_hash: B256::with_last_byte(1),
@@ -437,6 +449,54 @@ impl FakeChain {
         i.events.push(ev);
     }
 
+    /// The organizer moves the end to `new_end` (a shorten or an extension).
+    pub fn set_end(&self, new_end: u64) {
+        let mut i = self.inner.lock().unwrap();
+        i.proc.duration = new_end - i.proc.start_time;
+        push_duration(&mut i);
+    }
+
+    /// The organizer sets the process grace (`ProcessGraceChanged`).
+    pub fn set_grace(&self, grace: u64) {
+        let mut i = self.inner.lock().unwrap();
+        i.proc.grace = grace;
+        i.block += 1;
+        let block = i.block;
+        i.events.push(RegistryEvent {
+            block,
+            tx_hash: B256::with_last_byte(8),
+            log_index: 0,
+            kind: EventKind::GraceChanged {
+                pid: pid31(),
+                grace,
+            },
+        });
+    }
+
+    pub fn grace_params(&self) -> GraceParams {
+        self.inner.lock().unwrap().grace
+    }
+
+    /// `getProcessGraceEnd`.
+    pub fn grace_end(&self) -> u64 {
+        grace_end(&self.inner.lock().unwrap())
+    }
+
+    pub fn end_time(&self) -> u64 {
+        self.inner.lock().unwrap().proc.end_time()
+    }
+
+    pub fn last_vote_at(&self) -> u64 {
+        self.inner.lock().unwrap().proc.last_vote_at
+    }
+
+    /// Moves the head to the grace end: the window just closed.
+    pub fn pass_grace(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.time = i.time.max(grace_end(&i));
+        i.block += 1;
+    }
+
     pub fn voters(&self) -> u64 {
         self.inner.lock().unwrap().proc.voters_count
     }
@@ -445,10 +505,16 @@ impl FakeChain {
         self.inner.lock().unwrap().proc.results.clone()
     }
 
+    /// Like `setProcessStatus`: ENDED before the end collapses it to now
+    /// (`DurationChanged` first).
     pub fn set_status(&self, s: ProcessStatus) {
         let mut i = self.inner.lock().unwrap();
         let old = i.proc.status;
         i.proc.status = s;
+        if s == ProcessStatus::Ended && i.time < i.proc.end_time() {
+            i.proc.duration = i.time.saturating_sub(i.proc.start_time);
+            push_duration(&mut i);
+        }
         i.block += 1;
         let ev = RegistryEvent {
             block: i.block,
@@ -681,10 +747,30 @@ impl FakeChain {
     }
 }
 
+// `ProcessDurationChanged` in a new block.
+fn push_duration(i: &mut Inner) {
+    i.block += 1;
+    let (block, duration) = (i.block, i.proc.duration);
+    i.events.push(RegistryEvent {
+        block,
+        tx_hash: B256::with_last_byte(4),
+        log_index: 0,
+        kind: EventKind::DurationChanged {
+            pid: pid31(),
+            duration,
+        },
+    });
+}
+
+fn grace_end(i: &Inner) -> u64 {
+    i.proc.grace_end(i.grace.grace_max_total)
+}
+
 // Another sequencer's transition of `b` lands; returns its block.
 fn settle_foreign(i: &mut Inner, b: &davinci_state::PreparedBatch) -> u64 {
     assert_eq!(b.old_root, i.proc.state_root);
     i.proc.state_root = b.new_root;
+    i.proc.last_vote_at = i.time;
     i.proc.voters_count += b.expected.voters as u64;
     i.proc.overwritten_count += b.expected.overwrites as u64;
     i.proc.batch_number += 1;
@@ -833,12 +919,18 @@ pub fn revert(name: &str) -> RevertReason {
     }
 }
 
-/// The contract checks: window open, status READY and root continuity.
+/// The contract checks: READY or ENDED (or PAUSED past the end), the
+/// window `[start, graceEnd)`, root continuity and a non-empty batch.
 pub fn check_transition(i: &Inner, p: &BatchPublics) -> Result<(), RevertReason> {
-    if i.proc.status != ProcessStatus::Ready || i.time >= i.proc.start_time + i.proc.duration {
+    let settles = match i.proc.status {
+        ProcessStatus::Ready | ProcessStatus::Ended => true,
+        ProcessStatus::Paused => i.time >= i.proc.end_time(),
+        _ => false,
+    };
+    if !settles {
         return Err(revert("InvalidStatus"));
     }
-    if i.time < i.proc.start_time {
+    if i.time < i.proc.start_time || i.time >= grace_end(i) {
         return Err(revert("InvalidTimeBounds"));
     }
     if p.root_before != i.proc.state_root {
@@ -848,6 +940,9 @@ pub fn check_transition(i: &Inner, p: &BatchPublics) -> Result<(), RevertReason>
         && p.census_root != want
     {
         return Err(revert("InvalidCensusRoot"));
+    }
+    if p.voters == 0 && p.overwrites == 0 {
+        return Err(revert("EmptyTransition"));
     }
     Ok(())
 }
@@ -972,6 +1067,7 @@ impl Chain for FakeChain {
         check_transition(&i, &p).map_err(Web3Error::Revert)?;
         i.last_census_root = Some(p.census_root);
         i.proc.state_root = p.root_after;
+        i.proc.last_vote_at = i.time;
         i.proc.voters_count += p.voters as u64;
         i.proc.overwritten_count += p.overwrites as u64;
         i.proc.batch_number += 1;
@@ -1029,11 +1125,19 @@ impl Chain for FakeChain {
             return Err(Web3Error::Revert(revert(&name)));
         }
         // Like the registry: results are accepted once ended, explicitly
-        // or by the clock (a paused process past its end included).
-        let ended_by_time = i.time >= i.proc.start_time + i.proc.duration
-            && matches!(i.proc.status, ProcessStatus::Ready | ProcessStatus::Paused);
-        if i.proc.status != ProcessStatus::Ended && !ended_by_time {
+        // or by the clock (a paused process past its end included), and
+        // the grace window closed.
+        if matches!(
+            i.proc.status,
+            ProcessStatus::Canceled | ProcessStatus::Results
+        ) {
             return Err(Web3Error::Revert(revert("InvalidStatus")));
+        }
+        if !ended(&i) {
+            return Err(Web3Error::Revert(revert("InvalidTimeBounds")));
+        }
+        if i.time < grace_end(&i) {
+            return Err(Web3Error::Revert(revert("GraceOpen")));
         }
         if p.state_root != i.proc.state_root {
             return Err(Web3Error::Revert(revert("InvalidStateRoot")));
@@ -1099,6 +1203,9 @@ impl Chain for FakeChain {
         if !ended(&i) {
             return r("InvalidTimeBounds");
         }
+        if i.time < grace_end(&i) {
+            return r("GraceOpen");
+        }
         let mut h = Sha256::new();
         for c in accumulator {
             h.update(c);
@@ -1147,6 +1254,9 @@ impl Chain for FakeChain {
         }
         if !i.proc.dkg.requested {
             return r("ResultsNotReady");
+        }
+        if i.time < grace_end(&i) {
+            return r("GraceOpen");
         }
         let Some(mut results) = i.dkg_plaintexts.clone() else {
             return r("ResultsNotReady");
@@ -1273,6 +1383,8 @@ pub struct FakeProver {
     pub call_times: Mutex<Vec<tokio::time::Instant>>,
     /// Vote count of each batch proof requested, in order.
     pub sizes: Mutex<Vec<usize>>,
+    /// Proving seconds the fake reports (the service's `elapsed_ms`).
+    pub reported: Mutex<Option<f64>>,
 }
 
 impl FakeProver {
@@ -1291,6 +1403,7 @@ impl FakeProver {
             fail_batches_permanent: Mutex::new(0),
             call_times: Mutex::new(Vec::new()),
             sizes: Mutex::new(Vec::new()),
+            reported: Mutex::new(None),
         })
     }
 
@@ -1333,7 +1446,7 @@ impl Prover for FakeProver {
         &self,
         request: &ProveRequest,
         expected: &BatchPublics,
-    ) -> Result<(BatchPublics, PlonkSnark), ProverError> {
+    ) -> Result<(BatchPublics, PlonkSnark, Option<f64>), ProverError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.sizes.lock().unwrap().push(request.proofs.len());
         self.call_times
@@ -1374,6 +1487,7 @@ impl Prover for FakeProver {
                 public_values: encode_batch(&p),
                 proof_bytes: vec![0u8; 768],
             },
+            *self.reported.lock().unwrap(),
         ))
     }
 
@@ -1528,6 +1642,7 @@ pub async fn start_node_tracked(
         prover,
         blobs: Arc::new(FakeBlobs(chain.inner.clone())),
         clock: Arc::new(FakeClock(chain.inner.clone())),
+        grace: chain.grace_params(),
         tasks: tasks.clone(),
     };
     (spawn_node(cfg, deps, shutdown).await.unwrap(), tasks)

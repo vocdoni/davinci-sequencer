@@ -36,6 +36,31 @@
         "name": "_dkgManager",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "_defaultGrace",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "_graceFloor",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "_graceCeil",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "_graceMaxTotal",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "_noticeMin",
+        "type": "uint32",
+        "internalType": "uint32"
       }
     ],
     "stateMutability": "nonpayable"
@@ -101,6 +126,19 @@
   {
     "type": "function",
     "name": "chainID",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "defaultGrace",
     "inputs": [],
     "outputs": [
       {
@@ -455,6 +493,23 @@
             "name": "dkgAid",
             "type": "bytes32",
             "internalType": "bytes32"
+          },
+          {
+            "name": "window",
+            "type": "tuple",
+            "internalType": "struct DAVINCITypes.GraceWindow",
+            "components": [
+              {
+                "name": "grace",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "lastVoteAt",
+                "type": "uint64",
+                "internalType": "uint64"
+              }
+            ]
           }
         ]
       }
@@ -464,6 +519,25 @@
   {
     "type": "function",
     "name": "getProcessEndTime",
+    "inputs": [
+      {
+        "name": "processId",
+        "type": "bytes31",
+        "internalType": "bytes31"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getProcessGraceEnd",
     "inputs": [
       {
         "name": "processId",
@@ -502,6 +576,45 @@
         "name": "",
         "type": "bytes32",
         "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "graceCeil",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "graceFloor",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "graceMaxTotal",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
       }
     ],
     "stateMutability": "view"
@@ -687,6 +800,19 @@
       }
     ],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "noticeMin",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -934,6 +1060,16 @@
         "name": "dkgAid",
         "type": "bytes32",
         "internalType": "bytes32"
+      },
+      {
+        "name": "grace",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "lastVoteAt",
+        "type": "uint64",
+        "internalType": "uint64"
       }
     ],
     "stateMutability": "view"
@@ -1063,6 +1199,24 @@
         "name": "_duration",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "setProcessGrace",
+    "inputs": [
+      {
+        "name": "processId",
+        "type": "bytes31",
+        "internalType": "bytes31"
+      },
+      {
+        "name": "grace",
+        "type": "uint32",
+        "internalType": "uint32"
       }
     ],
     "outputs": [],
@@ -1260,6 +1414,25 @@
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ProcessGraceChanged",
+    "inputs": [
+      {
+        "name": "processId",
+        "type": "bytes31",
+        "indexed": true,
+        "internalType": "bytes31"
+      },
+      {
+        "name": "grace",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
       }
     ],
     "anonymous": false
@@ -1491,6 +1664,16 @@
   },
   {
     "type": "error",
+    "name": "EmptyTransition",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "GraceOpen",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "InvalidAccumulator",
     "inputs": []
   },
@@ -1558,6 +1741,11 @@
   {
     "type": "error",
     "name": "InvalidEncryptionKey",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidGrace",
     "inputs": []
   },
   {

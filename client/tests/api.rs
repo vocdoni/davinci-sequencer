@@ -290,6 +290,7 @@ fn view(m: BallotMode) -> ProcessView {
         },
         state_root: [4; 32],
         local_state_root: None,
+        synced: false,
         voters_count: 2,
         overwritten_votes_count: 1,
         max_voters: 100,
@@ -538,6 +539,8 @@ fn onchain(v: &ProcessView) -> OnchainProcess {
         metadata_uri: String::new(),
         metadata_hash: [0; 32],
         dkg: None,
+        grace: 0,
+        last_vote_at: 0,
     }
 }
 

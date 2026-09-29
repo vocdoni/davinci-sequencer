@@ -27,6 +27,9 @@ pub struct ProveModel(Mutex<HashMap<u8, f64>>);
 impl ProveModel {
     /// Floor of one observation, seconds per vote.
     pub const FLOOR: f64 = 0.05;
+    /// Ceiling of one observation, in seeds: a stalled job must not size
+    /// the rest of the window's batches to nothing.
+    pub const CEIL_SEEDS: f64 = 60.0;
 
     /// Seed before the first proof of `nf` fields: about twice an RTX 5090.
     pub fn seed(nf: u8) -> f64 {
@@ -44,12 +47,13 @@ impl ProveModel {
     }
 
     /// A proof of `n` votes took `secs`:
-    /// `spv ← 0.7·spv + 0.3·max(FLOOR, (secs − base)/n)`.
+    /// `spv ← 0.7·spv + 0.3·clamp((secs − base)/n, FLOOR, CEIL_SEEDS·seed)`.
     pub fn observe(&self, nf: u8, n: usize, secs: f64, base: f64) {
         if n == 0 {
             return;
         }
-        let sample = ((secs - base) / n as f64).max(Self::FLOOR);
+        let sample =
+            ((secs - base) / n as f64).clamp(Self::FLOOR, Self::CEIL_SEEDS * Self::seed(nf));
         let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let spv = m.entry(nf).or_insert_with(|| Self::seed(nf));
         *spv = 0.7 * *spv + 0.3 * sample;

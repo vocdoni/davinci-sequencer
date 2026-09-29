@@ -198,8 +198,10 @@ async fn duplicate_vote_settles_once() {
     shutdown.cancel();
 }
 
+/// An organizer END no longer closes out: the batch in flight lands in the
+/// grace, admission closes at the (collapsed) end.
 #[tokio::test]
-async fn process_closed_during_flight() {
+async fn end_event_flushes_instead_of_closing() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
@@ -216,7 +218,6 @@ async fn process_closed_during_flight() {
     )
     .await;
     let h = handle(&node).await;
-    let genesis = genesis_root(&s.env.cfg).unwrap();
 
     let votes: Vec<VerifiedVote> = (0..2)
         .map(|i| fake_vote(&s.env, i, &[1, 0], 30 + i as u64))
@@ -232,28 +233,19 @@ async fn process_closed_during_flight() {
         h.snapshot().await.unwrap().status == ProcessStatus::Ended
     })
     .await;
-    prover.release(100);
-    wait_until("votes errored", async || {
-        for vid in &vids {
-            match h.status(*vid).await.unwrap() {
-                Some(v) if v.status == VoteStatus::Error => {}
-                _ => return false,
-            }
-        }
-        true
-    })
-    .await;
-    let sv = h.status(vids[0]).await.unwrap().unwrap();
-    assert!(sv.error.unwrap().contains("closed"), "wrong error");
-    // The local state rolled back to the committed (genesis) root.
-    let snap = h.snapshot().await.unwrap();
-    assert_eq!(snap.root, genesis);
-    assert!(!snap.in_flight);
-    assert_eq!(snap.pending, 0);
-    assert_eq!(s.chain.voters(), 0);
     // New votes are refused.
     let late = fake_vote(&s.env, 3, &[1, 1], 99);
     assert!(matches!(h.submit(late).await, Err(ActorError::Closed(_))));
+    prover.release(100);
+    wait_until("settled in the grace", async || {
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    let snap = h.snapshot().await.unwrap();
+    assert!(!snap.in_flight);
+    assert_eq!(snap.pending, 0);
+    assert!(snap.synced);
     shutdown.cancel();
 }
 
@@ -355,9 +347,13 @@ async fn deadline_margin_blocks_sealing() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(prover.calls(), 0);
     assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
-    // Past the end the pending vote becomes an error.
+    // Past the end it still waits: the grace may extend.
     s.chain.advance_time(DURATION + 1);
-    wait_until("vote errored at end", async || {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    // Once the grace closes the pending vote becomes an error.
+    s.chain.pass_grace();
+    wait_until("vote errored at grace end", async || {
         vote_status(&h, vid).await == Some(VoteStatus::Error)
     })
     .await;
@@ -396,6 +392,7 @@ async fn finalize_with_key_sets_results() {
     }
     wait_until("settled", async || all_settled(&h, &vids).await).await;
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     wait_until("results on chain", async || !s.chain.results().is_empty()).await;
     let mut want = vec![0u64; 16];
     want[0] = 3;
@@ -444,6 +441,7 @@ async fn paused_past_end_still_finalizes() {
     // Paused, then the window closes: finalize must still fire.
     s.chain.set_status(ProcessStatus::Paused);
     s.chain.advance_time(DURATION + 1);
+    s.chain.pass_grace();
     wait_until("results on chain", async || !s.chain.results().is_empty()).await;
     wait_until("finalized", async || {
         h.snapshot().await.unwrap().local == LocalStatus::Finalized
@@ -584,9 +582,9 @@ async fn pause_the_node_has_not_seen_requeues_too() {
 }
 
 /// A batch refused by a pause, then the process ends instead of resuming:
-/// the requeued votes get the usual end, `process closed`.
+/// pause defers, so the requeued vote settles in the grace.
 #[tokio::test]
-async fn pause_then_end_closes_the_requeued_votes() {
+async fn end_from_paused_flushes() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
@@ -619,13 +617,12 @@ async fn pause_then_end_closes_the_requeued_votes() {
     })
     .await;
     s.chain.set_status(ProcessStatus::Ended);
-    wait_until("vote closed", async || {
-        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    prover.release(100);
+    wait_until("settled in the grace", async || {
+        all_settled(&h, &[vid]).await
     })
     .await;
-    let sv = h.status(vid).await.unwrap().unwrap();
-    assert!(sv.error.unwrap().contains("closed"), "wrong error");
-    assert_eq!(s.chain.voters(), 0);
+    assert_eq!(s.chain.voters(), 1);
     shutdown.cancel();
 }
 
@@ -764,6 +761,7 @@ async fn does_not_finalize(s: TestSetup) {
     h.submit(v).await.unwrap();
     wait_until("settled", async || all_settled(&h, &[vid]).await).await;
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(s.chain.results().is_empty());
     assert_ne!(h.snapshot().await.unwrap().local, LocalStatus::Finalized);
@@ -1108,6 +1106,9 @@ async fn stale_root_revert_settles(fail_read: bool, lost: u64) {
     let h = handle(&node).await;
     s.chain.revert_simulates("InvalidStateRoot", 1);
     if fail_read {
+        // After the boot read of the landing time, so the revert arm's
+        // read is the one that fails.
+        beats().await;
         s.chain.fail_process(1);
     }
     let v = fake_vote(&s.env, 0, &[1, 2], 5);
@@ -1236,6 +1237,7 @@ async fn restart_persists_root_and_finalizes() {
     assert!(all_settled(&h2, &vids).await);
     assert_eq!(h2.snapshot().await.unwrap().root, s.chain.root());
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     wait_until("results on chain", async || !s.chain.results().is_empty()).await;
     let mut want = vec![0u64; 16];
     want[0] = 3;
@@ -1272,6 +1274,7 @@ async fn finalize_rearms_after_transient_failure() {
     h.submit(v).await.unwrap();
     wait_until("settled", async || all_settled(&h, &[vid]).await).await;
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     // The first attempt fails transiently; after the ~2s cooldown a fresh
     // attempt succeeds.
     wait_until("results on chain", async || !s.chain.results().is_empty()).await;
@@ -2750,6 +2753,7 @@ async fn results_revert_on_reopened_window_rearms() {
     wait_until("settled", async || all_settled(&h, &[vid]).await).await;
     s.chain.revert_results_once("InvalidTimeBounds");
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     // The first broadcast reverts; after the cooldown a fresh attempt lands.
     wait_until("results on chain", async || !s.chain.results().is_empty()).await;
     wait_until("finalized", async || {
@@ -2759,12 +2763,12 @@ async fn results_revert_on_reopened_window_rearms() {
     shutdown.cancel();
 }
 
-/// A duration extension that lands while the results proof
-/// is in flight must keep the plaintext tally out of the mempool entirely.
-/// The pre-broadcast window re-check in `finalize.rs` catches it before
-/// `submit_results`; the node finalizes only once the new end passes.
+/// Eager results: proved during the grace at the quiescent root and held.
+/// Another sequencer's landing moves the root (and the grace end): the held
+/// proof is dropped and redone, then submitted once the grace ends. An
+/// `InvalidStateRoot` on that submit is transient and reuses the proof.
 #[tokio::test]
-async fn extension_during_results_proof_blocks_broadcast() {
+async fn eager_results_submits_at_grace_end_reproves_on_root_move() {
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
     let pk = node_key(&db);
@@ -2783,29 +2787,47 @@ async fn extension_during_results_proof_blocks_broadcast() {
     )
     .await;
     let h = handle(&node).await;
-    let v = fake_vote(&s.env, 0, &[1, 2], 40);
-    let vid = v.pkg.vote_id;
-    h.submit(v).await.unwrap();
-    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
-    // Close the window by time; the results proof hangs on the gate.
     prover.gate_results();
     s.chain.advance_time(DURATION + 1);
-    wait_until("results proving", async || prover.results_calls() == 1).await;
-    // The organizer extends the election while the proof is in flight,
-    // then the proof completes: the re-check must stop the broadcast.
-    s.chain.extend_duration(500_000);
-    prover.release_results(10);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    assert_eq!(s.chain.results_submits(), 0, "tally broadcast while open");
-    assert_ne!(h.snapshot().await.unwrap().local, LocalStatus::Finalized);
-    // Once the extended window closes too, finalize goes through.
-    s.chain.advance_time(500_000);
+    wait_until("eager proof", async || prover.results_calls() == 1).await;
+    // Another sequencer lands in the grace while the proof runs.
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let theirs = [
+        fake_vote(&s.env, 0, &[1, 2], 40),
+        fake_vote(&s.env, 1, &[2, 3], 41),
+    ];
+    let b = other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(3), &Default::default())
+        .unwrap();
+    s.chain.advance_time(60);
+    s.chain.settle_externally(&b);
+    wait_until("synced", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    prover.release_results(2);
+    wait_until("proved again", async || prover.results_calls() == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(s.chain.results_submits(), 0, "tally broadcast in the grace");
+    // Held until the grace end the landing moved.
+    assert_eq!(
+        s.chain.grace_end(),
+        T0 + DURATION + 61 + GRACE.default_grace
+    );
+    s.chain.revert_results_once("InvalidStateRoot");
+    s.chain.pass_grace();
     wait_until("results on chain", async || !s.chain.results().is_empty()).await;
     wait_until("finalized", async || {
         h.snapshot().await.unwrap().local == LocalStatus::Finalized
     })
     .await;
-    assert_eq!(s.chain.results_submits(), 1);
+    let mut want = vec![0u64; 16];
+    want[0] = 3;
+    want[1] = 5;
+    assert_eq!(s.chain.results(), want);
+    assert_eq!(s.chain.results_submits(), 2);
+    assert_eq!(prover.results_calls(), 2, "the held proof was reused");
     shutdown.cancel();
 }
 
@@ -2852,6 +2874,7 @@ async fn dkg_node_ended(
     } else {
         s.chain.set_status(ProcessStatus::Ended);
     }
+    s.chain.pass_grace();
     (s, node, h, shutdown, dir)
 }
 
@@ -3009,6 +3032,7 @@ async fn two_dkg_nodes_send_each_call_once() {
     })
     .await;
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     wait_until("decryption requested", async || {
         s.chain.dkg_calls().0.0 == 1
     })
@@ -3060,6 +3084,7 @@ async fn dkg_request_seen_after_the_pause_is_not_sent() {
     // before its second, the one right before sending.
     s.chain.race_dkg_request_on_read(2);
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     wait_until("the other request seen", async || {
         s.chain.dkg_state().requested
     })
@@ -3219,6 +3244,7 @@ async fn dkg_lagging_root_holds_the_request() {
     s.chain.hide_block(Some(s.chain.head_block() + 1));
     s.chain.settle_externally(&b);
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(s.chain.dkg_calls(), ((0, 0), (0, 0)));
     assert_ne!(h.snapshot().await.unwrap().root, s.chain.root());
@@ -3546,8 +3572,16 @@ async fn requeue_preserves_age_and_order_across_restart() {
     shutdown2.cancel();
 }
 
-/// Near the end the proving-time budget caps the batch below the queue;
-/// once not even one vote fits, nothing seals and the end errors the rest.
+// ~10 s per vote at nf 2 (prove_base 30 s).
+fn slow(node: &Node) {
+    for _ in 0..60 {
+        node.metrics.prove.observe(2, 1, 40.0, 30.0);
+    }
+}
+
+/// In the grace the budget sizes a batch to land before the grace end, and
+/// each landing moves that end: 70 s left fits 4 votes, the landing's fresh
+/// 150 s fits the rest.
 #[tokio::test]
 async fn budget_shrinks_flush_batches() {
     let s = setup(2, 8, None);
@@ -3565,43 +3599,59 @@ async fn budget_shrinks_flush_batches() {
         shutdown.clone(),
     )
     .await;
-    let votes: Vec<VerifiedVote> = (0..5)
+    let votes: Vec<VerifiedVote> = (0..8)
         .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
         .collect();
     let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
     for v in votes {
         h.submit(v).await.unwrap();
     }
-    // ~30 s per vote (prove_base 30 s).
-    let slow = || {
-        for _ in 0..60 {
-            node.metrics.prove.observe(2, 1, 60.0, 30.0);
-        }
-    };
-    slow();
-    beats().await;
-    assert_eq!(prover.calls(), 0);
-    // 100 s left: 100 - 30 base = 70 s, two votes fit.
-    s.chain.advance_time(DURATION - 100);
+    slow(&node);
+    // Paused until 80 s past the end: the grace end (end + 150) binds.
+    s.chain.set_status(ProcessStatus::Paused);
+    s.chain.advance_time(DURATION + 80);
     wait_until("all settled", async || all_settled(&h, &vids).await).await;
-    let sizes = prover.sizes();
-    assert_eq!(sizes[0], 2, "budget-capped first batch: {sizes:?}");
-    assert!(sizes.iter().all(|&n| n >= 1));
-    // 40 s left: 10 s after the base, no vote fits.
-    slow();
-    s.chain.advance_time(60);
-    let v = fake_vote(&s.env, 5, &[1, 2], 200);
-    let vid = v.pkg.vote_id;
-    h.submit(v).await.unwrap();
-    beats().await;
-    assert_eq!(prover.sizes(), sizes);
-    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
-    s.chain.advance_time(41);
-    wait_until("errored at end", async || {
-        vote_status(&h, vid).await == Some(VoteStatus::Error)
-    })
+    assert_eq!(prover.sizes(), vec![4, 4]);
+    assert_eq!(s.chain.last_vote_at(), T0 + DURATION + 80);
+    shutdown.cancel();
+}
+
+/// Far from the end a batch is still sized to survive the earliest legal
+/// close, an END now under the floor grace: 150 − 30 s fits 12 votes, and
+/// the END right after sealing still lands them.
+#[tokio::test]
+async fn budget_respects_worst_case_close() {
+    let s = setup(2, 16, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        20,
+        TIMERS,
+        shutdown.clone(),
+    )
     .await;
-    assert_eq!(prover.sizes(), sizes);
+    let votes: Vec<VerifiedVote> = (0..15)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    slow(&node);
+    s.chain.advance_time(115);
+    wait_until("sealed", async || prover.calls() == 1).await;
+    assert_eq!(prover.sizes(), vec![12]);
+    s.chain.set_status(ProcessStatus::Ended);
+    s.chain.advance_time(149);
+    prover.release(10);
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![12, 3]);
     shutdown.cancel();
 }
 
@@ -3620,6 +3670,11 @@ async fn ewma_update_rule() {
     m.observe(4, 10, 1.0, 30.0); // faster than the base: floored
     assert!((m.spv(4) - (0.7 * before + 0.3 * ProveModel::FLOOR)).abs() < 1e-12);
     assert_eq!(m.spv(8), 0.4, "per field count");
+    // A stalled job counts as at most CEIL_SEEDS seeds per vote.
+    let before = m.spv(4);
+    m.observe(4, 1, 1830.0, 30.0);
+    let ceil = ProveModel::CEIL_SEEDS * ProveModel::seed(4);
+    assert!((m.spv(4) - (0.7 * before + 0.3 * ceil)).abs() < 1e-12);
     assert!((m.estimate(4, 3, 30.0) - (30.0 + 3.0 * m.spv(4))).abs() < 1e-12);
 
     // Wiring: a job's proving seconds, on the node clock, update the model.
@@ -3634,11 +3689,53 @@ async fn ewma_update_rule() {
     let vid = v.pkg.vote_id;
     h.submit(v).await.unwrap();
     wait_until("proving", async || prover.calls() == 1).await;
-    s.chain.advance_time(130);
+    s.chain.advance_time(40);
     prover.release(1);
     wait_until("settled", async || all_settled(&h, &[vid]).await).await;
     let spv = node.metrics.prove.spv(2);
-    assert!((spv - (0.7 * 0.2 + 0.3 * 100.0)).abs() < 1e-9, "spv {spv}");
+    assert!((spv - (0.7 * 0.2 + 0.3 * 10.0)).abs() < 1e-9, "spv {spv}");
+    // The prover's own proving time wins over the wall time (queue wait).
+    *prover.reported.lock().unwrap() = Some(31.0);
+    let v = fake_vote(&s.env, 1, &[1, 2], 6);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("proving", async || prover.calls() == 2).await;
+    s.chain.advance_time(1800);
+    prover.release(1);
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    let want = 0.7 * spv + 0.3 * 1.0;
+    let got = node.metrics.prove.spv(2);
+    assert!((got - want).abs() < 1e-9, "spv {got}");
+    shutdown.cancel();
+}
+
+/// A job stalled behind the prover's queue must not starve the window: with
+/// no proving time reported, the capped observation still fits a vote.
+#[tokio::test]
+async fn stalled_job_does_not_starve_the_window() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    for _ in 0..60 {
+        node.metrics.prove.observe(2, 1, 1830.0, 30.0);
+    }
+    s.chain.advance_time(DURATION - 100);
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("flushed", async || all_settled(&h, &[vid]).await).await;
     shutdown.cancel();
 }
 
@@ -3725,6 +3822,162 @@ async fn max_voters_loser_errors_promptly() {
     shutdown.cancel();
 }
 
+/// A revote of a voter whose new slot is still queued reserves no second
+/// slot; a third distinct voter is still refused.
+#[tokio::test]
+async fn revote_of_queued_new_slot_is_not_max_voters() {
+    let s = setup(2, 8, None);
+    s.chain.set_max_voters(2);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    h.submit(fake_vote(&s.env, 0, &[1, 2], 80)).await.unwrap();
+    h.submit(fake_vote(&s.env, 1, &[1, 2], 81)).await.unwrap();
+    h.submit(fake_vote(&s.env, 0, &[2, 2], 82))
+        .await
+        .expect("revote of a queued voter");
+    match h.submit(fake_vote(&s.env, 2, &[1, 2], 83)).await {
+        Err(ActorError::MaxVoters) => {}
+        other => panic!("expected MaxVoters, got {other:?}"),
+    }
+    shutdown.cancel();
+}
+
+/// A resend of a queued vote id is a duplicate even when its slot is at depth.
+#[tokio::test]
+async fn resend_at_full_slot_depth_is_duplicate() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &["--slot-depth", "1"],
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 80);
+    h.submit(v.clone()).await.unwrap();
+    match h.submit(v).await {
+        Err(ActorError::Duplicate(_)) => {}
+        other => panic!("expected Duplicate, got {other:?}"),
+    }
+    shutdown.cancel();
+}
+
+// Voter 0 lands from another sequencer (occupied 1 of 2), voter 1 queues here.
+async fn one_occupied_one_queued(s: &TestSetup, h: &ActorHandle) -> u64 {
+    let v = fake_vote(&s.env, 1, &[1, 2], 91);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let b = other
+        .prepare(
+            &[fake_vote(&s.env, 0, &[2, 2], 92)],
+            &mut StdRng::seed_from_u64(9),
+            &Default::default(),
+        )
+        .unwrap();
+    s.chain.settle_externally(&b);
+    wait_until("synced", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(vote_status(h, vid).await, Some(VoteStatus::Pending));
+    vid
+}
+
+/// Lowering max_voters to the occupied count errors queued new-slot votes
+/// at once.
+#[tokio::test]
+async fn max_voters_lowered_errors_new_slots() {
+    let s = setup(2, 8, None);
+    s.chain.set_max_voters(2);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vid = one_occupied_one_queued(&s, &h).await;
+    s.chain.set_max_voters(1);
+    s.chain.advance_time(0);
+    s.chain.push_event(EventKind::MaxVotersChanged {
+        pid: pid31(),
+        max_voters: 1,
+    });
+    wait_until("errored", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// A restart over a full tree errors the recovered new-slot votes.
+#[tokio::test]
+async fn max_voters_full_on_recover_errors_new_slots() {
+    let s = setup(2, 8, None);
+    s.chain.set_max_voters(2);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vid = one_occupied_one_queued(&s, &h).await;
+    shutdown.cancel();
+    drop((h, node));
+    // The cap drops while the node is down (its event already consumed).
+    s.chain.set_max_voters(1);
+    drop(db);
+    let db = reopen_db(dir.path()).await;
+    let mut rec = db.process(&pid_fr()).unwrap().unwrap();
+    rec.onchain.max_voters = 1;
+    db.put_process(&rec).unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Error));
+    shutdown.cancel();
+}
+
 /// Idle heartbeats with a queue below the capacity estimate and no
 /// deadline due read no storage; a due timer does.
 #[tokio::test]
@@ -3759,5 +4012,515 @@ async fn capacity_trial_skipped_below_estimate() {
     wait_until("timer seal", async || all_settled(&h, &vids).await).await;
     assert!(db.arbo_reads() > reads);
     assert_eq!(prover.sizes(), vec![3]);
+    shutdown.cancel();
+}
+
+// --------------------------------------------------------- grace window
+
+// Sequencer-key results carry all 16 fields.
+fn key_tally(a: u64, b: u64) -> Vec<u64> {
+    let mut t = vec![0u64; 16];
+    (t[0], t[1]) = (a, b);
+    t
+}
+
+/// Two votes for voters `a` and `b`, prepared by another sequencer on the
+/// genesis root.
+fn foreign_batch(s: &TestSetup, a: usize, b: usize) -> davinci_state::PreparedBatch {
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let theirs = [
+        fake_vote(&s.env, a, &[1, 2], 70),
+        fake_vote(&s.env, b, &[2, 3], 71),
+    ];
+    other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(7), &Default::default())
+        .unwrap()
+}
+
+/// Past the end with no event the queue flushes; admission is closed.
+#[tokio::test]
+async fn time_ended_election_flushes_without_event() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    beats().await;
+    assert_eq!(prover.calls(), 0);
+    s.chain.advance_time(DURATION + 1);
+    wait_until("flushed", async || all_settled(&h, &vids).await).await;
+    assert_eq!(s.chain.voters(), 2);
+    assert_eq!(s.chain.status(), ProcessStatus::Ready);
+    assert!(!h.snapshot().await.unwrap().accepting);
+    let late = fake_vote(&s.env, 3, &[1, 1], 99);
+    assert!(matches!(h.submit(late).await, Err(ActorError::Closed(_))));
+    shutdown.cancel();
+}
+
+/// A vote admitted a second before the end lands in the grace, which then
+/// runs from its landing.
+#[tokio::test]
+async fn vote_admitted_at_end_minus_epsilon_settles_in_grace() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    s.chain.advance_time(DURATION - 1);
+    wait_until("head seen", async || prover.calls() == 0).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.advance_time(2);
+    prover.release(1);
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    let end = T0 + DURATION;
+    assert_eq!(s.chain.last_vote_at(), end + 1);
+    assert_eq!(s.chain.grace_end(), end + 1 + GRACE.default_grace);
+    shutdown.cancel();
+}
+
+/// Each landing moves the grace end; once it passes, it is frozen and a
+/// batch still in flight errors.
+#[tokio::test]
+async fn idle_grace_extends_and_freezes() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    let end = T0 + DURATION;
+    s.chain.advance_time(DURATION - 10);
+    beats().await;
+    let votes: Vec<VerifiedVote> = (0..3)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.advance_time(60); // end + 50
+    prover.release(1);
+    wait_until("first", async || all_settled(&h, &vids[..1]).await).await;
+    assert_eq!(s.chain.grace_end(), end + 200);
+    wait_until("resealed", async || prover.calls() == 2).await;
+    s.chain.advance_time(110); // end + 160: past end + grace, not the moved end
+    beats().await;
+    assert_eq!(vote_status(&h, vids[2]).await, Some(VoteStatus::Pending));
+    prover.release(1);
+    wait_until("second", async || all_settled(&h, &vids[..2]).await).await;
+    assert_eq!(s.chain.grace_end(), end + 310);
+    wait_until("third sealed", async || prover.calls() == 3).await;
+    s.chain.pass_grace();
+    beats().await;
+    prover.release(1);
+    wait_until("third errored", async || {
+        vote_status(&h, vids[2]).await == Some(VoteStatus::Error)
+    })
+    .await;
+    let sv = h.status(vids[2]).await.unwrap().unwrap();
+    assert!(sv.error.unwrap().contains("closed"));
+    assert_eq!(s.chain.grace_end(), end + 310, "frozen");
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+/// A backlog wider than one grace drains batch by batch, each landing
+/// buying the next its grace.
+#[tokio::test]
+async fn backlog_drains_across_extended_grace() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 2, &[], shutdown.clone()).await;
+    let votes: Vec<VerifiedVote> = (0..6)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.advance_time(DURATION + 1);
+    for k in 1..=3u64 {
+        s.chain.advance_time(140);
+        prover.release(1);
+        wait_until("landed", async || s.chain.voters() == 2 * k).await;
+        if k < 3 {
+            wait_until("next sealed", async || prover.calls() == k + 1).await;
+        }
+    }
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    assert!(s.chain.last_vote_at() > T0 + DURATION + GRACE.default_grace);
+    shutdown.cancel();
+}
+
+/// Losing a race in the grace: the winner's landing moved the grace end,
+/// and the reseal lands within it, past the original one.
+#[tokio::test]
+async fn lost_race_during_grace_flush_reseals_within_extended_window() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    s.chain.advance_time(DURATION + 100);
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.race_next_submit(foreign_batch(&s, 2, 3));
+    s.chain.advance_time(40); // end + 140
+    prover.release(1);
+    wait_until("resealed", async || prover.calls() == 2).await;
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 1);
+    s.chain.advance_time(100); // end + 240: past end + grace
+    prover.release(1);
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(s.chain.voters(), 4);
+    assert_eq!(s.chain.last_vote_at(), T0 + DURATION + 240);
+    shutdown.cancel();
+}
+
+/// Votes the budget cannot fit before the grace end wait, and error when
+/// it passes.
+#[tokio::test]
+async fn grace_end_errors_leftovers() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let votes: Vec<VerifiedVote> = (0..3)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    slow(&node);
+    // 25 s left: one vote needs 30 + 10.
+    s.chain.set_status(ProcessStatus::Paused);
+    s.chain.advance_time(DURATION + 125);
+    beats().await;
+    assert_eq!(prover.calls(), 0);
+    assert_eq!(vote_status(&h, vids[0]).await, Some(VoteStatus::Pending));
+    s.chain.pass_grace();
+    for vid in &vids {
+        wait_until("errored", async || {
+            vote_status(&h, *vid).await == Some(VoteStatus::Error)
+        })
+        .await;
+    }
+    let sv = h.status(vids[0]).await.unwrap().unwrap();
+    assert!(sv.error.unwrap().contains("closed"));
+    assert_eq!(prover.calls(), 0);
+    shutdown.cancel();
+}
+
+/// Eager results start only once nothing is in flight or pending, and are
+/// submitted at the grace end.
+#[tokio::test]
+async fn eager_trigger_quiescence() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    prover.gate_results();
+    let (_node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    let votes = [
+        fake_vote(&s.env, 0, &[1, 2], 40),
+        fake_vote(&s.env, 1, &[2, 3], 41),
+    ];
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        h.submit(v.clone()).await.unwrap();
+    }
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.advance_time(DURATION + 1);
+    beats().await;
+    assert_eq!(prover.results_calls(), 0, "in flight and pending");
+    prover.release(1);
+    wait_until("second sealed", async || prover.calls() == 2).await;
+    beats().await;
+    assert_eq!(prover.results_calls(), 0, "in flight");
+    prover.release(1);
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    wait_until("eager proof", async || prover.results_calls() == 1).await;
+    prover.release_results(1);
+    beats().await;
+    assert_eq!(s.chain.results_submits(), 0, "tally broadcast in the grace");
+    s.chain.pass_grace();
+    wait_until("results on chain", async || !s.chain.results().is_empty()).await;
+    assert_eq!(s.chain.results(), key_tally(3, 5));
+    assert_eq!(prover.results_calls(), 1);
+    shutdown.cancel();
+}
+
+/// Right after a restart the node is not quiescent: a landing it missed
+/// while down must be synced before the eager proof.
+#[tokio::test]
+async fn eager_waits_for_the_chain_after_recover() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown1 = CancellationToken::new();
+    let prover1 = FakeProver::open();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover1.clone(),
+        1,
+        &[],
+        shutdown1.clone(),
+    )
+    .await;
+    s.chain.advance_time(DURATION + 1);
+    s.chain.set_status(ProcessStatus::Ended);
+    wait_until("eager proof", async || prover1.results_calls() == 1).await;
+    shutdown1.cancel();
+    drop(h);
+    drop(node);
+    drop(db);
+    // Another sequencer lands while this node is down.
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    let db2 = reopen_db(dir.path()).await;
+    let shutdown2 = CancellationToken::new();
+    let prover2 = FakeProver::open();
+    prover2.gate_results();
+    let (_node2, h2) = batching_node(
+        db2,
+        dir.path(),
+        &s,
+        prover2.clone(),
+        1,
+        &[],
+        shutdown2.clone(),
+    )
+    .await;
+    wait_until("proving", async || prover2.results_calls() == 1).await;
+    prover2.release_results(1);
+    wait_until("synced", async || {
+        h2.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    beats().await;
+    s.chain.pass_grace();
+    wait_until("results on chain", async || !s.chain.results().is_empty()).await;
+    assert_eq!(s.chain.results(), key_tally(3, 5));
+    assert_eq!(prover2.results_calls(), 1, "no proof at the stale root");
+    shutdown2.cancel();
+}
+
+/// With eager results off nothing is proved before the grace end.
+#[tokio::test]
+async fn finalize_waits_for_grace_end() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        2,
+        &["--eager-results", "false"],
+        shutdown.clone(),
+    )
+    .await;
+    let votes = [
+        fake_vote(&s.env, 0, &[1, 2], 40),
+        fake_vote(&s.env, 1, &[2, 3], 41),
+    ];
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        h.submit(v.clone()).await.unwrap();
+    }
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    s.chain.set_status(ProcessStatus::Ended);
+    beats().await;
+    assert_eq!(prover.results_calls(), 0);
+    assert_eq!(s.chain.results_submits(), 0);
+    s.chain.pass_grace();
+    wait_until("results on chain", async || !s.chain.results().is_empty()).await;
+    assert_eq!(s.chain.results(), key_tally(3, 5));
+    shutdown.cancel();
+}
+
+/// A pause holds the queue before the end; once the end passes the paused
+/// process flushes through the grace like a ready one.
+#[tokio::test]
+async fn paused_at_end_flushes_through_grace() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    s.chain.set_status(ProcessStatus::Paused);
+    s.chain.advance_time(DURATION - 10); // in the flush horizon
+    beats().await;
+    assert_eq!(prover.calls(), 0, "paused before the end");
+    s.chain.advance_time(20);
+    wait_until("flushed", async || all_settled(&h, &vids).await).await;
+    assert_eq!(s.chain.status(), ProcessStatus::Paused);
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+/// InvalidStatus in the grace requeues the batch; after the grace end the
+/// same revert errors the batch in flight.
+#[tokio::test]
+async fn revert_during_grace_is_transient() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 1, &[], shutdown.clone()).await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.advance_time(DURATION + 10);
+    beats().await;
+    s.chain.revert_simulates("InvalidStatus", 1);
+    prover.release(1);
+    wait_until("requeued and resealed", async || prover.calls() == 2).await;
+    assert_eq!(vote_status(&h, vids[0]).await, Some(VoteStatus::Aggregated));
+    prover.release(1);
+    wait_until("first", async || all_settled(&h, &vids[..1]).await).await;
+    wait_until("second sealed", async || prover.calls() == 3).await;
+    s.chain.pass_grace();
+    beats().await;
+    prover.release(1);
+    wait_until("second errored", async || {
+        vote_status(&h, vids[1]).await == Some(VoteStatus::Error)
+    })
+    .await;
+    let sv = h.status(vids[1]).await.unwrap().unwrap();
+    assert!(sv.error.unwrap().contains("closed"));
+    shutdown.cancel();
+}
+
+/// A shortened end puts the queue in flush mode at once; admission closes
+/// at the new end.
+#[tokio::test]
+async fn shorten_enters_flush_and_closes_admission() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    beats().await;
+    assert_eq!(prover.calls(), 0);
+    s.chain.set_end(T0 + 100);
+    wait_until("flushed", async || all_settled(&h, &[vid0]).await).await;
+    s.chain.advance_time(99);
+    beats().await;
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 6);
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v1).await.unwrap();
+    wait_until("admitted before the new end", async || {
+        all_settled(&h, &[vid1]).await
+    })
+    .await;
+    s.chain.advance_time(2);
+    wait_until("closed", async || !h.snapshot().await.unwrap().accepting).await;
+    let late = fake_vote(&s.env, 2, &[1, 1], 7);
+    assert!(matches!(h.submit(late).await, Err(ActorError::Closed(_))));
     shutdown.cancel();
 }

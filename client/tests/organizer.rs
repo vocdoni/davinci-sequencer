@@ -50,6 +50,9 @@ fn bytecode(artifact: &str) -> Vec<u8> {
     hex::decode(hex.trim_start_matches("0x")).unwrap()
 }
 
+/// Registry grace constructor args: default, floor, ceil, max total, notice.
+const GRACE_ARGS: (u32, u32, u32, u32, u32) = (10, 2, 60, 60, 5);
+
 /// A metadata document nobody fetches: the tests only need its hash.
 const DOC: &[u8] = br#"{"title":{"default":"organizer test"}}"#;
 
@@ -84,6 +87,7 @@ async fn deploy_registry(
         .abi_encode_params();
     let mut code = registry_bytecode();
     code.extend_from_slice(&args);
+    code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
     deploy(p, code).await
 }
 
@@ -158,6 +162,7 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
         .abi_encode_params();
     let mut code = registry_bytecode();
     code.extend_from_slice(&args);
+    code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(url.parse()?);
@@ -230,6 +235,7 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
         },
         state_root: chain.state_root,
         local_state_root: None,
+        synced: false,
         voters_count: 0,
         overwritten_votes_count: 0,
         max_voters: chain.max_voters,
@@ -595,10 +601,12 @@ async fn process_controls() -> anyhow::Result<()> {
     let e = org.resume_process(&pid).await.unwrap_err();
     assert_eq!(reverted(e), "InvalidStatus");
 
-    // The end never moves earlier; max voters can shrink, never to zero.
+    // The end moves earlier only with notice, and must move; max voters
+    // can shrink, never to zero.
+    org.set_process_duration(&pid, 3000).await?;
     let e = org.set_process_duration(&pid, 3000).await.unwrap_err();
     assert_eq!(reverted(e), "InvalidDuration");
-    let e = org.set_process_duration(&pid, 7200).await.unwrap_err();
+    let e = org.set_process_duration(&pid, 1).await.unwrap_err();
     assert_eq!(reverted(e), "InvalidDuration");
     org.set_process_max_voters(&pid, 10).await?;
     let e = org.set_process_max_voters(&pid, 0).await.unwrap_err();
@@ -622,7 +630,7 @@ async fn process_controls() -> anyhow::Result<()> {
     let e = org.resume_process(&pid).await.unwrap_err();
     assert_eq!(reverted(e), "InvalidStatus");
     // Reverts are caught before sending: only the good calls were mined.
-    assert_eq!(org.receipts().len(), 7);
+    assert_eq!(org.receipts().len(), 8);
     Ok(())
 }
 
@@ -660,6 +668,7 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
         )
             .abi_encode_params(),
     );
+    code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
     let registry = deploy(&p, code).await?;
     let info = verify_registry(&url, registry).await?;
     assert!(info.dkg_adapter.is_some(), "registry has a DKG adapter");

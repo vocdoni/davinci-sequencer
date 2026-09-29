@@ -705,6 +705,8 @@ fn placeholder_process() -> crate::web3::OnchainProcess {
         },
         key_mode: crate::web3::KeyMode::Sequencer,
         dkg: crate::web3::DkgState::default(),
+        grace: 0,
+        last_vote_at: 0,
     }
 }
 

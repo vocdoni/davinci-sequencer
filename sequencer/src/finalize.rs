@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use davinci_zkvm_sdk::client::PlonkSnark;
 use davinci_zkvm_sdk::limits::NUM_FIELDS;
 use davinci_zkvm_sdk::publics::{ResultsPublics, results_fail_bits};
 use davinci_zkvm_sdk::release;
@@ -19,8 +20,10 @@ use crate::actor::{Chain, FinalizeFail, Msg, Prover};
 use crate::web3::{ProcessStatus, Web3Error};
 
 /// One finalize attempt: prove the results circuit, check the proof, submit.
-/// The actor owns retries: a transient failure re-arms after a cooldown,
-/// a failed check or a revert latches. Reports through the actor's mailbox.
+/// With `hold` (eager results, window still open) the checked snark goes back
+/// to the actor instead, which submits it once the grace ends. The actor owns
+/// retries: a transient failure re-arms after a cooldown, a failed check or a
+/// revert latches. Reports through the actor's mailbox.
 #[allow(clippy::too_many_arguments)] // a one-shot task, not an API
 pub(crate) async fn run_finalize(
     prover: Arc<dyn Prover>,
@@ -29,17 +32,63 @@ pub(crate) async fn run_finalize(
     request: ResultsRequest,
     expected_root: [u8; 32],
     tally: [u64; NUM_FIELDS],
+    max_total: u64,
+    hold: bool,
     generation: u64,
     tx: mpsc::Sender<Msg>,
 ) {
-    let result =
-        match attempt_once(&*prover, &*chain, &pid31, &request, &expected_root, &tally).await {
-            Ok(()) => {
-                info!(pid = %hex::encode(pid31), "results settled on-chain");
-                Ok(())
+    let attempt = async {
+        if !hold {
+            window_still_closed(&*chain, &pid31, max_total).await?;
+        }
+        let snark = prove_checked(&*prover, &request, &expected_root, &tally).await?;
+        if hold {
+            return Ok(Some(snark));
+        }
+        submit(&*chain, &pid31, &snark, max_total)
+            .await
+            .map(|()| None)
+    };
+    let msg = match attempt.await {
+        Ok(Some(snark)) => {
+            info!(pid = %hex::encode(pid31), "results proved; held until the grace ends");
+            Msg::ResultsHeld {
+                generation,
+                root: expected_root,
+                snark: Box::new(snark),
             }
-            Err(f) => Err(f.into()),
-        };
+        }
+        Ok(None) => {
+            info!(pid = %hex::encode(pid31), "results settled on-chain");
+            Msg::FinalizeDone {
+                generation,
+                result: Ok(()),
+            }
+        }
+        Err(f) => Msg::FinalizeDone {
+            generation,
+            result: Err(f.into()),
+        },
+    };
+    let _ = tx.send(msg).await;
+}
+
+/// Submits a held results snark (the window re-checked first).
+pub(crate) async fn run_submit_held(
+    chain: Arc<dyn Chain>,
+    pid31: [u8; 31],
+    snark: PlonkSnark,
+    max_total: u64,
+    generation: u64,
+    tx: mpsc::Sender<Msg>,
+) {
+    let result = match submit(&*chain, &pid31, &snark, max_total).await {
+        Ok(()) => {
+            info!(pid = %hex::encode(pid31), "held results settled on-chain");
+            Ok(())
+        }
+        Err(f) => Err(f.into()),
+    };
     let _ = tx.send(Msg::FinalizeDone { generation, result }).await;
 }
 
@@ -90,11 +139,19 @@ pub(crate) async fn run_finalize_dkg(
     pid31: [u8; 31],
     inputs: Option<DkgInputs>,
     expected_root: [u8; 32],
+    max_total: u64,
     generation: u64,
     tx: mpsc::Sender<Msg>,
 ) {
     let mut seen = None;
-    let attempt = dkg_attempt(&*chain, &pid31, inputs.as_ref(), &expected_root, &mut seen);
+    let attempt = dkg_attempt(
+        &*chain,
+        &pid31,
+        inputs.as_ref(),
+        &expected_root,
+        max_total,
+        &mut seen,
+    );
     let result = match attempt.await {
         Ok(()) => {
             info!(pid = %hex::encode(pid31), "DKG results on-chain");
@@ -115,6 +172,7 @@ async fn dkg_attempt(
     pid31: &[u8; 31],
     inputs: Option<&DkgInputs>,
     expected_root: &[u8; 32],
+    max_total: u64,
     seen: &mut Option<bool>,
 ) -> Result<(), Fail> {
     let transient = |e: Web3Error| Fail::Transient(e.to_string());
@@ -127,9 +185,8 @@ async fn dkg_attempt(
                 "process is Canceled; not finalizing".into(),
             ));
         }
-        ProcessStatus::Ended => {}
-        _ if now >= p.end_time() => {}
-        _ => return Err(Fail::Transient("election end moved".into())),
+        _ if now >= p.grace_end(max_total) => {}
+        _ => return Err(Fail::Transient("grace window still open".into())),
     }
     *seen = Some(p.dkg.requested);
     if !p.dkg.requested {
@@ -191,7 +248,8 @@ async fn dkg_attempt(
 // A DKG call failed. RESULTS already set (another node won) is done. A
 // race lost to another node's call (`InvalidStatus` once it finalized, or a
 // revert the replay cannot name) is no error: poll again. A window revert
-// (an extension) retries; any other revert latches.
+// (an extension, or a landing that moved the grace end) retries; any other
+// revert latches.
 async fn dkg_fail(
     chain: &dyn Chain,
     pid31: &[u8; 31],
@@ -201,7 +259,7 @@ async fn dkg_fail(
     let (race, window) = match &e {
         Web3Error::Revert(r) => (
             r.name() == Some("InvalidStatus"),
-            r.name() == Some("InvalidTimeBounds"),
+            matches!(r.name(), Some("InvalidTimeBounds" | "GraceOpen")),
         ),
         Web3Error::Lost { .. } => (true, false),
         _ => (false, false),
@@ -223,10 +281,15 @@ async fn dkg_fail(
     })
 }
 
-// The organizer can still extend a time-closed election, and results may
-// already be on-chain. Re-check the window before burning GPU time on the
-// proof and again right before the plaintext tally meets the mempool.
-async fn window_still_closed(chain: &dyn Chain, pid31: &[u8; 31]) -> Result<(), Fail> {
+// The organizer can still extend a time-closed election, a late landing
+// moves the grace end, and results may already be on-chain. Re-check the
+// window before burning GPU time on the proof and again right before the
+// plaintext tally meets the mempool.
+async fn window_still_closed(
+    chain: &dyn Chain,
+    pid31: &[u8; 31],
+    max_total: u64,
+) -> Result<(), Fail> {
     let (_, now) = chain
         .head()
         .await
@@ -236,27 +299,24 @@ async fn window_still_closed(chain: &dyn Chain, pid31: &[u8; 31]) -> Result<(), 
         .await
         .map_err(|e| Fail::Transient(e.to_string()))?;
     match p.status {
-        ProcessStatus::Ended => Ok(()),
         // Results landed (ours or another's) or the process died: nothing
         // to broadcast. Transient, the actor's own gates stop the retries.
         ProcessStatus::Results | ProcessStatus::Canceled => Err(Fail::Transient(format!(
             "process is {:?}; not broadcasting results",
             p.status
         ))),
-        _ if now >= p.end_time() => Ok(()),
-        _ => Err(Fail::Transient("election end moved while proving".into())),
+        _ if now >= p.grace_end(max_total) => Ok(()),
+        _ => Err(Fail::Transient("grace window still open".into())),
     }
 }
 
-async fn attempt_once(
+// Proves the results and checks the snark against the host's own view.
+async fn prove_checked(
     prover: &dyn Prover,
-    chain: &dyn Chain,
-    pid31: &[u8; 31],
     request: &ResultsRequest,
     expected_root: &[u8; 32],
     tally: &[u64; NUM_FIELDS],
-) -> Result<(), Fail> {
-    window_still_closed(chain, pid31).await?;
+) -> Result<PlonkSnark, Fail> {
     // A `failed` proving job fails the same way on every retry; only
     // transport/queue trouble is worth a new attempt.
     let (got, snark) = prover.prove_results(request).await.map_err(|e| {
@@ -295,16 +355,33 @@ async fn attempt_once(
             "root_c_vadcop_final is not the pinned setup".into(),
         ));
     }
-    // An extension may have landed while the proof ran.
-    window_still_closed(chain, pid31).await?;
-    match chain.submit_results(pid31, &snark).await {
+    Ok(snark)
+}
+
+// Submits checked results once the window is still closed.
+async fn submit(
+    chain: &dyn Chain,
+    pid31: &[u8; 31],
+    snark: &PlonkSnark,
+    max_total: u64,
+) -> Result<(), Fail> {
+    // An extension or a late landing may have moved the window meanwhile.
+    window_still_closed(chain, pid31, max_total).await?;
+    match chain.submit_results(pid31, snark).await {
         Ok(_) => Ok(()),
-        // "Not ended / bad time bounds" means an extension raced the
-        // broadcast: transient, the actor re-evaluates after its cooldown.
+        // Window reverts mean an extension or a late landing raced the
+        // broadcast, and a moved root a late foreign transition: transient,
+        // the actor resyncs and re-evaluates after its cooldown.
         Err(Web3Error::Revert(r))
             if matches!(
                 r.name(),
-                Some("InvalidStatus" | "InvalidTimeBounds" | "ProcessNotEnded")
+                Some(
+                    "InvalidStatus"
+                        | "InvalidTimeBounds"
+                        | "ProcessNotEnded"
+                        | "GraceOpen"
+                        | "InvalidStateRoot"
+                )
             ) =>
         {
             Err(Fail::Transient(format!("results reverted: {r}")))

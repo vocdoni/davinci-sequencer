@@ -198,6 +198,10 @@ pub struct OnchainProcess {
     pub census: OnchainCensus,
     pub key_mode: KeyMode,
     pub dkg: DkgState,
+    /// Idle seconds that close the grace window after the end.
+    pub grace: u64,
+    /// Block time of the latest transition; 0 before the first.
+    pub last_vote_at: u64,
 }
 
 impl OnchainProcess {
@@ -205,6 +209,29 @@ impl OnchainProcess {
     pub fn end_time(&self) -> u64 {
         self.start_time.saturating_add(self.duration)
     }
+
+    /// The registry's `_graceEnd`: `min(end + max_total, max(end, last_vote_at) + grace)`,
+    /// `u64::MAX` for an end within `max_total` of it. Transitions land
+    /// before it; results only at or after it.
+    pub fn grace_end(&self, max_total: u64) -> u64 {
+        let end = self.end_time();
+        if end > u64::MAX - max_total {
+            return u64::MAX;
+        }
+        let idle = self.last_vote_at.max(end).saturating_add(self.grace);
+        idle.min(end + max_total)
+    }
+}
+
+/// The registry's grace immutables, read once at boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraceParams {
+    pub default_grace: u64,
+    pub grace_floor: u64,
+    pub grace_ceil: u64,
+    pub grace_max_total: u64,
+    /// Shortest notice for a shortened end.
+    pub notice_min: u64,
 }
 
 /// Parameters of `newProcess`.
@@ -237,6 +264,10 @@ pub enum EventKind {
     DurationChanged {
         pid: [u8; 31],
         duration: u64,
+    },
+    GraceChanged {
+        pid: [u8; 31],
+        grace: u64,
     },
     MaxVotersChanged {
         pid: [u8; 31],
@@ -285,6 +316,7 @@ impl EventKind {
             EventKind::ProcessCreated { pid, .. }
             | EventKind::StatusChanged { pid, .. }
             | EventKind::DurationChanged { pid, .. }
+            | EventKind::GraceChanged { pid, .. }
             | EventKind::MaxVotersChanged { pid, .. }
             | EventKind::StateTransitioned { pid, .. }
             | EventKind::ResultsSet { pid, .. }

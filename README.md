@@ -267,14 +267,15 @@ Every flag has a `DAVINCI_*` environment variable. Durations take `90`, `90s`,
 | `--batch-time` | `DAVINCI_BATCH_TIME` | `15m` | Age of the oldest pending vote at which a batch of at least `--min-mix` slots seals (±10% jitter). |
 | `--min-mix` | `DAVINCI_MIN_MIX` | `2` | Distinct slots a timer batch needs; fewer wait for `--solo-wait` (at least 1). |
 | `--solo-wait` | `DAVINCI_SOLO_WAIT` | 3 × batch time | Age at which a batch below `--min-mix` seals anyway (±10% jitter). Not below `--batch-time`. |
-| `--flush-horizon` | `DAVINCI_FLUSH_HORIZON` | `3m` | From this long before the election end, every pending vote seals without waiting. |
+| `--flush-horizon` | `DAVINCI_FLUSH_HORIZON` | `3m` | From this long before the election end, and through the grace window after it, every pending vote seals without waiting. |
 | `--settle-margin` | `DAVINCI_SETTLE_MARGIN` | `60s` | Landing margin after proving: a batch is sized so its estimated proof plus this margin ends before the window closes. |
 | `--slot-depth` | `DAVINCI_SLOT_DEPTH` | `3` | Queued votes one slot may hold, in flight included (at least 1). |
 | `--prove-base` | `DAVINCI_PROVE_BASE` | `30s` | Fixed part of the proving-time estimate the batch budget uses. |
+| `--eager-results` | `DAVINCI_EAGER_RESULTS` | `true` | Prove a sequencer-key election's results during its grace window, once nothing is left to settle, and submit them when the window closes. |
 | `--confirmations` | `DAVINCI_CONFIRMATIONS` | network, else `2` | Blocks behind head the monitor treats as final. Raise it with load-balanced RPCs whose backends lag. |
 | `--start-block` | `DAVINCI_START_BLOCK` | network | First block a fresh deployment scans for registry events: the registry deployment block. Ignored once the deployment has scanned. The network's applies to its own registry only; otherwise unset scans from block 0, with a warning (about 9,700 `eth_getLogs` pages on Gnosis). Progress is saved after every 5,000-block page. |
 | `--poll-interval` | `DAVINCI_POLL_INTERVAL` | `5s` | Chain polling interval. |
-| `--heartbeat` | `DAVINCI_HEARTBEAT` | poll interval | Actor heartbeat: drives batch timing, window close-out and finalization. |
+| `--heartbeat` | `DAVINCI_HEARTBEAT` | poll interval | Actor heartbeat: drives batch timing, the close-out at the grace end and finalization. |
 | `--prover-poll` | `DAVINCI_PROVER_POLL` | `2s` | Prover job polling interval. |
 | `--prover-timeout` | `DAVINCI_PROVER_TIMEOUT` | `30m` | Wait for one proving job. On timeout the node waits on the same job up to 3 more times. |
 | `--census-dir` | `DAVINCI_CENSUS_DIR` | unset | Directory `file://` census URIs may read from. Unset: `file://` is refused. |
@@ -344,12 +345,12 @@ lengths exact, and vote bodies carry no unknown fields.
 | GET | `/ping` | Liveness (`pong`). | |
 | GET | `/info` | Sequencer address (`null` for an observer), chain id, registry, ballot VK hash, both program vks, `observer`, and the counters `settledBySelf`, `syncedFromOthers`, `lostRaces`. | |
 | GET | `/processes` | Process ids this node knows. | |
-| GET | `/processes/{pid}` | On-chain parameters plus the node's view: `isAcceptingVotes` (false before the start time too), `localStateRoot` (its committed tree root), `result` once on-chain, and `ignored`/`note` when the node refused to serve the process. | 40001, 40402 |
+| GET | `/processes/{pid}` | On-chain parameters plus the node's view: `isAcceptingVotes` (false before the start time and from the end on), `localStateRoot` (its committed tree root), `synced` (that root equals the on-chain root), `result` once on-chain, and `ignored`/`note` when the node refused to serve the process. | 40001, 40402 |
 | POST | `/processes/keys` | Body `{"processId"}`: this node's election key for that (future) process id, as `{x, y}`. The key is derived, not stored, so the same id always gets the same key. Organizers ask for the registry's `getNextProcessId(organizer)`. | 40001, 41203, 42901 |
 | GET | `/processes/{pid}/participants/{address}` | Weight and Merkle census proof, which voters need to build a ballot. Merkle census only. | 40001, 40402, 40401 (not a member, or a CSP census) |
 | GET | `/processes/{pid}/transitions` | The settled transitions: roots, tx hash, block, sender, voters, overwrites, blob count. | 40001, 40402 |
 | GET | `/processes/{pid}/transitions/{index}/blobs` | The raw blobs of one transition, `0x` hex. | 40001, 40402, 40401 |
-| POST | `/votes` | Submit a vote. A paused process still accepts votes: they queue locally and settle when the process resumes (only `ended`/`canceled`/past-end refuse with 41201, and a process before its start time with 41204). | see below |
+| POST | `/votes` | Submit a vote. A paused process still accepts votes until its end: they queue locally and settle when the process resumes, or through the grace window if it is still paused at the end. `ended`/`canceled` and any process at or past its end time refuse with 41201 (the grace window settles queued votes, it admits none), and a process before its start time with 41204. | see below |
 | GET | `/votes/{pid}/voteId/{voteId}` | Vote status. | 40001, 40402, 40401 |
 | GET | `/votes/{pid}/voteId/{voteId}/proof` | Tracker proof: the vote-id leaf under the node's committed root, which is an on-chain root. `davinci_client::api::verify_tracker` checks it. | 40001, 40402, 40401 |
 | GET | `/votes/{pid}/address/{address}` | The ballot currently stored in that voter's slot (re-encrypted). For a CSP census, only addresses this node served. | 40001, 40402, 40401 |
@@ -378,8 +379,9 @@ Vote status is one of:
 
 A batch that loses a race puts its votes back to `pending`, and so does one the
 settlement refuses because the organizer paused the process under it (or it has
-not started): those votes settle once it is open again, or end in
-`process closed` if it ends instead. A node that never stored the package still
+not started): those votes settle once it is open again or during the grace
+window. Votes still queued when the grace window closes, or when the process is
+canceled, end in `process closed`. A node that never stored the package still
 answers `settled` when the vote id is in its tree, and 404 otherwise.
 
 Errors are JSON `{"error": "<message>", "code": <code>}`. The code is the HTTP
@@ -393,7 +395,7 @@ detail goes to the node log. A request that runs longer than 60 s gets a 408.
 | 404 | 40401 | Not found. |
 | 408 | 40801 | The 60 s request deadline fired. The handler may still have finished: a timed-out `POST /votes` can have admitted the vote, in which case a retry answers 409. |
 | 404 | 40402 | Unknown process (or one this node does not serve). |
-| 409 | 40901 | Vote id already submitted or already in the tree. |
+| 409 | 40901 | Vote id already submitted, queued (at any slot depth) or already in the tree. |
 | 409 | 40902 | The slot already holds `--slot-depth` queued votes; retry once one settles. |
 | 412 | 41201 | The process does not accept votes. |
 | 412 | 41202 | Max voters reached. |
@@ -445,14 +447,18 @@ rules before queueing the vote:
 - timer: the batch would hold at least `--min-mix` distinct slots and the
   oldest vote has waited `--batch-time`;
 - solo: fewer than `--min-mix` slots and the oldest has waited `--solo-wait`;
-- flush: the election ends within `--flush-horizon`.
+- flush: the election ends within `--flush-horizon`, or has ended and its
+  grace window is still open.
 
 Both waits carry a ±10% jitter, drawn once per batch. A batch is also sized to
 the time left: proving is estimated as `--prove-base` plus a per-vote cost
-(an average over the node's finished proofs, per field count, seeded high), and
-the batch holds at most the votes whose estimated proof plus `--settle-margin`
-ends before the window closes. When not even one vote fits, nothing seals and
-the votes close out with the window. The actor then:
+(a moving average of the prover's own job time, queue wait excluded, per field
+count, seeded high and capped at 60 times the seed), and the batch holds at
+most the votes whose estimated proof plus `--settle-margin` ends before
+`min(graceEnd, now + graceFloor)`. The second term covers the worst legal
+close: the organizer ends or shortens the election right after the seal and
+lowers the grace to the registry's floor. When not even one vote fits, nothing
+seals and the votes wait, or close out with the window. The actor then:
 1. takes votes in FIFO order, the oldest per slot, within `maxVoters`, the
    size above and the per-transaction blob cap (`--max-blobs-per-tx`,
    counting the refreshes the guest will require);
@@ -477,6 +483,11 @@ call at its block (at `latest` when the RPC cannot serve that block). When both
 transactions land in one block, a lagging RPC may replay ours without the
 winner's and see it pass; a revert no replay names counts as a lost race too.
 
+Within one node a slot's queued votes settle in the order they were cast (one
+per batch, oldest first). Across nodes there is no order: when a voter's two
+ballots go to different nodes, the one that settles last stands, whichever was
+cast last. Clients should send one voter's ballots to one node.
+
 **Sync.** For a transition another node sent, the actor:
 1. fetches the blobs and matches them against the transaction's versioned hashes;
 2. decodes the vote ids, the slot updates and the accumulator;
@@ -487,8 +498,48 @@ Queued votes whose id is now in the tree become `settled`. Gaps are replayed fro
 the registry logs. Every node stores the transitions and blobs it sees and
 serves them under `/processes/{pid}/transitions`.
 
-**Finalization.** A node finalizes once the process has ended (status ENDED or
-past its end time), no batch is in flight and its tree is at the on-chain root.
+**The end and the grace window.** Admission closes at the election's end time
+(or on ENDED or CANCELED), but settlement does not. The registry accepts
+transitions until its grace end,
+
+```
+graceEnd = min(end + graceMaxTotal, max(end, lastVoteAt) + grace)
+```
+
+where `lastVoteAt` is the time of the latest transition and `grace` is set per
+process (the registry's `defaultGrace`; `setProcessGrace` changes it before the
+end, within `graceFloor..graceCeil`, else `InvalidGrace`). Every landing during the
+grace pushes the end out, so a backlog drains round by round, and the window
+freezes `grace` after the last one; `graceMaxTotal` caps it. The node stays in
+flush mode from `--flush-horizon` before the end until the grace end, while the
+process is READY, ENDED, or PAUSED past its end (the registry refuses a pause
+from the end on, and settles a process paused at its end like an ended one). A
+process paused before its end still seals nothing. At the grace end the node
+errors whatever is still queued (`process closed`); CANCELED closes out at once.
+A settlement that reverts `InvalidStatus` or `InvalidTimeBounds` while the
+window is open puts its votes back to `pending`. The registry refuses a
+transition with no vote (`EmptyTransition`); a node never builds one.
+
+The node reads the five grace parameters from the registry at boot. Events carry
+no timestamp, so after every landing it reads the process again to learn
+`lastVoteAt`, and it neither closes out nor finalizes until that read agrees
+with its tree.
+
+The organizer can also shorten a running election with `setProcessDuration`, to
+no less than `noticeMin` from now. Nodes see the new end within a poll or two,
+enter flush mode if it is within the horizon, and refuse votes from the new end
+on. The end only moves while the process is open and before the old end.
+
+The grace lets a sequencer include votes cast after the end, as long as it
+received them before: the node refuses them, but nothing on-chain can tell a
+late vote from a delayed one. The exposure is bounded by the window and
+visible, since every grace landing is a transition with its time on-chain.
+
+**Finalization.** Results unlock at the grace end: before it the registry
+reverts `setProcessResults`, `requestResultsDecryption` and
+`finalizeResultsFromDKG` with `GraceOpen`. A node finalizes once the grace
+window has closed, no batch is in flight and its tree is at the on-chain root.
+`GraceOpen` and `InvalidStateRoot` on a results call are transient and retried.
 For a sequencer-key process only the node holding the election key does it:
 1. decrypts the accumulator (baby-step giant-step, bounded by voters times the
    ballot's max value);
@@ -497,6 +548,12 @@ For a sequencer-key process only the node holding the election key does it:
 3. proves them with `POST /results`, and checks the published root and tally
    against its own and the vks against the SDK pins;
 4. calls `setProcessResults`.
+
+With `--eager-results` (the default) the key holder does steps 1 to 3 during the
+grace window, as soon as the process has ended, nothing is queued or in flight
+and its tree is at the on-chain root. It holds the proof and submits it on the
+first heartbeat at the grace end if the root has not moved; a later landing
+drops it and the node proves again.
 
 For a DKG-key process any signing node drives the committee's decryption; see
 [Key modes](#key-modes). Other nodes pick the results up from
@@ -679,7 +736,7 @@ every mode: the batch guest reads key leaf `0x03` whatever its source.
 
 **Results.** In DKG modes no node holds a key. After the process ends, any
 signing node sends `requestResultsDecryption(pid, accumulator, siblings)` from
-its committed tree, on its first heartbeat after the end. The registry checks the
+its committed tree, on its first heartbeat after the grace end. The registry checks the
 accumulator's SHA-256 SMT inclusion (key `0x04`) under the latest state root and
 submits each active field's ciphertext to the committee through the adapter. It
 accepts the request once per process and moves the process to ENDED, which only
@@ -744,6 +801,47 @@ org.reveal_process_key(&created.pid, &sk).await?;
 
 Not supported: key resharing across epochs, fees against pool draining, and
 chained (folded) mode with DKG keys.
+
+## AGM deployments
+
+A live meeting wants results a few minutes after the vote closes. The defaults
+suit an election that runs for days; for a meeting:
+
+- **Node profile:** `DAVINCI_BATCH_TIME=60s` and `DAVINCI_SOLO_WAIT=60s`, so votes
+  settle while voting runs and nothing is left to drain at the end. Cast times
+  become visible to about a minute instead of 15, which a room voting in the
+  same few minutes gives away anyway; overwrites stay hidden.
+- **Grace:** the organizer calls `setProcessGrace` at creation with the
+  registry's floor (150 s on the production parameters).
+- **Closing:** "voting closes in one minute" is a `setProcessDuration` that
+  shortens the end to one minute out (the registry's `noticeMin`). Every node
+  enters flush mode at once and drains during the notice. END (`setProcessStatus`
+  ENDED) closes at once instead.
+
+Throughput on Gnosis (2 blobs per transaction, steady batches with as many
+refreshes as votes). Transitions of one election serialize on its root, so the
+ceiling holds whatever the number of nodes:
+
+| nf | votes per transaction | round (prove + land) | ceiling (votes/min) |
+|---:|---:|---:|---:|
+| 2 | ~744 | ~145 s | ~305 |
+| 4 | ~430 | ~100 s | ~260 |
+| 8 | ~230 | ~75 s | ~185 |
+| 16 | ~122 | ~64 s | ~115 |
+
+Results on chain, from the END press, with a 150 s grace and a sequencer key:
+
+| Backlog at the end | Last landing | Grace end | Results |
+|---|---|---|---|
+| none | before the end | end + 150 s | ~2.8–3.0 min |
+| one round | end + ~75 s | end + ~225 s | ~4.0 min |
+| k rounds (nf = 16) | end + k·~70 s | last + 150 s | ~(1.2·k + 2.8) min |
+
+A DKG key adds the committee round (1 to 5 minutes) after the request at the
+grace end. A shortened end drains during the notice, so it lands in the first
+row: about 4.4 minutes from the announcement. Arrival above the ceiling leaves a
+backlog at the end whatever the batch time; keep large, fast meetings at
+nf ≤ 8.
 
 ## Operational notes and known limitations
 
@@ -813,7 +911,7 @@ chained (folded) mode with DKG keys.
   votes requeued. If a fully committed own transition is reorged out, there is
   no rewind path: the node's copy of that process stays ahead of the chain and
   stops following it. Confirmation-gated own commits are future work.
-- **Settle margin.** A transition that lands after the election window closes
+- **Settle margin.** A transition that lands after the grace window closes
   reverts, and its votes end in `error: process closed`. Near the end the actor
   shrinks batches so the estimated proof plus `--settle-margin` (the time to
   send and mine the transaction) still fits. The estimate starts high (about

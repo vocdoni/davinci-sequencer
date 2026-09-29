@@ -56,6 +56,8 @@ pub fn election(nf: u8, origin: u8, census_root: Fr, rng: &mut StdRng) -> Electi
             metadata_uri: String::new(),
             metadata_hash: [0; 32],
             dkg: None,
+            grace: 0,
+            last_vote_at: 0,
         },
         sk,
     }

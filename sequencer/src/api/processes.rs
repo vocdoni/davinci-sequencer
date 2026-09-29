@@ -46,6 +46,7 @@ fn view(
     rec: &ProcessRecord,
     accepting: bool,
     local_state_root: Option<[u8; 32]>,
+    synced: bool,
 ) -> Result<ProcessView, ApiError> {
     let p = &rec.onchain;
     let status = ProcessStatus::from_onchain(p.status as u8).unwrap_or(ProcessStatus::Unknown);
@@ -65,6 +66,7 @@ fn view(
         },
         state_root: p.state_root,
         local_state_root,
+        synced,
         voters_count: p.voters_count,
         overwritten_votes_count: p.overwritten_count,
         max_voters: p.max_voters,
@@ -83,16 +85,17 @@ pub async fn get(
     let pid = parse_pid(&pid)?;
     let rec = st.node.db.process(&pid)?.ok_or(ApiError::UnknownProcess)?;
     // The actor snapshot adds the node's own view: whether it accepts
-    // votes and its committed local tree root (may lead `state_root`).
-    let (accepting, local_root) = match st.node.processes.read().await.get(&pid).cloned() {
+    // votes, its committed local tree root (may lead `state_root`) and
+    // whether that root is the on-chain one.
+    let (accepting, local_root, synced) = match st.node.processes.read().await.get(&pid).cloned() {
         Some(h) => h
             .snapshot()
             .await
-            .map(|s| (s.accepting, Some(s.root)))
-            .unwrap_or((false, None)),
-        None => (false, None),
+            .map(|s| (s.accepting, Some(s.root), s.synced))
+            .unwrap_or((false, None, false)),
+        None => (false, None, false),
     };
-    Ok(Json(view(&rec, accepting, local_root)?))
+    Ok(Json(view(&rec, accepting, local_root, synced)?))
 }
 
 /// `POST /processes/keys`: this node's key for `processId`, derived, not

@@ -26,8 +26,8 @@ use super::ProcessRegistry as PR;
 use super::adapter::DavinciDKGAdapter as AD;
 use super::tx::SendState;
 use super::{
-    DkgState, EventKind, KeyMode, NewProcess, OnchainCensus, OnchainProcess, ProcessStatus,
-    RegistryEvent, Result, TxReceipt, Web3Error, rpc_err, rpc_provider,
+    DkgState, EventKind, GraceParams, KeyMode, NewProcess, OnchainCensus, OnchainProcess,
+    ProcessStatus, RegistryEvent, Result, TxReceipt, Web3Error, rpc_err, rpc_provider,
 };
 use crate::config::{Config, SecretString};
 
@@ -341,6 +341,8 @@ fn process_from_abi(p: &T::Process) -> Result<OnchainProcess> {
             first_index: p.dkgFirstIndex,
             count: p.dkgCount,
         },
+        grace: p.window.grace.into(),
+        last_vote_at: p.window.lastVoteAt,
     })
 }
 
@@ -378,6 +380,13 @@ fn event_from_log(log: &Log) -> Result<Option<RegistryEvent>> {
             EventKind::DurationChanged {
                 pid: e.processId.0,
                 duration: sat_u64(e.duration),
+            }
+        }
+        PR::ProcessGraceChanged::SIGNATURE_HASH => {
+            let e = PR::ProcessGraceChanged::decode_log(&log.inner).map_err(bad)?;
+            EventKind::GraceChanged {
+                pid: e.processId.0,
+                grace: e.grace.into(),
             }
         }
         PR::ProcessMaxVotersChanged::SIGNATURE_HASH => {
@@ -579,6 +588,26 @@ impl Contracts {
         process_from_abi(&p)
     }
 
+    /// `getProcessGraceEnd`, saturating.
+    pub async fn grace_end(&self, pid: &[u8; 31]) -> Result<u64> {
+        let call = PR::getProcessGraceEndCall {
+            processId: FixedBytes(*pid),
+        };
+        Ok(sat_u64(self.view(self.registry, call).await?))
+    }
+
+    /// The registry's grace immutables.
+    pub async fn grace_params(&self) -> Result<GraceParams> {
+        let r = self.registry;
+        Ok(GraceParams {
+            default_grace: self.view(r, PR::defaultGraceCall {}).await?.into(),
+            grace_floor: self.view(r, PR::graceFloorCall {}).await?.into(),
+            grace_ceil: self.view(r, PR::graceCeilCall {}).await?.into(),
+            grace_max_total: self.view(r, PR::graceMaxTotalCall {}).await?.into(),
+            notice_min: self.view(r, PR::noticeMinCall {}).await?.into(),
+        })
+    }
+
     /// Registry events in `[from, to]`, in chain order. Blocks near head can
     /// be reorged away: poll up to [`Contracts::confirmed_head`] with the
     /// configured `confirmations` (0 on dev chains).
@@ -587,6 +616,7 @@ impl Contracts {
             PR::ProcessCreated::SIGNATURE_HASH,
             PR::ProcessStatusChanged::SIGNATURE_HASH,
             PR::ProcessDurationChanged::SIGNATURE_HASH,
+            PR::ProcessGraceChanged::SIGNATURE_HASH,
             PR::ProcessMaxVotersChanged::SIGNATURE_HASH,
             PR::ProcessStateTransitioned::SIGNATURE_HASH,
             PR::ProcessResultsSet::SIGNATURE_HASH,
@@ -863,6 +893,12 @@ mod tests {
             names.get(&sel("MissingBlob(uint256)")).map(String::as_str),
             Some("MissingBlob")
         );
+        for e in ["GraceOpen", "EmptyTransition", "InvalidGrace"] {
+            assert_eq!(
+                names.get(&sel(&format!("{e}()"))).map(String::as_str),
+                Some(e)
+            );
+        }
     }
 
     // An EL stub: `head` blocks, one ProcessCreated log at block 95 that it

@@ -177,6 +177,8 @@ async fn start(
     }
     let vk_hash = crate::monitor::ballot_verifier(&cfg)?.vk_hash();
     contracts.check_release(&vk_hash).await?;
+    let grace = contracts.grace_params().await?;
+    tracing::info!(?grace, "registry grace window");
     let registry = cfg.registry.into_array();
     let dir = crate::storage::deployment_dir(&cfg.datadir, contracts.chain_id(), &registry);
     tracing::info!(
@@ -207,6 +209,7 @@ async fn start(
         prover,
         blobs: blob_source(&cfg),
         clock: Arc::new(SystemClock),
+        grace,
         tasks,
     };
     let addr = format!("{}:{}", cfg.api_host, cfg.api_port);

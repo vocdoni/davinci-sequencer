@@ -228,6 +228,8 @@ fn stand_in(spec: &Spec, pk: Point, root: Fr) -> OnchainProcess {
         metadata_uri: String::new(),
         metadata_hash: [0; 32],
         dkg: None,
+        grace: 0,
+        last_vote_at: 0,
     }
 }
 

@@ -58,7 +58,28 @@ fn onchain(root: u8) -> OnchainProcess {
             first_index: 2,
             count: 3,
         },
+        grace: 180,
+        last_vote_at: 7200,
     }
+}
+
+// The registry's `_graceEnd`: min(end + maxTotal, max(end, lastVoteAt) + grace).
+#[test]
+fn grace_end_matches_the_registry() {
+    let mut p = onchain(1);
+    let end = p.end_time();
+    assert_eq!(end, 3700);
+    p.last_vote_at = 0; // no votes
+    assert_eq!(p.grace_end(1800), end + 180);
+    p.last_vote_at = end - 50; // landed before the end
+    assert_eq!(p.grace_end(1800), end + 180);
+    p.last_vote_at = end + 100; // landed in the grace
+    assert_eq!(p.grace_end(1800), end + 280);
+    p.last_vote_at = end + 1700; // capped
+    assert_eq!(p.grace_end(1800), end + 1800);
+    assert_eq!(p.grace_end(0), end);
+    p.duration = u64::MAX - 100 - 10; // end + maxTotal overflows
+    assert_eq!(p.grace_end(11), u64::MAX);
 }
 
 fn process(n: u64) -> ProcessRecord {

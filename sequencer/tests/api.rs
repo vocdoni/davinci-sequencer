@@ -386,13 +386,20 @@ async fn vote_submission_error_codes() {
     let e = t.client.submit_vote(&req).await.unwrap_err();
     assert_eq!(api_code(e), (409, 40901));
     // A second vote for the same slot queues behind it; the slot is then
-    // full and refuses a third as slot-busy.
+    // full and refuses a third as slot-busy, while a resend of a queued
+    // vote id stays a duplicate.
     t.client
         .submit_vote(&wire_vote(&real_vote(&t.s.env, 0, &[1, 2], 6)))
         .await
         .unwrap();
-    let e = t.client.submit_vote(&req).await.unwrap_err();
+    let e = t
+        .client
+        .submit_vote(&wire_vote(&real_vote(&t.s.env, 0, &[1, 2], 7)))
+        .await
+        .unwrap_err();
     assert_eq!(api_code(e), (409, 40902));
+    let e = t.client.submit_vote(&req).await.unwrap_err();
+    assert_eq!(api_code(e), (409, 40901));
 
     // Status: pending vote, unknown vote id, unknown process.
     assert_eq!(
@@ -703,6 +710,7 @@ async fn finalized_process_serves_reads_after_restart() {
     h.submit(v).await.unwrap();
     wait_until("settled", async || all_settled(&h, &[vid]).await).await;
     s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
     wait_until("finalized", async || {
         h.snapshot().await.unwrap().local == LocalStatus::Finalized
     })

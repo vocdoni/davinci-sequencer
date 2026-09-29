@@ -177,7 +177,7 @@ call chains.**
 
 **DKG key modes** (README "Key modes"): a process's key is a sequencer's (derived,
 results PLONK) or a davinci-dkg committee's (`DKG_AUTOMATIC`, `DKG_LOCKED`). In the
-DKG modes no node holds a key: after the end any signing node sends
+DKG modes no node holds a key: once the grace window closes any signing node sends
 `requestResultsDecryption` from its committed tree (this also moves the process to
 ENDED), polls, then `finalizeResultsFromDKG` (`finalize.rs::run_finalize_dkg`). No
 results PLONK is needed in DKG modes; the committee's Groth16 proofs replace it.
@@ -249,7 +249,7 @@ results PLONK is needed in DKG modes; the committee's Groth16 proofs replace it.
   `--registry` is explicit.
 
 **Storage.**
-- Records are JSON in redb. Bump `storage.rs::SCHEMA_VERSION` (now 7) on any
+- Records are JSON in redb. Bump `storage.rs::SCHEMA_VERSION` (now 8) on any
   record-shape change; the node refuses a mismatched file.
 - One database per deployment: `<datadir>/<chain id>-0x<registry>/sequencer.redb`
   (`Db::open_deployment`), bound to it by the `meta_bytes` key `deployment`. A new

@@ -305,6 +305,10 @@ pub struct OnchainProcess {
     pub metadata_hash: [u8; 32],
     /// `None` for a sequencer-key process.
     pub dkg: Option<DkgProcess>,
+    /// Idle seconds that close the grace window after the end.
+    pub grace: u64,
+    /// Block time of the latest transition; 0 before the first.
+    pub last_vote_at: u64,
 }
 
 fn u64_of(what: &str, v: U256) -> Result<u64> {
@@ -999,6 +1003,8 @@ async fn read_process(
         metadata_uri: p.metadataURI.clone(),
         metadata_hash: p.metadataHash.0,
         dkg,
+        grace: p.window.grace.into(),
+        last_vote_at: p.window.lastVoteAt,
     })
 }
 

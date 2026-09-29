@@ -309,6 +309,10 @@ pub struct Config {
     /// Fixed term of the proving-time estimate.
     #[arg(long, env = "DAVINCI_PROVE_BASE", default_value = "30s", value_parser = parse_duration)]
     pub prove_base: Duration,
+    /// Prove a sequencer-key election's results during its grace window,
+    /// once nothing is left to settle, and submit them at its end.
+    #[arg(long, env = "DAVINCI_EAGER_RESULTS", default_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+    pub eager_results: bool,
     /// Blocks behind head the monitor treats as final (reorg margin).
     /// Default: the network's, else 2.
     #[arg(
@@ -385,6 +389,7 @@ impl fmt::Debug for Config {
             .field("settle_margin", &self.settle_margin)
             .field("slot_depth", &self.slot_depth)
             .field("prove_base", &self.prove_base)
+            .field("eager_results", &self.eager_results)
             .field("confirmations", &self.confirmations)
             .field("start_block", &self.start_block)
             .field("census_dir", &self.census_dir)
@@ -594,6 +599,7 @@ mod tests {
         assert_eq!(c.settle_margin, Duration::from_secs(60));
         assert_eq!(c.slot_depth, 3);
         assert_eq!(c.prove_base, Duration::from_secs(30));
+        assert!(c.eager_results);
         assert_eq!(c.blob_source, BlobSourceKind::Anvil);
         assert!(c.privkey.is_none());
 
@@ -630,11 +636,13 @@ mod tests {
             "1",
             "--slot-depth",
             "1",
+            "--eager-results",
+            "0",
         ]);
         let c = Config::parse_args(args).unwrap();
         assert_eq!(
-            (c.solo_wait, c.min_mix, c.slot_depth),
-            (Duration::from_secs(3), 1, 1)
+            (c.solo_wait, c.min_mix, c.slot_depth, c.eager_results),
+            (Duration::from_secs(3), 1, 1, false)
         );
     }
 

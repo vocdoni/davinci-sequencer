@@ -33,8 +33,8 @@ use crate::keys::KeyStore;
 use crate::metrics::Metrics;
 use crate::storage::{Db, LocalStatus, ProcessRecord, StoredVote, VoteStatus, fr_hex};
 use crate::web3::{
-    BlobSource, EventKind, KeyMode, OnchainProcess, ProcessStatus, RegistryEvent, RevertReason,
-    TxReceipt, Web3Error,
+    BlobSource, EventKind, GraceParams, KeyMode, OnchainProcess, ProcessStatus, RegistryEvent,
+    RevertReason, TxReceipt, Web3Error,
 };
 
 /// Votes an actor holds in memory before sealing; beyond it submits are refused.
@@ -120,11 +120,13 @@ impl ProverError {
 /// tests. `expected` is advisory (fakes echo it), the real prover ignores it.
 #[async_trait]
 pub trait Prover: Send + Sync {
+    /// Also returns the job's own proving seconds (queue wait excluded)
+    /// when the prover reports them.
     async fn prove_batch(
         &self,
         request: &ProveRequest,
         expected: &BatchPublics,
-    ) -> Result<(BatchPublics, PlonkSnark), ProverError>;
+    ) -> Result<(BatchPublics, PlonkSnark, Option<f64>), ProverError>;
     async fn prove_results(
         &self,
         request: &ResultsRequest,
@@ -164,6 +166,8 @@ pub struct Deps {
     pub prover: Arc<dyn Prover>,
     pub blobs: Arc<dyn BlobSource>,
     pub clock: Arc<dyn Clock>,
+    /// The registry's grace immutables.
+    pub grace: GraceParams,
     /// Actor and monitor tasks; `api::run` awaits it on shutdown so the
     /// database handle is released before the process exits.
     pub tasks: tokio_util::task::TaskTracker,
@@ -288,11 +292,14 @@ const WAIT_WINDOWS: u32 = 3;
 impl ProverService {
     /// Waits for a job, re-entering the wait on a poll timeout: the job is
     /// still ours, and resubmitting would double-queue the batch.
-    async fn wait_done(&self, id: &davinci_zkvm_sdk::types::JobId) -> Result<(), ProverError> {
+    async fn wait_done(
+        &self,
+        id: &davinci_zkvm_sdk::types::JobId,
+    ) -> Result<davinci_zkvm_sdk::types::Job, ProverError> {
         // The first window plus WAIT_WINDOWS extra ones.
         for _ in 0..=WAIT_WINDOWS {
             match self.client.wait(id, self.poll, self.timeout).await {
-                Ok(_) => return Ok(()),
+                Ok(job) => return Ok(job),
                 Err(davinci_zkvm_sdk::Error::Timeout) => continue,
                 Err(e) => return Err(werr(e)),
             }
@@ -307,14 +314,14 @@ impl Prover for ProverService {
         &self,
         request: &ProveRequest,
         _expected: &BatchPublics,
-    ) -> Result<(BatchPublics, PlonkSnark), ProverError> {
+    ) -> Result<(BatchPublics, PlonkSnark, Option<f64>), ProverError> {
         let id = self.client.prove(request).await.map_err(serr)?;
-        self.wait_done(&id).await?;
+        let job = self.wait_done(&id).await?;
         let publics = self.client.publics(&id).await.map_err(perr)?;
         let got =
             BatchPublics::parse(&publics).map_err(|e| ProverError::permanent(e.to_string()))?;
         let snark = self.client.snark(&id).await.map_err(perr)?;
-        Ok((got, snark))
+        Ok((got, snark, job.elapsed_ms.map(|ms| ms as f64 / 1000.0)))
     }
 
     async fn prove_results(
@@ -378,6 +385,8 @@ pub struct ProcessSnapshot {
     pub local: LocalStatus,
     /// Whether `submit` would be admitted right now.
     pub accepting: bool,
+    /// The committed root is the on-chain root.
+    pub synced: bool,
 }
 
 pub(crate) enum Msg {
@@ -404,6 +413,12 @@ pub(crate) enum Msg {
     FinalizeDone {
         generation: u64,
         result: Result<(), FinalizeFail>,
+    },
+    /// Eager results: a checked snark at `root`, submitted once the grace ends.
+    ResultsHeld {
+        generation: u64,
+        root: [u8; 32],
+        snark: Box<PlonkSnark>,
     },
     /// Test hook: the refresh-overflow path (the real trigger needs
     /// hundreds of live exposed slots).
@@ -700,6 +715,13 @@ struct Actor {
     finalize_attempts: u32,
     /// Transient finalize cooldown: no new attempt before this instant.
     finalize_after: Option<tokio::time::Instant>,
+    /// Prove the results during the grace (sequencer-key processes).
+    eager: bool,
+    /// Eager results: the checked snark and the root it proves.
+    held: Option<([u8; 32], Box<PlonkSnark>)>,
+    /// A transition landed since `last_vote_at` was last read from the chain;
+    /// the grace end may have moved, so nothing closes on it until re-read.
+    vote_at_stale: bool,
     /// The exposed set: every slot a sealed batch changed (writes and
     /// refreshes as one set) and the vote ids of those attempts. Mirrors
     /// the persisted `ExposedRecord`; cleared once every vote is final.
@@ -840,6 +862,10 @@ pub(crate) fn spawn_actor(
         finalize_failed: false,
         finalize_attempts: 0,
         finalize_after: None,
+        eager: cfg.eager_results,
+        held: None,
+        // The record may predate the last landing: re-read before closing.
+        vote_at_stale: true,
         exposed: BTreeSet::new(),
         exposed_vids: BTreeSet::new(),
         census_broken: None,
@@ -906,6 +932,7 @@ impl Actor {
             }
         }
         self.sort_pending();
+        self.error_new_slots_if_full();
         Ok(())
     }
 
@@ -970,6 +997,7 @@ impl Actor {
                     status: self.record.onchain.status,
                     local: self.record.local,
                     accepting: self.accepting(),
+                    synced: c.root == self.record.onchain.state_root,
                 });
             }
             Msg::Event(ev) => self.on_event(ev).await,
@@ -992,6 +1020,17 @@ impl Actor {
                 outcome,
             } => self.on_job_done(generation, outcome).await,
             Msg::ForceRefreshOverflow => self.refresh_overflow(),
+            Msg::ResultsHeld {
+                generation,
+                root,
+                snark,
+            } => {
+                if generation == self.generation {
+                    self.finalizing = false;
+                    self.finalize_attempts = 0;
+                    self.held = Some((root, snark));
+                }
+            }
             Msg::FinalizeDone { generation, result } => {
                 if generation != self.generation {
                     return;
@@ -1047,12 +1086,16 @@ impl Actor {
         self.record.onchain.end_time()
     }
 
-    /// Last instant a transition can land; becomes the on-chain grace end.
+    /// The registry's grace end: transitions land before it, results at or
+    /// after it. Moves with every landing (`last_vote_at`), up to the cap.
     fn grace_end(&self) -> u64 {
-        self.end_time()
+        self.record
+            .onchain
+            .grace_end(self.deps.grace.grace_max_total)
     }
 
-    /// Flush mode: seal whatever is pending, from `flush_horizon` before the end.
+    /// Flush mode: seal whatever is pending, from `flush_horizon` before the
+    /// end through the grace window.
     fn flush(&self) -> bool {
         self.chain_time != 0
             && self.chain_time >= self.end_time().saturating_sub(self.flush_horizon)
@@ -1099,18 +1142,31 @@ impl Actor {
         if self.state.has_vote_id(v.pkg.vote_id).map_err(ierr)? {
             return Err(ActorError::Duplicate(v.pkg.vote_id));
         }
+        // A resend of a queued vote is a duplicate whatever its slot's depth.
+        let flight = self.in_flight.as_ref().map_or(&[][..], |f| &f.votes[..]);
+        let vid = v.pkg.vote_id;
+        if self
+            .pending
+            .iter()
+            .chain(flight)
+            .any(|q| q.pkg.vote_id == vid)
+        {
+            return Err(ActorError::Duplicate(vid));
+        }
         // At most slot_depth queued (pending or in-flight) votes per slot;
         // they settle in admission order.
-        let queued = self.pending.iter().filter(|q| q.slot == v.slot).count()
-            + self
-                .in_flight
-                .as_ref()
-                .map_or(0, |f| f.votes.iter().filter(|q| q.slot == v.slot).count());
+        let queued = self
+            .pending
+            .iter()
+            .chain(flight)
+            .filter(|q| q.slot == v.slot)
+            .count();
         if queued >= self.slot_depth {
             return Err(ActorError::SlotBusy(v.slot));
         }
-        // A new-slot vote must fit under max_voters with the queued new slots.
-        if self.state.slot_ballot(v.slot).map_err(ierr)?.is_none() {
+        // A new-slot vote must fit under max_voters with the queued new
+        // slots. A revote of a queued slot reserves nothing new.
+        if queued == 0 && self.state.slot_ballot(v.slot).map_err(ierr)?.is_none() {
             let occupied = self.state.occupied() as u64;
             if occupied + self.queued_new_slots()? >= self.record.onchain.max_voters {
                 return Err(ActorError::MaxVoters);
@@ -1166,8 +1222,8 @@ impl Actor {
         Ok(n)
     }
 
-    /// Runs after every message: close out an ended window, seal a due
-    /// batch, kick finalization. The monitor's Head messages are the
+    /// Runs after every message: close out a closed grace window, seal a
+    /// due batch, kick finalization. The monitor's Head messages are the
     /// heartbeat that drives this.
     async fn tick(&mut self) {
         // A Finalized (or Ignored) actor is read-only: it serves proofs
@@ -1175,7 +1231,19 @@ impl Actor {
         if self.record.local != LocalStatus::Active {
             return;
         }
-        if self.chain_time != 0 && self.chain_time >= self.end_time() {
+        // Events carry no block time: read the landing time the grace end
+        // runs from. Stale until the read shows the tip the events reached.
+        if self.vote_at_stale
+            && let Ok(p) = self.deps.contracts.process(&self.pid31).await
+        {
+            let o = &mut self.record.onchain;
+            if p.last_vote_at > o.last_vote_at {
+                o.last_vote_at = p.last_vote_at;
+                self.put_record();
+            }
+            self.vote_at_stale = p.state_root != self.record.onchain.state_root;
+        }
+        if !self.vote_at_stale && self.chain_time != 0 && self.chain_time >= self.grace_end() {
             self.close_out("process closed");
         }
         // Landed-but-unconfirmed flight: if the chain never showed our root
@@ -1344,10 +1412,13 @@ impl Actor {
         {
             return;
         }
+        // Ready seals; Ended flushes; Paused blocks only before the end (a
+        // pause cannot outlive it, the registry settles it like Ended).
         let flush = self.flush();
         match self.record.onchain.status {
             ProcessStatus::Ready => {}
             ProcessStatus::Ended if flush => {}
+            ProcessStatus::Paused if self.chain_time >= self.end_time() => {}
             _ => return,
         }
         // Cooling down after transient prover/RPC trouble, or holding for
@@ -1419,11 +1490,14 @@ impl Actor {
             }
         };
         // Time budget: the largest batch whose estimated proof plus the
-        // landing margin ends before the window closes.
+        // landing margin ends before the window closes. The earliest legal
+        // close is an END now under a grace lowered to the floor.
         let nf = self.state.config().ballot_mode.num_fields;
         let now = self.chain_time.max(self.deps.clock.now());
-        let left =
-            self.grace_end() as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
+        let deadline = self
+            .grace_end()
+            .min(now.saturating_add(self.deps.grace.grace_floor));
+        let left = deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
         let n_max = (left / self.metrics.prove.spv(nf)).floor();
         if n_max < 1.0 {
             return; // nothing fits; the window closes on these votes
@@ -1943,8 +2017,9 @@ impl Actor {
                 if name == "InvalidStatus" || name == "InvalidTimeBounds" =>
             {
                 self.rollback_flight(&f);
-                // Paused under the flight (or not started): the votes wait
-                // for the process to open. Only a closed one errors them.
+                // Paused under the flight, not started, or a budget overrun
+                // inside the grace: the votes wait for the next seal. Only a
+                // closed window errors them.
                 if let Some(status) = self.may_reopen().await {
                     let secs = self.prove_backoff();
                     // Until the pause event arrives, the record still says
@@ -2028,15 +2103,21 @@ impl Actor {
     }
 
     /// After a status or window revert: the process's status if it may
-    /// still take the votes (paused, or before its start), by the chain and
-    /// by the events seen so far. `None` once ended, canceled or past its end.
+    /// still take the votes (paused, before its start, or in its grace), by
+    /// the chain and by the events seen so far. `None` once canceled or
+    /// past its grace end.
     async fn may_reopen(&self) -> Option<ProcessStatus> {
-        let open = |s| matches!(s, ProcessStatus::Ready | ProcessStatus::Paused);
-        let (status, end) = match self.deps.contracts.process(&self.pid31).await {
-            Ok(p) => (p.status, p.end_time()),
-            Err(_) => (self.record.onchain.status, self.end_time()),
+        let open = |s| {
+            matches!(
+                s,
+                ProcessStatus::Ready | ProcessStatus::Paused | ProcessStatus::Ended
+            )
         };
-        (open(status) && open(self.record.onchain.status) && self.chain_time < end)
+        let (status, grace_end) = match self.deps.contracts.process(&self.pid31).await {
+            Ok(p) => (p.status, p.grace_end(self.deps.grace.grace_max_total)),
+            Err(_) => (self.record.onchain.status, self.grace_end()),
+        };
+        (open(status) && open(self.record.onchain.status) && self.chain_time < grace_end)
             .then_some(status)
     }
 
@@ -2087,6 +2168,7 @@ impl Actor {
         self.next_index += 1;
         self.last_tx_block = self.last_tx_block.max(block);
         self.record.onchain.state_root = p.new_root;
+        self.vote_at_stale = true;
         self.put_record();
         self.await_sync = false;
         self.metrics.settled_by_self.fetch_add(1, Ordering::SeqCst);
@@ -2106,7 +2188,8 @@ impl Actor {
             EventKind::StatusChanged { new, .. } => {
                 self.record.onchain.status = new;
                 self.pause_hold = None;
-                if matches!(new, ProcessStatus::Ended | ProcessStatus::Canceled) {
+                // Ended flushes through the grace; the tick closes out at its end.
+                if new == ProcessStatus::Canceled {
                     self.close_out("process closed");
                 }
                 if new == ProcessStatus::Results {
@@ -2114,13 +2197,20 @@ impl Actor {
                 }
                 self.put_record();
             }
+            // Shortened or extended: admission, flush mode, the budget and
+            // the grace end all read it.
             EventKind::DurationChanged { duration, .. } => {
                 self.record.onchain.duration = duration;
+                self.put_record();
+            }
+            EventKind::GraceChanged { grace, .. } => {
+                self.record.onchain.grace = grace;
                 self.put_record();
             }
             EventKind::MaxVotersChanged { max_voters, .. } => {
                 self.record.onchain.max_voters = max_voters;
                 self.put_record();
+                self.error_new_slots_if_full();
             }
             // Followed like the duration and the census, so the stored copy
             // catches up with getProcess; nothing here reads it.
@@ -2209,6 +2299,8 @@ impl Actor {
         new_root: [u8; 32],
         n_blobs: u64,
     ) {
+        // Every landing (replays included, harmlessly) moves the grace end.
+        self.vote_at_stale = true;
         // Replayed events must not abort a live flight or roll the pinned
         // root back, so the already-applied checks come first.
         let committed = self.state.committed().root;
@@ -2403,24 +2495,63 @@ impl Actor {
         {
             return;
         }
-        // The contract also accepts results for a process paused past
-        // its end, so Paused counts like Ready here.
-        let ended = self.record.onchain.status == ProcessStatus::Ended
-            || (matches!(
-                self.record.onchain.status,
-                ProcessStatus::Ready | ProcessStatus::Paused
-            ) && self.chain_time >= self.end_time());
-        if !ended {
+        // The contract also accepts results for a process paused past its
+        // end, so Paused counts like Ready here.
+        if !matches!(
+            self.record.onchain.status,
+            ProcessStatus::Ended | ProcessStatus::Ready | ProcessStatus::Paused
+        ) {
             return;
         }
-        // Synced to the final on-chain root?
-        if self.state.committed().root != self.record.onchain.state_root {
+        // Synced to the on-chain root?
+        let root = self.state.committed().root;
+        if root != self.record.onchain.state_root {
             return;
         }
+        // Results land only once the grace window closed (`GraceOpen`).
+        let closed = !self.vote_at_stale && self.chain_time >= self.grace_end();
         if self.record.onchain.key_mode != KeyMode::Sequencer {
-            self.finalize_dkg();
+            if closed {
+                self.finalize_dkg();
+            }
             return;
         }
+        let hold = !closed;
+        if hold {
+            // Eager results: once the end is seen and nothing is left to
+            // settle here, prove at the current root during the grace. Not
+            // before a chain read confirmed that root (fresh after recover).
+            let end_seen = self.record.onchain.status == ProcessStatus::Ended
+                || (self.chain_time != 0 && self.chain_time >= self.end_time());
+            if !self.eager || !end_seen || !self.pending.is_empty() || self.vote_at_stale {
+                return;
+            }
+        }
+        if let Some((r, snark)) = &self.held
+            && *r == root
+        {
+            if hold {
+                return; // already holding this root
+            }
+            // Proved at this root during the grace: submit it now. It stays
+            // held for a retry after a transient failure.
+            let snark = (**snark).clone();
+            self.generation += 1;
+            self.finalizing = true;
+            self.finalize_after = None;
+            info!(pid = %hex::encode(self.pid31), "finalizing: submitting held results");
+            tokio::spawn(crate::finalize::run_submit_held(
+                self.deps.contracts.clone(),
+                self.pid31,
+                snark,
+                self.deps.grace.grace_max_total,
+                self.generation,
+                self.tx.clone(),
+            ));
+            return;
+        }
+        // Proved at a root that has moved since: prove again.
+        self.held = None;
         let Some(sk) = self
             .keys
             .secret_for(&self.pid31, &self.state.config().enc_key)
@@ -2441,14 +2572,16 @@ impl Actor {
         self.generation += 1;
         self.finalizing = true;
         self.finalize_after = None;
-        info!(pid = %hex::encode(self.pid31), "finalizing: proving results");
+        info!(pid = %hex::encode(self.pid31), hold, "finalizing: proving results");
         tokio::spawn(crate::finalize::run_finalize(
             self.deps.prover.clone(),
             self.deps.contracts.clone(),
             self.pid31,
             request,
-            self.state.committed().root,
+            root,
             tally,
+            self.deps.grace.grace_max_total,
+            hold,
             self.generation,
             self.tx.clone(),
         ));
@@ -2488,6 +2621,7 @@ impl Actor {
             self.pid31,
             inputs,
             self.state.committed().root,
+            self.deps.grace.grace_max_total,
             self.generation,
             self.tx.clone(),
         ));
@@ -2527,12 +2661,13 @@ async fn run_job(job: JobInput) {
 async fn job_inner(job: JobInput) -> JobOutcome {
     let t0 = job.clock.now();
     let (got, snark) = match job.prover.prove_batch(&job.request, &job.expected).await {
-        Ok(x) => {
-            let secs = job.clock.now().saturating_sub(t0) as f64;
+        Ok((got, snark, proving)) => {
+            // Wall time counts queue wait: only when the prover reports none.
+            let secs = proving.unwrap_or_else(|| job.clock.now().saturating_sub(t0) as f64);
             job.metrics
                 .prove
                 .observe(job.nf, job.n, secs, job.prove_base);
-            x
+            (got, snark)
         }
         // Transport/queue trouble is retried; a failed job never is.
         Err(e) if !e.permanent => return JobOutcome::Transient(e.to_string()),
@@ -2617,37 +2752,38 @@ mod tests {
         let submits = Arc::new(AtomicUsize::new(0));
         let polls = Arc::new(AtomicUsize::new(0));
         let (sc, pc) = (submits.clone(), polls.clone());
-        let app =
-            axum::Router::new()
-                .route(
-                    "/prove",
-                    axum::routing::post(move || {
-                        sc.fetch_add(1, Ordering::SeqCst);
-                        async {
-                            (
-                                axum::http::StatusCode::ACCEPTED,
-                                axum::Json(serde_json::json!({"job_id": "j1"})),
-                            )
+        let app = axum::Router::new()
+            .route(
+                "/prove",
+                axum::routing::post(move || {
+                    sc.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        (
+                            axum::http::StatusCode::ACCEPTED,
+                            axum::Json(serde_json::json!({"job_id": "j1"})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/jobs/:id",
+                axum::routing::get(
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        assert_eq!(id, "j1", "polled a different job id");
+                        let n = pc.fetch_add(1, Ordering::SeqCst) + 1;
+                        let status = if done_after != 0 && n >= done_after {
+                            "done"
+                        } else {
+                            "running"
+                        };
+                        async move {
+                            axum::Json(serde_json::json!({
+                                "job_id": "j1", "status": status, "elapsed_ms": 1500
+                            }))
                         }
-                    }),
-                )
-                .route(
-                    "/jobs/:id",
-                    axum::routing::get(
-                        move |axum::extract::Path(id): axum::extract::Path<String>| {
-                            assert_eq!(id, "j1", "polled a different job id");
-                            let n = pc.fetch_add(1, Ordering::SeqCst) + 1;
-                            let status = if done_after != 0 && n >= done_after {
-                                "done"
-                            } else {
-                                "running"
-                            };
-                            async move {
-                                axum::Json(serde_json::json!({"job_id": "j1", "status": status}))
-                            }
-                        },
-                    ),
-                );
+                    },
+                ),
+            );
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -2662,7 +2798,9 @@ mod tests {
         let (url, submits, polls) = stub_prover(8).await;
         let svc = ProverService::new(&url, Duration::from_millis(20), Duration::from_millis(80));
         let id = davinci_zkvm_sdk::types::JobId::parse("j1").unwrap();
-        svc.wait_done(&id).await.unwrap();
+        let job = svc.wait_done(&id).await.unwrap();
+        // The job's own proving time, which the budget model observes.
+        assert_eq!(job.elapsed_ms, Some(1500));
         assert_eq!(submits.load(Ordering::SeqCst), 0, "resubmitted the job");
         assert!(polls.load(Ordering::SeqCst) >= 8);
     }
