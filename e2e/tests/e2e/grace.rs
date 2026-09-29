@@ -47,7 +47,10 @@ const FLUSH: std::ops::Range<usize> = 1..7;
 const TWICE: usize = 7;
 const LATE: usize = 8;
 /// Seconds past `noticeMin` the shortened end leaves for the flush votes.
+/// Live it also covers the head read lagging the chain and the shorten
+/// transaction's inclusion, or the end lands inside the notice and reverts.
 const SHORTEN_SLACK: u64 = 6;
+const SHORTEN_SLACK_LIVE: u64 = 45;
 /// Backlog node's batch cap, and its two sets of votes.
 const SMALL_BATCH: usize = 2;
 const BURST: std::ops::Range<usize> = 0..6;
@@ -535,7 +538,12 @@ async fn shorten(
     // The end moves to the notice's edge; votes and a package sent to two
     // nodes go in before it; the nodes flush.
     let (_, now) = head(&net.rpc).await?;
-    let end = now + u64::from(params.notice_min) + SHORTEN_SLACK;
+    let slack = if net.live {
+        SHORTEN_SLACK_LIVE
+    } else {
+        SHORTEN_SLACK
+    };
+    let end = now + u64::from(params.notice_min) + slack;
     org.set_process_duration(&pid, end - p.start_time)
         .await
         .context("shorten")?;
