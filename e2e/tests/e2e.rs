@@ -50,7 +50,8 @@ use davinci_client::api::{
     CensusFile, Fr, ProcessId, ProcessStatus, VoteRequest, VoteStatus, verify_tracker,
 };
 use davinci_client::organizer::{
-    KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret, RegistryReader, merkle_census,
+    CreatedProcess, KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret,
+    RegistryReader, merkle_census,
 };
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::Voter;
@@ -394,13 +395,11 @@ async fn setup_checks(
     if let Some(w) = &net.dkg {
         for mode in [KeyMode::DkgAutomatic, KeyMode::DkgLocked] {
             let next = org.next_process_id().await?;
-            let c = org
-                .create_process(&NewProcess {
-                    key_mode: mode,
-                    ..dkg_new_process(next, &p1, 3600)
-                })
-                .await
-                .with_context(|| format!("create a {mode:?} process"))?;
+            let np = NewProcess {
+                key_mode: mode,
+                ..dkg_new_process(next, &p1, 3600)
+            };
+            let c = create_dkg(net, w, org, &np).await?;
             let p = reader.process(&c.pid).await?;
             dkg::check_process_key(&net.rpc, w, &p, c.organizer_secret.as_ref())
                 .await
@@ -433,7 +432,7 @@ async fn setup_checks(
 }
 
 /// The run's gas bill: organizer and census transactions, then every
-/// transition and results transaction since the run began.
+/// transition and results transaction of its processes since the run began.
 async fn costs(net: &Net, org: &Organizer, mut extra: Vec<TxCost>) -> Result<String> {
     let mut all: Vec<TxCost> = org
         .receipts()
@@ -442,13 +441,28 @@ async fn costs(net: &Net, org: &Organizer, mut extra: Vec<TxCost>) -> Result<Str
         .collect();
     all.append(&mut extra);
     let from = net.start_block.unwrap_or(net.from_block);
-    for t in chain::transitions(&net.rpc, net.registry, from).await? {
+    // A live registry is shared: other organizers' processes are not ours.
+    let created = org.created();
+    let ours = |t: &chain::RegistryTx| created.contains(&t.pid);
+    for t in chain::transitions(&net.rpc, net.registry, from)
+        .await?
+        .into_iter()
+        .filter(ours)
+    {
         let label = format!("transition {}", ProcessId(t.pid));
         all.push(cost::fetch(&net.rpc, label, t.tx).await?);
     }
-    let results = chain::results_txs(&net.rpc, net.registry, from).await?;
+    let results: Vec<_> = chain::results_txs(&net.rpc, net.registry, from)
+        .await?
+        .into_iter()
+        .filter(ours)
+        .collect();
     // A zero-vote DKG request sets the results in the same transaction.
-    for t in chain::dkg_requests(&net.rpc, net.registry, from).await? {
+    for t in chain::dkg_requests(&net.rpc, net.registry, from)
+        .await?
+        .into_iter()
+        .filter(ours)
+    {
         if results.iter().any(|r| r.tx == t.tx) {
             continue;
         }
@@ -2007,6 +2021,37 @@ fn dkg_new_process(process_id: [u8; 31], p1: &OnchainProcess, duration: u64) -> 
     }
 }
 
+/// Creates a DKG-mode process. The shared committee spends its pool of keys
+/// and then opens its next epoch on its own: while no epoch has a free key,
+/// waits for the next one and tries again (three times at most).
+async fn create_dkg(
+    net: &Net,
+    w: &DkgWiring,
+    org: &Organizer,
+    np: &NewProcess,
+) -> Result<CreatedProcess> {
+    let mode = np.key_mode;
+    let mut waits = 0;
+    loop {
+        match org.create_process(np).await {
+            Err(e) if dkg::no_free_pool_key(&e) && waits < 3 => {
+                waits += 1;
+                say!("create a {mode:?} process: {e}; waiting for the committee's next epoch");
+                let t = Instant::now();
+                let eid = dkg::wait_registration_epoch(&net.rpc, w.adapter)
+                    .await
+                    .with_context(|| format!("create a {mode:?} process"))?;
+                say!(
+                    "DKG epoch 0x{} has a free pool key after {:.0} s",
+                    hex::encode(eid),
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            r => return r.with_context(|| format!("create a {mode:?} process")),
+        }
+    }
+}
+
 /// Waits for `pid`'s `ResultsDecryptionRequested`; returns it.
 async fn dkg_request(
     net: &Net,
@@ -2057,26 +2102,26 @@ async fn dkg_processes(
     let voters = fx::merkle_voters();
     let locked_duration = net::scaled(DKG_LOCKED_DURATION).as_secs();
     let mut created = Vec::new();
+    // The locked one last: its clock starts at creation, and a wait for the
+    // committee's next epoch before another create would eat into it.
     for (mode, duration) in [
         (KeyMode::DkgAutomatic, 2 * 3600),
-        (KeyMode::DkgLocked, locked_duration),
         (KeyMode::DkgAutomatic, 2 * 3600),
+        (KeyMode::DkgLocked, locked_duration),
     ] {
         let next = org.next_process_id().await?;
-        let c = org
-            .create_process(&NewProcess {
-                key_mode: mode,
-                ..dkg_new_process(next, p1, duration)
-            })
-            .await
-            .with_context(|| format!("create a {mode:?} process"))?;
+        let np = NewProcess {
+            key_mode: mode,
+            ..dkg_new_process(next, p1, duration)
+        };
+        let c = create_dkg(net, w, org, &np).await?;
         let p = wait_listed(nodes, reader, &c.pid).await?;
         dkg::check_process_key(&net.rpc, w, &p, c.organizer_secret.as_ref())
             .await
             .with_context(|| format!("{mode:?} key of {}", ProcessId(c.pid)))?;
         created.push((p, c.organizer_secret));
     }
-    let [(pa, _), (pl, sk), (pz, _)] =
+    let [(pa, _), (pz, _), (pl, sk)] =
         <[_; 3]>::try_from(created).map_err(|_| anyhow::anyhow!("three processes"))?;
     let sk = sk.context("no organizer secret for the locked process")?;
     let (da, dl, dz) = (
@@ -2085,11 +2130,13 @@ async fn dkg_processes(
         pz.dkg.context("dkg")?,
     );
     say!(
-        "DKG processes: automatic {}, locked {} ({locked_duration} s), zero-vote {}; epoch 0x{}",
+        "DKG processes: automatic {}, locked {} ({locked_duration} s), zero-vote {}; epochs 0x{}, 0x{}, 0x{}",
         ProcessId(pa.id),
         ProcessId(pl.id),
         ProcessId(pz.id),
-        hex::encode(da.epoch_id)
+        hex::encode(da.epoch_id),
+        hex::encode(dl.epoch_id),
+        hex::encode(dz.epoch_id)
     );
     // No votes: tallied as zeros on the request, without the committee.
     org.end_process(&pz.id)

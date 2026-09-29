@@ -173,6 +173,11 @@ impl Net {
                     .await
                     .context("the registry adapter's DKG manager")?,
             };
+            // A spent pool leaves nothing to register in until the
+            // committee's next epoch goes Live.
+            if let Some(a) = info.dkg_adapter {
+                dkg::wait_registration_epoch(&net.rpc, a).await?;
+            }
             let w = dkg::check_wiring(&net.rpc, net.registry, manager)
                 .await
                 .context("DKG wiring")?;

@@ -149,6 +149,12 @@ impl NodeConfig {
     }
 }
 
+/// Seconds [`Node::start`] waits before each start, as a supervisor's
+/// restart backoff would. A node dies before answering when its port was
+/// taken between the probe and its bind, and when its RPC refuses the boot
+/// checks: public RPCs refuse a busy host for a minute or two.
+const START_PAUSES: [u64; 6] = [0, 5, 15, 30, 60, 90];
+
 /// Counters from `GET /info`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Metrics {
@@ -249,12 +255,15 @@ impl Node {
         }
     }
 
-    /// Starts the node on a free port, retrying twice with another port if
-    /// it dies before answering (the port may be taken between the probe
-    /// and the node's bind).
+    /// Starts the node on a free port. One that dies before answering is
+    /// started again on another port after the next of [`START_PAUSES`].
     pub async fn start(bin: &Path, cfg: &NodeConfig) -> Result<Node> {
-        let mut last = None;
-        for _ in 0..3 {
+        let mut last: Option<anyhow::Error> = None;
+        for pause in START_PAUSES {
+            if let Some(e) = &last {
+                eprintln!("{e:#}; starting it again in {pause} s");
+            }
+            tokio::time::sleep(Duration::from_secs(pause)).await;
             match Node::spawn(bin, cfg, crate::chain::free_port()?).await {
                 Ok(n) => return Ok(n),
                 Err(e) => last = Some(e),

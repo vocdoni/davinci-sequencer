@@ -605,6 +605,30 @@ pub async fn registration_epoch(rpc: &str, adapter: Address) -> Result<EpochId> 
         .await?)
 }
 
+/// Longest wait for the committee's next epoch once its pool is spent: its
+/// nodes open one on their own, Live about two minutes later on Gnosis.
+const EPOCH_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// Waits (timeouts scaled) until `adapter` has a Live epoch with a free pool
+/// key and returns it.
+pub async fn wait_registration_epoch(rpc: &str, adapter: Address) -> Result<EpochId> {
+    wait::until(
+        "a Live DKG epoch with a free pool key",
+        net::scaled(EPOCH_WAIT),
+        Duration::from_secs(5),
+        || async { Ok(registration_epoch(rpc, adapter).await.ok()) },
+    )
+    .await
+}
+
+/// A DKG-mode `newProcess` refused only because no Live epoch has a free
+/// pool key: the pool is spent and the next epoch is not Live yet.
+/// `PoolExhausted` is the last key taken under a create, after the client's
+/// own retry.
+pub fn no_free_pool_key(e: &davinci_client::Error) -> bool {
+    matches!(e, davinci_client::Error::Reverted(n) if n == "NoLiveEpoch" || n == "PoolExhausted")
+}
+
 /// Fails unless `registry` has an adapter on `manager` wired to its app
 /// manager, and the adapter has a Live epoch to register in.
 pub async fn check_wiring(rpc: &str, registry: Address, manager: Address) -> Result<DkgWiring> {
@@ -739,6 +763,22 @@ mod tests {
             env.iter()
                 .any(|(k, v)| { *k == "DAVINCI_DKG_PRIVKEY" && v.is_some_and(|v| v == key) })
         );
+    }
+
+    #[test]
+    fn only_a_spent_pool_waits() {
+        use davinci_client::Error;
+        let r = |n: &str| Error::Reverted(n.into());
+        assert!(no_free_pool_key(&r("NoLiveEpoch")));
+        assert!(no_free_pool_key(&r("PoolExhausted")));
+        for e in [
+            r("InvalidEpoch"),
+            r("InvalidSchnorrProof"),
+            Error::Chain("reverted: NoLiveEpoch".into()),
+            Error::DkgDisabled,
+        ] {
+            assert!(!no_free_pool_key(&e), "{e}");
+        }
     }
 
     #[test]
