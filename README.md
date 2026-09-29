@@ -1282,9 +1282,9 @@ DAVINCI contracts:
 
 | Contract | Address | Block |
 |---|---|---|
-| ZiskVerifier | `0x6D804CC99BfdA4E3F6413C3310803D2D2e0A3E3A` | 48489492 |
-| ProcessRegistry | `0x7e79660dE04b8fC1FFAfB9d09f3B0770Bdb0D831` | 48489493 |
-| DavinciDKGAdapter | `0xfcB637FbC34Db90Da9B151dCCfF27838d45114D6` | 48489493 |
+| ZiskVerifier | `0x150547716bD6f15D872508b66b2ae7ce17677C9C` | 48504089 |
+| ProcessRegistry | `0x6702e0141B6b72bCF8C1bdff20A82A35C5502E7D` | 48504090 |
+| DavinciDKGAdapter | `0xE9559c78E7ff8c19937A0657a092A221E90CCBC3` | 48504090 |
 
 DKG contracts:
 
@@ -1316,7 +1316,7 @@ every pin:
 
 ```bash
 python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \
-  --registry 0x7e79660dE04b8fC1FFAfB9d09f3B0770Bdb0D831 --chain-id 100 \
+  --registry 0x6702e0141B6b72bCF8C1bdff20A82A35C5502E7D --chain-id 100 \
   --batch-vk  0x6cfc89d562d0b22f04478a5c15b390433eb52f1b03147030b183076260da7a10 \
   --results-vk 0x7bc8c5e9235548386a44b1885732a2a7ffb1badddc8c7fba599d07ece47be794 \
   --root-c 0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80 \

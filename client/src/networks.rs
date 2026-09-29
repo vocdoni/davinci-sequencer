@@ -34,8 +34,8 @@ impl Network {
 pub const GNOSIS: Network = Network {
     name: "gnosis",
     chain_id: 100,
-    registry: address!("7e79660dE04b8fC1FFAfB9d09f3B0770Bdb0D831"),
-    start_block: 48_489_493,
+    registry: address!("6702e0141B6b72bCF8C1bdff20A82A35C5502E7D"),
+    start_block: 48_504_090,
     rpc_urls: &[
         "https://gnosis-rpc.publicnode.com",
         "https://gnosis-rpc.blockreq.com/v1/rpc/public",
