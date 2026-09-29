@@ -736,6 +736,27 @@ async fn submit_refused(
 /// Census members and weights, in leaf order.
 type Parts = Vec<([u8; 20], u128)>;
 
+/// A public RPC refusing a burst, past the client's own retries.
+fn rate_limited(e: &ClientError) -> bool {
+    matches!(e, ClientError::Chain(m) if m.contains("429") || m.contains("Too Many Requests"))
+}
+
+/// Process `pid` as the registry has it, riding out RPC rate limits: every
+/// public Gnosis RPC answers 429 to a busy host for a minute or two.
+async fn read_process(org: &Organizer, pid: &[u8; 31]) -> Result<OnchainProcess> {
+    let mut tries = 0;
+    loop {
+        match org.process(pid).await {
+            Err(e) if rate_limited(&e) && tries < 10 => {
+                tries += 1;
+                say!("registry read rate-limited ({tries}); retrying in 30 s");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            r => return Ok(r?),
+        }
+    }
+}
+
 /// How a round's ballots prove census membership.
 enum Witness {
     Tree(LeanImt),
@@ -812,6 +833,10 @@ impl Run {
 
     fn save(&self) -> Result<()> {
         self.state.save(&self.state_path)
+    }
+
+    async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess> {
+        read_process(&self.org, pid).await
     }
 
     /// Marks `step` done for election `n` and notes `line`.
@@ -1065,7 +1090,7 @@ impl Run {
         if let Lifecycle::CanceledEarly { .. } = spec.lifecycle
             && !self.is_done(n, "cancel")
         {
-            let p = self.org.process(&pid).await?;
+            let p = self.process(&pid).await?;
             if is_open(p.status) {
                 self.org
                     .cancel_process(&pid)
@@ -1083,7 +1108,7 @@ impl Run {
             && !self.is_done(n, "metadata")
         {
             let (path, hash) = demo::metadata_update(spec)?.context("no metadata update")?;
-            let p = self.org.process(&pid).await?;
+            let p = self.process(&pid).await?;
             let ahead = p.start_time.saturating_sub(unix_now());
             if ahead > 0 {
                 self.org
@@ -1169,7 +1194,7 @@ impl Run {
             self.ensure_census_contract(spec, spec.members).await?;
         }
         let pid = self.pid(n)?;
-        let p = self.org.process(&pid).await?;
+        let p = self.process(&pid).await?;
         let probe = self.census_probe(spec).await?;
         for (i, api) in self.nodes.iter().enumerate() {
             let t = Instant::now();
@@ -1237,7 +1262,7 @@ impl Run {
                 continue;
             }
             let pid = self.pid(n)?;
-            let p = self.org.process(&pid).await?;
+            let p = self.process(&pid).await?;
             let paused = round == 2 && spec.pauses() && p.status == ProcessStatus::Paused;
             let (now, end) = (unix_now(), p.start_time + p.duration);
             ensure!(now >= p.start_time, "election {n} has not started");
@@ -1300,7 +1325,7 @@ impl Run {
     async fn send(&mut self, spec: &Spec, todo: Vec<Planned>) -> Result<()> {
         let n = spec.n;
         let pid = self.pid(n)?;
-        let p = self.org.process(&pid).await?;
+        let p = self.process(&pid).await?;
         let (witness, parts) = self.witness(spec, &p)?;
         let keys = self.secrets.keys(n)?;
         let pid_fr = ProcessId(pid).to_fr();
@@ -1474,8 +1499,7 @@ impl Run {
                         .is_none_or(|e| e.refusal(r).is_none())
             });
             let revotes = spec.revotes > 0 && !self.round_done(&spec, 2);
-            if (refusals || revotes)
-                && voting(&self.org.process(&self.pid(spec.n)?).await?, unix_now())
+            if (refusals || revotes) && voting(&self.process(&self.pid(spec.n)?).await?, unix_now())
             {
                 self.wait_roots(&spec).await?;
             }
@@ -1509,7 +1533,7 @@ impl Run {
                     let pid = self.pid(n)?;
                     let parts = demo::census_parts(&spec, &self.secrets, true)?;
                     let root = demo::census_root(&parts)?;
-                    if self.org.process(&pid).await?.census_root != root {
+                    if self.process(&pid).await?.census_root != root {
                         // The member's vote goes in first, so it is pending
                         // when the census changes under it.
                         if let Some(x) = reweight {
@@ -1622,7 +1646,7 @@ impl Run {
             READY_TIMEOUT,
             POLL,
             || async {
-                let chain = self.org.process(&pid).await?.state_root;
+                let chain = self.process(&pid).await?.state_root;
                 for api in &self.nodes {
                     let v = api.process(&pid).await?;
                     if v.local_state_root.unwrap_or(v.state_root) != chain {
@@ -1687,7 +1711,7 @@ impl Run {
             if self.is_done(n, step) {
                 continue;
             }
-            let p = self.org.process(&pid).await?;
+            let p = self.process(&pid).await?;
             if step == "cancel" && p.status == ProcessStatus::Canceled {
                 self.done(n, step, "canceled during voting".into())?;
                 continue;
@@ -1820,7 +1844,7 @@ impl Run {
             return Ok(());
         }
         let pid = self.pid(n)?;
-        let p = self.org.process(&pid).await?;
+        let p = self.process(&pid).await?;
         if r != Refusal::AfterEnd && !voting(&p, unix_now()) {
             let line = format!("{} not sent: the election is not open", r.describe());
             say!("election {n}: {line}");
@@ -1895,7 +1919,7 @@ impl Run {
             return Ok(());
         }
         let pid = self.pid(n)?;
-        let p = self.org.process(&pid).await?;
+        let p = self.process(&pid).await?;
         if p.status == ProcessStatus::Ready {
             self.org
                 .pause_process(&pid)
@@ -1935,7 +1959,7 @@ impl Run {
                 continue;
             }
             let pid = self.pid(n)?;
-            let before = self.org.process(&pid).await?;
+            let before = self.process(&pid).await?;
             let sent: Vec<(usize, u64)> = self.state.elections[&n]
                 .votes
                 .iter()
@@ -1956,7 +1980,7 @@ impl Run {
                 };
                 *by.entry(s).or_default() += 1;
             }
-            let after = self.org.process(&pid).await?;
+            let after = self.process(&pid).await?;
             let line = format!(
                 "{} votes sent while paused were taken (HTTP 200); {} s later they are {}; \
                  on-chain voters {} -> {}, status {}",
@@ -1990,7 +2014,7 @@ impl Run {
             if !matches!(spec.lifecycle, Lifecycle::Later { .. }) || self.round_done(&spec, 3) {
                 continue;
             }
-            let p = self.org.process(&self.pid(spec.n)?).await?;
+            let p = self.process(&self.pid(spec.n)?).await?;
             // A little past the start, for the chain's clock.
             let wait = (p.start_time + 20).saturating_sub(unix_now());
             if wait > 0 {
@@ -2009,7 +2033,7 @@ impl Run {
         for spec in self.specs.clone() {
             let n = spec.n;
             let pid = self.pid(n)?;
-            let p = self.org.process(&pid).await?;
+            let p = self.process(&pid).await?;
             match spec.lifecycle {
                 Lifecycle::Tally | Lifecycle::Later { .. } if is_open(p.status) => {
                     self.org
@@ -2054,7 +2078,7 @@ impl Run {
             return Ok(());
         }
         let pid = self.pid(n)?;
-        let p = self.org.process(&pid).await?;
+        let p = self.process(&pid).await?;
         let end = p.start_time + p.duration;
         let wait = (end + 10).saturating_sub(unix_now());
         if is_open(p.status) && wait > 0 {
@@ -2083,14 +2107,14 @@ impl Run {
             return Ok(());
         }
         let pid = self.pid(n)?;
-        if self.org.process(&pid).await?.status != ProcessStatus::Results {
+        if self.process(&pid).await?.status != ProcessStatus::Results {
             let t = Instant::now();
             wait::until(
                 &format!("the decryption request of election {n}"),
                 REQUEST_TIMEOUT,
                 POLL,
                 || async {
-                    let p = self.org.process(&pid).await?;
+                    let p = self.process(&pid).await?;
                     Ok(p.dkg.is_some_and(|d| d.results_requested).then_some(()))
                 },
             )
@@ -2115,7 +2139,7 @@ impl Run {
         let mut last_end = unix_now();
         for spec in &tallied {
             if let Lifecycle::Timed { .. } = spec.lifecycle {
-                let p = self.org.process(&self.pid(spec.n)?).await?;
+                let p = self.process(&self.pid(spec.n)?).await?;
                 last_end = last_end.max(p.start_time + p.duration);
             }
         }
@@ -2131,7 +2155,7 @@ impl Run {
                 if self.state.election(n).results.is_some() {
                     continue;
                 }
-                let p = self.org.process(&self.pid(n)?).await?;
+                let p = self.process(&self.pid(n)?).await?;
                 if p.status == ProcessStatus::Results {
                     say!(
                         "election {n}: results on-chain {:?} ({:.0} s into the wait)",
@@ -2191,7 +2215,7 @@ impl Run {
         for spec in &self.specs {
             let n = spec.n;
             let pid = self.pid(n)?;
-            let p = self.org.process(&pid).await?;
+            let p = self.process(&pid).await?;
             let transitions = self.transitions(&pid).await;
             let (batches, blobs) = match &transitions {
                 Some(t) => (
