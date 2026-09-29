@@ -370,6 +370,13 @@ impl Net {
         }
         c.confirmations = self.confirmations;
         c.poll = self.poll.clone();
+        if self.live {
+            // The registry's production grace: the node's own budget
+            // defaults, with room for 5 s blocks.
+            c.flush_horizon = None;
+            c.prove_base = None;
+            c.settle_margin = Some("20s".into());
+        }
         c.start_block = self.start_block;
         Ok(c)
     }

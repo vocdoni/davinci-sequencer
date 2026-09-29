@@ -189,9 +189,16 @@ pub struct Deployment {
     pub dkg_adapter: Address,
 }
 
+/// Grace immutables of the anvil registry, in seconds: `defaultGrace,
+/// graceFloor, graceCeil, graceMaxTotal, noticeMin`. The floor bounds every
+/// node's round budget, so it fits one small batch's proof and settlement. The
+/// default covers the first landing after an END that three racing nodes flush
+/// through one GPU: the losers' proofs still queue ahead, up to five jobs.
+pub const GRACE_ARGS: (u32, u32, u32, u32, u32) = (120, 40, 180, 240, 5);
+
 /// Deploys `ZiskVerifier` (a `PlonkVerifier`) and `ProcessRegistry` pinned to
-/// the release vks and the ballot VK hash, with `dkg_manager` (zero disables
-/// the DKG key modes), then reads the pins back.
+/// the release vks, the ballot VK hash and [`GRACE_ARGS`], with `dkg_manager`
+/// (zero disables the DKG key modes), then reads the pins back.
 pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deployment> {
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer(0)?))
@@ -227,6 +234,7 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
         .abi_encode_params();
     let mut code = bytecode(dir, "ProcessRegistry.sol/ProcessRegistry.json")?;
     code.extend_from_slice(&args);
+    code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
     let registry = deploy_code(&provider, code)
         .await
         .context("deploy ProcessRegistry")?;
@@ -237,6 +245,15 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
     ensure!(r.rootCVadcopFinal().call().await? == B256::from(release::ROOT_C_VADCOP_FINAL));
     ensure!(r.ballotVKHash().call().await? == vk_hash);
     ensure!(r.ziskVerifier().call().await? == verifier);
+    ensure!(
+        (
+            r.defaultGrace().call().await?,
+            r.graceFloor().call().await?,
+            r.graceCeil().call().await?,
+            r.graceMaxTotal().call().await?,
+            r.noticeMin().call().await?,
+        ) == GRACE_ARGS
+    );
     let dkg_adapter = r.dkgAdapter().call().await?;
     ensure!(
         (dkg_adapter == Address::ZERO) == (dkg_manager == Address::ZERO),

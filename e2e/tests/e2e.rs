@@ -38,6 +38,13 @@
 //! (`DAVINCI_E2E_DKG_MANAGER` overrides it). Then,
 //! after the sequencer-key processes, an automatic, a locked and a zero-vote
 //! DKG process and the eth_call negatives around their requests.
+//!
+//! Every process closes after the registry's grace window, and the last
+//! phase exercises it (`grace`): an AGM END with batches in flight, a
+//! shortened end, a backlog that extends the window round by round and one
+//! that hits its cap, with queued revotes, a failover and the batching
+//! policy's lone-vote and burst paths on the way. `DAVINCI_E2E_GRACE_ONLY=1`
+//! runs that phase alone, right after the processes are created.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -132,6 +139,9 @@ macro_rules! say {
         eprintln!("[e2e {:>7.1}s] {}", t0().elapsed().as_secs_f64(), format!($($arg)*))
     };
 }
+
+#[path = "e2e/grace.rs"]
+mod grace;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e() -> Result<()> {
@@ -901,9 +911,14 @@ async fn scenario(dir: &Path) -> Result<()> {
     };
     // Three sequencers and, last, an observer without a key that only
     // syncs and serves reads (it is never sent votes or key requests).
+    let seq_cfgs = ["node-a", "node-b", "node-c"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| cfg(name, i, Some(i)))
+        .collect::<Result<Vec<_>>>()?;
     let mut nodes: Vec<Node> = Vec::new();
-    for (i, name) in ["node-a", "node-b", "node-c"].into_iter().enumerate() {
-        nodes.push(Node::start(&bin, &cfg(name, i, Some(i))?).await?);
+    for c in &seq_cfgs {
+        nodes.push(Node::start(&bin, c).await?);
     }
     nodes.push(Node::start(&bin, &cfg("node-obs", OBS, None)?).await?);
     for n in &nodes {
@@ -1030,8 +1045,23 @@ async fn scenario(dir: &Path) -> Result<()> {
             );
         }
 
-        // Every ballot of the scenario, proved up front.
         let prover = ballot_prover.await??;
+        if flag("DAVINCI_E2E_GRACE_ONLY") {
+            return grace::run(
+                &mut nodes,
+                &seq_cfgs,
+                &bin,
+                &net,
+                &org,
+                &reader,
+                (&p1, &tree),
+                &prover,
+            )
+            .await
+            .context("grace window");
+        }
+
+        // Every ballot of the scenario, proved up front.
         let t = Instant::now();
         let fx::Ballots {
             round1,
@@ -1278,6 +1308,7 @@ async fn scenario(dir: &Path) -> Result<()> {
                 "process {i}: on-chain results {got:?}, expected tally {want:?}"
             );
             say!("process {i} results on-chain {got:?} = expected tally");
+            grace::closed_after_grace(&net, &reader, pid).await?;
             for n in &nodes {
                 wait::until(
                     &format!("{} to report the results of process {i}", n.name),
@@ -1300,7 +1331,7 @@ async fn scenario(dir: &Path) -> Result<()> {
         onchain_census(
             &mut nodes,
             &bin,
-            &cfg("node-b", B, Some(B))?,
+            &seq_cfgs[B],
             &net,
             &org,
             &reader,
@@ -1319,6 +1350,19 @@ async fn scenario(dir: &Path) -> Result<()> {
                 .await
                 .context("DKG processes")?;
         }
+
+        grace::run(
+            &mut nodes,
+            &seq_cfgs,
+            &bin,
+            &net,
+            &org,
+            &reader,
+            (&p1, &tree),
+            &prover,
+        )
+        .await
+        .context("grace window")?;
 
         // Last, so an RPC that cannot simulate them gates nothing.
         if flag("DAVINCI_E2E_NEGATIVE") {
@@ -2085,7 +2129,8 @@ async fn results_block(net: &Net, pid: &[u8; 31]) -> Result<u64> {
 }
 
 /// The DKG key modes, through the registry only: an automatic process
-/// (with a ballot under another key refused), a locked one that ends by
+/// ended with a batch in flight (with a ballot under another key refused),
+/// a locked one that ends by
 /// time and stays undecrypted until its organizer reveals (a wrong secret
 /// first), a zero-vote one tallied without the DKG, and the eth_call
 /// negatives around the two requests.
@@ -2165,12 +2210,8 @@ async fn dkg_processes(
     let (auto_reqs, rest) = reqs.split_at(DKG_AUTO_VOTERS.len());
     let (locked_reqs, other) = rest.split_at(DKG_LOCKED_VOTERS.len());
 
+    // The locked votes first: its clock is running.
     let (mut sa, mut sl) = (Vec::new(), Vec::new());
-    for (v, r) in DKG_AUTO_VOTERS.zip(auto_reqs) {
-        let label = format!("dkg-auto voter {v}");
-        submit(&nodes[fx::first_node(v)], r, &label).await?;
-        sa.push(sent(label, fx::first_node(v), r));
-    }
     for (v, r) in DKG_LOCKED_VOTERS.zip(locked_reqs) {
         let label = format!("dkg-locked voter {v}");
         submit(&nodes[fx::first_node(v)], r, &label).await?;
@@ -2184,27 +2225,44 @@ async fn dkg_processes(
         "ballot under another process's key",
     )
     .await?;
-    let all: Vec<_> = sa.iter().chain(&sl).cloned().collect();
-    wait_settled(nodes, &all, "DKG votes").await?;
+    wait_settled(nodes, &sl, "DKG locked votes").await?;
     let p = reader.process(&pl.id).await?;
     ensure!(
         p.status == ProcessStatus::Ready && !p.dkg.is_some_and(|d| d.results_requested),
         "the locked process ended before its votes settled: raise DAVINCI_E2E_TIMEOUT_SCALE"
     );
 
-    // Automatic: the organizer ends it, a sequencer requests, the committee
-    // decrypts, a sequencer finalizes.
+    // Automatic, an AGM END: the organizer ends it with a batch in flight,
+    // the nodes flush in the grace, a sequencer requests once it closes, the
+    // committee decrypts, a sequencer finalizes.
+    for (v, r) in DKG_AUTO_VOTERS.zip(auto_reqs) {
+        let label = format!("dkg-auto voter {v}");
+        submit(&nodes[fx::first_node(v)], r, &label).await?;
+        sa.push(sent(label, fx::first_node(v), r));
+    }
+    let (label, st) = grace::wait_sealed(nodes, &sa).await?;
+    let (end_block, _) = grace::head(&net.rpc).await?;
+    let t = Instant::now();
+    org.end_process(&pa.id).await.context("end automatic")?;
+    say!("automatic: END with {label} {st}");
+    wait_settled(nodes, &sa, "DKG automatic votes").await?;
+    let in_grace = grace::landings(net, &pa.id, end_block + 1).await?;
+    ensure!(
+        !in_grace.is_empty(),
+        "automatic: no transition landed after the END"
+    );
     let want_a = fx::expected_tally(
         &DKG_AUTO_VOTERS
             .map(|v| fx::choices(v, 1))
             .collect::<Vec<_>>(),
     );
-    let t = Instant::now();
     let counts = (DKG_AUTO_VOTERS.len() as u64, 0);
-    check_and_tally(nodes, org, reader, &pa.id, &sa, counts, want_a)
+    check_settled(nodes, reader, &pa.id, &sa, counts).await?;
+    wait_results(nodes, org, &pa.id, &want_a)
         .await
         .context("automatic")?;
     let req_a = dkg_request(net, nodes, &pa.id, sync_timeout()).await?;
+    grace::closed_after_grace(net, reader, &pa.id).await?;
     let res_a = results_block(net, &pa.id).await?;
     let a = reader.process(&pa.id).await?.dkg.context("dkg")?;
     ensure!(
@@ -2220,8 +2278,9 @@ async fn dkg_processes(
         cts.len()
     );
     say!(
-        "automatic: results {:.0} s after the end; request at block {}, results at {}",
+        "automatic: results {:.0} s after the END, {} transitions in the grace; request at block {}, results at {}",
         t.elapsed().as_secs_f64(),
+        in_grace.len(),
         req_a.block,
         res_a
     );

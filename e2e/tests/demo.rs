@@ -70,9 +70,10 @@ use rand::rngs::OsRng;
 const DEFAULT_NODES: &str = "http://127.0.0.1:9090,http://127.0.0.1:9091";
 /// Longest wait for a node to list a process and serve its census.
 const READY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Longest wait for one round of votes to settle (90 s batches, proving,
-/// 5 s blocks and confirmations).
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+/// Longest wait for one round of votes to settle: a lone vote waits the
+/// nodes' solo wait (45 min by default), then every election's batch queues
+/// for the shared provers, with 5 s blocks and confirmations.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 /// Longest wait for a sequencer's `requestResultsDecryption`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Longest wait for every tally after the ends and the reveal, or after the
@@ -83,17 +84,18 @@ const DKG_WAIT: Duration = Duration::from_secs(20 * 60);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(600);
 const PROGRESS_EVERY: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_secs(5);
-/// Between the chunks of a chunked first round: past the 90 s batch time,
-/// so each chunk seals on its own.
+/// Between the chunks of a chunked first round: each chunk is past one
+/// transaction's capacity, so the node seals on capacity as they arrive.
 const CHUNK_GAP: Duration = Duration::from_secs(100);
 /// How long the votes sent to a paused election are watched before it
-/// resumes: more than two batch windows.
+/// resumes.
 const PAUSE_HOLD: Duration = Duration::from_secs(240);
-/// A timed election this close to its end takes no more votes: they would
-/// not settle in time.
+/// A timed election this close to its end takes no more votes of a round,
+/// so a round's proofs and sends never straddle the end.
 const LATE_MARGIN: u64 = 10 * 60;
-/// Longest wait for the reweighted member's pending vote to leave the queue.
-const REWEIGHT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Longest wait for the reweighted member's pending vote to leave the queue:
+/// the node errors it at seal time, after the solo wait (45 min by default).
+const REWEIGHT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 fn t0() -> Instant {
     static T0: OnceLock<Instant> = OnceLock::new();
@@ -1757,22 +1759,21 @@ impl Run {
                         created.saturating_sub(secs)
                     };
                     let (from, to) = (p.duration / 60, d / 60);
-                    if step == "extend" && p.duration >= d {
+                    if (step == "extend" && p.duration >= d)
+                        || (step == "shorten" && p.duration <= d)
+                    {
                         self.done(n, step, format!("duration already {from} min"))?;
                         continue;
                     }
-                    match self.org.set_process_duration(&pid, d).await {
-                        Ok(()) => {
-                            self.wait_nodes(n, "the new duration", |v| v.duration == d)
-                                .await?;
-                            format!("duration {from} -> {to} min")
-                        }
-                        // The registry only moves the end later.
-                        Err(ClientError::Reverted(r)) => {
-                            format!("duration {from} -> {to} min refused by the registry: {r}")
-                        }
-                        Err(e) => return Err(e).context(format!("election {n}: duration")),
-                    }
+                    // A shorter end must leave the registry's noticeMin: the
+                    // timed elections outlast the rounds, so both succeed.
+                    self.org
+                        .set_process_duration(&pid, d)
+                        .await
+                        .with_context(|| format!("election {n}: duration {from} -> {to} min"))?;
+                    self.wait_nodes(n, "the new duration", |v| v.duration == d)
+                        .await?;
+                    format!("duration {from} -> {to} min")
                 }
                 "max-voters" => {
                     let m = spec
@@ -1783,10 +1784,20 @@ impl Run {
                             _ => None,
                         })
                         .context("max voters")?;
-                    self.org
-                        .set_process_max_voters(&pid, m)
-                        .await
-                        .with_context(|| format!("election {n}: setProcessMaxVoters"))?;
+                    match self.org.set_process_max_voters(&pid, m).await {
+                        Ok(()) => {}
+                        // The registry refuses it once the end passed, which
+                        // can happen between the read above and the call.
+                        Err(ClientError::Reverted(r))
+                            if !voting(&self.process(&pid).await?, unix_now()) =>
+                        {
+                            self.done(n, step, format!("max voters refused after the end: {r}"))?;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(e).context(format!("election {n}: setProcessMaxVoters"));
+                        }
+                    }
                     // A node still on the old cap refuses the new voters.
                     self.wait_nodes(n, "the new max voters", |v| v.max_voters == m)
                         .await?;
@@ -2137,17 +2148,9 @@ impl Run {
 
     async fn wait_results(&mut self) -> Result<()> {
         let tallied: Vec<Spec> = self.specs.iter().filter(|s| s.tallied()).copied().collect();
-        // Timed elections end on their own; wait past the last end.
-        let mut last_end = unix_now();
-        for spec in &tallied {
-            if let Lifecycle::Timed { .. } = spec.lifecycle {
-                let p = self.process(&self.pid(spec.n)?).await?;
-                last_end = last_end.max(p.start_time + p.duration);
-            }
-        }
-        let deadline = Instant::now()
-            + Duration::from_secs(last_end.saturating_sub(unix_now()))
-            + RESULTS_TIMEOUT;
+        // Results land once each grace window closes, and a window moves
+        // with every landing: the deadline follows the latest close.
+        let mut deadline = Instant::now() + RESULTS_TIMEOUT;
         let start = Instant::now();
         let mut report = Instant::now();
         loop {
@@ -2167,9 +2170,24 @@ impl Run {
                     self.state.election(n).results = Some(p.result);
                     self.save()?;
                 } else {
-                    let left = (p.start_time + p.duration).saturating_sub(unix_now());
+                    let now = unix_now();
+                    // getProcessGraceEnd before its graceMaxTotal cap: an
+                    // upper bound, with no extra read.
+                    let close = (p.start_time + p.duration).max(p.last_vote_at) + p.grace;
+                    deadline = deadline.max(
+                        Instant::now()
+                            + Duration::from_secs(close.saturating_sub(now))
+                            + RESULTS_TIMEOUT,
+                    );
+                    let left = (p.start_time + p.duration).saturating_sub(now);
                     waiting.push(if is_open(p.status) && left > 0 {
                         format!("election {n} ends in {left} s")
+                    } else if close > now {
+                        format!(
+                            "election {n} {}, grace closes in {} s",
+                            status_name(p.status),
+                            close - now
+                        )
                     } else {
                         format!("election {n} {}", status_name(p.status))
                     });

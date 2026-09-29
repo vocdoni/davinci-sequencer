@@ -455,9 +455,11 @@ the time left: proving is estimated as `--prove-base` plus a per-vote cost
 (a moving average of the prover's own job time, queue wait excluded, per field
 count, seeded high and capped at 60 times the seed), and the batch holds at
 most the votes whose estimated proof plus `--settle-margin` ends before
-`min(graceEnd, now + graceFloor)`. The second term covers the worst legal
-close: the organizer ends or shortens the election right after the seal and
-lowers the grace to the registry's floor. When not even one vote fits, nothing
+`min(graceEnd, now + graceFloor)` while the election is open, and before
+`graceEnd` once it has ended. The second term covers the worst legal close: the
+organizer ends or shortens the election right after the seal and lowers the
+grace to the registry's floor, both only possible before the end. When not even
+one vote fits, nothing
 seals and the votes wait, or close out with the window. The actor then:
 1. takes votes in FIFO order, the oldest per slot, within `maxVoters`, the
    size above and the per-transaction blob cap (`--max-blobs-per-tx`,
@@ -829,6 +831,12 @@ ceiling holds whatever the number of nodes:
 | 8 | ~230 | ~75 s | ~185 |
 | 16 | ~122 | ~64 s | ~115 |
 
+Before the end the budget can cap batches below the transaction capacity: it
+leaves `graceFloor − prove_base − settle_margin` (60 s on the production
+parameters and defaults) for the per-vote cost, which is 75 votes at nf = 16
+on the cold estimate. The moving average reaches the prover's real cost after
+a few batches, and past the end the whole grace window counts.
+
 Results on chain, from the END press, with a 150 s grace and a sequencer key:
 
 | Backlog at the end | Last landing | Grace end | Results |
@@ -948,11 +956,20 @@ Rust beats Go on 9 of 10 benchmark rows; the one slower row
 
 `e2e/tests/e2e.rs` (crate `davinci-e2e`, gated by `DAVINCI_E2E=1`) is the
 acceptance test. It starts anvil (Osaka, 1 s blocks) and deploys `ZiskVerifier`
-and `ProcessRegistry` pinned to the SDK release vks. It then runs three real
-`davinci-sequencer` nodes and one observer without a key as subprocesses, all
-sharing one davinci-zkvm prover, and drives the elections below through them. The
-nodes run with `BATCH_MAX=8`, `BATCH_TIME=3s`, `SETTLE_MARGIN=20s`,
-`CONFIRMATIONS=0` and a 1 s poll, so they race.
+and `ProcessRegistry` pinned to the SDK release vks, with a grace window sized
+for real proofs: `defaultGrace` 120 s, `graceFloor` 40 s, `graceCeil` 180 s,
+`graceMaxTotal` 240 s, `noticeMin` 5 s (`davinci_e2e::chain::GRACE_ARGS`). It then
+runs three real `davinci-sequencer` nodes and one observer without a key as
+subprocesses, all sharing one davinci-zkvm prover, and drives the elections
+below through them. The nodes run with `BATCH_MAX=8`, `BATCH_TIME=3s` (a lone
+vote waits `SOLO_WAIT=9s`), `MIN_MIX=2`, `SLOT_DEPTH=3`, `FLUSH_HORIZON=10s`,
+`PROVE_BASE=15s`, `SETTLE_MARGIN=5s`, `CONFIRMATIONS=0` and a 1 s poll, so they
+race. A small batch proves in 16 to 25 s on one RTX 5090, so a flush from 10 s
+before the end plus 15 s of fixed proving cost and 5 s to land fits the 40 s
+floor. The default grace is longer because at an END all three nodes flush at
+once through one GPU: a lost race does not cancel its proof, so the first
+landing can queue behind five jobs (45 s saw none land). Live runs keep the deployment's grace (180 s on Gnosis) and the node
+defaults, except a 20 s settle margin.
 
 Run it inside a memory-capped systemd scope:
 
@@ -979,8 +996,8 @@ Prerequisites:
 the harness builds and runs three `davinci-dkg-node` processes (dev accounts 5–7 as operators,
 8 as the DKG deployer) and waits for an epoch to go Live before the registry is deployed.
 The node binary is built from `DAVINCI_DKG_DIR` (default `../davinci-dkg`) unless
-`DAVINCI_E2E_DKG_NODE_BIN` is set; artifacts go to `~/.cache/davinci-dkg-artifacts` (~1.1 GB
-on first download). A live run uses the external committee of the registry
+`DAVINCI_E2E_DKG_NODE_BIN` is set; artifacts go to `~/.cache/davinci-dkg-artifacts`
+(`DAVINCI_E2E_DKG_ARTIFACTS`, ~1.1 GB on first download). A live run uses the external committee of the registry
 adapter's `DKGManager` (`DAVINCI_E2E_DKG_MANAGER` overrides it) and starts no nodes.
 Each DKG process takes one of the 16 keys of the committee's current epoch; once they are
 spent the committee opens the next epoch on its own, and the harness waits for it to go
@@ -1054,12 +1071,18 @@ and `CIRCOM_ARTIFACTS` point the script elsewhere.
 `DAVINCI_E2E_ORGANIZER_KEY` and `DAVINCI_E2E_SEQUENCER_KEYS` are mounted
 read-only and handed to the test under their container paths. The census
 contract project is mounted writable, since the scenario runs `forge build`
-in it. The DKG scenarios run only live: on anvil they need a
-`davinci-dkg-node` build that the image cannot make. The log is
+in it. With `DAVINCI_E2E_DKG=1` on anvil the script mounts the davinci-dkg
+checkout (`DAVINCI_DKG_DIR`) read-only, a prebuilt node
+(`DAVINCI_E2E_DKG_NODE_BIN`, default `~/.cache/davinci-e2e/dkg/davinci-dkg-node`,
+which the image cannot build; `CGO_ENABLED=0 go build -o <path>
+./cmd/davinci-dkg-node` in the checkout makes one, static because the image's
+glibc is older than the host's) and the artifacts directory. The log is
 `~/.cache/davinci-bench/e2e-<time>.log`; a failed run leaves its node logs and
 datadirs next to it.
 
 ```bash
+DAVINCI_E2E=1 DAVINCI_E2E_DKG=1 DAVINCI_E2E_NEGATIVE=1 \
+  DAVINCI_ZKVM_URL=http://127.0.0.1:8080 e2e/bench.sh    # anvil
 DAVINCI_E2E=1 DAVINCI_E2E_LIVE=1 DAVINCI_E2E_DKG=1 DAVINCI_E2E_NEGATIVE=1 \
   DAVINCI_E2E_ORGANIZER_KEY=/path/to/organizer.key \
   DAVINCI_E2E_SEQUENCER_KEYS=/path/to/seq1.key,/path/to/seq2.key,/path/to/seq3.key \
@@ -1101,8 +1124,9 @@ revealed while voting is open and one after the end. The organizer's controls
 all appear: ends by time and by the organizer, pause and resume, a longer
 duration, more max voters, cancels during voting and before the start, a start
 during the run, metadata updated before the start and while open, and a
-registered hash that does not match its document. A shorter duration is tried
-too; the registry only moves the end later, so it reverts `InvalidDuration`.
+registered hash that does not match its document. A shorter duration too:
+the new end leaves more than the registry's `noticeMin`, so the nodes flush
+during the notice and the tally follows the grace window.
 Two elections end with no votes. A 16-option approval takes 400 voters, the
 first 390 in chunks of 130, more than two blobs hold, so the node splits them
 over several transitions, and its 60 revotes come with silent refreshes.
@@ -1112,8 +1136,17 @@ checks each answer: a key outside the census (400/40001), a bad signature
 under looser rules it fails the inputs hash, 400/40002), a reused vote id
 (409/40901) and a vote beyond max voters (412/41202); one after the end
 follows at the close (412/41201). The report compares every tally, final
-status and voter count with the votes that settled. A run takes about 80
-minutes, more when the provers are busy.
+status and voter count with the votes that settled. Against nodes on the
+default policy (15 min batch time, 45 min solo wait) and a 180 s grace a wave
+takes two to three and a half hours, more when the provers are busy: a round
+waits for its lone votes, the reweighted member's vote sits alone for the solo
+wait, and the timed elections run 135 to 150 minutes so they outlast round 2.
+
+To run both waves again on a new registry, move `state.json` and
+`state-wave2.json` aside (keep the `voters*.json` files, which hold the keys)
+and run with the same `DAVINCI_DEMO_BASE_URL`: the census and metadata files
+already published at that commit are reused, since neither depends on the
+registry.
 
 ```bash
 DAVINCI_DEMO_WAVE=2 DAVINCI_E2E_DEMO=prepare e2e/bench.sh    # then check and run as above
@@ -1124,13 +1157,20 @@ Without `DAVINCI_SEQUENCER_BIN`, the test builds the node with
 anvil log and datadirs and prints their paths. `DAVINCI_E2E_NODE_LOG` sets the
 nodes' log filter. `DAVINCI_E2E_SETUP=1` runs only the part before the nodes:
 chain, contracts, both processes and all ballots. That part needs neither the
-prover nor the node binary.
+prover nor the node binary. `DAVINCI_E2E_GRACE_ONLY=1` runs only the grace
+phase, right after processes 1 and 2 are created (it votes on neither).
 
 The vk fail-fast compares the registry pins and each node's `/info` against
 `davinci_zkvm_sdk::release`. The prover's `/health` carries no vks, so the
 prover's own vks are only exercised through the nodes' publics checks.
 
-The scenario runs four processes in order on the same chain and nodes:
+The scenario runs the processes below in order on the same chain and nodes.
+Every process closes after its grace window: the harness checks that the
+results (or the DKG request) landed at or after `getProcessGraceEnd`, and
+through `eth_call` that the same call reverts `GraceOpen` in the last block
+before it, that a transition in the first block after it reverts
+`InvalidTimeBounds`, and that the last transition with its vote counts zeroed
+reverts `EmptyTransition`.
 
 - **Process 1:** 24-voter Merkle census (`file://`), nf=4, election key from node A.
   - Voters vote round-robin across the three nodes.
@@ -1153,6 +1193,35 @@ The scenario runs four processes in order on the same chain and nodes:
   one member. That member's pending vote errors with "census changed, recast".
   6 new members vote and 1 original voter revotes. Expected: 10 voters, 1 overwrite.
 
+- **DKG** (with `DAVINCI_E2E_DKG=1`): an automatic process ended while a
+  batch is in flight (its votes land in the grace and the sequencer requests
+  decryption once the window closes), a locked one that ends by time and is
+  decrypted after the reveal, and a zero-vote one.
+- **Grace window** (`e2e/tests/e2e/grace.rs`), four sequencer-key processes
+  on process 1's census:
+  - *AGM END.* One voter casts three ballots through one node, back to back:
+    the node queues them (a resend is 409/40901, a fourth 409/40902) and
+    settles them in order. Another voter routed by `pick_node` casts two
+    through its first node, then a third, and that node is killed; the fourth
+    goes to the next node of its order and the killed one restarts with its
+    queue. The later landing counts, and every node serves the same ballot.
+    Then 15 voters across the three nodes, and END once a batch is sealed
+    with more queued: every vote settles in the grace, a node loses a race on
+    the way, results follow the window. Expected: 17 voters, 5 overwrites.
+  - *Shorten with notice.* A lone vote seals after `SOLO_WAIT`, not
+    `BATCH_TIME`. The organizer moves the end to `noticeMin` + 6 s from now;
+    seven voters go in during the notice, one package to two nodes (settled
+    once, both report it settled), and a vote after the new end is 412/41201.
+  - *Backlog.* Node C restarts with `BATCH_MAX=2`. A burst of six seals back
+    to back (one transition per two votes); six more are held at an END. Each
+    landing in the grace moves `getProcessGraceEnd` to
+    `min(end + graceMaxTotal, lastVoteAt + grace)`, and the observed series
+    must be exactly that.
+  - *Extension cap.* `setProcessGrace(graceCeil)` and ten votes to node C.
+    After the END the window stops at `end + graceMaxTotal`; votes it could not
+    land error with "process closed", and the tally counts the settled ones.
+    Skipped when `graceMaxTotal` is over 600 s.
+
 Process 1 and 2 assert roots, tracker proofs, tally and inter-node races.
 Process 3 and 4 additionally assert census growth and update, recovery across
 the restart, and the reweight-induced error.
@@ -1172,6 +1241,19 @@ On anvil with one RTX 5090 prover (2026-09-27), processes 1 and 2 take about
   - node B: 2 / 6 / 3;
   - node C: 3 / 5 / 5;
   - observer: 0 / 8 / 0.
+
+With `DAVINCI_E2E_DKG=1 DAVINCI_E2E_NEGATIVE=1` and the grace window
+(2026-09-29, same prover) the whole run took 47 minutes, 20 of them in the
+grace scenarios:
+
+| Grace scenario | Time |
+|---|---|
+| AGM: 15 votes pending at the END settled | 178 s |
+| AGM: results after the END | 242 s |
+| shorten: lone vote sealed, notice votes settled | 20 s, 90 s |
+| backlog: burst of six settled | 60 s |
+| cap: results after the END (window stopped at `end + graceMaxTotal`) | 242 s |
+| DKG automatic: results after the END | 241 s |
 
 ## Deployments
 

@@ -60,7 +60,8 @@ pub enum StorageError {
     Db(String),
     #[error(
         "schema version {found} in the data file, this build uses {expected}; records are not \
-         migrated: start with a fresh DAVINCI_DATADIR (the chain is the source of truth)"
+         migrated: move the data file aside and start with an empty DAVINCI_DATADIR (the chain \
+         is the source of truth); keep the old file, it holds the master secret"
     )]
     Schema { found: u64, expected: u64 },
     #[error("corrupt {table} row: {reason}")]

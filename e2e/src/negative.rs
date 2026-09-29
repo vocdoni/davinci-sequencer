@@ -167,9 +167,12 @@ pub async fn run(
     }
     let (res, proc) = target.context("no origin-1 process with results to check against")?;
     let pid = res.pid;
+    // The process's own last transition: another process's could land at the
+    // edge of its grace window, where the replay would fail on time first.
     let tr = chain::transitions(rpc, registry, from)
         .await?
-        .pop()
+        .into_iter()
+        .rfind(|t| t.pid == pid)
         .context("no transition to check against")?;
     let organizer = Address::from(proc.organization_id);
     let sim = Sim { p, to: registry };
@@ -329,6 +332,111 @@ pub async fn run(
         tr.block,
         res.tx,
         res.block
+    );
+    verdict(out)
+}
+
+/// Bytes of words 18 and 19 in the 512-byte publics: the batch's new voters
+/// and overwrites. Zero both and the transition carries no vote.
+const COUNTS: std::ops::Range<usize> = 144..160;
+
+/// Latest block in `lo..=hi` whose timestamp is below `ts`; `lo`'s must be.
+async fn last_before<P: Provider>(p: &P, ts: u64, mut lo: u64, mut hi: u64) -> Result<u64> {
+    let time = async |n: u64| -> Result<u64> {
+        Ok(p.get_block_by_number(n.into())
+            .await?
+            .with_context(|| format!("block {n}"))?
+            .header
+            .timestamp)
+    };
+    anyhow::ensure!(time(lo).await? < ts, "block {lo} is not before {ts}");
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if time(mid).await? < ts {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// The grace window's gates around `pid`'s settled history since `from`:
+/// its closing call (the results, or a DKG process's decryption request)
+/// replayed at the last block before `getProcessGraceEnd` reverts
+/// `GraceOpen` and goes through at the block before the original; its last
+/// transition replayed at the first block of the closed window reverts
+/// `InvalidTimeBounds` (not `InvalidStateRoot`: the time gate comes first);
+/// and that transition with no vote in its counters reverts
+/// `EmptyTransition` at the block before it.
+pub async fn grace(rpc: &str, registry: Address, pid: [u8; 31], from: u64) -> Result<Vec<Check>> {
+    let p = ProviderBuilder::new().connect_client(chain::rpc(rpc)?);
+    let reader = RegistryReader::connect(rpc, registry)?;
+    let ge = reader.grace_end(&pid).await?;
+    let proc = reader.process(&pid).await?;
+    let tr = chain::transitions(rpc, registry, from)
+        .await?
+        .into_iter()
+        .rfind(|t| t.pid == pid)
+        .context("no transition of the process")?;
+    let closing = if proc.dkg.is_some() {
+        chain::dkg_requests(rpc, registry, from).await?
+    } else {
+        chain::results_txs(rpc, registry, from).await?
+    };
+    let close = closing
+        .into_iter()
+        .find(|t| t.pid == pid)
+        .context("no closing call of the process")?;
+    let last = last_before(&p, ge, tr.block, close.block - 1).await?;
+    let sim = Sim { p, to: registry };
+    let sp = &sim.p;
+    let tx = |h| async move { sp.get_transaction_by_hash(h).await?.context("tx not found") };
+    let (ctx, ttx) = (tx(close.tx).await?, tx(tr.tx).await?);
+    let (cfrom, cin) = (ctx.inner.signer(), ctx.inner.input().to_vec());
+    let (tfrom, tin) = (ttx.inner.signer(), ttx.inner.input().to_vec());
+    let mut out = Vec::new();
+
+    let got = sim
+        .call(cfrom, cin.clone(), None, BlockId::number(close.block - 1))
+        .await;
+    out.push(control("closing call control at R-1", got));
+    let got = sim.call(cfrom, cin, None, BlockId::number(last)).await;
+    out.push(judge("closing call, grace open", got, &["GraceOpen"]));
+    if last + 1 < close.block {
+        let got = sim
+            .call(tfrom, tin.clone(), None, BlockId::number(last + 1))
+            .await;
+        out.push(judge(
+            "transition, grace closed",
+            got,
+            &["InvalidTimeBounds"],
+        ));
+    } else {
+        out.push(Check {
+            name: "transition, grace closed",
+            got: Outcome::Rpc("skipped".into()),
+            problem: Some("the closing call is the window's first block".into()),
+            inconclusive: true,
+        });
+    }
+    let mut c = PR::submitStateTransitionCall::abi_decode(&tin).context("decode transition")?;
+    let mut pubs = c.publicValues.to_vec();
+    pubs[COUNTS].fill(0);
+    c.publicValues = pubs.into();
+    let got = sim
+        .call(tfrom, c.abi_encode(), None, BlockId::number(tr.block - 1))
+        .await;
+    out.push(judge(
+        "transition without votes at N-1",
+        got,
+        &["EmptyTransition"],
+    ));
+    eprintln!(
+        "grace checks on {} (grace end {ge}, last open block {last}, transition at {}, closing call at {}):",
+        davinci_client::api::ProcessId(pid),
+        tr.block,
+        close.block
     );
     verdict(out)
 }

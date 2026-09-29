@@ -221,7 +221,7 @@ pub fn elections() -> Vec<Spec> {
             ballot: BallotKind::SingleChoice { abstain: true },
             members: 30,
             key: KeySource::Node(1),
-            lifecycle: Lifecycle::Timed { secs: 60 * MINUTE },
+            lifecycle: Lifecycle::Timed { secs: 150 * MINUTE },
             actions: &[
                 Action::Refuse(Refusal::NotInCensus),
                 Action::Refuse(Refusal::BadSignature),
@@ -294,7 +294,7 @@ pub fn elections() -> Vec<Spec> {
             ballot: BallotKind::MultipleChoice { min: 2, max: 2 },
             members: 30,
             key: KeySource::DkgAutomatic,
-            lifecycle: Lifecycle::Timed { secs: 60 * MINUTE },
+            lifecycle: Lifecycle::Timed { secs: 150 * MINUTE },
             actions: &[
                 Action::Shorten(10 * MINUTE),
                 Action::Refuse(Refusal::BreaksRules),
@@ -493,7 +493,7 @@ pub fn elections() -> Vec<Spec> {
             },
             members: 20,
             key: KeySource::Node(1),
-            lifecycle: Lifecycle::Timed { secs: 45 * MINUTE },
+            lifecycle: Lifecycle::Timed { secs: 135 * MINUTE },
             actions: &[Action::Extend(25 * MINUTE)],
             round1: 12,
             round2: (12, 17),

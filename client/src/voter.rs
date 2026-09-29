@@ -142,6 +142,31 @@ pub fn random_k(rng: &mut (impl RngCore + CryptoRng)) -> Fr {
     Fr::from_le_bytes_mod_order(&b)
 }
 
+/// Nodes in the order a voter tries them for process `pid`: sorted by
+/// `SHA256(voter ‖ pid ‖ url)` (20 + 31 bytes, then the URL's UTF-8). Send
+/// to the first reachable and fail over down the list. Every cast of one
+/// voter then goes through one node, whose slot queue keeps revotes in
+/// order; after a failover only the last-settled ballot counts.
+pub fn pick_node<'a, S: AsRef<str>>(
+    voter: &[u8; 20],
+    pid: &[u8; 31],
+    nodes: &'a [S],
+) -> Vec<&'a S> {
+    use sha2::{Digest, Sha256};
+    let mut keyed: Vec<([u8; 32], &S)> = nodes
+        .iter()
+        .map(|n| {
+            let h = Sha256::new()
+                .chain_update(voter)
+                .chain_update(pid)
+                .chain_update(n.as_ref().as_bytes());
+            (h.finalize().into(), n)
+        })
+        .collect();
+    keyed.sort_by_key(|k| k.0);
+    keyed.into_iter().map(|(_, n)| n).collect()
+}
+
 fn check_key(pk: &Point) -> Result<()> {
     // The circuit requires a prime-order, non-identity key.
     if !pk.is_on_curve() || *pk == Point::IDENTITY || !pk.in_subgroup() {
@@ -330,5 +355,44 @@ impl Voter {
         }
         let k = prep.k;
         Ok((self.finish_vote(prep, proof)?, k))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_node_orders_by_voter_process_and_url() {
+        let nodes = ["http://a:8080", "http://b:8080", "http://c:8080"];
+        let pid = [7u8; 31];
+        let order = pick_node(&[1u8; 20], &pid, &nodes);
+        // A permutation, stable across calls and input order.
+        let mut sorted: Vec<_> = order.iter().map(|n| **n).collect();
+        sorted.sort();
+        assert_eq!(sorted, nodes);
+        let reversed = ["http://c:8080", "http://b:8080", "http://a:8080"];
+        assert_eq!(
+            pick_node(&[1u8; 20], &pid, &reversed)
+                .into_iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            order.iter().map(|n| **n).collect::<Vec<_>>()
+        );
+        // The key is exactly SHA256(voter ‖ pid ‖ url).
+        let key = |url: &str| {
+            let mut b = vec![1u8; 20];
+            b.extend_from_slice(&pid);
+            b.extend_from_slice(url.as_bytes());
+            <[u8; 32]>::from(<sha2::Sha256 as sha2::Digest>::digest(&b))
+        };
+        for w in order.windows(2) {
+            assert!(key(w[0]) < key(w[1]));
+        }
+        // Voters spread over the nodes.
+        let firsts: std::collections::BTreeSet<&str> = (0..32u8)
+            .map(|v| *pick_node(&[v; 20], &pid, &nodes)[0])
+            .collect();
+        assert_eq!(firsts.len(), nodes.len());
     }
 }

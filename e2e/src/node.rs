@@ -112,13 +112,24 @@ pub struct NodeConfig {
     pub batch_max: usize,
     /// e.g. `3s`.
     pub batch_time: String,
+    /// Batching and grace knobs (`DAVINCI_SOLO_WAIT`, `DAVINCI_FLUSH_HORIZON`,
+    /// `DAVINCI_SETTLE_MARGIN`, `DAVINCI_PROVE_BASE`,
+    /// `DAVINCI_MAX_BLOBS_PER_TX`); `None` keeps the node's default.
+    pub solo_wait: Option<String>,
+    pub flush_horizon: Option<String>,
+    pub settle_margin: Option<String>,
+    pub prove_base: Option<String>,
+    pub max_blobs_per_tx: Option<usize>,
     /// First block the monitor scans on a fresh datadir
     /// (`DAVINCI_START_BLOCK`; ignored by nodes that lack it).
     pub start_block: Option<u64>,
 }
 
 impl NodeConfig {
-    /// The anvil defaults: 8 votes or 3 s per batch, no confirmations, 1 s polls.
+    /// The anvil defaults: 8 votes or 3 s per batch (a lone vote 9 s), no
+    /// confirmations, 1 s polls, and a round budget sized for the anvil
+    /// registry's 40 s grace floor: a flush from 10 s before the end, 15 s of
+    /// fixed proving cost and 5 s to land.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: &str,
@@ -144,6 +155,11 @@ impl NodeConfig {
             poll: "1s".into(),
             batch_max: 8,
             batch_time: "3s".into(),
+            solo_wait: None,
+            flush_horizon: Some("10s".into()),
+            settle_margin: Some("5s".into()),
+            prove_base: Some("15s".into()),
+            max_blobs_per_tx: None,
             start_block: None,
         }
     }
@@ -201,6 +217,21 @@ impl Node {
         if let Some(b) = cfg.start_block {
             cmd.env("DAVINCI_START_BLOCK", b.to_string());
         }
+        let knobs = [
+            ("DAVINCI_SOLO_WAIT", cfg.solo_wait.clone()),
+            ("DAVINCI_FLUSH_HORIZON", cfg.flush_horizon.clone()),
+            ("DAVINCI_SETTLE_MARGIN", cfg.settle_margin.clone()),
+            ("DAVINCI_PROVE_BASE", cfg.prove_base.clone()),
+            (
+                "DAVINCI_MAX_BLOBS_PER_TX",
+                cfg.max_blobs_per_tx.map(|n| n.to_string()),
+            ),
+        ];
+        for (k, v) in knobs {
+            if let Some(v) = v {
+                cmd.env(k, v);
+            }
+        }
         let child = cmd
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &cfg.dir)
@@ -216,7 +247,6 @@ impl Node {
             .env("DAVINCI_PROVER_URL", &cfg.prover_url)
             .env("DAVINCI_BATCH_MAX", cfg.batch_max.to_string())
             .env("DAVINCI_BATCH_TIME", &cfg.batch_time)
-            .env("DAVINCI_SETTLE_MARGIN", "20s")
             .env("DAVINCI_CONFIRMATIONS", cfg.confirmations.to_string())
             .env("DAVINCI_CENSUS_DIR", &cfg.census_dir)
             .env("DAVINCI_POLL_INTERVAL", &cfg.poll)

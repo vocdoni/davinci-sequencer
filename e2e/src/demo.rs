@@ -277,8 +277,8 @@ pub enum Action {
     Pause,
     /// `setProcessDuration`, `secs` longer.
     Extend(u64),
-    /// `setProcessDuration`, `secs` shorter. The registry only moves the end
-    /// later, so the revert is what gets recorded.
+    /// `setProcessDuration`, `secs` shorter. The registry takes it when the
+    /// new end leaves at least `noticeMin`; a revert is recorded instead.
     Shorten(u64),
     /// `setProcessMaxVoters`.
     MaxVoters(u64),
@@ -1006,7 +1006,7 @@ impl Spec {
             match a {
                 Action::Pause => out.push("paused and resumed".into()),
                 Action::Extend(s) => out.push(format!("extended by {} min", s / MINUTE)),
-                Action::Shorten(s) => out.push(format!("shortened by {} min (tried)", s / MINUTE)),
+                Action::Shorten(s) => out.push(format!("shortened by {} min", s / MINUTE)),
                 Action::MaxVoters(m) => out.push(format!("max voters raised to {m}")),
                 Action::Refuse(Refusal::OverMaxVoters) => out.push("max voters reached".into()),
                 Action::Refuse(_) => {}
@@ -2162,7 +2162,8 @@ impl State {
             || !self.registry.eq_ignore_ascii_case(registry)
         {
             bail!(
-                "the state file is for chain {} registry {}, not chain {chain_id} registry {registry}",
+                "the state file is for chain {} registry {}, not chain {chain_id} registry \
+                 {registry}: move it aside to start fresh (keep the voters file)",
                 self.chain_id,
                 self.registry
             );
@@ -2265,8 +2266,10 @@ mod tests {
                     assert!(start_in >= 10 * MINUTE, "{at}");
                 }
                 Lifecycle::Canceled => assert!(s.last_round() <= 1, "{at}"),
+                // Past round 1, the reweight watch and round 2 under the
+                // nodes' default 45 min solo wait.
                 Lifecycle::Timed { secs } => {
-                    assert!((30 * MINUTE..=90 * MINUTE).contains(&secs), "{at}");
+                    assert!((120 * MINUTE..=180 * MINUTE).contains(&secs), "{at}");
                     assert!(s.votes_in(1), "{at}");
                 }
                 Lifecycle::Tally => {}

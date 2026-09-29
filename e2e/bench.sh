@@ -22,7 +22,11 @@
 # read-only.
 #
 # With DAVINCI_E2E=1 it runs the acceptance test (tests/e2e.rs) instead, on
-# the released node image (NODE_IMAGE default ...:latest). Live, the key
+# the released node image (NODE_IMAGE default ...:latest). With
+# DAVINCI_E2E_DKG=1 on anvil it mounts the davinci-dkg checkout
+# (DAVINCI_DKG_DIR), a prebuilt node (DAVINCI_E2E_DKG_NODE_BIN, default
+# ~/.cache/davinci-e2e/dkg/davinci-dkg-node) and the committee's artifacts
+# (DAVINCI_E2E_DKG_ARTIFACTS, default ~/.cache/davinci-dkg-artifacts). Live, the key
 # files named by DAVINCI_E2E_ORGANIZER_KEY and DAVINCI_E2E_SEQUENCER_KEYS
 # are mounted read-only and passed on under their container paths:
 #
@@ -127,8 +131,22 @@ elif [[ ${DAVINCI_E2E:-} == 1 ]]; then
         # Mapped to their container paths above, not passed through.
         unset DAVINCI_E2E_ORGANIZER_KEY DAVINCI_E2E_SEQUENCER_KEYS
     elif [[ ${DAVINCI_E2E_DKG:-} == 1 ]]; then
-        echo "DAVINCI_E2E_DKG on anvil builds davinci-dkg-node, which the image cannot: run it live" >&2
-        exit 1
+        # The committee on anvil: contracts from the checkout (forge output
+        # goes to the cache volume), a prebuilt node, shared artifacts.
+        dkg=${DAVINCI_DKG_DIR:-$parent/davinci-dkg}
+        dkg_bin=${DAVINCI_E2E_DKG_NODE_BIN:-$HOME/.cache/davinci-e2e/dkg/davinci-dkg-node}
+        dkg_art=${DAVINCI_E2E_DKG_ARTIFACTS:-$HOME/.cache/davinci-dkg-artifacts}
+        need_dir "$dkg/solidity"
+        [[ -f $dkg_bin ]] || { echo "no davinci-dkg-node at $dkg_bin (go build ./cmd/davinci-dkg-node in $dkg)" >&2; exit 1; }
+        mkdir -p "$dkg_art"
+        mounts+=(
+            -v "$dkg:/work/davinci-dkg:ro" -e DAVINCI_DKG_DIR=/work/davinci-dkg
+            -v "$(realpath "$dkg_bin"):/dkg/davinci-dkg-node:ro"
+            -e DAVINCI_E2E_DKG_NODE_BIN=/dkg/davinci-dkg-node
+            -v "$dkg_art:/dkg/artifacts" -e DAVINCI_E2E_DKG_ARTIFACTS=/dkg/artifacts
+        )
+        # Mapped to their container paths above, not passed through.
+        unset DAVINCI_E2E_DKG_NODE_BIN DAVINCI_E2E_DKG_ARTIFACTS
     fi
 else
     for d in "$contracts/src" "$census/src" "$circom"; do

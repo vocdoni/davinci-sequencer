@@ -254,6 +254,9 @@ pub struct Inner {
     submits: u64,
     /// Scripted failures: next N `process()` calls fail with an RPC error.
     fail_process: u32,
+    /// Next N `process()` calls show a root behind the events (a lagging
+    /// endpoint).
+    lag_process: u32,
     /// Next N blob fetches fail.
     fail_blobs: u32,
     /// Next N `submit_transition` calls fail without landing.
@@ -360,6 +363,7 @@ impl FakeChain {
             blobs: HashMap::new(),
             submits: 0,
             fail_process: 0,
+            lag_process: 0,
             fail_blobs: 0,
             fail_submits: 0,
             timeout_submits: 0,
@@ -547,6 +551,10 @@ impl FakeChain {
 
     pub fn fail_process(&self, n: u32) {
         self.inner.lock().unwrap().fail_process = n;
+    }
+
+    pub fn lag_process(&self, n: u32) {
+        self.inner.lock().unwrap().lag_process = n;
     }
 
     pub fn fail_blobs(&self, n: u32) {
@@ -972,6 +980,13 @@ impl Chain for FakeChain {
         if i.fail_process > 0 {
             i.fail_process -= 1;
             return Err(Web3Error::Rpc("scripted process failure".into()));
+        }
+        if i.lag_process > 0 {
+            i.lag_process -= 1;
+            let mut p = i.proc.clone();
+            p.state_root = [0xAB; 32];
+            p.last_vote_at = 0;
+            return Ok(p);
         }
         let other = Address::repeat_byte(0xEE);
         if let Some(n) = i.dkg_request_on_read {

@@ -649,6 +649,11 @@ pub(crate) enum JobOutcome {
 /// before the flight is rolled back (covers a reorg dropping the tx).
 const LANDED_EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Consecutive ticks the landing-time read may stay stale (failing, or a
+/// root behind the events) before the node warns and counts a stall; it
+/// warns again every as many ticks.
+const STALE_WARN_TICKS: u32 = 30;
+
 /// How long a pause read on-chain, but not yet routed as an event, holds
 /// sealing back.
 const PAUSE_HOLD: std::time::Duration = std::time::Duration::from_secs(90);
@@ -722,6 +727,8 @@ struct Actor {
     /// A transition landed since `last_vote_at` was last read from the chain;
     /// the grace end may have moved, so nothing closes on it until re-read.
     vote_at_stale: bool,
+    /// Consecutive ticks the stale read has not cleared.
+    stale_ticks: u32,
     /// The exposed set: every slot a sealed batch changed (writes and
     /// refreshes as one set) and the vote ids of those attempts. Mirrors
     /// the persisted `ExposedRecord`; cleared once every vote is final.
@@ -866,6 +873,7 @@ pub(crate) fn spawn_actor(
         held: None,
         // The record may predate the last landing: re-read before closing.
         vote_at_stale: true,
+        stale_ticks: 0,
         exposed: BTreeSet::new(),
         exposed_vids: BTreeSet::new(),
         census_broken: None,
@@ -1062,6 +1070,12 @@ impl Actor {
                         debug!(pid = %hex::encode(self.pid31), e = ?f.msg, "waiting for the DKG");
                     }
                     Err(f) => {
+                        // A moved root: drop the held proof and re-read the
+                        // chain, so the retry proves at the root it has.
+                        if f.msg.contains("InvalidStateRoot") {
+                            self.held = None;
+                            self.vote_at_stale = true;
+                        }
                         // Transient trouble re-arms after a cooldown.
                         self.finalize_attempts += 1;
                         let secs = (1u64 << self.finalize_attempts.min(6)).min(60);
@@ -1233,15 +1247,38 @@ impl Actor {
         }
         // Events carry no block time: read the landing time the grace end
         // runs from. Stale until the read shows the tip the events reached.
-        if self.vote_at_stale
-            && let Ok(p) = self.deps.contracts.process(&self.pid31).await
-        {
-            let o = &mut self.record.onchain;
-            if p.last_vote_at > o.last_vote_at {
-                o.last_vote_at = p.last_vote_at;
-                self.put_record();
+        // Close-out and results wait on it, so a read that keeps failing
+        // (or an endpoint stuck behind the events) is logged and counted.
+        if self.vote_at_stale {
+            let why = match self.deps.contracts.process(&self.pid31).await {
+                Ok(p) => {
+                    let o = &mut self.record.onchain;
+                    if p.last_vote_at > o.last_vote_at {
+                        o.last_vote_at = p.last_vote_at;
+                        self.put_record();
+                    }
+                    self.vote_at_stale = p.state_root != self.record.onchain.state_root;
+                    format!(
+                        "chain root 0x{} behind the events",
+                        hex::encode(p.state_root)
+                    )
+                }
+                Err(e) => e.to_string(),
+            };
+            if self.vote_at_stale {
+                self.stale_ticks += 1;
+                if self.stale_ticks.is_multiple_of(STALE_WARN_TICKS) {
+                    self.metrics.stalled_reads.fetch_add(1, Ordering::SeqCst);
+                    warn!(
+                        pid = %hex::encode(self.pid31),
+                        ticks = self.stale_ticks,
+                        %why,
+                        "cannot read the latest landing time; close-out and results wait"
+                    );
+                }
+            } else {
+                self.stale_ticks = 0;
             }
-            self.vote_at_stale = p.state_root != self.record.onchain.state_root;
         }
         if !self.vote_at_stale && self.chain_time != 0 && self.chain_time >= self.grace_end() {
             self.close_out("process closed");
@@ -1490,13 +1527,15 @@ impl Actor {
             }
         };
         // Time budget: the largest batch whose estimated proof plus the
-        // landing margin ends before the window closes. The earliest legal
-        // close is an END now under a grace lowered to the floor.
+        // landing margin ends before the window closes. While open, the
+        // earliest legal close is an END now under a grace lowered to the
+        // floor; past the end neither is possible and the grace end binds.
         let nf = self.state.config().ballot_mode.num_fields;
         let now = self.chain_time.max(self.deps.clock.now());
-        let deadline = self
-            .grace_end()
-            .min(now.saturating_add(self.deps.grace.grace_floor));
+        let mut deadline = self.grace_end();
+        if self.chain_time < self.end_time() {
+            deadline = deadline.min(now.saturating_add(self.deps.grace.grace_floor));
+        }
         let left = deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
         let n_max = (left / self.metrics.prove.spv(nf)).floor();
         if n_max < 1.0 {
@@ -2105,7 +2144,8 @@ impl Actor {
     /// After a status or window revert: the process's status if it may
     /// still take the votes (paused, before its start, or in its grace), by
     /// the chain and by the events seen so far. `None` once canceled or
-    /// past its grace end.
+    /// past its grace end. A failed read keeps it open: the local grace end
+    /// can miss a landing, and close-out errors the votes once it is known.
     async fn may_reopen(&self) -> Option<ProcessStatus> {
         let open = |s| {
             matches!(
@@ -2115,7 +2155,10 @@ impl Actor {
         };
         let (status, grace_end) = match self.deps.contracts.process(&self.pid31).await {
             Ok(p) => (p.status, p.grace_end(self.deps.grace.grace_max_total)),
-            Err(_) => (self.record.onchain.status, self.grace_end()),
+            Err(e) => {
+                warn!(pid = %hex::encode(self.pid31), %e, "process read failed after a revert; requeueing");
+                (self.record.onchain.status, u64::MAX)
+            }
         };
         (open(status) && open(self.record.onchain.status) && self.chain_time < grace_end)
             .then_some(status)
@@ -2286,6 +2329,7 @@ impl Actor {
             return;
         }
         self.record.local = LocalStatus::Finalized;
+        self.held = None;
         self.put_record();
         info!(pid = %hex::encode(self.pid31), "process finalized");
     }

@@ -12,6 +12,9 @@ pub struct Metrics {
     pub synced_from_others: AtomicU64,
     /// Batches lost to another sequencer settling first.
     pub lost_races: AtomicU64,
+    /// Stalls of the landing-time read (`STALE_WARN_TICKS` consecutive
+    /// ticks each): close-out and results wait until it clears.
+    pub stalled_reads: AtomicU64,
     /// Results requests built for elections holding this node's key.
     pub finalize_attempts: AtomicU64,
     /// Proving-time model the batch budget sizes against.

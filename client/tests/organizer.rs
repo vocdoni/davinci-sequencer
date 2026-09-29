@@ -538,8 +538,9 @@ alloy::sol! {
     }
 }
 
-/// Pause and resume, the duration and max voters, as the registry allows
-/// them: the end only moves later, max voters never drops below the count.
+/// Pause and resume, the duration, max voters and grace, as the registry
+/// allows them: the end moves earlier only with notice, max voters never
+/// drops below the count, the grace stays within the registry's bounds.
 #[tokio::test]
 async fn process_controls() -> anyhow::Result<()> {
     if std::env::var("ANVIL").as_deref() != Ok("1") {
@@ -613,12 +614,41 @@ async fn process_controls() -> anyhow::Result<()> {
     assert_eq!(reverted(e), "InvalidMaxVoters");
     assert_eq!(reader.process(&pid).await?.max_voters, 10);
 
+    // The grace window: the registry's immutables, a grace within
+    // floor..=ceil, and a window closing at end + grace with no landing.
+    let g = reader.grace_params().await?;
+    assert_eq!(
+        (
+            g.default_grace,
+            g.grace_floor,
+            g.grace_ceil,
+            g.grace_max_total,
+            g.notice_min
+        ),
+        GRACE_ARGS
+    );
+    assert_eq!(org.grace_params().await?, g);
+    assert_eq!(reader.process(&pid).await?.grace, 10);
+    org.set_process_grace(&pid, 60).await?;
+    for bad in [1, 61] {
+        let e = org.set_process_grace(&pid, bad).await.unwrap_err();
+        assert_eq!(reverted(e), "InvalidGrace");
+    }
+    let got = reader.process(&pid).await?;
+    assert_eq!((got.grace, got.last_vote_at), (60, 0));
+    assert_eq!(
+        reader.grace_end(&pid).await?,
+        got.start_time + got.duration + 60
+    );
+    assert_eq!(org.grace_end(&pid).await?, reader.grace_end(&pid).await?);
+
     // Only the organizer.
     let other = Organizer::connect(&url, anvil.keys()[1].clone().into(), registry)?;
     for e in [
         other.pause_process(&pid).await.unwrap_err(),
         other.set_process_duration(&pid, 9000).await.unwrap_err(),
         other.set_process_max_voters(&pid, 40).await.unwrap_err(),
+        other.set_process_grace(&pid, 30).await.unwrap_err(),
     ] {
         assert_eq!(reverted(e), "Unauthorized");
     }
@@ -629,8 +659,16 @@ async fn process_controls() -> anyhow::Result<()> {
     assert_eq!(reverted(e), "InvalidStatus");
     let e = org.resume_process(&pid).await.unwrap_err();
     assert_eq!(reverted(e), "InvalidStatus");
+    let e = org.set_process_grace(&pid, 30).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidStatus");
+    // An early END pulls the end to now: the window closes a grace later.
+    let got = reader.process(&pid).await?;
+    assert_eq!(
+        reader.grace_end(&pid).await?,
+        got.start_time + got.duration + 60
+    );
     // Reverts are caught before sending: only the good calls were mined.
-    assert_eq!(org.receipts().len(), 8);
+    assert_eq!(org.receipts().len(), 9);
     Ok(())
 }
 

@@ -672,7 +672,9 @@ impl Organizer {
         Ok(())
     }
 
-    /// Sets the process status to ENDED (only the organizer can).
+    /// Sets the process status to ENDED (only the organizer can, from the
+    /// start on). Before the end it moves the end to now: votes already
+    /// admitted settle through the grace window, and results follow it.
     pub async fn end_process(&self, pid: &[u8; 31]) -> Result<()> {
         self.set_status(pid, STATUS_ENDED).await
     }
@@ -682,8 +684,9 @@ impl Organizer {
         self.set_status(pid, STATUS_CANCELED).await
     }
 
-    /// Pauses a READY process: nodes still take votes but settle nothing
-    /// until it resumes.
+    /// Pauses a READY process before its end: nodes still take votes but
+    /// settle nothing until it resumes. A process still paused at its end
+    /// settles through the grace window.
     pub async fn pause_process(&self, pid: &[u8; 31]) -> Result<()> {
         self.set_status(pid, STATUS_PAUSED).await
     }
@@ -694,9 +697,10 @@ impl Organizer {
     }
 
     /// Sets the duration, from the start time (`setProcessDuration`,
-    /// organizer only, while READY or PAUSED and before the end). The
-    /// registry only moves the end later: a shorter one reverts
-    /// `InvalidDuration`.
+    /// organizer only, while READY or PAUSED and before the end). Extending is
+    /// free; a shorter one must still end in the future and no earlier than
+    /// now + `noticeMin` (see [`GraceParams`]), else `InvalidDuration`. The
+    /// nodes flush during the notice and results follow the grace window.
     pub async fn set_process_duration(&self, pid: &[u8; 31], duration: u64) -> Result<()> {
         let call = self
             .registry
@@ -706,8 +710,18 @@ impl Organizer {
         Ok(())
     }
 
+    /// Sets the idle grace window after the end (`setProcessGrace`, organizer
+    /// only, while READY or PAUSED and before the end), within the registry's
+    /// `graceFloor..=graceCeil`, else `InvalidGrace`.
+    pub async fn set_process_grace(&self, pid: &[u8; 31], secs: u32) -> Result<()> {
+        let call = self.registry.setProcessGrace(FixedBytes(*pid), secs);
+        call.call().await.map_err(chain_err)?;
+        self.mined(call.send().await.map_err(chain_err)?).await?;
+        Ok(())
+    }
+
     /// Sets max voters (`setProcessMaxVoters`, organizer only, while READY
-    /// or PAUSED), never below the voters already counted.
+    /// or PAUSED and before the end), never below the voters already counted.
     pub async fn set_process_max_voters(&self, pid: &[u8; 31], max_voters: u64) -> Result<()> {
         let call = self
             .registry
@@ -785,10 +799,57 @@ impl Organizer {
     }
 
     /// The tally once the results are on-chain (status RESULTS), else `None`.
+    /// Results land only after the grace window ([`Organizer::grace_end`]).
     pub async fn results(&self, pid: &[u8; 31]) -> Result<Option<Vec<u64>>> {
         let p = self.process(pid).await?;
         Ok((p.status == ProcessStatus::Results).then_some(p.result))
     }
+
+    pub async fn grace_end(&self, pid: &[u8; 31]) -> Result<u64> {
+        read_grace_end(&self.registry, pid).await
+    }
+
+    pub async fn grace_params(&self) -> Result<GraceParams> {
+        read_grace_params(&self.registry).await
+    }
+}
+
+/// The registry's grace immutables, in seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraceParams {
+    /// Grace window of a new process.
+    pub default_grace: u32,
+    /// `setProcessGrace` bounds.
+    pub grace_floor: u32,
+    pub grace_ceil: u32,
+    /// The window never closes later than end + this.
+    pub grace_max_total: u32,
+    /// Least notice a shortened end gives.
+    pub notice_min: u32,
+}
+
+// Block time the window closes at: min(end + graceMaxTotal,
+// max(end, lastVoteAt) + grace). It moves forward with every landing.
+async fn read_grace_end(
+    registry: &ProcessRegistryInstance<DynProvider>,
+    pid: &[u8; 31],
+) -> Result<u64> {
+    let end = registry
+        .getProcessGraceEnd(FixedBytes(*pid))
+        .call()
+        .await
+        .map_err(chain_err)?;
+    u64_of("graceEnd", end)
+}
+
+async fn read_grace_params(registry: &ProcessRegistryInstance<DynProvider>) -> Result<GraceParams> {
+    Ok(GraceParams {
+        default_grace: registry.defaultGrace().call().await.map_err(chain_err)?,
+        grace_floor: registry.graceFloor().call().await.map_err(chain_err)?,
+        grace_ceil: registry.graceCeil().call().await.map_err(chain_err)?,
+        grace_max_total: registry.graceMaxTotal().call().await.map_err(chain_err)?,
+        notice_min: registry.noticeMin().call().await.map_err(chain_err)?,
+    })
 }
 
 /// What [`verify_registry`] found.
@@ -934,6 +995,14 @@ impl RegistryReader {
 
     pub async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess> {
         read_process(&self.registry, pid).await
+    }
+
+    pub async fn grace_end(&self, pid: &[u8; 31]) -> Result<u64> {
+        read_grace_end(&self.registry, pid).await
+    }
+
+    pub async fn grace_params(&self) -> Result<GraceParams> {
+        read_grace_params(&self.registry).await
     }
 }
 
