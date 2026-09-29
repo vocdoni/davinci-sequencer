@@ -3155,7 +3155,8 @@ async fn dkg_lost_finalize_is_retried_not_latched() {
         true,
     )
     .await;
-    wait_until("finalize lost", async || s.chain.dkg_calls().1.1 == 1).await;
+    // Behind the request's and the finalize's random delays: up to 20 s.
+    wait_long("finalize lost", async || s.chain.dkg_calls().1.1 == 1).await;
     assert_ne!(s.chain.status(), ProcessStatus::Results);
     s.chain.set_results_externally(tally(3, 5));
     s.chain.hide_block(Some(s.chain.head_block()));
