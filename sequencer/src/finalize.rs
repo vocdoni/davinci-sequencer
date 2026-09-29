@@ -160,16 +160,21 @@ async fn dkg_attempt(
 }
 
 // A DKG call failed. RESULTS already set (another node won) is done; a
-// status or window revert is an extension or a race, retried; any other
-// revert latches.
+// status or window revert, or one the replay cannot name, is an extension
+// or a race, retried; any other revert latches.
 async fn dkg_fail(
     chain: &dyn Chain,
     pid31: &[u8; 31],
     e: Web3Error,
     what: &str,
 ) -> Result<(), Fail> {
+    let retry = match &e {
+        Web3Error::Revert(r) => matches!(r.name(), Some("InvalidStatus" | "InvalidTimeBounds")),
+        Web3Error::Lost { .. } => true,
+        _ => false,
+    };
     Err(match e {
-        Web3Error::Revert(r) if matches!(r.name(), Some("InvalidStatus" | "InvalidTimeBounds")) => {
+        e if retry => {
             if chain
                 .process(pid31)
                 .await
@@ -177,7 +182,7 @@ async fn dkg_fail(
             {
                 return Ok(());
             }
-            Fail::Transient(format!("{what} reverted: {r}"))
+            Fail::Transient(format!("{what} reverted: {e}"))
         }
         Web3Error::Revert(r) => Fail::Permanent(format!("{what} reverted: {r}")),
         e @ Web3Error::NoSigner => Fail::Permanent(e.to_string()),
@@ -274,6 +279,8 @@ async fn attempt_once(
         Err(Web3Error::Revert(r)) => Err(Fail::Permanent(format!("results reverted: {r}"))),
         // An observer can never submit; retrying would loop forever.
         Err(e @ Web3Error::NoSigner) => Err(Fail::Permanent(e.to_string())),
+        // Everything else re-arms, a mined revert the replay cannot name
+        // (`Lost`) included.
         Err(e) => Err(Fail::Transient(e.to_string())),
     }
 }

@@ -846,6 +846,241 @@ async fn send_that_failed_over_is_maybe_sent() {
     assert_eq!(c.process(&pid).await.unwrap().metadata_uri, "ipfs://second");
 }
 
+/// How a [`lagging_proxy`] lags; 0 turns a knob off.
+#[derive(Default)]
+struct Lag {
+    /// `eth_call` at "latest" runs at this block: a backend behind the head.
+    latest: std::sync::atomic::AtomicU64,
+    /// `eth_call` at a block above this answers "header not found".
+    known: std::sync::atomic::AtomicU64,
+}
+
+// A JSON-RPC proxy in front of anvil whose `eth_call` lags per `lag`, like
+// a load-balanced public RPC whose backends trail each other.
+async fn lagging_proxy(upstream: url::Url, lag: std::sync::Arc<Lag>) -> url::Url {
+    use std::sync::atomic::Ordering::Relaxed;
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let (lag, upstream) = (lag.clone(), upstream.clone());
+            async move {
+                let mut req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if req["method"] == "eth_call" {
+                    let tag = req["params"][1].as_str().unwrap_or("latest").to_string();
+                    let (latest, known) = (lag.latest.load(Relaxed), lag.known.load(Relaxed));
+                    if tag == "latest" && latest != 0 {
+                        req["params"][1] = format!("{latest:#x}").into();
+                    } else if let Some(n) = tag.strip_prefix("0x")
+                        && known != 0
+                        && u64::from_str_radix(n, 16).unwrap() > known
+                    {
+                        let e = serde_json::json!({"code": -32000, "message": "header not found"});
+                        return serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "error": e})
+                            .to_string();
+                    }
+                }
+                reqwest::Client::new()
+                    .post(upstream)
+                    .header("content-type", "application/json")
+                    .body(req.to_string())
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap()
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", l.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await });
+    url
+}
+
+// Two sequencers settle the same root in one block (live on Gnosis in block
+// 48495639). The loser's RPC lags behind that block, so a replay at
+// `latest` passes and once left the revert unnamed, erroring the votes.
+// Replayed at the receipt's block it names InvalidStateRoot; when the RPC
+// lacks that block too, the loser gets `Lost`, never a named failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_block_race_names_the_loser() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let secret = |k: usize| {
+        let key: PrivateKeySigner = anvil.keys()[k].clone().into();
+        SecretString::new(hex::encode(key.to_bytes()))
+    };
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(PrivateKeySigner::from(
+            anvil.keys()[0].clone(),
+        )))
+        .connect_http(url.clone());
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(BALLOT_VK_HASH),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    let registry = deploy(&deployer, code).await;
+    let lag = std::sync::Arc::new(Lag::default());
+    let proxy = lagging_proxy(url.clone(), lag.clone()).await;
+    let a = Contracts::new(std::slice::from_ref(&proxy), registry, Some(&secret(0)))
+        .await
+        .unwrap();
+    let b = Contracts::new(std::slice::from_ref(&proxy), registry, Some(&secret(1)))
+        .await
+        .unwrap();
+
+    let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+    let mut census_root = [0u8; 32];
+    census_root[31] = 0x2a;
+    let (pid, _) = a
+        .create_process(&NewProcess {
+            status: ProcessStatus::Ready,
+            start_time: 0,
+            duration: 3600,
+            max_voters: 1000,
+            ballot_mode: BallotMode {
+                num_fields: NF,
+                group_size: 1,
+                unique_values: false,
+                cost_exponent: 1,
+                max_value: 5,
+                min_value: 0,
+                max_value_sum: 20,
+                min_value_sum: 0,
+            },
+            census: OnchainCensus {
+                origin: 1,
+                root: census_root,
+                uri: "file:///tmp/census.json".into(),
+                contract_address: [0u8; 20],
+            },
+            metadata: "ipfs://meta".into(),
+            metadata_hash: metadata_hash(META_DOC),
+            enc_key: pk,
+        })
+        .await
+        .unwrap();
+
+    let rpc = ProviderBuilder::new().connect_http(url.clone());
+    // Both nodes settle a 2-vote transition from the current root, mined
+    // together; returns the winner's new root and the loser's error.
+    let race = async |round: u64| {
+        let p = a.process(&pid).await.unwrap();
+        let transition = |tag: u8| {
+            let t = TransitionData {
+                vote_ids: vec![
+                    VOTE_ID_MIN + 100 * round + tag as u64,
+                    VOTE_ID_MIN + 100 * round + 50 + tag as u64,
+                ],
+                updates: vec![
+                    (0x10 + 2 * tag as u64, some_ballot(&pk, tag as u64)),
+                    (0x11 + 2 * tag as u64, some_ballot(&pk, 9 + tag as u64)),
+                ],
+                accumulator: some_ballot(&pk, 20 + tag as u64),
+                num_fields: NF,
+            };
+            let blobs = build_blobs(&t, &pid_fr(&pid), &p.state_root).unwrap();
+            let batch = Batch {
+                before: p.state_root,
+                after: [tag + 0x10 * round as u8; 32],
+                voters: 2,
+                overwrites: 0,
+                occupied_before: p.voters_count as u32,
+            };
+            (batch_snark(&batch, &census_root, &blobs), blobs)
+        };
+        let ((sa, ba), (sb, bb)) = (transition(1), transition(2));
+        let _: () = rpc
+            .raw_request("evm_setAutomine".into(), (false,))
+            .await
+            .unwrap();
+        let miner = async {
+            // Mine once both transactions are pooled.
+            for _ in 0..600 {
+                let st: serde_json::Value =
+                    rpc.raw_request("txpool_status".into(), ()).await.unwrap();
+                let pending = match &st["pending"] {
+                    serde_json::Value::String(s) => {
+                        u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
+                    }
+                    v => v.as_u64().unwrap(),
+                };
+                if pending == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await.unwrap();
+            let _: () = rpc
+                .raw_request("evm_setAutomine".into(), (true,))
+                .await
+                .unwrap();
+        };
+        let (ra, rb, ()) = tokio::join!(
+            a.submit_transition(&pid, &sa, &ba),
+            b.submit_transition(&pid, &sb, &bb),
+            miner
+        );
+        let (won, lost) = match (ra, rb) {
+            (Ok(r), Err(e)) | (Err(e), Ok(r)) => (r, e),
+            (ra, rb) => panic!("want one winner: {ra:?} / {rb:?}"),
+        };
+        (won, lost)
+    };
+
+    // The RPC answers `latest` from the block before the race.
+    let (head, _) = a.head().await.unwrap();
+    lag.latest.store(head, Relaxed);
+    let (won, lost) = race(1).await;
+    assert_eq!(won.block, head + 1);
+    match &lost {
+        Web3Error::Revert(r) => assert_eq!(r.name(), Some("InvalidStateRoot"), "{r}"),
+        e => panic!("want a named revert, got {e}"),
+    }
+
+    // Nor does it serve the race block: the replay falls back to `latest`,
+    // which passes. A lost race, not a failure.
+    let (head, _) = a.head().await.unwrap();
+    lag.latest.store(head, Relaxed);
+    lag.known.store(head, Relaxed);
+    let (won, lost) = race(2).await;
+    assert_eq!(won.block, head + 1);
+    assert!(
+        matches!(lost, Web3Error::Lost { block, .. } if block == won.block),
+        "{lost}"
+    );
+
+    lag.latest.store(0, Relaxed);
+    lag.known.store(0, Relaxed);
+    let p = a.process(&pid).await.unwrap();
+    assert_eq!((p.batch_number, p.voters_count), (2, 4));
+}
+
 alloy::sol! {
     #[sol(rpc)]
     interface IMockDKG {

@@ -444,7 +444,10 @@ parallel.
 **Races.** Settlement is permissionless. If another sequencer lands first, our
 pre-flight or transaction reverts with `InvalidStateRoot`. The actor then rolls
 the tree back, counts a lost race, puts the votes back in the queue, syncs, and
-builds the next batch on the new root.
+builds the next batch on the new root. A mined revert is named by replaying the
+call at its block (at `latest` when the RPC cannot serve that block). When both
+transactions land in one block, a lagging RPC may replay ours without the
+winner's and see it pass; a revert no replay names counts as a lost race too.
 
 **Sync.** For a transition another node sent, the actor:
 1. fetches the blobs and matches them against the transaction's versioned hashes;

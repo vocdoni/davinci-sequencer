@@ -353,6 +353,13 @@ pub enum Web3Error {
     /// says why. Retrying the same call will not help.
     #[error("{0}")]
     Revert(RevertReason),
+    /// Mined but reverted, and no replay names why: it passes (the state
+    /// moved under it, another sequencer's transaction in the same block,
+    /// where the replay cannot see it) or cannot run. A lost race, never final.
+    #[error(
+        "tx {tx_hash} reverted in block {block} and no replay names why: lost to a concurrent change"
+    )]
+    Lost { tx_hash: B256, block: u64 },
     /// The node refused the fees even after bumping; retry later.
     #[error("underpriced: {0}")]
     Underpriced(String),

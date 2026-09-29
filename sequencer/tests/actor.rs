@@ -888,6 +888,65 @@ async fn stale_root_revert_settles(fail_read: bool, lost: u64) {
     shutdown.cancel();
 }
 
+/// Two sequencers settle in the same block and ours loses, but the replay
+/// cannot name the revert (`Lost`): a lost race like `InvalidStateRoot`.
+/// The votes go back to pending, the node syncs the winner and settles
+/// them next; none is ever errored.
+#[tokio::test]
+async fn unnamed_revert_in_a_same_block_race_requeues() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    // The winner's batch, built on the same genesis root.
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let theirs = [
+        fake_vote(&s.env, 2, &[1, 1], 60),
+        fake_vote(&s.env, 3, &[2, 1], 61),
+    ];
+    let b = other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(5), &Default::default())
+        .unwrap();
+    s.chain.race_next_submit(b);
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let ours: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 50 + i as u64))
+        .collect();
+    let vids: Vec<u64> = ours.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &ours {
+        h.submit(v.clone()).await.unwrap();
+    }
+    wait_until("settled after the lost race", async || {
+        for vid in &vids {
+            let st = vote_status(&h, *vid).await;
+            assert_ne!(st, Some(VoteStatus::Error), "a lost race errored a vote");
+            if st != Some(VoteStatus::Settled) {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 4);
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.settled_by_self.load(Ordering::SeqCst), 1);
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
 /// After a restart, `recover()` finds the settled state root in the
 /// persisted record, so the key holder still finalizes when the election ends.
 #[tokio::test]

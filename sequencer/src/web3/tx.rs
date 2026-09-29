@@ -508,22 +508,11 @@ impl Contracts {
             .block_number
             .ok_or_else(|| Web3Error::Data("receipt without a block".into()))?;
         if !receipt.status() {
-            // Replay on the latest state to name it (usually a lost race).
             tx.nonce = None;
-            let reason = match self
-                .provider
-                .call(tx)
-                .block(alloy::eips::BlockId::latest())
-                .await
-            {
-                Err(e) => self.reason(&e),
-                Ok(_) => RevertReason::Revert {
-                    name: "unknown".into(),
-                    data: Bytes::new(),
-                },
-            };
-            tracing::warn!(%tx_hash, block, %reason, "transaction reverted");
-            return Err(Web3Error::Revert(reason));
+            let e = self.mined_revert(tx, tx_hash, block).await;
+            // Callers log the verdict: a lost race is routine, not a warning.
+            tracing::info!(%tx_hash, block, error = %e, "transaction reverted");
+            return Err(e);
         }
         let logs = receipt.inner.logs().to_vec();
         Ok((
@@ -535,6 +524,47 @@ impl Contracts {
             },
             logs,
         ))
+    }
+
+    /// Names a mined revert by replaying the call on the state its block
+    /// left, where the transactions that beat it are applied. An RPC that
+    /// cannot serve that block (a lagging backend, pruned state) replays
+    /// at `latest` instead.
+    async fn mined_revert(&self, tx: TransactionRequest, tx_hash: B256, block: u64) -> Web3Error {
+        let replay = async |at: alloy::eips::BlockId| {
+            self.provider
+                .call(tx.clone())
+                .block(at)
+                .await
+                .map(|_| ())
+                .map_err(|e| self.reason(&e))
+        };
+        let mut res = replay(alloy::eips::BlockId::number(block)).await;
+        if let Err(RevertReason::Rpc(e)) = &res {
+            tracing::debug!(%tx_hash, block, error = %e, "replay at the receipt's block failed, trying latest");
+            res = replay(alloy::eips::BlockId::latest()).await;
+        }
+        replay_verdict(res, tx_hash, block)
+    }
+}
+
+/// What the replay of a mined revert says: the revert it names, else
+/// `Lost`. A replay that passes can only mean a state change it does not
+/// see (a lagging endpoint still before the winner's transaction); one no
+/// endpoint can run names nothing either. Callers retry both; a revert that
+/// holds shows up named in the next pre-flight.
+fn replay_verdict(
+    res: std::result::Result<(), RevertReason>,
+    tx_hash: B256,
+    block: u64,
+) -> Web3Error {
+    match res {
+        Err(r @ RevertReason::Revert { .. }) => Web3Error::Revert(r),
+        Ok(()) => Web3Error::Lost { tx_hash, block },
+        Err(RevertReason::Rpc(e)) => {
+            tracing::debug!(%tx_hash, block, error = %e, "replay of a mined revert failed");
+            Web3Error::Lost { tx_hash, block }
+        }
     }
 }
 
@@ -710,6 +740,112 @@ mod tests {
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
         format!("http://{addr}").parse().unwrap()
+    }
+
+    /// How the replay stub answers an `eth_call`.
+    #[derive(Clone, Copy)]
+    enum Replay {
+        Pass,
+        Revert([u8; 4]),
+        /// A backend without the block, like a lagging load-balanced one.
+        NoBlock,
+    }
+
+    // An RPC answering `eth_call` at block 0x10 with `at_block` and at
+    // "latest" with `at_latest`; records the block tags it was asked for.
+    async fn replay_stub(
+        at_block: Replay,
+        at_latest: Replay,
+    ) -> (url::Url, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{Json, Router, routing::post};
+        let tags = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = tags.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                let id = req["id"].clone();
+                let tag = req["params"][1].as_str().unwrap_or_default().to_string();
+                seen.lock().unwrap().push(tag.clone());
+                let answer = if tag == "latest" { at_latest } else { at_block };
+                Json(match answer {
+                    Replay::Pass => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": "0x"}),
+                    Replay::Revert(sel) => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": 3, "message": "execution reverted",
+                            "data": format!("0x{}", hex::encode(sel))}}),
+                    Replay::NoBlock => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32000, "message": "header not found"}}),
+                })
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}").parse().unwrap(), tags)
+    }
+
+    // A read-only registry handle over `url`, without the boot checks.
+    fn contracts_at(url: url::Url) -> Contracts {
+        let (provider, epoch) = crate::web3::failover_provider(&[url]);
+        Contracts {
+            provider,
+            epoch,
+            registry: alloy::primitives::Address::repeat_byte(1),
+            signer: None,
+            wallet: None,
+            chain_id: 1,
+            cell_proofs: Default::default(),
+            blob_cap: None,
+            errors: std::sync::Arc::new(crate::web3::contracts::error_names().unwrap()),
+            send_lock: Default::default(),
+            receipt_timeout: Duration::from_secs(1),
+            dkg_adapter: Default::default(),
+        }
+    }
+
+    // A mined revert is named from the state its block left. Replaying at
+    // `latest` on an endpoint that lags behind that block passes, which once
+    // errored the votes of a lost race as "unknown".
+    #[tokio::test]
+    async fn mined_revert_is_replayed_at_its_block() {
+        use alloy::sol_types::SolError;
+        let root = PR::InvalidStateRoot::SELECTOR;
+        let status = PR::InvalidStatus::SELECTOR;
+        let hash = B256::repeat_byte(7);
+        let verdict = async |at_block, at_latest| {
+            let (url, tags) = replay_stub(at_block, at_latest).await;
+            let e = contracts_at(url)
+                .mined_revert(TransactionRequest::default(), hash, 0x10)
+                .await;
+            (e, tags.lock().unwrap().clone())
+        };
+
+        let (e, tags) = verdict(Replay::Revert(root), Replay::Pass).await;
+        assert!(
+            matches!(&e, Web3Error::Revert(r) if r.name() == Some("InvalidStateRoot")),
+            "{e}"
+        );
+        assert_eq!(tags, ["0x10"], "replayed at the receipt's block only");
+
+        // The block is out of the endpoint's reach: latest names it.
+        let (e, tags) = verdict(Replay::NoBlock, Replay::Revert(status)).await;
+        assert!(
+            matches!(&e, Web3Error::Revert(r) if r.name() == Some("InvalidStatus")),
+            "{e}"
+        );
+        assert_eq!(tags, ["0x10", "latest"]);
+
+        // Nothing reverts on the state the endpoint has: a lost race.
+        let (e, _) = verdict(Replay::NoBlock, Replay::Pass).await;
+        assert!(
+            matches!(e, Web3Error::Lost { tx_hash, block: 0x10 } if tx_hash == hash),
+            "{e}"
+        );
+        let (e, _) = verdict(Replay::Pass, Replay::Pass).await;
+        assert!(matches!(e, Web3Error::Lost { .. }), "{e}");
+
+        // No endpoint can run it: nothing named, retried the same way.
+        let (e, _) = verdict(Replay::NoBlock, Replay::NoBlock).await;
+        assert!(matches!(e, Web3Error::Lost { .. }), "{e}");
     }
 
     #[tokio::test]

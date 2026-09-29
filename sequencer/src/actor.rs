@@ -620,6 +620,8 @@ pub(crate) enum JobOutcome {
     Failed(String),
     /// The settlement reverted with this error name.
     Reverted(String),
+    /// The settlement reverted on-chain and no replay names why: a race.
+    Lost(String),
     /// RPC trouble; the votes go back to pending.
     Transient(String),
 }
@@ -1707,22 +1709,15 @@ impl Actor {
                 self.set_status(&vids, VoteStatus::Error, Some(&msg));
             }
             JobOutcome::Reverted(name) if name == "InvalidStateRoot" => {
-                self.rollback_flight(&f);
-                // The chain still shows our root, so nobody settled: a
-                // lagging endpoint answered. Retry after a cooldown.
-                if let Ok(p) = self.deps.contracts.process(&self.pid31).await
-                    && p.state_root == self.state.committed().root
-                {
-                    let secs = self.prove_backoff();
-                    warn!(pid = %hex::encode(self.pid31), retry_in = secs, "InvalidStateRoot at our own root, requeueing");
-                    self.requeue_flight(f);
+                if self.race_lost(f).await {
                     return;
                 }
-                // Another sequencer settled first; sync, then retry the votes.
-                self.metrics.lost_races.fetch_add(1, Ordering::SeqCst);
-                self.await_sync = true;
-                warn!(pid = %hex::encode(self.pid31), "lost the settlement race, waiting for sync");
-                self.requeue_flight(f);
+            }
+            JobOutcome::Lost(e) => {
+                info!(pid = %hex::encode(self.pid31), %e, "settlement reverted in a race");
+                if self.race_lost(f).await {
+                    return;
+                }
             }
             JobOutcome::Reverted(name) if name == "InvalidCensusRoot" => {
                 // The census re-rooted under the flight. Requeue the
@@ -1791,6 +1786,27 @@ impl Actor {
         self.prove_attempts = 0;
         self.prove_after = None;
         self.census_reverts = ([0u8; 32], 0);
+    }
+
+    /// A settlement that lost a race: roll back and requeue its votes. When
+    /// the chain still shows our root nobody settled (a lagging endpoint
+    /// answered); that cools down and returns true, keeping the failure
+    /// streak. Otherwise another sequencer settled first: sync, then retry.
+    async fn race_lost(&mut self, f: Flight) -> bool {
+        self.rollback_flight(&f);
+        if let Ok(p) = self.deps.contracts.process(&self.pid31).await
+            && p.state_root == self.state.committed().root
+        {
+            let secs = self.prove_backoff();
+            warn!(pid = %hex::encode(self.pid31), retry_in = secs, "settlement race at our own root, requeueing");
+            self.requeue_flight(f);
+            return true;
+        }
+        self.metrics.lost_races.fetch_add(1, Ordering::SeqCst);
+        self.await_sync = true;
+        warn!(pid = %hex::encode(self.pid31), "lost the settlement race, waiting for sync");
+        self.requeue_flight(f);
+        false
     }
 
     fn commit_flight(&mut self, f: Flight, tx_hash: [u8; 32], block: u64) {
@@ -2315,6 +2331,7 @@ async fn job_inner(job: JobInput) -> JobOutcome {
     {
         Ok(rc) => JobOutcome::Landed(rc),
         Err(Web3Error::Revert(r)) => JobOutcome::Reverted(r.name().unwrap_or("revert").to_string()),
+        Err(e @ Web3Error::Lost { .. }) => JobOutcome::Lost(e.to_string()),
         Err(e) => JobOutcome::Transient(e.to_string()),
     }
 }

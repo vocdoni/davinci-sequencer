@@ -289,6 +289,8 @@ pub struct Inner {
     events_delay: Option<Duration>,
     /// The next N `simulate_transition` calls revert with this name.
     revert_simulate: Option<(String, u32)>,
+    /// Another sequencer's batch lands first in the next submit's block.
+    race_submit: Option<davinci_state::PreparedBatch>,
 }
 
 #[derive(Clone)]
@@ -362,6 +364,7 @@ impl FakeChain {
             fail_events_at: None,
             events_delay: None,
             revert_simulate: None,
+            race_submit: None,
         };
         FakeChain {
             inner: Arc::new(Mutex::new(inner)),
@@ -496,6 +499,13 @@ impl FakeChain {
 
     pub fn revert_simulates(&self, name: &str, n: u32) {
         self.inner.lock().unwrap().revert_simulate = Some((name.into(), n));
+    }
+
+    /// Another sequencer's `b` lands in the next submit's block, ahead of
+    /// it: ours reverts on-chain, and a lagging endpoint's replay of it
+    /// passes, so the node sees `Lost`.
+    pub fn race_next_submit(&self, b: davinci_state::PreparedBatch) {
+        self.inner.lock().unwrap().race_submit = Some(b);
     }
 
     pub fn head_block(&self) -> u64 {
@@ -636,32 +646,36 @@ impl FakeChain {
     /// Another sequencer settles `b` (built on this chain's root); returns
     /// the block its `StateTransitioned` lands in.
     pub fn settle_externally(&self, b: &davinci_state::PreparedBatch) -> u64 {
-        let mut i = self.inner.lock().unwrap();
-        assert_eq!(b.old_root, i.proc.state_root);
-        i.proc.state_root = b.new_root;
-        i.proc.voters_count += b.expected.voters as u64;
-        i.proc.overwritten_count += b.expected.overwrites as u64;
-        i.proc.batch_number += 1;
-        i.block += 1;
-        let tx = B256::repeat_byte(0x5e);
-        i.blobs.insert(tx, b.blobs.blobs.clone());
-        let (block, voters, overwrites) = (i.block, i.proc.voters_count, i.proc.overwritten_count);
-        i.events.push(RegistryEvent {
-            block,
-            tx_hash: tx,
-            log_index: 0,
-            kind: EventKind::StateTransitioned {
-                pid: pid31(),
-                sender: Address::repeat_byte(0xEE),
-                old_root: b.old_root,
-                new_root: b.new_root,
-                voters,
-                overwrites,
-                n_blobs: b.blobs.blobs.len() as u64,
-            },
-        });
-        block
+        settle_foreign(&mut self.inner.lock().unwrap(), b)
     }
+}
+
+// Another sequencer's transition of `b` lands; returns its block.
+fn settle_foreign(i: &mut Inner, b: &davinci_state::PreparedBatch) -> u64 {
+    assert_eq!(b.old_root, i.proc.state_root);
+    i.proc.state_root = b.new_root;
+    i.proc.voters_count += b.expected.voters as u64;
+    i.proc.overwritten_count += b.expected.overwrites as u64;
+    i.proc.batch_number += 1;
+    i.block += 1;
+    let tx = B256::repeat_byte(0x5e);
+    i.blobs.insert(tx, b.blobs.blobs.clone());
+    let (block, voters, overwrites) = (i.block, i.proc.voters_count, i.proc.overwritten_count);
+    i.events.push(RegistryEvent {
+        block,
+        tx_hash: tx,
+        log_index: 0,
+        kind: EventKind::StateTransitioned {
+            pid: pid31(),
+            sender: Address::repeat_byte(0xEE),
+            old_root: b.old_root,
+            new_root: b.new_root,
+            voters,
+            overwrites,
+            n_blobs: b.blobs.blobs.len() as u64,
+        },
+    });
+    block
 }
 
 /// `Sha256SmtLib.verifyInclusion`, as the registry runs it.
@@ -898,6 +912,15 @@ impl Chain for FakeChain {
         if i.fail_submits > 0 {
             i.fail_submits -= 1;
             return Err(Web3Error::Rpc("scripted submit failure".into()));
+        }
+        if let Some(b) = i.race_submit.take() {
+            let block = settle_foreign(&mut i, &b);
+            if check_transition(&i, &p).is_err() {
+                return Err(Web3Error::Lost {
+                    tx_hash: B256::repeat_byte(0x10),
+                    block,
+                });
+            }
         }
         check_transition(&i, &p).map_err(Web3Error::Revert)?;
         i.last_census_root = Some(p.census_root);
