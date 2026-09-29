@@ -169,9 +169,10 @@ while IFS= read -r v; do
 done < <(compgen -e | grep -E '^DAVINCI_E2E_|^DAVINCI_ZKVM_URL$|^DAVINCI_DEMO_' \
     | grep -vE '^DAVINCI_DEMO_(DIR|ORGANIZER_KEY)$' || true)
 
+# A missing image still prints an empty line, so fall back on empty output.
+digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$node_image" 2>/dev/null || true)
 {
-    echo "node image: $(docker image inspect --format '{{index .RepoDigests 0}}' \
-        "$node_image" 2>/dev/null || echo "$node_image")"
+    echo "node image: ${digest:-$node_image}"
     [[ -n $demo || $test == e2e ]] || echo "report: $runs/$kind-$stamp.md"
 } | tee "$log"
 
