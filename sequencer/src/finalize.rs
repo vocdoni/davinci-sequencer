@@ -5,11 +5,13 @@
 //! publishes its plaintexts (`run_finalize_dkg`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use davinci_zkvm_sdk::limits::NUM_FIELDS;
 use davinci_zkvm_sdk::publics::{ResultsPublics, results_fail_bits};
 use davinci_zkvm_sdk::release;
 use davinci_zkvm_sdk::types::ResultsRequest;
+use rand::Rng;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -68,10 +70,21 @@ impl From<Fail> for FinalizeFail {
 /// siblings, root to leaf.
 pub(crate) type DkgInputs = ([[u8; 32]; 64], Vec<[u8; 32]>);
 
+/// Longest random pause before a DKG call. Every signing node reaches the
+/// same call on the same heartbeat; staggered, the first one's transaction
+/// shows in the others' fresh read and they skip theirs.
+const DKG_JITTER: Duration = Duration::from_secs(10);
+
+async fn jitter() {
+    let ms = rand::thread_rng().gen_range(0..DKG_JITTER.as_millis() as u64);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
 /// One DKG finalize pass: request the decryption unless it was, then
-/// publish the plaintexts once the committee combined them all. Another
-/// node winning either step counts as done. `inputs` is `None` when the
-/// actor already saw the request on-chain. Reports through the mailbox.
+/// publish the plaintexts once the committee combined them all. Each call
+/// goes out after a random pause and only if a fresh read still lacks it;
+/// another node winning either step counts as done. `inputs` is `None` when
+/// the actor already saw the request on-chain. Reports through the mailbox.
 pub(crate) async fn run_finalize_dkg(
     chain: Arc<dyn Chain>,
     pid31: [u8; 31],
@@ -133,13 +146,23 @@ async fn dkg_attempt(
                 "on-chain root is not the local committed root".into(),
             ));
         }
-        match chain
-            .request_results_decryption(pid31, accumulator, siblings)
-            .await
-        {
-            Ok(r) => info!(pid = %hex::encode(pid31), tx = %r.tx_hash, "DKG decryption requested"),
-            Err(Web3Error::Revert(r)) if r.name() == Some("ResultsAlreadyRequested") => {}
-            Err(e) => return dkg_fail(chain, pid31, e, "request").await,
+        // Send only if another node's request has not landed meanwhile.
+        jitter().await;
+        let p = chain.process(pid31).await.map_err(transient)?;
+        if p.status == ProcessStatus::Results {
+            return Ok(());
+        }
+        if !p.dkg.requested {
+            match chain
+                .request_results_decryption(pid31, accumulator, siblings)
+                .await
+            {
+                Ok(r) => {
+                    info!(pid = %hex::encode(pid31), tx = %r.tx_hash, "DKG decryption requested")
+                }
+                Err(Web3Error::Revert(r)) if r.name() == Some("ResultsAlreadyRequested") => {}
+                Err(e) => return dkg_fail(chain, pid31, e, "request").await,
+            }
         }
         *seen = Some(true);
         // No active field: the request itself finalized.
@@ -150,6 +173,12 @@ async fn dkg_attempt(
     if !chain.dkg_results_ready(pid31).await.map_err(transient)? {
         return Err(Fail::Wait("DKG plaintexts not combined yet".into()));
     }
+    // The same for the finalize: pause, then send unless another node's
+    // has landed.
+    jitter().await;
+    if chain.process(pid31).await.map_err(transient)?.status == ProcessStatus::Results {
+        return Ok(());
+    }
     match chain.finalize_results_from_dkg(pid31).await {
         Ok(_) => Ok(()),
         Err(Web3Error::Revert(r)) if r.name() == Some("ResultsNotReady") => {
@@ -159,31 +188,35 @@ async fn dkg_attempt(
     }
 }
 
-// A DKG call failed. RESULTS already set (another node won) is done; a
-// status or window revert, or one the replay cannot name, is an extension
-// or a race, retried; any other revert latches.
+// A DKG call failed. RESULTS already set (another node won) is done. A
+// race lost to another node's call (`InvalidStatus` once it finalized, or a
+// revert the replay cannot name) is no error: poll again. A window revert
+// (an extension) retries; any other revert latches.
 async fn dkg_fail(
     chain: &dyn Chain,
     pid31: &[u8; 31],
     e: Web3Error,
     what: &str,
 ) -> Result<(), Fail> {
-    let retry = match &e {
-        Web3Error::Revert(r) => matches!(r.name(), Some("InvalidStatus" | "InvalidTimeBounds")),
-        Web3Error::Lost { .. } => true,
-        _ => false,
+    let (race, window) = match &e {
+        Web3Error::Revert(r) => (
+            r.name() == Some("InvalidStatus"),
+            r.name() == Some("InvalidTimeBounds"),
+        ),
+        Web3Error::Lost { .. } => (true, false),
+        _ => (false, false),
     };
+    if (race || window)
+        && chain
+            .process(pid31)
+            .await
+            .is_ok_and(|p| p.status == ProcessStatus::Results)
+    {
+        return Ok(());
+    }
     Err(match e {
-        e if retry => {
-            if chain
-                .process(pid31)
-                .await
-                .is_ok_and(|p| p.status == ProcessStatus::Results)
-            {
-                return Ok(());
-            }
-            Fail::Transient(format!("{what} reverted: {e}"))
-        }
+        e if race => Fail::Wait(format!("{what} lost a race: {e}")),
+        e if window => Fail::Transient(format!("{what} reverted: {e}")),
         Web3Error::Revert(r) => Fail::Permanent(format!("{what} reverted: {r}")),
         e @ Web3Error::NoSigner => Fail::Permanent(e.to_string()),
         e => Fail::Transient(format!("{what}: {e}")),

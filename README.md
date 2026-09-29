@@ -663,6 +663,10 @@ plaintexts are public on the DKG before they reach the registry: a process left
 READY could be canceled by an organizer who disliked the tally. The node then
 polls until every ciphertext is combined and calls `finalizeResultsFromDKG`,
 which reads the plaintexts, stores the results and emits `ProcessResultsSet`.
+Every signing node gets to both calls at about the same time, so each one waits
+a random moment (up to 10 s) and sends only if a fresh read still lacks the
+call. A node that loses the race anyway (`ResultsAlreadyRequested`,
+`InvalidStatus`) takes the winner's call as its own.
 
 There is no results PLONK in DKG modes: the committee's Groth16 proofs of every
 partial decryption and combine, and the registry's inclusion check, replace it.

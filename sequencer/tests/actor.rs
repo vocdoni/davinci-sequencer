@@ -2954,6 +2954,135 @@ async fn dkg_finalize_race_is_tolerated() {
     shutdown.cancel();
 }
 
+/// Two signing nodes finalize the same DKG process from the same heartbeat.
+/// Each waits a random moment and reads again before sending, so only one
+/// request and one finalize reach the chain; the other node skips both.
+#[tokio::test(start_paused = true)]
+async fn two_dkg_nodes_send_each_call_once() {
+    let s = setup(2, 8, None);
+    s.chain.set_key_mode(KeyMode::DkgAutomatic);
+    let shutdown = CancellationToken::new();
+    let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let mut nodes = Vec::new();
+    for (dir, signer) in [(&dir_a, 0xa1), (&dir_b, 0xb2)] {
+        let node = start_node(
+            Db::open_in(dir.path()).unwrap(),
+            dir.path(),
+            &s,
+            s.chain.with_signer(signer),
+            FakeProver::open(),
+            2,
+            "0s",
+            shutdown.clone(),
+        )
+        .await;
+        let h = handle(&node).await;
+        nodes.push((node, h));
+    }
+    let votes = [
+        fake_vote(&s.env, 0, &[1, 2], 40),
+        fake_vote(&s.env, 1, &[2, 3], 41),
+    ];
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        nodes[0].1.submit(v.clone()).await.unwrap();
+    }
+    wait_until("settled and synced", async || {
+        all_settled(&nodes[0].1, &vids).await
+            && nodes[1].1.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Ended);
+    wait_until("decryption requested", async || {
+        s.chain.dkg_calls().0.0 == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(s.chain.dkg_calls(), ((1, 1), (0, 0)), "a second request");
+    s.chain.dkg_combine(vec![3, 5]);
+    for (_, h) in &nodes {
+        wait_long("finalized", async || {
+            h.snapshot().await.unwrap().local == LocalStatus::Finalized
+        })
+        .await;
+    }
+    assert_eq!(s.chain.results(), tally(3, 5));
+    assert_eq!(s.chain.dkg_calls(), ((1, 1), (1, 1)), "a second finalize");
+    shutdown.cancel();
+}
+
+/// Another node's request lands while this node pauses before sending its
+/// own: the fresh read after the pause shows it, so none goes out.
+#[tokio::test(start_paused = true)]
+async fn dkg_request_seen_after_the_pause_is_not_sent() {
+    let s = setup(2, 8, None);
+    s.chain.set_key_mode(KeyMode::DkgAutomatic);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let votes = [
+        fake_vote(&s.env, 0, &[1, 2], 40),
+        fake_vote(&s.env, 1, &[2, 3], 41),
+    ];
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        h.submit(v.clone()).await.unwrap();
+    }
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    // The attempt's first read sees no request; the other node's lands
+    // before its second, the one right before sending.
+    s.chain.race_dkg_request_on_read(2);
+    s.chain.set_status(ProcessStatus::Ended);
+    wait_until("the other request seen", async || {
+        s.chain.dkg_state().requested
+    })
+    .await;
+    s.chain.dkg_combine(vec![3, 5]);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results(), tally(3, 5));
+    assert_eq!(s.chain.dkg_calls(), ((0, 0), (1, 1)), "request sent anyway");
+    shutdown.cancel();
+}
+
+/// Another node's finalize lands between this node's readiness check and
+/// its send: the read after the pause shows RESULTS, and it sends nothing.
+#[tokio::test(start_paused = true)]
+async fn dkg_finalize_seen_after_the_pause_is_not_sent() {
+    let (s, _node, h, shutdown, _dir) =
+        dkg_node(KeyMode::DkgAutomatic, FakeChain::clone, true).await;
+    wait_until("decryption requested", async || {
+        s.chain.dkg_calls().0.0 == 1
+    })
+    .await;
+    s.chain.race_dkg_finalize_after_ready();
+    s.chain.dkg_combine(vec![3, 5]);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results(), tally(3, 5));
+    assert_eq!(
+        s.chain.dkg_calls(),
+        ((1, 1), (0, 0)),
+        "finalize sent anyway"
+    );
+    shutdown.cancel();
+}
+
 /// Nothing to decrypt: the request itself finalizes to zeros.
 #[tokio::test(start_paused = true)]
 async fn dkg_zero_vote_process_finalizes_on_the_request() {

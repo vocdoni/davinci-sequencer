@@ -291,6 +291,12 @@ pub struct Inner {
     revert_simulate: Option<(String, u32)>,
     /// Another sequencer's batch lands first in the next submit's block.
     race_submit: Option<davinci_state::PreparedBatch>,
+    /// Another node's DKG request lands before the n-th `process()` read.
+    dkg_request_on_read: Option<u32>,
+    /// Another node's finalize lands before the first `process()` read
+    /// after `dkg_results_ready` says ready (`armed` once it did).
+    dkg_finalize_after_ready: bool,
+    dkg_finalize_armed: bool,
 }
 
 #[derive(Clone)]
@@ -365,6 +371,9 @@ impl FakeChain {
             events_delay: None,
             revert_simulate: None,
             race_submit: None,
+            dkg_request_on_read: None,
+            dkg_finalize_after_ready: false,
+            dkg_finalize_armed: false,
         };
         FakeChain {
             inner: Arc::new(Mutex::new(inner)),
@@ -649,6 +658,18 @@ impl FakeChain {
         self.inner.lock().unwrap().dkg_finalize_lost = true;
     }
 
+    /// Another node's request (every field active) lands just before the
+    /// `n`-th `process()` read from now.
+    pub fn race_dkg_request_on_read(&self, n: u32) {
+        self.inner.lock().unwrap().dkg_request_on_read = Some(n);
+    }
+
+    /// Another node's finalize lands between our readiness check and the
+    /// next `process()` read.
+    pub fn race_dkg_finalize_after_ready(&self) {
+        self.inner.lock().unwrap().dkg_finalize_after_ready = true;
+    }
+
     pub fn status(&self) -> ProcessStatus {
         self.inner.lock().unwrap().proc.status
     }
@@ -856,6 +877,19 @@ impl Chain for FakeChain {
         if i.fail_process > 0 {
             i.fail_process -= 1;
             return Err(Web3Error::Rpc("scripted process failure".into()));
+        }
+        let other = Address::repeat_byte(0xEE);
+        if let Some(n) = i.dkg_request_on_read {
+            i.dkg_request_on_read = (n > 1).then_some(n - 1);
+            if n == 1 {
+                let count = i.proc.ballot_mode.num_fields;
+                dkg_mark_requested(&mut i, other, count);
+            }
+        }
+        if std::mem::take(&mut i.dkg_finalize_armed) {
+            let mut results = i.dkg_plaintexts.clone().unwrap_or_default();
+            results.resize(i.proc.ballot_mode.num_fields as usize, 0);
+            dkg_set_results(&mut i, other, results);
         }
         Ok(i.proc.clone())
     }
@@ -1085,8 +1119,12 @@ impl Chain for FakeChain {
     }
 
     async fn dkg_results_ready(&self, _pid: &[u8; 31]) -> Result<bool, Web3Error> {
-        let i = self.inner.lock().unwrap();
-        Ok(i.proc.dkg.requested && (i.proc.dkg.count == 0 || i.dkg_plaintexts.is_some()))
+        let mut i = self.inner.lock().unwrap();
+        let ready = i.proc.dkg.requested && (i.proc.dkg.count == 0 || i.dkg_plaintexts.is_some());
+        if ready && std::mem::take(&mut i.dkg_finalize_after_ready) {
+            i.dkg_finalize_armed = true;
+        }
+        Ok(ready)
     }
 
     async fn finalize_results_from_dkg(&self, _pid: &[u8; 31]) -> Result<TxReceipt, Web3Error> {
