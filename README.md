@@ -165,6 +165,9 @@ confirmations:
 
 The registry and its block are under [Deployments](#deployments).
 
+The preset RPCs are public and rate-limit busy clients (at times all of them at
+once): for production load, set your own with `--rpc-url`.
+
 - Every explicit setting (`--registry`, `--start-block`, `--rpc-url`,
   `--blob-source`, `--confirmations`, or its `DAVINCI_*` variable) replaces the
   network's value, so a custom deployment works on any chain.
@@ -215,6 +218,11 @@ nothing about the next), a 2xx body that is not JSON-RPC, or a node-side
 JSON-RPC error (missing historical state, Nethermind's "No state available",
 rate limits, `-32603`); reverts, nonce and funding errors come back as they
 are, and so does a too-wide `eth_getLogs` range, which the census scan halves.
+A rate limit (429, or a JSON-RPC rate-limit error) also rests that endpoint, for
+its `Retry-After` (up to 5 minutes) or else 1 s doubling on each limit in a row
+(up to a minute). Requests skip resting endpoints; when all of them rest, a
+request waits for the first one back, up to 10 s, and past that fails without
+asking.
 A beacon API fails over on a connection error, 429 or 5xx. A 404 (a slot pruned
 there) is asked once of the next beacon, without switching, so an archive
 beacon listed second can serve old blobs. At boot every RPC must report

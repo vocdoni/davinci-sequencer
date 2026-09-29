@@ -272,7 +272,8 @@ mod tests {
         eth_config: Option<serde_json::Value>,
         /// eth_chainId; 0 answers Gnosis (100).
         chain_id: u64,
-        /// P256VERIFY calls still to fail with a 429-style error.
+        /// P256VERIFY calls still to fail with a timeout. (A 429 would rest
+        /// the endpoint in the transport, which has its own tests.)
         p256_fail: std::sync::atomic::AtomicUsize,
         p256_calls: std::sync::atomic::AtomicUsize,
         uas: std::sync::Mutex<Vec<String>>,
@@ -313,7 +314,7 @@ mod tests {
                     if failing > 0 {
                         f.p256_fail.store(failing - 1, SeqCst);
                         return axum::Json(serde_json::json!({"jsonrpc":"2.0","id":req["id"],
-                            "error":{"code":-32005,"message":"429 Too Many Requests"}}));
+                            "error":{"code":-32603,"message":"request timeout"}}));
                     }
                     let mut one = vec![0u8; 32];
                     one[31] = 1;
