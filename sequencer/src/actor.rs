@@ -633,6 +633,10 @@ pub(crate) enum JobOutcome {
 /// before the flight is rolled back (covers a reorg dropping the tx).
 const LANDED_EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// How long a pause read on-chain, but not yet routed as an event, holds
+/// sealing back.
+const PAUSE_HOLD: std::time::Duration = std::time::Duration::from_secs(90);
+
 struct Flight {
     generation: u64,
     prepared: davinci_state::PreparedBatch,
@@ -694,6 +698,9 @@ struct Actor {
     census_recheck: bool,
     /// Consecutive `InvalidCensusRoot` reverts of one census root (LE).
     census_reverts: ([u8; 32], u32),
+    /// Set when a settlement met a pause the events have not shown yet: no
+    /// seal before this instant or the next status event.
+    pause_hold: Option<tokio::time::Instant>,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -811,6 +818,7 @@ pub(crate) fn spawn_actor(
         census_broken: None,
         census_recheck: false,
         census_reverts: ([0u8; 32], 0),
+        pause_hold: None,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1252,8 +1260,9 @@ impl Actor {
         {
             return;
         }
-        // Cooling down after transient prover/RPC trouble?
-        if let Some(t) = self.prove_after
+        // Cooling down after transient prover/RPC trouble, or holding for
+        // a pause the events have not shown yet?
+        if let Some(t) = self.prove_after.max(self.pause_hold)
             && tokio::time::Instant::now() < t
         {
             return;
@@ -1756,8 +1765,25 @@ impl Actor {
                 self.requeue_flight(f);
                 return;
             }
-            JobOutcome::Reverted(name) if name == "InvalidStatus" => {
+            JobOutcome::Reverted(name)
+                if name == "InvalidStatus" || name == "InvalidTimeBounds" =>
+            {
                 self.rollback_flight(&f);
+                // Paused under the flight (or not started): the votes wait
+                // for the process to open. Only a closed one errors them.
+                if let Some(status) = self.may_reopen().await {
+                    let secs = self.prove_backoff();
+                    // Until the pause event arrives, the record still says
+                    // Ready: re-sealing would only re-prove into the revert.
+                    if status == ProcessStatus::Paused
+                        && self.record.onchain.status == ProcessStatus::Ready
+                    {
+                        self.pause_hold = Some(tokio::time::Instant::now() + PAUSE_HOLD);
+                    }
+                    info!(pid = %hex::encode(self.pid31), %name, retry_in = secs, "settlement refused while the process is not open, requeueing");
+                    self.requeue_flight(f);
+                    return;
+                }
                 warn!(pid = %hex::encode(self.pid31), "window closed while the batch was in flight");
                 self.set_status(&vids, VoteStatus::Error, Some("process closed"));
             }
@@ -1827,6 +1853,19 @@ impl Actor {
         false
     }
 
+    /// After a status or window revert: the process's status if it may
+    /// still take the votes (paused, or before its start), by the chain and
+    /// by the events seen so far. `None` once ended, canceled or past its end.
+    async fn may_reopen(&self) -> Option<ProcessStatus> {
+        let open = |s| matches!(s, ProcessStatus::Ready | ProcessStatus::Paused);
+        let (status, end) = match self.deps.contracts.process(&self.pid31).await {
+            Ok(p) => (p.status, p.end_time()),
+            Err(_) => (self.record.onchain.status, self.end_time()),
+        };
+        (open(status) && open(self.record.onchain.status) && self.chain_time < end)
+            .then_some(status)
+    }
+
     fn commit_flight(&mut self, f: Flight, tx_hash: [u8; 32], block: u64) {
         if let Err(e) = self.state.commit(&f.prepared) {
             // The transition IS on-chain; record the target root so resync
@@ -1891,6 +1930,7 @@ impl Actor {
             EventKind::ProcessCreated { .. } => {}
             EventKind::StatusChanged { new, .. } => {
                 self.record.onchain.status = new;
+                self.pause_hold = None;
                 if matches!(new, ProcessStatus::Ended | ProcessStatus::Canceled) {
                     self.close_out("process closed");
                 }

@@ -492,6 +492,142 @@ async fn paused_process_queues_votes_until_resume() {
     shutdown.cancel();
 }
 
+/// The organizer pauses while a batch is in flight: its settlement reverts
+/// `InvalidStatus` and the votes go back to pending, not to an error. They
+/// wait out the pause (still reported, still accepting) and settle on
+/// resume. `seen`: whether the node has the pause event by then, or only a
+/// fresh chain read shows it.
+async fn pause_during_flight(seen: bool) {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 0], 130 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        h.submit(v.clone()).await.unwrap();
+    }
+    wait_until("proving", async || prover.calls() >= 1).await;
+    if !seen {
+        s.chain.hide_block(Some(s.chain.head_block() + 1));
+    }
+    s.chain.set_status(ProcessStatus::Paused);
+    if seen {
+        wait_until("actor sees the pause", async || {
+            h.snapshot().await.unwrap().status == ProcessStatus::Paused
+        })
+        .await;
+    }
+    prover.release(100);
+    let no_error = async || {
+        for vid in &vids {
+            assert_ne!(
+                vote_status(&h, *vid).await,
+                Some(VoteStatus::Error),
+                "a paused batch errored its votes"
+            );
+        }
+    };
+    wait_until("votes back to pending", async || {
+        no_error().await;
+        let snap = h.snapshot().await.unwrap();
+        !snap.in_flight && snap.pending == 2
+    })
+    .await;
+    // Past the requeue cooldown: still no second proof, event or not.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    no_error().await;
+    assert_eq!(s.chain.voters(), 0);
+    assert_eq!(prover.calls(), 1, "sealed while paused");
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    if seen {
+        let snap = h.snapshot().await.unwrap();
+        assert_eq!(snap.status, ProcessStatus::Paused);
+        assert!(snap.accepting, "a paused process takes votes");
+    }
+    s.chain.hide_block(None);
+    s.chain.set_status(ProcessStatus::Ready);
+    wait_until("settled after the resume", async || {
+        no_error().await;
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn pause_during_flight_requeues_until_resume() {
+    pause_during_flight(true).await;
+}
+
+#[tokio::test]
+async fn pause_the_node_has_not_seen_requeues_too() {
+    pause_during_flight(false).await;
+}
+
+/// A batch refused by a pause, then the process ends instead of resuming:
+/// the requeued votes get the usual end, `process closed`.
+#[tokio::test]
+async fn pause_then_end_closes_the_requeued_votes() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 0], 140);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("proving", async || prover.calls() >= 1).await;
+    s.chain.set_status(ProcessStatus::Paused);
+    wait_until("actor sees the pause", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Paused
+    })
+    .await;
+    prover.release(100);
+    wait_until("vote back to pending", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Pending)
+            && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Ended);
+    wait_until("vote closed", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    let sv = h.status(vid).await.unwrap().unwrap();
+    assert!(sv.error.unwrap().contains("closed"), "wrong error");
+    assert_eq!(s.chain.voters(), 0);
+    shutdown.cancel();
+}
+
 /// Before its start time a process refuses votes as not open yet (a sealed
 /// batch would revert `InvalidTimeBounds`); from the start it takes them.
 #[tokio::test]

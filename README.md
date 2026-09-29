@@ -363,9 +363,11 @@ Vote status is one of:
 - `error`, with an `error` string: a guest fail bit, `process closed`, a
   settlement revert, or a prover refusal.
 
-A batch that loses a race puts its votes back to `pending`. A node that never
-stored the package still answers `settled` when the vote id is in its tree, and
-404 otherwise.
+A batch that loses a race puts its votes back to `pending`, and so does one the
+settlement refuses because the organizer paused the process under it (or it has
+not started): those votes settle once it is open again, or end in
+`process closed` if it ends instead. A node that never stored the package still
+answers `settled` when the vote id is in its tree, and 404 otherwise.
 
 Errors are JSON `{"error": "<message>", "code": <code>}`. The code is the HTTP
 status times 100 plus a discriminator. 500 bodies say only `internal error`; the
