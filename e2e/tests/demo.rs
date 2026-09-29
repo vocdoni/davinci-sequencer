@@ -1,27 +1,35 @@
 //! Demo elections on a live deployment (Gnosis by default), gated by
-//! `DAVINCI_E2E_DEMO`, one phase per run:
+//! `DAVINCI_E2E_DEMO`, one phase per run, for the election set
+//! `DAVINCI_DEMO_WAVE` names (1, the default, or 2; see
+//! `davinci_e2e::demo::Wave`):
 //!
 //! - `prepare` draws every voter key, the CSP key and the seed behind every
 //!   ballot secret and choice into the private directory
 //!   (`DAVINCI_DEMO_DIR`, default `~/.davinci-gnosis/demo`, mode 0700), and
 //!   writes the public census and metadata files of each election into
-//!   `e2e/demo/`. Run again, it reuses the keys and rewrites the same files.
-//! - `run` creates the elections of `davinci_e2e::demo::elections`, their
-//!   census and metadata URIs under `DAVINCI_DEMO_BASE_URL` (the committed
-//!   `e2e/demo`, e.g. on raw.githubusercontent.com at a pinned commit) and
-//!   the SHA-256 of each `metadata.json` as its metadata hash. It
-//!   casts the votes through the nodes in `DAVINCI_DEMO_NODES` (default
-//!   `http://127.0.0.1:9090,http://127.0.0.1:9091`), runs each lifecycle and
-//!   prints a table. It spawns nothing: the nodes, their provers and the DKG
-//!   committee are the deployment's. Progress goes to `state.json` in the
-//!   private directory, so an interrupted run resumes without duplicates.
+//!   `e2e/demo/` (the second wave under `e2e/demo/wave2/`). Run again, it
+//!   reuses the keys and rewrites the same files.
+//! - `run` creates the elections, their census and metadata URIs under
+//!   `DAVINCI_DEMO_BASE_URL` (the committed `e2e/demo`, e.g. on
+//!   raw.githubusercontent.com at a pinned commit) and the SHA-256 of each
+//!   `metadata.json` as its metadata hash (a draft's for the deliberate
+//!   mismatch). It casts the votes through the nodes in `DAVINCI_DEMO_NODES`
+//!   (default `http://127.0.0.1:9090,http://127.0.0.1:9091`) in up to three
+//!   rounds, runs the organizer actions between the first two (metadata and
+//!   census updates, reveals, pause, duration and max voters, cancels) and
+//!   the votes the nodes must refuse, ends what the organizer ends, waits for
+//!   every result and prints a table. It spawns nothing: the nodes, their
+//!   provers and the DKG committee are the deployment's. Progress goes to the
+//!   wave's state file in the private directory, so an interrupted run
+//!   resumes without duplicates.
 //!
-//! `check` proves every planned ballot with the circom prover against a
-//! stand-in process of each election, offline; `run` does the same before it
-//! creates anything. `run` also needs the organizer key file
-//! `DAVINCI_DEMO_ORGANIZER_KEY`, the circom artifacts (`CIRCOM_ARTIFACTS`)
-//! and the built census contract project (`DAVINCI_CENSUS_CONTRACT_DIR`). The
-//! chain comes from `davinci_e2e::net::live_target` (`DAVINCI_E2E_RPC`,
+//! `check` proves every planned ballot, and every refused vote's, with the
+//! circom prover against a stand-in process of each election, offline; `run`
+//! does the same before it creates anything. `run` also needs the organizer
+//! key file `DAVINCI_DEMO_ORGANIZER_KEY`, the circom artifacts
+//! (`CIRCOM_ARTIFACTS`) and the built census contract project
+//! (`DAVINCI_CENSUS_CONTRACT_DIR`). The chain comes from
+//! `davinci_e2e::net::live_target` (`DAVINCI_E2E_RPC`,
 //! `DAVINCI_E2E_REGISTRY`). Only addresses and process ids are printed.
 //! `e2e/bench.sh` runs any phase in Docker.
 
@@ -35,21 +43,25 @@ use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::{Context, Result, bail, ensure};
 use davinci_client::Error as ClientError;
 use davinci_client::SequencerClient;
-use davinci_client::api::{Fr, ProcessId, ProcessStatus, VoteRequest, VoteStatus, vote_id_hex};
+use davinci_client::api::{
+    Fr, ProcessId, ProcessStatus, ProcessView, TransitionView, VoteRequest, VoteStatus, vote_id_hex,
+};
 use davinci_client::organizer::{
-    KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret, metadata_hash, verify_registry,
+    KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret, verify_registry,
 };
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::random_k;
 use davinci_e2e::census::{self, Census};
 use davinci_e2e::cost::{self, TxCost};
 use davinci_e2e::demo::{
-    self, CensusKind, KeySource, Lifecycle, Planned, SecretHex, Secrets, Spec, State, VoteState,
+    self, Action, CensusKind, KeySource, Lifecycle, MetaPlan, Planned, Refusal, RefusedVote,
+    SecretHex, Secrets, Spec, State, VoteState, Wave,
 };
 use davinci_e2e::fixture as fx;
 use davinci_e2e::{chain, dkg, net, wait};
 use davinci_zkvm_sdk::ballot::{address_to_fr, vote_id};
-use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, csp_sign};
+use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, csp_sign, eth_address, vote_id_sign};
+use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::keygen;
 use davinci_zkvm_sdk::release;
 use k256::ecdsa::SigningKey;
@@ -63,13 +75,25 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 /// Longest wait for a sequencer's `requestResultsDecryption`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-/// Longest wait for every tally after the ends and the reveal.
+/// Longest wait for every tally after the ends and the reveal, or after the
+/// last timed end.
 const RESULTS_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 /// Longest wait for a DKG epoch with a free pool key.
 const DKG_WAIT: Duration = Duration::from_secs(20 * 60);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(600);
 const PROGRESS_EVERY: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_secs(5);
+/// Between the chunks of a chunked first round: past the 90 s batch time,
+/// so each chunk seals on its own.
+const CHUNK_GAP: Duration = Duration::from_secs(100);
+/// How long the votes sent to a paused election are watched before it
+/// resumes: more than two batch windows.
+const PAUSE_HOLD: Duration = Duration::from_secs(240);
+/// A timed election this close to its end takes no more votes: they would
+/// not settle in time.
+const LATE_MARGIN: u64 = 10 * 60;
+/// Longest wait for the reweighted member's pending vote to leave the queue.
+const REWEIGHT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 fn t0() -> Instant {
     static T0: OnceLock<Instant> = OnceLock::new();
@@ -98,35 +122,38 @@ macro_rules! say {
 async fn demo() -> Result<()> {
     let phase = std::env::var("DAVINCI_E2E_DEMO").unwrap_or_default();
     t0();
+    if phase.is_empty() {
+        eprintln!("DAVINCI_E2E_DEMO not set, skipping");
+        return Ok(());
+    }
+    let wave = Wave::from_env()?;
     let r = match phase.as_str() {
-        "" => {
-            eprintln!("DAVINCI_E2E_DEMO not set, skipping");
-            return Ok(());
-        }
-        "prepare" => prepare(),
-        "check" => check().await,
-        "run" => run().await,
+        "prepare" => prepare(wave),
+        "check" => check(wave).await,
+        "run" => run(wave).await,
         p => bail!("DAVINCI_E2E_DEMO={p:.20}: prepare, check or run"),
     };
     match &r {
         Ok(()) => say!(
-            "{phase} done in {:.1} min",
+            "wave {} {phase} done in {:.1} min",
+            wave.number(),
             t0().elapsed().as_secs_f64() / 60.0
         ),
-        Err(e) => say!("{phase} FAILED: {e:#}"),
+        Err(e) => say!("wave {} {phase} FAILED: {e:#}", wave.number()),
     }
     r
 }
 
 /// Voter keys (drawn once, then reused) and the public files.
-fn prepare() -> Result<()> {
-    let specs = demo::elections();
-    let dir = demo::private_dir()?;
-    let (secrets, fresh) = Secrets::load_or_generate(&dir, &specs)?;
+fn prepare(wave: Wave) -> Result<()> {
+    let specs = wave.elections();
+    let path = demo::private_dir()?.join(wave.secrets_file());
+    let (secrets, fresh) = Secrets::load_or_generate(&path, &specs)?;
     let keys: usize = secrets.elections.values().map(Vec::len).sum();
     say!(
-        "{keys} voter keys, the CSP key and the ballot seed in {} ({})",
-        dir.join(demo::SECRETS_FILE).display(),
+        "wave {}: {keys} voter keys, the CSP key and the ballot seed in {} ({})",
+        wave.number(),
+        path.display(),
         if fresh { "new" } else { "existing, reused" }
     );
     let out = demo::public_dir();
@@ -136,29 +163,28 @@ fn prepare() -> Result<()> {
         say!("wrote {}", out.join(&f.path).display());
     }
     for s in &specs {
+        let root = |updated| -> Result<String> {
+            Ok(hex_fr(&demo::census_root(&demo::census_parts(
+                s, &secrets, updated,
+            )?)?))
+        };
         let census = match s.census {
-            CensusKind::Static => format!(
-                "root {}",
-                hex_fr(&demo::census_root(&secrets.parts(s.n, s.members)?)?)
-            ),
-            CensusKind::Updatable { .. } => format!(
-                "roots {} then {}",
-                hex_fr(&demo::census_root(&secrets.parts(s.n, s.members)?)?),
-                hex_fr(&demo::census_root(&secrets.parts(s.n, s.total_members())?)?)
-            ),
+            CensusKind::Static => format!("root {}", root(false)?),
+            CensusKind::Updatable { .. } => {
+                format!("roots {} then {}", root(false)?, root(true)?)
+            }
             CensusKind::Contract { .. } => "members go to a census contract at run time".into(),
             CensusKind::Csp => format!(
                 "CSP signer 0x{}",
-                hex::encode(davinci_zkvm_sdk::census::eth_address(
-                    secrets.csp()?.verifying_key()
-                ))
+                hex::encode(eth_address(secrets.csp()?.verifying_key()))
             ),
         };
         say!(
-            "election {}: {} ({}), {} members, {census}",
+            "election {}: {} ({}; {}), {} members, {census}",
             s.n,
             s.title,
             s.kind(),
+            s.lifecycle_name(),
             s.total_members()
         );
     }
@@ -166,80 +192,264 @@ fn prepare() -> Result<()> {
 }
 
 /// The voter keys `prepare` drew, checked against the election table.
-fn load_secrets() -> Result<Secrets> {
-    let dir = demo::private_dir()?;
-    let secrets = Secrets::load(&dir.join(demo::SECRETS_FILE))
-        .context("no voter keys: run the prepare phase first")?;
-    secrets.check(&demo::elections())?;
+fn load_secrets(wave: Wave) -> Result<Secrets> {
+    let path = demo::private_dir()?.join(wave.secrets_file());
+    let secrets = Secrets::load(&path).context("no voter keys: run the prepare phase first")?;
+    secrets.check(&wave.elections())?;
     Ok(secrets)
 }
 
-async fn check() -> Result<()> {
-    let secrets = load_secrets()?;
+async fn check(wave: Wave) -> Result<()> {
+    let secrets = load_secrets(wave)?;
     let prover = tokio::task::spawn_blocking(fx::load_prover).await??;
-    check_ballots(&demo::elections(), &secrets, &prover)
+    check_ballots(&wave.elections(), &secrets, &prover)
 }
 
-/// Proves every planned ballot against a stand-in of each election: its
-/// ballot mode and census, a throwaway key and process id, fresh ballot
-/// secrets. The prover verifies each proof, so a ballot the circuit refuses
-/// fails here, before anything is created on-chain. Nothing is kept.
+/// A stand-in of `spec`'s process: its ballot mode and origin, key `pk`,
+/// census root `root`.
+fn stand_in(spec: &Spec, pk: Point, root: Fr) -> OnchainProcess {
+    OnchainProcess {
+        id: [spec.n as u8; 31],
+        status: ProcessStatus::Ready,
+        organization_id: [0; 20],
+        encryption_key: pk,
+        state_root: [0; 32],
+        result: Vec::new(),
+        start_time: 0,
+        duration: 0,
+        max_voters: spec.max_voters,
+        voters_count: 0,
+        overwritten_votes_count: 0,
+        ballot_mode: spec.ballot_mode(),
+        census_origin: spec.origin(),
+        census_root: root,
+        census_contract: [0; 20],
+        census_uri: String::new(),
+        metadata_uri: String::new(),
+        metadata_hash: [0; 32],
+        dkg: None,
+    }
+}
+
+/// The stand-in of `spec` under its first or updated census, with the
+/// witness and the members it proves.
+fn stand_in_census(
+    spec: &Spec,
+    secrets: &Secrets,
+    pk: Point,
+    updated: bool,
+) -> Result<(OnchainProcess, Witness, Parts)> {
+    Ok(match spec.census {
+        CensusKind::Csp => {
+            let csp = secrets.csp()?;
+            let p = stand_in(spec, pk, fx::csp_root(&csp)?);
+            let pid = ProcessId(p.id).to_fr();
+            let parts = secrets.parts(spec.n, spec.total_members())?;
+            (p, Witness::Csp(csp, pid), parts)
+        }
+        CensusKind::Contract { .. } => {
+            let parts = secrets.parts(spec.n, spec.total_members())?;
+            let t = demo::census_tree(&parts)?;
+            (stand_in(spec, pk, t.root()), Witness::Tree(t), parts)
+        }
+        _ => {
+            let parts = demo::census_parts(spec, secrets, updated)?;
+            let t = demo::census_tree(&parts)?;
+            (stand_in(spec, pk, t.root()), Witness::Tree(t), parts)
+        }
+    })
+}
+
+/// Proves every planned ballot, and every refused vote's, against a
+/// stand-in of each election: its ballot mode and census, a throwaway key
+/// and process id, fresh ballot secrets. The prover verifies each proof, so
+/// a ballot the circuit refuses fails here, before anything is created
+/// on-chain; and every ballot outside the rules must be refused by the
+/// client. Nothing is kept.
 fn check_ballots(specs: &[Spec], secrets: &Secrets, prover: &BallotProver) -> Result<()> {
     let t = Instant::now();
     let (_, pk) = keygen(&mut OsRng);
     let seed = secrets.seed()?;
     let mut jobs = Vec::new();
-    for spec in specs.iter().filter(|s| s.has_votes()) {
+    let mut strict = Vec::new();
+    for spec in specs {
         let n = spec.n;
-        let parts = secrets.parts(n, spec.total_members())?;
         let keys = secrets.keys(n)?;
-        let mut p = OnchainProcess {
-            id: [n as u8; 31],
-            status: ProcessStatus::Ready,
-            organization_id: [0; 20],
-            encryption_key: pk,
-            state_root: [0; 32],
-            result: Vec::new(),
-            start_time: 0,
-            duration: 0,
-            max_voters: spec.max_voters,
-            voters_count: 0,
-            overwritten_votes_count: 0,
-            ballot_mode: spec.ballot_mode(),
-            census_origin: spec.origin(),
-            census_root: demo::census_root(&parts)?,
-            census_contract: [0; 20],
-            census_uri: String::new(),
-            metadata_uri: String::new(),
-            metadata_hash: [0; 32],
-            dkg: None,
-        };
-        let witness = match spec.census {
-            CensusKind::Csp => {
-                p.census_root = fx::csp_root(&secrets.csp()?)?;
-                Witness::Csp(secrets.csp()?, ProcessId(p.id).to_fr())
-            }
-            _ => Witness::Tree(demo::census_tree(&parts)?),
-        };
-        for v in demo::plan(spec, &secrets.weights(n)?, &seed, 2) {
+        let plan = demo::plan(spec, &secrets.weights(n)?, &seed, 2);
+        for v in &plan {
+            let updated = demo::under_updated_census(spec, v);
+            let (p, witness, parts) = stand_in_census(spec, secrets, pk, updated)?;
+            ensure!(
+                parts[v.voter].1 == u128::from(v.weight),
+                "election {n} voter {} round {}: census weight {}, planned {}",
+                v.voter,
+                v.round,
+                parts[v.voter].1,
+                v.weight
+            );
             jobs.push(fx::Job {
                 label: format!("election {n} voter {} round {}", v.voter, v.round),
                 key: keys[v.voter].clone(),
-                process: p.clone(),
-                fields: v.fields,
+                process: p,
+                fields: v.fields.clone(),
                 census: witness.of(v.voter, &parts)?,
                 weight: parts[v.voter].1,
                 k: random_k(&mut OsRng),
             });
         }
+        for r in spec.refusals() {
+            let updated = matches!(spec.census, CensusKind::Updatable { .. });
+            let (p, witness, parts) = stand_in_census(spec, secrets, pk, updated)?;
+            let first = plan.iter().find(|v| v.round == 1);
+            let reused = first.map(|v| (v.voter, v.fields.as_slice()));
+            let rb = refusal_ballot(spec, secrets, &seed, r, &p, &witness, &parts, reused)?;
+            strict.extend(rb.strict);
+            jobs.push(rb.job);
+        }
     }
     let reqs = tokio::task::block_in_place(|| fx::prove_all(prover, &jobs))?;
+    for j in &strict {
+        ensure!(
+            fx::prove_all(prover, std::slice::from_ref(j)).is_err(),
+            "{}: the client proved a ballot outside the rules",
+            j.label
+        );
+    }
     say!(
-        "the circuit takes all {} planned ballots ({:.1} s)",
+        "the circuit takes all {} planned and refused-vote ballots, and the client refuses the \
+         {} outside the rules ({:.1} s)",
         reqs.len(),
+        strict.len(),
         t.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// A refused vote to prove.
+struct RefusalBallot {
+    job: fx::Job,
+    /// Signs the vote id instead of the voter: a bad signature.
+    resign: Option<SigningKey>,
+    /// The same ballot under the election's own rules, which the client
+    /// must refuse to prove.
+    strict: Option<fx::Job>,
+}
+
+/// The ballot of refused vote `r` of `spec` for process `p`, whose census
+/// `witness` proves `parts`. `reused` is the settled round-1 voter whose
+/// ballot secret a reused vote id takes, with that ballot.
+#[allow(clippy::too_many_arguments)]
+fn refusal_ballot(
+    spec: &Spec,
+    secrets: &Secrets,
+    seed: &[u8; 32],
+    r: Refusal,
+    p: &OnchainProcess,
+    witness: &Witness,
+    parts: &[([u8; 20], u128)],
+    reused: Option<(usize, &[u64])>,
+) -> Result<RefusalBallot> {
+    let n = spec.n;
+    let label = format!("election {n}: {}", r.describe());
+    let keys = secrets.keys(n)?;
+    let member = |m: usize| -> Result<fx::Job> {
+        let weight = parts.get(m).context("refusing member")?.1;
+        Ok(fx::Job {
+            label: label.clone(),
+            key: keys[m].clone(),
+            process: p.clone(),
+            fields: demo::choose(spec.ballot, spec.lean, u64::try_from(weight)?, &mut OsRng),
+            census: witness.of(m, parts)?,
+            weight,
+            k: demo::refusal_k(seed, n, m, r),
+        })
+    };
+    let taker = || {
+        spec.refusal_member(r)
+            .with_context(|| format!("election {n}: no member casts {}", r.describe()))
+    };
+    Ok(match r {
+        // Proved against a census of its own: the inputs hash does not bind
+        // the census root, so the proof is valid; the node finds no member.
+        Refusal::NotInCensus => {
+            let key = demo::outsider(seed, n);
+            let weight = u128::from(spec.weights.0);
+            let tree = demo::census_tree(&[(eth_address(key.verifying_key()), weight)])?;
+            let mut own = p.clone();
+            own.census_root = tree.root();
+            RefusalBallot {
+                job: fx::Job {
+                    label,
+                    key,
+                    process: own,
+                    fields: demo::choose(spec.ballot, spec.lean, spec.weights.0, &mut OsRng),
+                    census: CensusWitness::Merkle(tree.proof(0)?),
+                    weight,
+                    k: demo::refusal_k(seed, n, spec.total_members(), r),
+                },
+                resign: None,
+                strict: None,
+            }
+        }
+        Refusal::ReusedVoteId => {
+            let (v, prev) = reused.context("no settled first-round vote to reuse")?;
+            let weight = parts[v].1;
+            RefusalBallot {
+                job: fx::Job {
+                    label,
+                    key: keys[v].clone(),
+                    process: p.clone(),
+                    fields: demo::revote(
+                        spec.ballot,
+                        spec.lean,
+                        u64::try_from(weight)?,
+                        prev,
+                        &mut OsRng,
+                    ),
+                    census: witness.of(v, parts)?,
+                    weight,
+                    k: demo::vote_k(seed, n, v, 1),
+                },
+                resign: None,
+                strict: None,
+            }
+        }
+        Refusal::BadSignature => {
+            let m = taker()?;
+            RefusalBallot {
+                job: member(m)?,
+                resign: Some(keys[(m + 1) % keys.len()].clone()),
+                strict: None,
+            }
+        }
+        // Valid under looser rules, so it proves; the node's inputs hash
+        // over the registry's ballot mode differs.
+        Refusal::BreaksRules => {
+            let m = taker()?;
+            let (fields, looser) =
+                demo::breaking_ballot(spec).context("no ballot outside these rules")?;
+            let strict = fx::Job {
+                fields: fields.clone(),
+                ..member(m)?
+            };
+            let mut loose = p.clone();
+            loose.ballot_mode = looser;
+            RefusalBallot {
+                job: fx::Job {
+                    fields,
+                    process: loose,
+                    ..member(m)?
+                },
+                resign: None,
+                strict: Some(strict),
+            }
+        }
+        Refusal::OverMaxVoters | Refusal::AfterEnd => RefusalBallot {
+            job: member(taker()?)?,
+            resign: None,
+            strict: None,
+        },
+    })
 }
 
 fn hex_fr(x: &Fr) -> String {
@@ -251,6 +461,7 @@ fn hex_fr(x: &Fr) -> String {
 
 /// Everything a run holds.
 struct Run {
+    wave: Wave,
     specs: Vec<Spec>,
     secrets: Secrets,
     seed: [u8; 32],
@@ -265,7 +476,7 @@ struct Run {
     censuses: BTreeMap<usize, Census>,
 }
 
-async fn run() -> Result<()> {
+async fn run(wave: Wave) -> Result<()> {
     let base = std::env::var("DAVINCI_DEMO_BASE_URL")
         .context("DAVINCI_DEMO_BASE_URL (where e2e/demo is served) is required")?;
     let base = base.trim().trim_end_matches('/').to_string();
@@ -273,9 +484,9 @@ async fn run() -> Result<()> {
         base.starts_with("https://"),
         "DAVINCI_DEMO_BASE_URL must be https: the nodes fetch censuses from public hosts only"
     );
-    let specs = demo::elections();
+    let specs = wave.elections();
     let dir = demo::private_dir()?;
-    let secrets = load_secrets()?;
+    let secrets = load_secrets(wave)?;
     let ballot_prover = tokio::task::spawn_blocking(fx::load_prover);
 
     check_published(&base, &specs, &secrets).await?;
@@ -285,7 +496,8 @@ async fn run() -> Result<()> {
         .await
         .context("registry pins")?;
     say!(
-        "chain {} registry {registry} verifier {} (pins ok)",
+        "wave {}: chain {} registry {registry} verifier {} (pins ok)",
+        wave.number(),
         info.chain_id,
         info.verifier
     );
@@ -333,7 +545,7 @@ async fn run() -> Result<()> {
     let nodes: Vec<SequencerClient> = urls.iter().map(|u| SequencerClient::new(u)).collect();
     check_nodes(&nodes, &urls, info.chain_id, registry).await?;
 
-    let state_path = dir.join(demo::STATE_FILE);
+    let state_path = dir.join(wave.state_file());
     let mut state = State::load(&state_path)?;
     state.bind(info.chain_id, &registry.to_string(), &base)?;
     if state.base_url != base {
@@ -347,6 +559,7 @@ async fn run() -> Result<()> {
     let prover = ballot_prover.await??;
     check_ballots(&specs, &secrets, &prover)?;
     let mut r = Run {
+        wave,
         specs,
         secrets,
         seed,
@@ -490,6 +703,39 @@ async fn submit(api: &SequencerClient, req: &VoteRequest) -> Result<()> {
     }
 }
 
+/// Sends a vote that must be refused, once: the node's answer, `(200, None,
+/// "")` if it took it. Only transport trouble and 5xx are retried.
+async fn submit_refused(
+    api: &SequencerClient,
+    req: &VoteRequest,
+) -> Result<(u16, Option<u32>, String)> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match api.submit_vote(req).await {
+            Ok(()) => return Ok((200, None, String::new())),
+            Err(
+                e @ (ClientError::Http(_)
+                | ClientError::Api {
+                    status: 500..=599, ..
+                }),
+            ) if tries < 5 => {
+                say!("refused vote {}: {e}; retrying", vote_id_hex(req.vote_id));
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Err(ClientError::Api {
+                status,
+                code,
+                message,
+            }) => return Ok((status, code, message)),
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Census members and weights, in leaf order.
+type Parts = Vec<([u8; 20], u128)>;
+
 /// How a round's ballots prove census membership.
 enum Witness {
     Tree(LeanImt),
@@ -523,30 +769,65 @@ fn is_open(s: ProcessStatus) -> bool {
     matches!(s, ProcessStatus::Ready | ProcessStatus::Paused)
 }
 
+/// Taking votes by the registry: open, started and not past its end.
+fn voting(p: &OnchainProcess, now: u64) -> bool {
+    is_open(p.status) && now >= p.start_time && now < p.start_time + p.duration
+}
+
 impl Run {
     async fn stages(&mut self) -> Result<()> {
         say!("stage 1: create the elections");
-        for spec in self.specs.clone() {
+        // The ones that end by time last: their clocks start at creation.
+        let mut order = self.specs.clone();
+        order.sort_by_key(|s| matches!(s.lifecycle, Lifecycle::Timed { .. }));
+        for spec in order {
             self.ensure_created(&spec).await?;
+            self.after_creation(&spec).await?;
         }
-        for spec in self.specs.clone().iter().filter(|s| s.has_votes()) {
-            if self.round_done(spec, 2) {
+        for spec in self.specs.clone() {
+            if !spec.votes_in(1) || self.round_done(&spec, spec.last_round()) {
                 continue;
             }
-            self.wait_ready(spec).await?;
+            self.wait_ready(&spec).await?;
         }
         say!("stage 2: first round of votes");
-        self.cast(1).await?;
-        say!("stage 3: census growth, then the second round");
-        self.grow().await?;
-        self.cast(2).await?;
-        say!("stage 4: ends, reveal, cancel and results");
+        self.send_round(1).await?;
+        self.wait_votes(1).await?;
+        say!("stage 3: census changes, organizer actions and refused votes");
+        self.midway().await?;
+        say!("stage 4: second round");
+        self.send_round(2).await?;
+        self.hold_paused().await?;
+        self.wait_votes(2).await?;
+        if self.specs.iter().any(|s| s.votes_in(3)) {
+            say!("stage 5: third round, once the later elections open");
+            self.open_later().await?;
+            self.send_round(3).await?;
+            self.wait_votes(3).await?;
+        }
+        say!("stage 6: ends, reveals, cancels, late votes and results");
         self.close().await?;
         self.report().await
     }
 
     fn save(&self) -> Result<()> {
         self.state.save(&self.state_path)
+    }
+
+    /// Marks `step` done for election `n` and notes `line`.
+    fn done(&mut self, n: usize, step: &str, line: String) -> Result<()> {
+        say!("election {n}: {line}");
+        let e = self.state.election(n);
+        e.mark(step);
+        e.note(line);
+        self.save()
+    }
+
+    fn is_done(&self, n: usize, step: &str) -> bool {
+        self.state
+            .elections
+            .get(&n)
+            .is_some_and(|e| e.is_done(step))
     }
 
     fn url(&self, path: &str) -> String {
@@ -582,6 +863,16 @@ impl Run {
             .all(|v| e.is_some_and(|e| e.vote(v.round, v.voter).is_some()))
     }
 
+    /// The transitions a node serves for `pid`, from the first that answers.
+    async fn transitions(&self, pid: &[u8; 31]) -> Option<Vec<TransitionView>> {
+        for api in &self.nodes {
+            if let Ok(t) = api.transitions(pid).await {
+                return Some(t);
+            }
+        }
+        None
+    }
+
     /// Creates the process of `spec` unless the state has it, adopting one a
     /// crashed run sent.
     async fn ensure_created(&mut self, spec: &Spec) -> Result<()> {
@@ -607,7 +898,7 @@ impl Run {
                         .with_context(|| format!("election {n}: key from node {}", i + 1))?,
                 ),
                 KeySource::DkgAutomatic => KeyMode::DkgAutomatic,
-                KeySource::DkgLocked => KeyMode::DkgLocked,
+                KeySource::DkgLocked | KeySource::DkgLockedEarly => KeyMode::DkgLocked,
             };
             let np = self.new_process(spec, next, key_mode)?;
             self.state.election(n).pending = Some(ProcessId(next));
@@ -681,7 +972,7 @@ impl Run {
             self.save()?;
             return Ok(false);
         };
-        if spec.key == KeySource::DkgLocked {
+        if spec.locked() {
             say!(
                 "election {n}: {pending} was created but its organizer secret is lost; canceling it"
             );
@@ -719,10 +1010,9 @@ impl Run {
     }
 
     fn new_process(&self, spec: &Spec, next: [u8; 31], key_mode: KeyMode) -> Result<NewProcess> {
-        let n = spec.n;
         let (census_root, census_contract, census_uri) = match spec.census {
             CensusKind::Static | CensusKind::Updatable { .. } => (
-                demo::census_root(&self.secrets.parts(n, spec.members)?)?,
+                demo::census_root(&demo::census_parts(spec, &self.secrets, false)?)?,
                 [0u8; 20],
                 self.url(&spec.census_path(false).context("census path")?),
             ),
@@ -731,7 +1021,7 @@ impl Run {
                 let a: Address = self
                     .state
                     .elections
-                    .get(&n)
+                    .get(&spec.n)
                     .and_then(|e| e.census_contract.as_deref())
                     .context("no census contract")?
                     .parse()?;
@@ -759,11 +1049,57 @@ impl Run {
             census_root,
             census_contract,
             census_uri,
-            // The bytes check_published found at that URL.
+            // The bytes check_published found at that URL; the mismatch
+            // registers a draft's hash instead.
             metadata: self.url(&spec.metadata_path()),
-            metadata_hash: metadata_hash(&demo::metadata(spec)?),
+            metadata_hash: demo::registered_hash(spec)?,
             key_mode,
         })
+    }
+
+    /// What happens right after creation: a cancel before the start, a
+    /// metadata update before the start.
+    async fn after_creation(&mut self, spec: &Spec) -> Result<()> {
+        let n = spec.n;
+        let pid = self.pid(n)?;
+        if let Lifecycle::CanceledEarly { .. } = spec.lifecycle
+            && !self.is_done(n, "cancel")
+        {
+            let p = self.org.process(&pid).await?;
+            if is_open(p.status) {
+                self.org
+                    .cancel_process(&pid)
+                    .await
+                    .with_context(|| format!("cancel election {n}"))?;
+            }
+            let ahead = p.start_time.saturating_sub(unix_now()) / 60;
+            self.done(
+                n,
+                "cancel",
+                format!("canceled {ahead} min before its start"),
+            )?;
+        }
+        if let MetaPlan::BeforeStart(_) = spec.metadata
+            && !self.is_done(n, "metadata")
+        {
+            let (path, hash) = demo::metadata_update(spec)?.context("no metadata update")?;
+            let p = self.org.process(&pid).await?;
+            let ahead = p.start_time.saturating_sub(unix_now());
+            if ahead > 0 {
+                self.org
+                    .set_process_metadata(&pid, &self.url(&path), hash)
+                    .await
+                    .with_context(|| format!("election {n}: setProcessMetadata"))?;
+                let line = format!(
+                    "metadata updated {} min before the start, to {path}",
+                    ahead / 60
+                );
+                self.done(n, "metadata", line)?;
+            } else {
+                self.done(n, "metadata", "started before the metadata update".into())?;
+            }
+        }
+        Ok(())
     }
 
     /// The `OwnedCensus` of `spec` (deployed on first use) with at least its
@@ -809,16 +1145,17 @@ impl Run {
     /// the last member of the census in force.
     async fn census_probe(&self, spec: &Spec) -> Result<Option<([u8; 20], Fr)>> {
         let n = spec.n;
-        let count = match spec.census {
+        let parts = match spec.census {
             CensusKind::Csp => return Ok(None),
-            CensusKind::Static => spec.members,
-            CensusKind::Updatable { .. } if self.state.elections[&n].census_updated => {
-                spec.total_members()
+            CensusKind::Static | CensusKind::Updatable { .. } => {
+                let updated = self.state.elections[&n].census_updated;
+                demo::census_parts(spec, &self.secrets, updated)?
             }
-            CensusKind::Updatable { .. } => spec.members,
-            CensusKind::Contract { .. } => usize::try_from(self.censuses[&n].size().await?)?,
+            CensusKind::Contract { .. } => {
+                let size = usize::try_from(self.censuses[&n].size().await?)?;
+                self.secrets.parts(n, size)?
+            }
         };
-        let parts = self.secrets.parts(n, count)?;
         let last = parts.last().context("empty census")?.0;
         Ok(Some((last, demo::census_root(&parts)?)))
     }
@@ -882,10 +1219,12 @@ impl Run {
         Ok(())
     }
 
-    /// Proves and sends every vote of `round` not on record yet, then waits
-    /// until they all settle.
-    async fn cast(&mut self, round: u8) -> Result<()> {
-        for spec in self.specs.clone() {
+    /// Sends every vote of `round` not on record yet. Chunked elections go
+    /// last, since they take a while.
+    async fn send_round(&mut self, round: u8) -> Result<()> {
+        let mut specs = self.specs.clone();
+        specs.sort_by_key(|s| s.chunk > 0);
+        for spec in specs {
             let n = spec.n;
             let done = self.state.elections.get(&n);
             let todo: Vec<Planned> = self
@@ -899,100 +1238,146 @@ impl Run {
             }
             let pid = self.pid(n)?;
             let p = self.org.process(&pid).await?;
-            ensure!(
-                p.status == ProcessStatus::Ready,
-                "election {n} is {}, not taking votes",
-                status_name(p.status)
-            );
-            let parts = self.secrets.parts(n, spec.total_members())?;
-            let keys = self.secrets.keys(n)?;
-            let witness = self.witness(&spec, &p, &parts)?;
-            let pid_fr = ProcessId(pid).to_fr();
-            let mut jobs = Vec::new();
-            let mut pending = Vec::new();
-            for v in todo {
-                let k = demo::vote_k(&self.seed, n, v.voter, round);
-                let vid = vote_id(&pid_fr, &address_to_fr(&parts[v.voter].0), &k);
-                // Sent by a run that stopped before recording it.
-                if known(&self.nodes[v.node], &pid, vid).await? {
-                    self.state.election(n).record(&v, vid);
-                    self.save()?;
-                    continue;
-                }
-                jobs.push(fx::Job {
-                    label: format!("election {n} voter {} round {round}", v.voter),
-                    key: keys[v.voter].clone(),
-                    process: p.clone(),
-                    fields: v.fields.clone(),
-                    census: witness.of(v.voter, &parts)?,
-                    weight: parts[v.voter].1,
-                    k,
-                });
-                pending.push((v, vid));
-            }
-            if jobs.is_empty() {
+            let paused = round == 2 && spec.pauses() && p.status == ProcessStatus::Paused;
+            let (now, end) = (unix_now(), p.start_time + p.duration);
+            ensure!(now >= p.start_time, "election {n} has not started");
+            let closed = !(p.status == ProcessStatus::Ready || paused);
+            if closed || end < now + LATE_MARGIN {
+                let line = if closed {
+                    format!(
+                        "round {round}: {} votes not sent, the election is {}",
+                        todo.len(),
+                        status_name(p.status)
+                    )
+                } else {
+                    format!(
+                        "round {round}: {} votes not sent, the election closes in {} s",
+                        todo.len(),
+                        end.saturating_sub(now)
+                    )
+                };
+                say!("election {n}: {line}");
+                self.state.election(n).note(line);
+                self.save()?;
                 continue;
             }
-            let t = Instant::now();
-            let reqs = tokio::task::block_in_place(|| fx::prove_all(&self.prover, &jobs))?;
-            say!(
-                "election {n}: {} round-{round} ballots proved in {:.1} s",
-                reqs.len(),
-                t.elapsed().as_secs_f64()
-            );
-            let mut per_node = vec![0usize; self.nodes.len()];
-            for (req, (v, vid)) in reqs.iter().zip(&pending) {
-                ensure!(req.vote_id == *vid, "election {n}: vote id differs");
-                submit(&self.nodes[v.node], req)
-                    .await
-                    .with_context(|| format!("election {n} voter {} round {round}", v.voter))?;
-                self.state.election(n).record(v, req.vote_id);
-                self.save()?;
-                per_node[v.node] += 1;
-            }
-            say!(
-                "election {n}: {} round-{round} votes sent ({})",
-                reqs.len(),
-                per_node
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| format!("{c} to node {}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            self.send(&spec, todo).await?;
         }
-        self.wait_votes(round).await
+        Ok(())
     }
 
-    /// The census witness of a ballot for process `p` as it stands.
-    fn witness(
-        &self,
-        spec: &Spec,
-        p: &OnchainProcess,
-        parts: &[([u8; 20], u128)],
-    ) -> Result<Witness> {
+    /// The census witness of a ballot for process `p` as it stands, and the
+    /// members and weights it proves.
+    fn witness(&self, spec: &Spec, p: &OnchainProcess) -> Result<(Witness, Parts)> {
+        let n = spec.n;
         Ok(match spec.census {
             // The root pinned now: the first census or the replacement.
             CensusKind::Static | CensusKind::Updatable { .. } => {
-                let mut found = None;
-                for count in [spec.members, spec.total_members()] {
-                    let t = demo::census_tree(&parts[..count])?;
+                for updated in [false, true] {
+                    let parts = demo::census_parts(spec, &self.secrets, updated)?;
+                    let t = demo::census_tree(&parts)?;
                     if t.root() == p.census_root {
-                        found = Some(t);
-                        break;
+                        return Ok((Witness::Tree(t), parts));
                     }
                 }
-                Witness::Tree(found.with_context(|| {
-                    format!(
-                        "election {}: the registry's census root is not ours",
-                        spec.n
-                    )
-                })?)
+                bail!("election {n}: the registry's census root is not ours")
             }
             // Not pinned to a root: the contract's moves.
-            CensusKind::Contract { .. } => Witness::Tree(demo::census_tree(parts)?),
-            CensusKind::Csp => Witness::Csp(self.secrets.csp()?, ProcessId(p.id).to_fr()),
+            CensusKind::Contract { .. } => {
+                let parts = self.secrets.parts(n, spec.total_members())?;
+                (Witness::Tree(demo::census_tree(&parts)?), parts)
+            }
+            CensusKind::Csp => (
+                Witness::Csp(self.secrets.csp()?, ProcessId(p.id).to_fr()),
+                self.secrets.parts(n, spec.total_members())?,
+            ),
         })
+    }
+
+    /// Proves and sends `todo`, votes of one round of `spec` not on record,
+    /// recording each as it goes. A chunked first round goes out a chunk at
+    /// a time, `CHUNK_GAP` apart.
+    async fn send(&mut self, spec: &Spec, todo: Vec<Planned>) -> Result<()> {
+        let n = spec.n;
+        let pid = self.pid(n)?;
+        let p = self.org.process(&pid).await?;
+        let (witness, parts) = self.witness(spec, &p)?;
+        let keys = self.secrets.keys(n)?;
+        let pid_fr = ProcessId(pid).to_fr();
+        let mut jobs = Vec::new();
+        let mut pending = Vec::new();
+        for v in todo {
+            let (addr, weight) = parts[v.voter];
+            ensure!(
+                weight == u128::from(v.weight),
+                "election {n} voter {}: census weight {weight}, planned {}",
+                v.voter,
+                v.weight
+            );
+            let k = demo::vote_k(&self.seed, n, v.voter, v.round);
+            let vid = vote_id(&pid_fr, &address_to_fr(&addr), &k);
+            // Sent by a run that stopped before recording it.
+            if known(&self.nodes[v.node], &pid, vid).await? {
+                self.state.election(n).record(&v, vid);
+                self.save()?;
+                continue;
+            }
+            jobs.push(fx::Job {
+                label: format!("election {n} voter {} round {}", v.voter, v.round),
+                key: keys[v.voter].clone(),
+                process: p.clone(),
+                fields: v.fields.clone(),
+                census: witness.of(v.voter, &parts)?,
+                weight,
+                k,
+            });
+            pending.push((v, vid));
+        }
+        let Some(round) = pending.first().map(|(v, _)| v.round) else {
+            return Ok(());
+        };
+        let t = Instant::now();
+        let reqs = tokio::task::block_in_place(|| fx::prove_all(&self.prover, &jobs))?;
+        say!(
+            "election {n}: {} round-{round} ballots proved in {:.1} s",
+            reqs.len(),
+            t.elapsed().as_secs_f64()
+        );
+        let chunk = if spec.chunk > 0 && round == 1 {
+            spec.chunk
+        } else {
+            reqs.len()
+        };
+        let mut per_node = vec![0usize; self.nodes.len()];
+        for (i, (req, (v, vid))) in reqs.iter().zip(&pending).enumerate() {
+            if i > 0 && i % chunk == 0 {
+                say!(
+                    "election {n}: {i} of {} sent; {} more in {} s",
+                    reqs.len(),
+                    chunk.min(reqs.len() - i),
+                    CHUNK_GAP.as_secs()
+                );
+                tokio::time::sleep(CHUNK_GAP).await;
+            }
+            ensure!(req.vote_id == *vid, "election {n}: vote id differs");
+            submit(&self.nodes[v.node], req)
+                .await
+                .with_context(|| format!("election {n} voter {} round {round}", v.voter))?;
+            self.state.election(n).record(v, req.vote_id);
+            self.save()?;
+            per_node[v.node] += 1;
+        }
+        say!(
+            "election {n}: {} round-{round} votes sent ({})",
+            reqs.len(),
+            per_node
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c} to node {}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(())
     }
 
     /// Waits until no vote of `round` is still on its way; an errored vote
@@ -1070,21 +1455,73 @@ impl Run {
         }
     }
 
+    /// Between the first and the second round: the census changes, the
+    /// organizer's actions, the refused votes and, last, the pause.
+    async fn midway(&mut self) -> Result<()> {
+        self.grow().await?;
+        for spec in self.specs.clone() {
+            self.organizer_actions(&spec).await?;
+        }
+        // Revotes and refused votes need every node's tree at the chain's
+        // root: an overwrite, a reused id and max voters are judged on it.
+        for spec in self.specs.clone() {
+            let refusals = spec.refusals().into_iter().any(|r| {
+                r != Refusal::AfterEnd
+                    && self
+                        .state
+                        .elections
+                        .get(&spec.n)
+                        .is_none_or(|e| e.refusal(r).is_none())
+            });
+            let revotes = spec.revotes > 0 && !self.round_done(&spec, 2);
+            if (refusals || revotes)
+                && voting(&self.org.process(&self.pid(spec.n)?).await?, unix_now())
+            {
+                self.wait_roots(&spec).await?;
+            }
+        }
+        for spec in self.specs.clone() {
+            for r in spec.refusals() {
+                if r != Refusal::AfterEnd {
+                    self.refuse(&spec, r).await?;
+                }
+            }
+        }
+        for spec in self.specs.clone() {
+            if spec.pauses() {
+                self.pause(&spec).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// The census changes between the rounds: the updatable census is
-    /// replaced, the census contract grows. Then every node must hold the
-    /// first round, which the revotes overwrite through the other node.
+    /// replaced (reweighting a member whose vote is pending), the census
+    /// contract grows.
     async fn grow(&mut self) -> Result<()> {
         for spec in self.specs.clone() {
             let n = spec.n;
-            if spec.added() == 0 || self.round_done(&spec, 2) {
+            if spec.added() == 0 || self.round_done(&spec, spec.last_round()) {
                 continue;
             }
             match spec.census {
-                CensusKind::Updatable { .. } => {
+                CensusKind::Updatable { reweight, .. } => {
                     let pid = self.pid(n)?;
-                    let parts = self.secrets.parts(n, spec.total_members())?;
+                    let parts = demo::census_parts(&spec, &self.secrets, true)?;
                     let root = demo::census_root(&parts)?;
                     if self.org.process(&pid).await?.census_root != root {
+                        // The member's vote goes in first, so it is pending
+                        // when the census changes under it.
+                        if let Some(x) = reweight {
+                            let v = self
+                                .plan(&spec)?
+                                .into_iter()
+                                .find(|v| v.round == 2 && v.voter == x)
+                                .context("the reweighted member's second-round vote")?;
+                            if self.state.election(n).vote(2, x).is_none() {
+                                self.send(&spec, vec![v]).await?;
+                            }
+                        }
                         let uri = self.url(&spec.census_path(true).context("census path")?);
                         self.org
                             .set_process_census(&pid, root, &uri)
@@ -1098,6 +1535,9 @@ impl Run {
                     }
                     self.state.election(n).census_updated = true;
                     self.save()?;
+                    if let Some(x) = reweight {
+                        self.watch_reweight(&spec, x).await?;
+                    }
                 }
                 CensusKind::Contract { .. } => {
                     self.ensure_census_contract(&spec, spec.total_members())
@@ -1107,12 +1547,70 @@ impl Run {
             }
             self.wait_ready(&spec).await?;
         }
-        for spec in self.specs.clone() {
-            if spec.revotes > 0 && !self.round_done(&spec, 2) {
-                self.wait_roots(&spec).await?;
-            }
-        }
         Ok(())
+    }
+
+    /// Waits until the reweighted member's second-round vote leaves the
+    /// queue, and notes how.
+    async fn watch_reweight(&mut self, spec: &Spec, x: usize) -> Result<()> {
+        let n = spec.n;
+        let pid = self.pid(n)?;
+        let Some(v) = self.state.election(n).vote(2, x).cloned() else {
+            return Ok(());
+        };
+        if v.state != VoteState::Sent {
+            return Ok(());
+        }
+        let api = &self.nodes[v.node];
+        let got = wait::until(
+            &format!("the reweighted member's vote in election {n}"),
+            REWEIGHT_TIMEOUT,
+            POLL,
+            || async {
+                let s = api.vote_status_full(&pid, v.vote_id).await?;
+                Ok(matches!(s.status, VoteStatus::Settled | VoteStatus::Error).then_some(s))
+            },
+        )
+        .await;
+        let w = self.secrets.weights(n)?;
+        let (old, new) = (w[x], spec.weight_at(&w, x, 3));
+        let vid = vote_id_hex(v.vote_id);
+        let line = match got {
+            Ok(s) if s.status == VoteStatus::Error => {
+                let why = s.error.unwrap_or_default();
+                let r = self
+                    .state
+                    .election(n)
+                    .votes
+                    .iter_mut()
+                    .find(|r| r.vote_id == v.vote_id);
+                if let Some(r) = r {
+                    r.state = VoteState::Error;
+                    r.error = Some(why.clone());
+                }
+                format!(
+                    "member {x} was reweighted {old} -> {new} while vote {vid} was pending: the \
+                     node errored it ({why}); the member recasts in round 3"
+                )
+            }
+            Ok(_) => {
+                if let Some(r) = self
+                    .state
+                    .election(n)
+                    .votes
+                    .iter_mut()
+                    .find(|r| r.vote_id == v.vote_id)
+                {
+                    r.state = VoteState::Settled;
+                }
+                format!(
+                    "member {x}'s vote {vid} settled before the reweight {old} -> {new} reached \
+                     the node; the round-3 ballot overwrites it"
+                )
+            }
+            Err(e) => format!("member {x}'s vote {vid} still queued after the reweight: {e:#}"),
+        };
+        self.done(n, "reweight", line)
     }
 
     /// Waits until every node's committed tree of `spec`'s process is at
@@ -1137,16 +1635,383 @@ impl Run {
         .await
     }
 
-    /// Ends the tallied elections, cancels the withdrawn one, reveals the
-    /// locked key once a sequencer has asked the committee, and waits for
-    /// every tally.
+    /// Waits until every node's view of election `n` passes `ok`: the
+    /// nodes apply registry events a few blocks late.
+    async fn wait_nodes(
+        &self,
+        n: usize,
+        what: &str,
+        ok: impl Fn(&ProcessView) -> bool,
+    ) -> Result<()> {
+        let pid = self.pid(n)?;
+        for (i, api) in self.nodes.iter().enumerate() {
+            let ok = &ok;
+            wait::until(
+                &format!("node {} to apply {what} of election {n}", i + 1),
+                READY_TIMEOUT,
+                POLL,
+                || async move { Ok(ok(&api.process(&pid).await?).then_some(())) },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The organizer's steps once the first round settled: the metadata
+    /// update while open, the early reveal, the duration and max voters, the
+    /// cancel during voting. Each runs once; a closed election skips them.
+    async fn organizer_actions(&mut self, spec: &Spec) -> Result<()> {
+        let n = spec.n;
+        let Ok(pid) = self.pid(n) else {
+            return Ok(());
+        };
+        let mut steps: Vec<&str> = Vec::new();
+        if let MetaPlan::WhileOpen(_) = spec.metadata {
+            steps.push("metadata");
+        }
+        if spec.key == KeySource::DkgLockedEarly {
+            steps.push("reveal");
+        }
+        for a in spec.actions {
+            match a {
+                Action::Extend(_) => steps.push("extend"),
+                Action::Shorten(_) => steps.push("shorten"),
+                Action::MaxVoters(_) => steps.push("max-voters"),
+                _ => {}
+            }
+        }
+        if spec.lifecycle == Lifecycle::Canceled && spec.has_votes() {
+            steps.push("cancel");
+        }
+        for step in steps {
+            if self.is_done(n, step) {
+                continue;
+            }
+            let p = self.org.process(&pid).await?;
+            if step == "cancel" && p.status == ProcessStatus::Canceled {
+                self.done(n, step, "canceled during voting".into())?;
+                continue;
+            }
+            if !voting(&p, unix_now()) {
+                let line = format!("{step} skipped: the election is not open");
+                self.done(n, step, line)?;
+                continue;
+            }
+            let batches = self.transitions(&pid).await.map_or(0, |t| t.len());
+            let line = match step {
+                "metadata" => {
+                    let (path, hash) = demo::metadata_update(spec)?.context("no update")?;
+                    self.org
+                        .set_process_metadata(&pid, &self.url(&path), hash)
+                        .await
+                        .with_context(|| format!("election {n}: setProcessMetadata"))?;
+                    format!("metadata updated while open, after {batches} batches, to {path}")
+                }
+                "reveal" => {
+                    self.reveal_key(n).await?;
+                    format!("organizer key revealed while open, after {batches} batches")
+                }
+                "extend" | "shorten" => {
+                    let secs = spec
+                        .actions
+                        .iter()
+                        .find_map(|a| match (a, step) {
+                            (Action::Extend(s), "extend") | (Action::Shorten(s), "shorten") => {
+                                Some(*s)
+                            }
+                            _ => None,
+                        })
+                        .context("duration step")?;
+                    // From the duration it was created with, so a resumed
+                    // run does not extend twice.
+                    let (_, created) = spec.timing(0);
+                    let d = if step == "extend" {
+                        created + secs
+                    } else {
+                        created.saturating_sub(secs)
+                    };
+                    let (from, to) = (p.duration / 60, d / 60);
+                    if step == "extend" && p.duration >= d {
+                        self.done(n, step, format!("duration already {from} min"))?;
+                        continue;
+                    }
+                    match self.org.set_process_duration(&pid, d).await {
+                        Ok(()) => {
+                            self.wait_nodes(n, "the new duration", |v| v.duration == d)
+                                .await?;
+                            format!("duration {from} -> {to} min")
+                        }
+                        // The registry only moves the end later.
+                        Err(ClientError::Reverted(r)) => {
+                            format!("duration {from} -> {to} min refused by the registry: {r}")
+                        }
+                        Err(e) => return Err(e).context(format!("election {n}: duration")),
+                    }
+                }
+                "max-voters" => {
+                    let m = spec
+                        .actions
+                        .iter()
+                        .find_map(|a| match a {
+                            Action::MaxVoters(m) => Some(*m),
+                            _ => None,
+                        })
+                        .context("max voters")?;
+                    self.org
+                        .set_process_max_voters(&pid, m)
+                        .await
+                        .with_context(|| format!("election {n}: setProcessMaxVoters"))?;
+                    // A node still on the old cap refuses the new voters.
+                    self.wait_nodes(n, "the new max voters", |v| v.max_voters == m)
+                        .await?;
+                    format!(
+                        "max voters {} -> {m}, with {} voters in",
+                        p.max_voters, p.voters_count
+                    )
+                }
+                "cancel" => {
+                    self.org
+                        .cancel_process(&pid)
+                        .await
+                        .with_context(|| format!("cancel election {n}"))?;
+                    format!(
+                        "canceled during voting, after {batches} batches and {} voters",
+                        p.voters_count
+                    )
+                }
+                _ => continue,
+            };
+            self.done(n, step, line)?;
+        }
+        Ok(())
+    }
+
+    /// Reveals the organizer secret of locked election `n`.
+    async fn reveal_key(&mut self, n: usize) -> Result<()> {
+        let e = self.state.election(n);
+        if e.revealed {
+            return Ok(());
+        }
+        let sk = OrganizerSecret::from_be_bytes(
+            &e.organizer_secret
+                .as_ref()
+                .with_context(|| format!("election {n}: no organizer secret on record"))?
+                .bytes32()?,
+        )?;
+        let pid = self.pid(n)?;
+        match self.org.reveal_process_key(&pid, &sk).await {
+            Ok(()) => say!("election {n}: organizer key revealed"),
+            Err(ClientError::Reverted(r)) if r == "AlreadyRevealed" => {}
+            Err(e) => return Err(e).with_context(|| format!("reveal election {n}")),
+        }
+        self.state.election(n).revealed = true;
+        self.save()
+    }
+
+    /// Sends refused vote `r` of `spec` once and records the answer.
+    async fn refuse(&mut self, spec: &Spec, r: Refusal) -> Result<()> {
+        let n = spec.n;
+        if self
+            .state
+            .elections
+            .get(&n)
+            .is_some_and(|e| e.refusal(r).is_some())
+        {
+            return Ok(());
+        }
+        let pid = self.pid(n)?;
+        let p = self.org.process(&pid).await?;
+        if r != Refusal::AfterEnd && !voting(&p, unix_now()) {
+            let line = format!("{} not sent: the election is not open", r.describe());
+            say!("election {n}: {line}");
+            self.state.election(n).note(line);
+            return self.save();
+        }
+        let (witness, parts) = self.witness(spec, &p)?;
+        let e = &self.state.elections[&n];
+        let reused = e
+            .votes
+            .iter()
+            .find(|v| v.round == 1 && v.state == VoteState::Settled)
+            .map(|v| (v.voter, v.fields.clone()));
+        let rb = refusal_ballot(
+            spec,
+            &self.secrets,
+            &self.seed,
+            r,
+            &p,
+            &witness,
+            &parts,
+            reused.as_ref().map(|(v, f)| (*v, f.as_slice())),
+        )?;
+        if let Some(strict) = &rb.strict {
+            let e = tokio::task::block_in_place(|| {
+                fx::prove_all(&self.prover, std::slice::from_ref(strict))
+            })
+            .err()
+            .context("the client proved a ballot outside the rules")?;
+            let line = format!("the client refuses to prove a ballot outside the rules: {e:#}");
+            say!("election {n}: {line}");
+            self.state.election(n).note(line);
+        }
+        let mut req = tokio::task::block_in_place(|| {
+            fx::prove_all(&self.prover, std::slice::from_ref(&rb.job))
+        })?
+        .pop()
+        .context("no proof")?;
+        if let Some(key) = &rb.resign {
+            let sig = vote_id_sign(key, req.vote_id);
+            req.signature[..32].copy_from_slice(&sig.r);
+            req.signature[32..64].copy_from_slice(&sig.s);
+            req.signature[64] = sig.v;
+        }
+        let at = spec.refusals().iter().position(|x| *x == r).unwrap_or(0);
+        let node = at % self.nodes.len();
+        let (status, code, error) = submit_refused(&self.nodes[node], &req).await?;
+        let rec = RefusedVote {
+            case: r,
+            node,
+            vote_id: req.vote_id,
+            status,
+            code,
+            error,
+        };
+        let (want_status, want_code) = r.expected();
+        say!(
+            "election {n}: {} to node {}: {status} {} ({}), expected {want_status} {want_code}",
+            r.describe(),
+            node + 1,
+            code.map_or("-".into(), |c| c.to_string()),
+            rec.error
+        );
+        self.state.election(n).refused.push(rec);
+        self.save()
+    }
+
+    /// Pauses `spec` once every node can see it, before its second round.
+    async fn pause(&mut self, spec: &Spec) -> Result<()> {
+        let n = spec.n;
+        if self.is_done(n, "pause") {
+            return Ok(());
+        }
+        let pid = self.pid(n)?;
+        let p = self.org.process(&pid).await?;
+        if p.status == ProcessStatus::Ready {
+            self.org
+                .pause_process(&pid)
+                .await
+                .with_context(|| format!("pause election {n}"))?;
+        }
+        // Every node must know before the votes go in.
+        let mut accepting = Vec::new();
+        for (i, api) in self.nodes.iter().enumerate() {
+            let v = wait::until(
+                &format!("node {} to see election {n} paused", i + 1),
+                READY_TIMEOUT,
+                POLL,
+                || async {
+                    let v = api.process(&pid).await?;
+                    Ok((v.status == ProcessStatus::Paused).then_some(v))
+                },
+            )
+            .await?;
+            accepting.push(format!("node {}: {}", i + 1, v.is_accepting_votes));
+        }
+        let line = format!(
+            "paused after round 1 with {} voters; the nodes report paused, still accepting votes \
+             ({})",
+            p.voters_count,
+            accepting.join(", ")
+        );
+        self.done(n, "pause", line)
+    }
+
+    /// Watches the votes sent to each paused election for `PAUSE_HOLD`,
+    /// notes what the nodes did with them, then resumes it.
+    async fn hold_paused(&mut self) -> Result<()> {
+        for spec in self.specs.clone() {
+            let n = spec.n;
+            if !spec.pauses() || self.is_done(n, "resume") || !self.is_done(n, "pause") {
+                continue;
+            }
+            let pid = self.pid(n)?;
+            let before = self.org.process(&pid).await?;
+            let sent: Vec<(usize, u64)> = self.state.elections[&n]
+                .votes
+                .iter()
+                .filter(|v| v.round == 2)
+                .map(|v| (v.node, v.vote_id))
+                .collect();
+            say!(
+                "election {n}: {} votes sent while paused; watching them for {} s",
+                sent.len(),
+                PAUSE_HOLD.as_secs()
+            );
+            tokio::time::sleep(PAUSE_HOLD).await;
+            let mut by: BTreeMap<String, usize> = BTreeMap::new();
+            for (node, vid) in &sent {
+                let s = match self.nodes[*node].vote_status(&pid, *vid).await {
+                    Ok(s) => s.to_string(),
+                    Err(e) => format!("unreadable ({e})"),
+                };
+                *by.entry(s).or_default() += 1;
+            }
+            let after = self.org.process(&pid).await?;
+            let line = format!(
+                "{} votes sent while paused were taken (HTTP 200); {} s later they are {}; \
+                 on-chain voters {} -> {}, status {}",
+                sent.len(),
+                PAUSE_HOLD.as_secs(),
+                by.iter()
+                    .map(|(s, c)| format!("{c} {s}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                before.voters_count,
+                after.voters_count,
+                status_name(after.status)
+            );
+            say!("election {n}: {line}");
+            self.state.election(n).note(line);
+            if after.status == ProcessStatus::Paused {
+                self.org
+                    .resume_process(&pid)
+                    .await
+                    .with_context(|| format!("resume election {n}"))?;
+            }
+            self.done(n, "resume", "resumed".into())?;
+        }
+        Ok(())
+    }
+
+    /// Waits until every election that votes only once it opens has opened,
+    /// and every node serves it.
+    async fn open_later(&mut self) -> Result<()> {
+        for spec in self.specs.clone() {
+            if !matches!(spec.lifecycle, Lifecycle::Later { .. }) || self.round_done(&spec, 3) {
+                continue;
+            }
+            let p = self.org.process(&self.pid(spec.n)?).await?;
+            // A little past the start, for the chain's clock.
+            let wait = (p.start_time + 20).saturating_sub(unix_now());
+            if wait > 0 {
+                say!("election {}: opens in {wait} s; waiting", spec.n);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            }
+            self.wait_ready(&spec).await?;
+        }
+        Ok(())
+    }
+
+    /// Ends what the organizer ends, cancels the rest of the canceled ones,
+    /// reveals the locked keys once a sequencer asked the committee, sends
+    /// the votes after the end, and waits for every tally.
     async fn close(&mut self) -> Result<()> {
         for spec in self.specs.clone() {
             let n = spec.n;
             let pid = self.pid(n)?;
             let p = self.org.process(&pid).await?;
             match spec.lifecycle {
-                Lifecycle::Tally if is_open(p.status) => {
+                Lifecycle::Tally | Lifecycle::Later { .. } if is_open(p.status) => {
                     self.org
                         .end_process(&pid)
                         .await
@@ -1164,25 +2029,59 @@ impl Run {
             }
         }
         for spec in self.specs.clone() {
-            if spec.key == KeySource::DkgLocked && spec.lifecycle == Lifecycle::Tally {
+            if spec.key == KeySource::DkgLocked && spec.tallied() {
                 self.reveal(&spec).await?;
+            }
+        }
+        for spec in self.specs.clone() {
+            if spec.refusals().contains(&Refusal::AfterEnd) {
+                self.refuse_after_end(&spec).await?;
             }
         }
         self.wait_results().await
     }
 
-    async fn reveal(&mut self, spec: &Spec) -> Result<()> {
+    /// Waits for `spec` to end and its receiving node to stop taking votes,
+    /// then sends it a vote.
+    async fn refuse_after_end(&mut self, spec: &Spec) -> Result<()> {
         let n = spec.n;
-        let e = self.state.election(n);
-        if e.revealed {
+        if self
+            .state
+            .elections
+            .get(&n)
+            .is_some_and(|e| e.refusal(Refusal::AfterEnd).is_some())
+        {
             return Ok(());
         }
-        let sk = OrganizerSecret::from_be_bytes(
-            &e.organizer_secret
-                .as_ref()
-                .with_context(|| format!("election {n}: no organizer secret on record"))?
-                .bytes32()?,
-        )?;
+        let pid = self.pid(n)?;
+        let p = self.org.process(&pid).await?;
+        let end = p.start_time + p.duration;
+        let wait = (end + 10).saturating_sub(unix_now());
+        if is_open(p.status) && wait > 0 {
+            say!("election {n}: ends in {wait} s; a vote goes in after that");
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
+        let at = spec
+            .refusals()
+            .iter()
+            .position(|r| *r == Refusal::AfterEnd)
+            .unwrap_or(0);
+        let api = &self.nodes[at % self.nodes.len()];
+        wait::until(
+            &format!("the node to close election {n}"),
+            READY_TIMEOUT,
+            POLL,
+            || async { Ok((!api.process(&pid).await?.is_accepting_votes).then_some(())) },
+        )
+        .await?;
+        self.refuse(spec, Refusal::AfterEnd).await
+    }
+
+    async fn reveal(&mut self, spec: &Spec) -> Result<()> {
+        let n = spec.n;
+        if self.state.election(n).revealed {
+            return Ok(());
+        }
         let pid = self.pid(n)?;
         if self.org.process(&pid).await?.status != ProcessStatus::Results {
             let t = Instant::now();
@@ -1201,23 +2100,28 @@ impl Run {
                  until the reveal",
                 t.elapsed().as_secs_f64()
             );
-            match self.org.reveal_process_key(&pid, &sk).await {
-                Ok(()) => say!("election {n}: organizer key revealed"),
-                Err(ClientError::Reverted(r)) if r == "AlreadyRevealed" => {}
-                Err(e) => return Err(e).with_context(|| format!("reveal election {n}")),
-            }
+            self.reveal_key(n).await?;
+            self.state
+                .election(n)
+                .note("organizer key revealed after the end");
         }
         self.state.election(n).revealed = true;
         self.save()
     }
 
     async fn wait_results(&mut self) -> Result<()> {
-        let tallied: Vec<Spec> = self
-            .specs
-            .iter()
-            .filter(|s| s.lifecycle == Lifecycle::Tally)
-            .copied()
-            .collect();
+        let tallied: Vec<Spec> = self.specs.iter().filter(|s| s.tallied()).copied().collect();
+        // Timed elections end on their own; wait past the last end.
+        let mut last_end = unix_now();
+        for spec in &tallied {
+            if let Lifecycle::Timed { .. } = spec.lifecycle {
+                let p = self.org.process(&self.pid(spec.n)?).await?;
+                last_end = last_end.max(p.start_time + p.duration);
+            }
+        }
+        let deadline = Instant::now()
+            + Duration::from_secs(last_end.saturating_sub(unix_now()))
+            + RESULTS_TIMEOUT;
         let start = Instant::now();
         let mut report = Instant::now();
         loop {
@@ -1230,22 +2134,27 @@ impl Run {
                 let p = self.org.process(&self.pid(n)?).await?;
                 if p.status == ProcessStatus::Results {
                     say!(
-                        "election {n}: results on-chain {:?} ({:.0} s after the ends)",
+                        "election {n}: results on-chain {:?} ({:.0} s into the wait)",
                         p.result,
                         start.elapsed().as_secs_f64()
                     );
                     self.state.election(n).results = Some(p.result);
                     self.save()?;
                 } else {
-                    waiting.push(format!("election {n} {}", status_name(p.status)));
+                    let left = (p.start_time + p.duration).saturating_sub(unix_now());
+                    waiting.push(if is_open(p.status) && left > 0 {
+                        format!("election {n} ends in {left} s")
+                    } else {
+                        format!("election {n} {}", status_name(p.status))
+                    });
                 }
             }
             if waiting.is_empty() {
                 return Ok(());
             }
             ensure!(
-                start.elapsed() < RESULTS_TIMEOUT,
-                "no results after {RESULTS_TIMEOUT:?}: {}",
+                Instant::now() < deadline,
+                "no results in time: {}",
                 waiting.join(", ")
             );
             if report.elapsed() > PROGRESS_EVERY {
@@ -1256,7 +2165,10 @@ impl Run {
         }
     }
 
-    /// The table, and each tally against the settled ballots.
+    /// The table, each tally against the settled ballots, each count
+    /// against the votes that settled (so no refused vote reached the
+    /// chain), each refusal against its expected answer, each final status
+    /// against the plan, and the notes.
     async fn report(&self) -> Result<()> {
         let now = unix_now();
         // An explorer to link each process to, when one is given.
@@ -1265,8 +2177,10 @@ impl Run {
             .map(|u| u.trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty());
         let mut rows = vec![
-            "| # | process id | kind | status | voters | overwrites | transitions |".to_string(),
-            "|---:|---|---|---|---:|---:|---:|".to_string(),
+            "| # | process id | ballot | census | key | lifecycle | status | voters | changed \
+             votes | batches | blobs |"
+                .to_string(),
+            "|---:|---|---|---|---|---|---|---:|---:|---:|---:|".to_string(),
         ];
         if explorer.is_some() {
             rows[0].push_str(" explorer |");
@@ -1278,13 +2192,14 @@ impl Run {
             let n = spec.n;
             let pid = self.pid(n)?;
             let p = self.org.process(&pid).await?;
-            let mut transitions = "?".to_string();
-            for api in &self.nodes {
-                if let Ok(t) = api.transitions(&pid).await {
-                    transitions = t.len().to_string();
-                    break;
-                }
-            }
+            let transitions = self.transitions(&pid).await;
+            let (batches, blobs) = match &transitions {
+                Some(t) => (
+                    t.len().to_string(),
+                    t.iter().map(|t| t.n_blobs).sum::<u64>().to_string(),
+                ),
+                None => ("?".into(), "?".into()),
+            };
             let status = match p.status {
                 ProcessStatus::Ready if now < p.start_time => {
                     format!("ready, opens in {} h", (p.start_time - now).div_ceil(3600))
@@ -1296,9 +2211,12 @@ impl Run {
                 s => status_name(s).to_string(),
             };
             let mut row = format!(
-                "| {n} | {} | {} | {status} | {} | {} | {transitions} |",
+                "| {n} | {} | {} | {} | {} | {} | {status} | {} | {} | {batches} | {blobs} |",
                 ProcessId(pid),
-                spec.kind(),
+                spec.ballot_name(),
+                spec.census_name(),
+                spec.key_name(),
+                spec.lifecycle_name(),
                 p.voters_count,
                 p.overwritten_votes_count,
             );
@@ -1315,7 +2233,67 @@ impl Run {
             if errored > 0 {
                 notes.push(format!("election {n}: {errored} votes errored"));
             }
-            if spec.lifecycle != Lifecycle::Tally {
+            for l in &e.notes {
+                notes.push(format!("election {n}: {l}"));
+            }
+            // Large elections: how the batches split into transactions.
+            if spec.chunk > 0
+                && let Some(t) = &transitions
+            {
+                let split: Vec<String> = t
+                    .iter()
+                    .map(|t| format!("{}v/{}o/{}b", t.voters, t.overwrites, t.n_blobs))
+                    .collect();
+                notes.push(format!(
+                    "election {n}: transitions (voters/overwrites/blobs): {}",
+                    split.join(" ")
+                ));
+            }
+            // What the registry counted is what settled: no refused vote
+            // got in.
+            let counted = (p.voters_count, p.overwritten_votes_count);
+            if counted != e.counts() {
+                bad.push(format!(
+                    "election {n}: the registry counts {counted:?} (voters, overwrites), the \
+                     settled votes {:?}",
+                    e.counts()
+                ));
+            }
+            for r in spec.refusals() {
+                match e.refusal(r) {
+                    Some(x) if x.as_expected() => notes.push(format!(
+                        "election {n}: {} refused with {} {} ({})",
+                        r.describe(),
+                        x.status,
+                        x.code.unwrap_or_default(),
+                        x.error
+                    )),
+                    Some(x) => bad.push(format!(
+                        "election {n}: {} got {} {:?} ({}), not {:?}",
+                        r.describe(),
+                        x.status,
+                        x.code,
+                        x.error,
+                        r.expected()
+                    )),
+                    None => notes.push(format!("election {n}: {} not sent", r.describe())),
+                }
+            }
+            let expected = match spec.lifecycle {
+                Lifecycle::Tally | Lifecycle::Later { .. } | Lifecycle::Timed { .. } => {
+                    ProcessStatus::Results
+                }
+                Lifecycle::Canceled | Lifecycle::CanceledEarly { .. } => ProcessStatus::Canceled,
+                Lifecycle::Open { .. } | Lifecycle::Upcoming { .. } => ProcessStatus::Ready,
+            };
+            if p.status != expected {
+                bad.push(format!(
+                    "election {n} is {}, not {}",
+                    status_name(p.status),
+                    status_name(expected)
+                ));
+            }
+            if !spec.tallied() {
                 continue;
             }
             let nf = spec.num_fields();
@@ -1341,7 +2319,7 @@ impl Run {
                 ));
             }
         }
-        eprintln!("\n{}\n", rows.join("\n"));
+        eprintln!("\nwave {}\n\n{}\n", self.wave.number(), rows.join("\n"));
         for l in &notes {
             say!("{l}");
         }

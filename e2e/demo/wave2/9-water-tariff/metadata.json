@@ -1,0 +1,60 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Water cooperative: tariff reform",
+    "en": "Water cooperative: tariff reform",
+    "es": "Cooperativa de aguas: reforma de la tarifa",
+    "ca": "Cooperativa d'aigües: reforma de la tarifa"
+  },
+  "description": {
+    "default": "Resolution 2027-02: adopt the two-tier water tariff proposed by the board. Each member votes with the weight of their shares, as certified by the cooperative's census service, and puts that whole weight on one option.",
+    "en": "Resolution 2027-02: adopt the two-tier water tariff proposed by the board. Each member votes with the weight of their shares, as certified by the cooperative's census service, and puts that whole weight on one option.",
+    "es": "Resolución 2027-02: adoptar la tarifa de agua de dos tramos que propone el consejo rector. Cada socio vota con el peso de sus participaciones, certificado por el servicio de censo de la cooperativa, y pone todo ese peso en una sola opción.",
+    "ca": "Resolució 2027-02: adoptar la tarifa d'aigua de dos trams que proposa el consell rector. Cada soci vota amb el pes de les seves participacions, certificat pel servei de cens de la cooperativa, i posa tot aquest pes en una sola opció."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Do you approve the new tariff?",
+        "en": "Do you approve the new tariff?",
+        "es": "¿Apruebas la nueva tarifa?",
+        "ca": "Aproves la nova tarifa?"
+      },
+      "description": {
+        "default": "Your whole weight goes to one option.",
+        "en": "Your whole weight goes to one option.",
+        "es": "Todo tu peso va a una sola opción.",
+        "ca": "Tot el teu pes va a una sola opció."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "In favour",
+            "en": "In favour",
+            "es": "A favor",
+            "ca": "A favor"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Against",
+            "en": "Against",
+            "es": "En contra",
+            "ca": "En contra"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Abstain",
+            "en": "Abstain",
+            "es": "Abstención",
+            "ca": "Abstenció"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ]
+}

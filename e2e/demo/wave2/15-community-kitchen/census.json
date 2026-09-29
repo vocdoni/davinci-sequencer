@@ -1,0 +1,68 @@
+{
+  "participants": [
+    {
+      "key": "0xda6a19541d504353794a48c191e232dc119d872c",
+      "weight": "1"
+    },
+    {
+      "key": "0xd7b63233f9049268470b31d4a2ef52a3c29ac661",
+      "weight": "1"
+    },
+    {
+      "key": "0x925ed9c6159e1b82759183bfa2d19f9490881035",
+      "weight": "1"
+    },
+    {
+      "key": "0xa1829a2d3f2e2bca543efa098786478426be91e2",
+      "weight": "1"
+    },
+    {
+      "key": "0x6251f6b368c7ca92e82335901ac7f977e70f5281",
+      "weight": "1"
+    },
+    {
+      "key": "0x823f2604753084f72c9e223825920e9482328a5c",
+      "weight": "1"
+    },
+    {
+      "key": "0x5651daf9344a845048b4c7ff7f456ef06a8b1e8a",
+      "weight": "1"
+    },
+    {
+      "key": "0x4eccbd161763241002b2e8705a25326abb89d6e8",
+      "weight": "1"
+    },
+    {
+      "key": "0x900ec75228d185375b8fbb69c9e440923cef3c9e",
+      "weight": "1"
+    },
+    {
+      "key": "0x5438a2333df5f4f8c659379108fa82fa3ba801b9",
+      "weight": "1"
+    },
+    {
+      "key": "0xe4ab69759db306597298ad2f26cab9019ef7712a",
+      "weight": "1"
+    },
+    {
+      "key": "0x2f8309fa894c86181cb7263153205eb4d1728ad4",
+      "weight": "1"
+    },
+    {
+      "key": "0x4764df5f059fb2f9c4b078f7bcf7ea87aa79d5cd",
+      "weight": "1"
+    },
+    {
+      "key": "0xd52550e23d2a38f6b034f6f94b953ad5648f0a73",
+      "weight": "1"
+    },
+    {
+      "key": "0xb11ba86336f83bf28c872d3d6232119ccea3bf97",
+      "weight": "1"
+    },
+    {
+      "key": "0xc6ce5bc436947fc20f20a25bfb3d2fd04c899ef2",
+      "weight": "1"
+    }
+  ]
+}

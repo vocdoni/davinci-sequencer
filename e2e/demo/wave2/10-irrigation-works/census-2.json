@@ -1,0 +1,88 @@
+{
+  "participants": [
+    {
+      "key": "0xfd40d0c1956f4cfa99e2d5fb5b74b98a6ac0846b",
+      "weight": "65"
+    },
+    {
+      "key": "0x430c0feca320e4933b2293e8f462bc2613f82092",
+      "weight": "127"
+    },
+    {
+      "key": "0x700ac6345f980888b87c820638ce88270794de1c",
+      "weight": "25"
+    },
+    {
+      "key": "0xb4ebd33d8b6d38146dc03e130e0d0b0743c86428",
+      "weight": "41"
+    },
+    {
+      "key": "0x15b93b2d30d4391935be6665f765df258a17b76e",
+      "weight": "148"
+    },
+    {
+      "key": "0x44ff83af5dc2dfd739f5f19d1623fda680e2ce0e",
+      "weight": "92"
+    },
+    {
+      "key": "0xc94d3249d163b16250f2d9e31384bcb88f3f2efd",
+      "weight": "27"
+    },
+    {
+      "key": "0xf29b622aaef45f65ccc365a44c1264014a26007b",
+      "weight": "41"
+    },
+    {
+      "key": "0x8f60c83ad51bf5bdb1108454a7613f7ec6b75f01",
+      "weight": "20"
+    },
+    {
+      "key": "0x098713fe316137cb414bd726ec0207f459cad958",
+      "weight": "63"
+    },
+    {
+      "key": "0x5d981c8fdaea58417e914c69d93e14736c8aadfc",
+      "weight": "114"
+    },
+    {
+      "key": "0x167504027738caf30c106f157b5f9a59ebe5c363",
+      "weight": "58"
+    },
+    {
+      "key": "0x4c4ff2763955a5d650bdc82ddce27c5daef571e2",
+      "weight": "133"
+    },
+    {
+      "key": "0xa3ea9e1ee433a7c8e50ddd3bc6f3b3fdc72fb998",
+      "weight": "26"
+    },
+    {
+      "key": "0x2691398de1325400d7feb4d58261d20686dbaca9",
+      "weight": "21"
+    },
+    {
+      "key": "0x2e3e258a85906060eef880cdb9e378e89bfbecdf",
+      "weight": "148"
+    },
+    {
+      "key": "0x8009a3b1d6770cc95274de8c59033bb2b6e58eef",
+      "weight": "74"
+    },
+    {
+      "key": "0xd88819c1773c6a031095bf70c232f2377f6c3d3e",
+      "weight": "55"
+    },
+    {
+      "key": "0x293a7b5f12ea470972271f1dd014a019c2819ba7",
+      "weight": "92"
+    },
+    {
+      "key": "0x0bc21a78a6b682c066d30cc74f1e565d47864b2d",
+      "weight": "56"
+    },
+    {
+      "key": "0x0726066d70bb08a2f41b8a34e3be3c5b4c286678",
+      "weight": "22"
+    }
+  ]
+}

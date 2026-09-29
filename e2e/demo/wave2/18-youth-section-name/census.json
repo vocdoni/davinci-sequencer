@@ -1,0 +1,44 @@
+{
+  "participants": [
+    {
+      "key": "0xbcb5058c5279fcbe59e620f4a777bf6efc57961f",
+      "weight": "1"
+    },
+    {
+      "key": "0xa05147ce2537961055a329d9a94b73357bc5dc80",
+      "weight": "1"
+    },
+    {
+      "key": "0xd6b41973bda4c5288199a3d2f911f05797b509b2",
+      "weight": "1"
+    },
+    {
+      "key": "0x859bba38828aeaf9acf123a7c6e8edc6340a52fa",
+      "weight": "1"
+    },
+    {
+      "key": "0x0f3eb03e78a0e733f9ca335970a078fd4812a874",
+      "weight": "1"
+    },
+    {
+      "key": "0x8a72389331e3794d5324ce315abac76a6e77f0d8",
+      "weight": "1"
+    },
+    {
+      "key": "0x7184e52808721088c897db5646e8b1faaac5e4e2",
+      "weight": "1"
+    },
+    {
+      "key": "0xa787e57444612c0b8bf2b7b085fdfea7b8851d3c",
+      "weight": "1"
+    },
+    {
+      "key": "0xed6fd7c21580bf52e5776869050ba0b9cda3117e",
+      "weight": "1"
+    },
+    {
+      "key": "0xcea419fe81446d7ab207b6b2f3ffe151d7abd8d3",
+      "weight": "1"
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "participants": [
+    {
+      "key": "0x0b6e4b90d7ec605f7fd0c5fc35f0a00edb0dd457",
+      "weight": "1"
+    },
+    {
+      "key": "0x30cb187db30ddfabc03af03639183d126b2dd9f0",
+      "weight": "1"
+    },
+    {
+      "key": "0xe20d5d394de9bf9a0e706d6fcf6ca45c15429a63",
+      "weight": "1"
+    },
+    {
+      "key": "0xe8e89e4fcc9c49d291282b1ef1e7bd4fee54d3ca",
+      "weight": "1"
+    },
+    {
+      "key": "0x36ab93d582f5efabee6c3a3970e7767c039eb61b",
+      "weight": "1"
+    },
+    {
+      "key": "0x00513d16c2463591154221dde00506d7e7647acd",
+      "weight": "1"
+    },
+    {
+      "key": "0x4ea39fa044e063cdf8cff9b152b8868c279bcfd3",
+      "weight": "1"
+    },
+    {
+      "key": "0xe2f5eb0fff0c8ea25e60cb367b9e516a753390a3",
+      "weight": "1"
+    },
+    {
+      "key": "0xd1708722497205797d30608466c871bc6c983a34",
+      "weight": "1"
+    },
+    {
+      "key": "0x1ddd73d8abdce6b1d23f91d6a6a6d6dac057ce69",
+      "weight": "1"
+    },
+    {
+      "key": "0xa909b8dcf8d820f208ea4beaeb06204400fca9cd",
+      "weight": "1"
+    },
+    {
+      "key": "0xb2e8a60583e18f16ac8be22b21640d653fc400f3",
+      "weight": "1"
+    },
+    {
+      "key": "0x5173839e8cde4960a3768199c89f2521d67a29f6",
+      "weight": "1"
+    },
+    {
+      "key": "0xe2eb3520f29ca484e002ffa2f72774bfaf6ed35a",
+      "weight": "1"
+    },
+    {
+      "key": "0x028bf91f54f0576763c46d338261e0a7c63926d9",
+      "weight": "1"
+    },
+    {
+      "key": "0xb22be90fba02541ea68855150ac2d45a924a7caa",
+      "weight": "1"
+    },
+    {
+      "key": "0x34451a992d9688c23069042cc823bc3f89acc72c",
+      "weight": "1"
+    },
+    {
+      "key": "0xac8b9409d745574245dfc7d05d260328fddcb447",
+      "weight": "1"
+    },
+    {
+      "key": "0x2c4805c302c45132d5e4ff1d6ed3077ff167c006",
+      "weight": "1"
+    },
+    {
+      "key": "0x5de72230998657b1087f2f906d6a54dc465a15b5",
+      "weight": "1"
+    },
+    {
+      "key": "0x264ed57296e3617e6d956ff6e0692cfb1bf397f4",
+      "weight": "1"
+    },
+    {
+      "key": "0x7436c259361d9c4cbabd0df293bc5beee672a56e",
+      "weight": "1"
+    },
+    {
+      "key": "0xa5d2506826a6da26f5b9be02f3bc28848e5af3d3",
+      "weight": "1"
+    },
+    {
+      "key": "0x40eca01166ffd60e0f05911de03f1a2078c09f2e",
+      "weight": "1"
+    }
+  ]
+}

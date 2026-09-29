@@ -532,6 +532,100 @@ alloy::sol! {
     }
 }
 
+/// Pause and resume, the duration and max voters, as the registry allows
+/// them: the end only moves later, max voters never drops below the count.
+#[tokio::test]
+async fn process_controls() -> anyhow::Result<()> {
+    if std::env::var("ANVIL").as_deref() != Ok("1") {
+        eprintln!("ANVIL not set, skipping");
+        return Ok(());
+    }
+    let anvil = Anvil::at(anvil_bin()).try_spawn()?;
+    let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let url = anvil.endpoint();
+    let p = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer.clone()))
+        .connect_http(url.parse()?);
+    let vk = release::BATCH_PROGRAM_VK;
+    let registry = deploy_registry(&p, 31337, Address::repeat_byte(0x11), vk).await?;
+    let org = Organizer::connect(&url, signer, registry)?;
+    let reader = RegistryReader::connect(&url, registry)?;
+    let params = NewProcess {
+        process_id: org.next_process_id().await?,
+        start_time: 0,
+        duration: 3600,
+        max_voters: 24,
+        ballot_mode: BallotMode {
+            num_fields: 4,
+            group_size: 4,
+            unique_values: false,
+            cost_exponent: 1,
+            max_value: 1,
+            min_value: 0,
+            max_value_sum: 1,
+            min_value_sum: 1,
+        },
+        census_origin: 1,
+        census_root: Fr::from(123456789u64),
+        census_contract: [0; 20],
+        census_uri: "file:///tmp/census.json".into(),
+        metadata: "ipfs://v1".into(),
+        metadata_hash: metadata_hash(DOC),
+        key_mode: KeyMode::Sequencer(Point::generator().mul(&U256::from(4242u64))),
+    };
+    let pid = org.create_process(&params).await?.pid;
+    let reverted = |e: Error| match e {
+        Error::Reverted(n) => n,
+        e => panic!("not a revert: {e}"),
+    };
+
+    org.pause_process(&pid).await?;
+    assert_eq!(reader.process(&pid).await?.status, ProcessStatus::Paused);
+    let e = org.pause_process(&pid).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidStatus");
+    // Paused, the organizer still sets the duration and max voters.
+    org.set_process_duration(&pid, 7200).await?;
+    org.set_process_max_voters(&pid, 50).await?;
+    org.resume_process(&pid).await?;
+    let got = reader.process(&pid).await?;
+    assert_eq!(
+        (got.status, got.duration, got.max_voters),
+        (ProcessStatus::Ready, 7200, 50)
+    );
+    let e = org.resume_process(&pid).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidStatus");
+
+    // The end never moves earlier; max voters can shrink, never to zero.
+    let e = org.set_process_duration(&pid, 3000).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidDuration");
+    let e = org.set_process_duration(&pid, 7200).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidDuration");
+    org.set_process_max_voters(&pid, 10).await?;
+    let e = org.set_process_max_voters(&pid, 0).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidMaxVoters");
+    assert_eq!(reader.process(&pid).await?.max_voters, 10);
+
+    // Only the organizer.
+    let other = Organizer::connect(&url, anvil.keys()[1].clone().into(), registry)?;
+    for e in [
+        other.pause_process(&pid).await.unwrap_err(),
+        other.set_process_duration(&pid, 9000).await.unwrap_err(),
+        other.set_process_max_voters(&pid, 40).await.unwrap_err(),
+    ] {
+        assert_eq!(reverted(e), "Unauthorized");
+    }
+
+    // Once ended, nothing moves.
+    org.end_process(&pid).await?;
+    let e = org.set_process_duration(&pid, 9000).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidStatus");
+    let e = org.resume_process(&pid).await.unwrap_err();
+    assert_eq!(reverted(e), "InvalidStatus");
+    // Reverts are caught before sending: only the good calls were mined.
+    assert_eq!(org.receipts().len(), 7);
+    Ok(())
+}
+
 // Both DKG modes on the real registry with the contracts' MockDKG (real
 // curve math; only the Schnorr PoP is not checked): the keys the registry
 // stores, the organizer secret and its reveal.

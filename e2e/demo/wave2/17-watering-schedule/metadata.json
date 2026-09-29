@@ -1,0 +1,65 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Allotment gardens: new watering schedule",
+    "en": "Allotment gardens: new watering schedule",
+    "es": "Huertos urbanos: nuevo horario de riego",
+    "ca": "Horts urbans: nou horari de reg"
+  },
+  "description": {
+    "default": "This election is a demonstration of a metadata mismatch: the hash registered on-chain is that of an earlier draft of this document, so explorers must show its text as unverified. The ballots it receives are counted as usual. The question itself is real: the allotment gardens need a new watering schedule for the summer.",
+    "en": "This election is a demonstration of a metadata mismatch: the hash registered on-chain is that of an earlier draft of this document, so explorers must show its text as unverified. The ballots it receives are counted as usual. The question itself is real: the allotment gardens need a new watering schedule for the summer.",
+    "es": "Esta votación es una demostración de un desajuste de metadatos: el hash registrado en la cadena es el de un borrador anterior de este documento, así que los exploradores deben mostrar su texto como no verificado. Las papeletas que reciba se cuentan con normalidad. La pregunta es real: los huertos urbanos necesitan un nuevo horario de riego para el verano.",
+    "ca": "Aquesta votació és una demostració d'un desajust de metadades: el hash registrat a la cadena és el d'un esborrany anterior d'aquest document, de manera que els exploradors n'han de mostrar el text com a no verificat. Les paperetes que rebi es compten amb normalitat. La pregunta és real: els horts urbans necessiten un nou horari de reg per a l'estiu."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Which watering slot do you prefer?",
+        "en": "Which watering slot do you prefer?",
+        "es": "¿Qué franja de riego prefieres?",
+        "ca": "Quina franja de reg prefereixes?"
+      },
+      "description": {
+        "default": "Pick one slot.",
+        "en": "Pick one slot.",
+        "es": "Elige una franja.",
+        "ca": "Tria una franja."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Early morning, 6:00 to 9:00",
+            "en": "Early morning, 6:00 to 9:00",
+            "es": "Primera hora, de 6:00 a 9:00",
+            "ca": "A primera hora, de 6:00 a 9:00"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Evening, 19:00 to 22:00",
+            "en": "Evening, 19:00 to 22:00",
+            "es": "Tarde, de 19:00 a 22:00",
+            "ca": "Al vespre, de 19:00 a 22:00"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Alternate days, all day",
+            "en": "Alternate days, all day",
+            "es": "Días alternos, todo el día",
+            "ca": "Dies alterns, tot el dia"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

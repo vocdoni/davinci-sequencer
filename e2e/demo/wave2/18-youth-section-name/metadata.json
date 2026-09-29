@@ -1,0 +1,38 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Rename the youth section?"
+  },
+  "description": {
+    "default": "The board proposes renaming the youth section to Young Members. Vote yes or no."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Should the youth section be renamed?"
+      },
+      "description": {
+        "default": "Pick one option."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Yes"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "No"
+          },
+          "value": 1
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

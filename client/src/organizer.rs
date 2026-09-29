@@ -1,7 +1,7 @@
 //! Organizer helper: the census file and the process lifecycle on the zkVM
 //! ProcessRegistry (create in any key mode, replace the census or the
-//! metadata, end, reveal a DKG organizer key, read results), and the registry
-//! pin check.
+//! metadata, pause, change the duration or max voters, end, reveal a DKG
+//! organizer key, read results), and the registry pin check.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -108,9 +108,11 @@ fn read_provider(url: &str) -> Result<DynProvider> {
         .erased())
 }
 
-/// `DAVINCITypes.ProcessStatus` ENDED and CANCELED.
+/// `DAVINCITypes.ProcessStatus` READY, ENDED, CANCELED and PAUSED.
+const STATUS_READY: u8 = 0;
 const STATUS_ENDED: u8 = 1;
 const STATUS_CANCELED: u8 = 2;
+const STATUS_PAUSED: u8 = 3;
 
 /// Where a new process's election key comes from (`DAVINCITypes.KeyMode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -645,6 +647,41 @@ impl Organizer {
     /// Sets the process status to CANCELED: no results will be set.
     pub async fn cancel_process(&self, pid: &[u8; 31]) -> Result<()> {
         self.set_status(pid, STATUS_CANCELED).await
+    }
+
+    /// Pauses a READY process: nodes still take votes but settle nothing
+    /// until it resumes.
+    pub async fn pause_process(&self, pid: &[u8; 31]) -> Result<()> {
+        self.set_status(pid, STATUS_PAUSED).await
+    }
+
+    /// Resumes a PAUSED process.
+    pub async fn resume_process(&self, pid: &[u8; 31]) -> Result<()> {
+        self.set_status(pid, STATUS_READY).await
+    }
+
+    /// Sets the duration, from the start time (`setProcessDuration`,
+    /// organizer only, while READY or PAUSED and before the end). The
+    /// registry only moves the end later: a shorter one reverts
+    /// `InvalidDuration`.
+    pub async fn set_process_duration(&self, pid: &[u8; 31], duration: u64) -> Result<()> {
+        let call = self
+            .registry
+            .setProcessDuration(FixedBytes(*pid), U256::from(duration));
+        call.call().await.map_err(chain_err)?;
+        self.mined(call.send().await.map_err(chain_err)?).await?;
+        Ok(())
+    }
+
+    /// Sets max voters (`setProcessMaxVoters`, organizer only, while READY
+    /// or PAUSED), never below the voters already counted.
+    pub async fn set_process_max_voters(&self, pid: &[u8; 31], max_voters: u64) -> Result<()> {
+        let call = self
+            .registry
+            .setProcessMaxVoters(FixedBytes(*pid), U256::from(max_voters));
+        call.call().await.map_err(chain_err)?;
+        self.mined(call.send().await.map_err(chain_err)?).await?;
+        Ok(())
     }
 
     /// The processes this organizer (or a clone) created, in order.

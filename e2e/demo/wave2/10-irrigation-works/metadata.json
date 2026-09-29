@@ -1,0 +1,78 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Irrigation community: works programme",
+    "en": "Irrigation community: works programme",
+    "es": "Comunidad de regantes: programa de obras",
+    "ca": "Comunitat de regants: programa d'obres"
+  },
+  "description": {
+    "default": "Members vote on next year's works with as many credits as the census gives them, one per tenth of a hectare they irrigate. Giving a work v votes costs v³ credits, which strongly rewards spreading support. The census is updated when plots change hands, and new members can vote from then on.",
+    "en": "Members vote on next year's works with as many credits as the census gives them, one per tenth of a hectare they irrigate. Giving a work v votes costs v³ credits, which strongly rewards spreading support. The census is updated when plots change hands, and new members can vote from then on.",
+    "es": "Los comuneros votan las obras del año que viene con tantos créditos como les asigna el censo, uno por cada décima de hectárea que riegan. Dar v votos a una obra cuesta v³ créditos, lo que premia mucho repartir el apoyo. El censo se actualiza cuando las parcelas cambian de manos, y los nuevos comuneros pueden votar desde ese momento.",
+    "ca": "Els comuners voten les obres de l'any vinent amb tants crèdits com els assigna el cens, un per cada dècima d'hectàrea que reguen. Donar v vots a una obra costa v³ crèdits, cosa que premia molt repartir el suport. El cens s'actualitza quan les parcel·les canvien de mans, i els comuners nous poden votar des d'aquell moment."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "How many votes do you give each work?",
+        "en": "How many votes do you give each work?",
+        "es": "¿Cuántos votos das a cada obra?",
+        "ca": "Quants vots dones a cada obra?"
+      },
+      "description": {
+        "default": "v votes cost v³ credits, up to 5 votes per work, within your credits.",
+        "en": "v votes cost v³ credits, up to 5 votes per work, within your credits.",
+        "es": "v votos cuestan v³ créditos, hasta 5 votos por obra, dentro de tus créditos.",
+        "ca": "v vots costen v³ crèdits, fins a 5 vots per obra, dins dels teus crèdits."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Line the main channel",
+            "en": "Line the main channel",
+            "es": "Revestir la acequia principal",
+            "ca": "Revestir la sèquia principal"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Replace the north sluice gates",
+            "en": "Replace the north sluice gates",
+            "es": "Cambiar las compuertas del norte",
+            "ca": "Canviar les comportes del nord"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Automatic water meters",
+            "en": "Automatic water meters",
+            "es": "Contadores de agua automáticos",
+            "ca": "Comptadors d'aigua automàtics"
+          },
+          "value": 2
+        },
+        {
+          "title": {
+            "default": "Dredge the reservoir",
+            "en": "Dredge the reservoir",
+            "es": "Dragar el embalse",
+            "ca": "Dragar l'embassament"
+          },
+          "value": 3
+        },
+        {
+          "title": {
+            "default": "A solar pump for the well",
+            "en": "A solar pump for the well",
+            "es": "Una bomba solar para el pozo",
+            "ca": "Una bomba solar per al pou"
+          },
+          "value": 4
+        }
+      ]
+    }
+  ]
+}

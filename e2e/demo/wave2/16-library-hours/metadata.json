@@ -1,0 +1,44 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Library: extra opening hours during exams"
+  },
+  "description": {
+    "default": "During the June exams the library can open for extra hours. Choose when they should be; voting opens a few days after this announcement."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "When should the library open longer?"
+      },
+      "description": {
+        "default": "Pick one option."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Early mornings, from 7:00"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Late evenings, until midnight"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Sunday afternoons"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

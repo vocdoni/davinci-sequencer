@@ -1,0 +1,65 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Extraordinary assembly: new statutes",
+    "en": "Extraordinary assembly: new statutes",
+    "es": "Asamblea extraordinaria: nuevos estatutos",
+    "ca": "Assemblea extraordinària: nous estatuts"
+  },
+  "description": {
+    "default": "The extraordinary assembly votes on the new statutes drafted by the working group. The ballots are encrypted with a key held jointly by an independent committee.",
+    "en": "The extraordinary assembly votes on the new statutes drafted by the working group. The ballots are encrypted with a key held jointly by an independent committee.",
+    "es": "La asamblea extraordinaria vota los nuevos estatutos que ha redactado el grupo de trabajo. Las papeletas se cifran con una clave que custodia de forma conjunta un comité independiente.",
+    "ca": "L'assemblea extraordinària vota els nous estatuts que ha redactat el grup de treball. Les paperetes es xifren amb una clau que custodia de manera conjunta un comitè independent."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Do you approve the new statutes?",
+        "en": "Do you approve the new statutes?",
+        "es": "¿Apruebas los nuevos estatutos?",
+        "ca": "Aproves els nous estatuts?"
+      },
+      "description": {
+        "default": "Pick one option.",
+        "en": "Pick one option.",
+        "es": "Elige una opción.",
+        "ca": "Tria una opció."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Approve",
+            "en": "Approve",
+            "es": "Aprobar",
+            "ca": "Aprovar"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Reject",
+            "en": "Reject",
+            "es": "Rechazar",
+            "ca": "Rebutjar"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Abstain",
+            "en": "Abstain",
+            "es": "Abstenerse",
+            "ca": "Abstenir-se"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

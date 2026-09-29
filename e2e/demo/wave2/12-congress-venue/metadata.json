@@ -1,0 +1,65 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Board decision: venue of the spring congress",
+    "en": "Board decision: venue of the spring congress",
+    "es": "Decisión de la junta: sede del congreso de primavera",
+    "ca": "Decisió de la junta: seu del congrés de primavera"
+  },
+  "description": {
+    "default": "The board has eight voting seats and twelve members and substitutes on its list. The first eight ballots fill the seats; once they are taken, further ballots are refused, although a seated member can still change their vote.",
+    "en": "The board has eight voting seats and twelve members and substitutes on its list. The first eight ballots fill the seats; once they are taken, further ballots are refused, although a seated member can still change their vote.",
+    "es": "La junta tiene ocho plazas con voto y doce titulares y suplentes en su lista. Las ocho primeras papeletas ocupan las plazas; una vez ocupadas, las siguientes se rechazan, aunque quien ya tiene plaza puede cambiar su voto.",
+    "ca": "La junta té vuit places amb vot i dotze titulars i suplents a la llista. Les vuit primeres paperetes ocupen les places; un cop ocupades, les següents es rebutgen, tot i que qui ja té plaça pot canviar el seu vot."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Where should the spring congress be held?",
+        "en": "Where should the spring congress be held?",
+        "es": "¿Dónde debería celebrarse el congreso de primavera?",
+        "ca": "On s'hauria de fer el congrés de primavera?"
+      },
+      "description": {
+        "default": "Pick one venue.",
+        "en": "Pick one venue.",
+        "es": "Elige una sede.",
+        "ca": "Tria una seu."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "The cultural centre",
+            "en": "The cultural centre",
+            "es": "El centro cultural",
+            "ca": "El centre cultural"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "The sports pavilion",
+            "en": "The sports pavilion",
+            "es": "El pabellón deportivo",
+            "ca": "El pavelló esportiu"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "The town theatre",
+            "en": "The town theatre",
+            "es": "El teatro municipal",
+            "ca": "El teatre municipal"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

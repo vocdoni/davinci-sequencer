@@ -1,0 +1,42 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "What should next year's membership fee be?",
+    "en": "What should next year's membership fee be?",
+    "es": "¿Cuál debería ser la cuota del año que viene?",
+    "ca": "Quina hauria de ser la quota de l'any vinent?"
+  },
+  "description": {
+    "default": "The association is setting next year's annual membership fee. Enter the amount in euros, from 0 to 100, that you think is fair. The fee will be the average of all answers, rounded to the nearest euro.",
+    "en": "The association is setting next year's annual membership fee. Enter the amount in euros, from 0 to 100, that you think is fair. The fee will be the average of all answers, rounded to the nearest euro.",
+    "es": "La asociación fija la cuota anual del año que viene. Escribe la cantidad en euros, de 0 a 100, que te parezca justa. La cuota será la media de todas las respuestas, redondeada al euro.",
+    "ca": "L'associació fixa la quota anual de l'any vinent. Escriu la quantitat en euros, de 0 a 100, que et sembli justa. La quota serà la mitjana de totes les respostes, arrodonida a l'euro."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "How much should the annual fee be, in euros?",
+        "en": "How much should the annual fee be, in euros?",
+        "es": "¿Cuánto debería ser la cuota anual, en euros?",
+        "ca": "Quant hauria de ser la quota anual, en euros?"
+      },
+      "description": {
+        "default": "A whole number from 0 to 100.",
+        "en": "A whole number from 0 to 100.",
+        "es": "Un número entero de 0 a 100.",
+        "ca": "Un nombre enter de 0 a 100."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Annual fee in euros",
+            "en": "Annual fee in euros",
+            "es": "Cuota anual en euros",
+            "ca": "Quota anual en euros"
+          },
+          "value": 0
+        }
+      ]
+    }
+  ]
+}

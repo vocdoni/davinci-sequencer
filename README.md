@@ -931,6 +931,37 @@ DAVINCI_E2E_DEMO=run \
   e2e/bench.sh    # organizer key: DAVINCI_DEMO_ORGANIZER_KEY, default ~/gnosis-chain-privkey.txt
 ```
 
+**Second wave.** `DAVINCI_DEMO_WAVE=2` drives nineteen more elections
+(`davinci_e2e::demo::wave2`), most in English, Spanish and Catalan, with their
+own keys (`voters-wave2.json`), state (`state-wave2.json`) and files
+(`e2e/demo/wave2/`). Together they take every davinci-sdk ballot preset plus
+points, weighted, cost-exponent and single-number ballots, and every census
+origin: the updatable census reweights a member while their vote is pending
+(the node errors it with `census changed, recast` and the member votes again)
+and adds members, the census contract grows during voting, and the CSP signs
+weights. Keys come from both nodes and from the DKG, with one locked key
+revealed while voting is open and one after the end. The organizer's controls
+all appear: ends by time and by the organizer, pause and resume, a longer
+duration, more max voters, cancels during voting and before the start, a start
+during the run, metadata updated before the start and while open, and a
+registered hash that does not match its document. A shorter duration is tried
+too; the registry only moves the end later, so it reverts `InvalidDuration`.
+Two elections end with no votes. A 16-option approval takes 400 voters, the
+first 390 in chunks of 130, more than two blobs hold, so the node splits them
+over several transitions, and its 60 revotes come with silent refreshes.
+Between the first two rounds the run sends votes the nodes must refuse and
+checks each answer: a key outside the census (400/40001), a bad signature
+(400/40002), a ballot outside the rules (the client will not prove it; proved
+under looser rules it fails the inputs hash, 400/40002), a reused vote id
+(409/40901) and a vote beyond max voters (412/41202); one after the end
+follows at the close (412/41201). The report compares every tally, final
+status and voter count with the votes that settled. A run takes about 80
+minutes, more when the provers are busy.
+
+```bash
+DAVINCI_DEMO_WAVE=2 DAVINCI_E2E_DEMO=prepare e2e/bench.sh    # then check and run as above
+```
+
 Without `DAVINCI_SEQUENCER_BIN`, the test builds the node with
 `cargo build --release -p davinci-sequencer`. On failure it keeps the node logs,
 anvil log and datadirs and prints their paths. `DAVINCI_E2E_NODE_LOG` sets the

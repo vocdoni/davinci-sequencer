@@ -1,0 +1,94 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Parents' association: new after-school activities",
+    "en": "Parents' association: new after-school activities",
+    "es": "AMPA: nuevas actividades extraescolares",
+    "ca": "AFA: noves activitats extraescolars"
+  },
+  "description": {
+    "default": "The school can add up to three after-school activities next term. Choose between one and three; the most requested ones start in January.",
+    "en": "The school can add up to three after-school activities next term. Choose between one and three; the most requested ones start in January.",
+    "es": "La escuela puede añadir hasta tres actividades extraescolares el próximo trimestre. Elige entre una y tres; las más pedidas empezarán en enero.",
+    "ca": "L'escola pot afegir fins a tres activitats extraescolars el trimestre vinent. Tria'n entre una i tres; les més demanades començaran al gener."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Which activities would your family sign up for?",
+        "en": "Which activities would your family sign up for?",
+        "es": "¿Qué actividades elegiría tu familia?",
+        "ca": "Quines activitats triaria la teva família?"
+      },
+      "description": {
+        "default": "Choose between one and three.",
+        "en": "Choose between one and three.",
+        "es": "Elige entre una y tres.",
+        "ca": "Tria'n entre una i tres."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Robotics",
+            "en": "Robotics",
+            "es": "Robótica",
+            "ca": "Robòtica"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Chess",
+            "en": "Chess",
+            "es": "Ajedrez",
+            "ca": "Escacs"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Theatre",
+            "en": "Theatre",
+            "es": "Teatro",
+            "ca": "Teatre"
+          },
+          "value": 2
+        },
+        {
+          "title": {
+            "default": "Swimming",
+            "en": "Swimming",
+            "es": "Natación",
+            "ca": "Natació"
+          },
+          "value": 3
+        },
+        {
+          "title": {
+            "default": "Choir",
+            "en": "Choir",
+            "es": "Coro",
+            "ca": "Coral"
+          },
+          "value": 4
+        },
+        {
+          "title": {
+            "default": "School garden",
+            "en": "School garden",
+            "es": "Huerto escolar",
+            "ca": "Hort escolar"
+          },
+          "value": 5
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "multiple_choice",
+      "maxSelections": 3,
+      "minSelections": 1
+    }
+  }
+}
