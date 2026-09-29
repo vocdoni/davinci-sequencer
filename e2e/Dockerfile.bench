@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 
-# Runs the e2e benchmarks (tests/throughput.rs, tests/bench.rs) and the demo
-# driver (tests/demo.rs) with nothing native on the host: the nodes are the
-# published image's binary, anvil and forge come from foundry, and the
-# harness is built at run time from the mounted source trees. Nothing is
-# copied from a build context:
+# Runs the e2e benchmarks (tests/throughput.rs, tests/bench.rs), the
+# acceptance test (tests/e2e.rs) and the demo driver (tests/demo.rs) with
+# nothing native on the host: the nodes are the published image's binary,
+# anvil and forge come from foundry, and the harness is built at run time
+# from the mounted source trees. Nothing is copied from a build context:
 #
 #   docker build -t davinci-sequencer-bench - < e2e/Dockerfile.bench
 #

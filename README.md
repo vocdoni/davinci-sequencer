@@ -866,6 +866,9 @@ The node binary is built from `DAVINCI_DKG_DIR` (default `../davinci-dkg`) unles
 `DAVINCI_E2E_DKG_NODE_BIN` is set; artifacts go to `~/.cache/davinci-dkg-artifacts` (~1.1 GB
 on first download). A live run uses the external committee of the registry
 adapter's `DKGManager` (`DAVINCI_E2E_DKG_MANAGER` overrides it) and starts no nodes.
+Each DKG process takes one of the 16 keys of the committee's current epoch; once they are
+spent the committee opens the next epoch on its own, and the harness waits for it to go
+Live before it creates another.
 
 **Live runs.** `DAVINCI_E2E_LIVE=1` runs the same scenario on an existing
 deployment, by default the `gnosis` network of `davinci_client::networks`
@@ -877,7 +880,8 @@ separated), prints only addresses, checks the registry pins first and wants 0.05
 of the native token in every account. `DAVINCI_E2E_RESILIENCE=1` adds full RPC,
 prover and beacon outages and an observer RPC failover, through loopback
 proxies. `DAVINCI_E2E_NEGATIVE=1` replays settled transactions, tampered, through
-`eth_call`. Every run ends with its gas bill.
+`eth_call`. Every run ends with its gas bill, which counts only the processes it
+created (a live registry is shared).
 
 **Benchmark.** `DAVINCI_E2E_BENCH=sizes cargo test -p davinci-e2e --test bench --
 --nocapture` proves a first and a steady batch per size on one node (sizes from
@@ -926,6 +930,25 @@ DAVINCI_E2E_BENCH=sizes e2e/bench.sh    # the batch-size benchmark
 The sibling checkouts default to the directories next to this one.
 `DAVINCI_ZKVM_DIR`, `DAVINCI_CONTRACTS_DIR`, `DAVINCI_CENSUS_CONTRACT_DIR`
 and `CIRCOM_ARTIFACTS` point the script elsewhere.
+
+**Acceptance test in Docker.** With `DAVINCI_E2E=1` the script runs
+`tests/e2e.rs` in the same image, on the node binary of the release,
+`ghcr.io/vocdoni/davinci-sequencer:latest` (`NODE_IMAGE` overrides it). The
+`DAVINCI_E2E_*` flags pass through. Live, the key files named by
+`DAVINCI_E2E_ORGANIZER_KEY` and `DAVINCI_E2E_SEQUENCER_KEYS` are mounted
+read-only and handed to the test under their container paths. The census
+contract project is mounted writable, since the scenario runs `forge build`
+in it. The DKG scenarios run only live: on anvil they need a
+`davinci-dkg-node` build that the image cannot make. The log is
+`~/.cache/davinci-bench/e2e-<time>.log`; a failed run leaves its node logs and
+datadirs next to it.
+
+```bash
+DAVINCI_E2E=1 DAVINCI_E2E_LIVE=1 DAVINCI_E2E_DKG=1 DAVINCI_E2E_NEGATIVE=1 \
+  DAVINCI_E2E_ORGANIZER_KEY=/path/to/organizer.key \
+  DAVINCI_E2E_SEQUENCER_KEYS=/path/to/seq1.key,/path/to/seq2.key,/path/to/seq3.key \
+  DAVINCI_ZKVM_URL=http://127.0.0.1:8080 e2e/bench.sh
+```
 
 **Demo elections.** `e2e/tests/demo.rs`, gated by `DAVINCI_E2E_DEMO`, fills a
 live deployment with eight elections, one of every ballot kind, census origin,

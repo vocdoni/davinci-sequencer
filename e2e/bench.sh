@@ -21,13 +21,24 @@
 # key file DAVINCI_DEMO_ORGANIZER_KEY (default ~/gnosis-chain-privkey.txt)
 # read-only.
 #
+# With DAVINCI_E2E=1 it runs the acceptance test (tests/e2e.rs) instead, on
+# the released node image (NODE_IMAGE default ...:latest). Live, the key
+# files named by DAVINCI_E2E_ORGANIZER_KEY and DAVINCI_E2E_SEQUENCER_KEYS
+# are mounted read-only and passed on under their container paths:
+#
+#   DAVINCI_E2E=1 DAVINCI_E2E_LIVE=1 DAVINCI_E2E_DKG=1 DAVINCI_E2E_NEGATIVE=1 \
+#     DAVINCI_E2E_ORGANIZER_KEY=/path/org.key \
+#     DAVINCI_E2E_SEQUENCER_KEYS=/path/seq1.key,/path/seq2.key,/path/seq3.key \
+#     DAVINCI_ZKVM_URL=http://127.0.0.1:8080 e2e/bench.sh
+#
 # Host paths (defaults: siblings of this checkout): DAVINCI_ZKVM_DIR,
 # DAVINCI_CONTRACTS_DIR (branch zkvm, with submodules; forge writes its
 # out/ and cache there), DAVINCI_CENSUS_CONTRACT_DIR, CIRCOM_ARTIFACTS.
 # BENCH_RUNS (default ~/.cache/davinci-bench) gets the report, the log and,
 # on failure, the node logs and datadirs; BENCH_LOG overrides the log path.
 # BENCH_MEMORY caps the container (default 24g); the provers run elsewhere.
-# NODE_IMAGE picks the node build (default ghcr.io/vocdoni/davinci-sequencer:main);
+# NODE_IMAGE picks the node build (default ghcr.io/vocdoni/davinci-sequencer:main,
+# :latest for the acceptance test);
 # BENCH_PULL=0 skips refreshing it and the base images.
 set -euo pipefail
 
@@ -81,6 +92,44 @@ if [[ -n $demo ]]; then
     esac
     test=demo
     kind=demo-$demo
+elif [[ ${DAVINCI_E2E:-} == 1 ]]; then
+    for d in "$contracts/src" "$census/src" "$circom"; do
+        need_dir "$d"
+    done
+    need_zkey
+    node_image=${NODE_IMAGE:-ghcr.io/vocdoni/davinci-sequencer:latest}
+    test=e2e
+    kind=e2e
+    : "${BENCH_NAME:=davinci-e2e}"
+    # The scenario runs forge build in the census project, so it is writable.
+    mounts+=(
+        -e DAVINCI_E2E=1
+        -v "$contracts:$contracts" -e "DAVINCI_CONTRACTS_DIR=$contracts"
+        -v "$census:$census" -e "DAVINCI_CENSUS_CONTRACT_DIR=$census"
+        -v "$circom:/work/davinci-circom/artifacts:ro"
+    )
+    if [[ ${DAVINCI_E2E_LIVE:-} == 1 ]]; then
+        # Absolute paths: docker takes a relative one for a volume name.
+        org=${DAVINCI_E2E_ORGANIZER_KEY:-}
+        [[ -f $org ]] || { echo "DAVINCI_E2E_ORGANIZER_KEY: no key file '$org'" >&2; exit 1; }
+        mounts+=(-v "$(realpath "$org"):/e2e-keys/organizer.key:ro"
+            -e DAVINCI_E2E_ORGANIZER_KEY=/e2e-keys/organizer.key)
+        IFS=, read -ra seq_keys <<< "${DAVINCI_E2E_SEQUENCER_KEYS:-}"
+        paths=()
+        for k in "${seq_keys[@]}"; do
+            [[ -n $k ]] || continue
+            [[ -f $k ]] || { echo "DAVINCI_E2E_SEQUENCER_KEYS: no key file '$k'" >&2; exit 1; }
+            paths+=("/e2e-keys/seq${#paths[@]}.key")
+            mounts+=(-v "$(realpath "$k"):${paths[-1]}:ro")
+        done
+        (( ${#paths[@]} )) || { echo "DAVINCI_E2E_SEQUENCER_KEYS: no key files" >&2; exit 1; }
+        mounts+=(-e "DAVINCI_E2E_SEQUENCER_KEYS=$(IFS=,; echo "${paths[*]}")")
+        # Mapped to their container paths above, not passed through.
+        unset DAVINCI_E2E_ORGANIZER_KEY DAVINCI_E2E_SEQUENCER_KEYS
+    elif [[ ${DAVINCI_E2E_DKG:-} == 1 ]]; then
+        echo "DAVINCI_E2E_DKG on anvil builds davinci-dkg-node, which the image cannot: run it live" >&2
+        exit 1
+    fi
 else
     for d in "$contracts/src" "$census/src" "$circom"; do
         need_dir "$d"
@@ -103,7 +152,7 @@ fi
 mkdir -p "$runs"
 stamp=$(date -u +%Y%m%d-%H%M%S)
 log=${BENCH_LOG:-$runs/$kind-$stamp.log}
-[[ -n $demo ]] || export DAVINCI_E2E_BENCH_OUT=/runs/$kind-$stamp.md
+[[ -n $demo || $test == e2e ]] || export DAVINCI_E2E_BENCH_OUT=/runs/$kind-$stamp.md
 
 pull=()
 if [[ ${BENCH_PULL:-1} != 0 ]]; then
@@ -123,7 +172,7 @@ done < <(compgen -e | grep -E '^DAVINCI_E2E_|^DAVINCI_ZKVM_URL$|^DAVINCI_DEMO_' 
 {
     echo "node image: $(docker image inspect --format '{{index .RepoDigests 0}}' \
         "$node_image" 2>/dev/null || echo "$node_image")"
-    [[ -n $demo ]] || echo "report: $runs/$kind-$stamp.md"
+    [[ -n $demo || $test == e2e ]] || echo "report: $runs/$kind-$stamp.md"
 } | tee "$log"
 
 # Host network: provers and nodes on loopback and on the private network are
