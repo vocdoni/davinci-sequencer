@@ -13,8 +13,9 @@ use alloy::rpc::client::{ClientBuilder, RpcClient};
 use alloy::rpc::types::TransactionReceipt;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
+use alloy::transports::TransportError;
 use alloy::transports::http::{Http, reqwest};
-use alloy::transports::layers::RetryBackoffLayer;
+use alloy::transports::layers::{RateLimitRetryPolicy, RetryBackoffLayer, RetryPolicy};
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::census::{LeanImt, census_leaf};
 use davinci_zkvm_sdk::crypto::babyjubjub::{Point, SUBGROUP_ORDER};
@@ -85,6 +86,29 @@ pub const USER_AGENT: &str = concat!("davinci-client/", env!("CARGO_PKG_VERSION"
 /// Default wait for a transaction receipt.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Retries of a rate-limited request, a second apart: the public Gnosis RPCs
+/// refuse a busy host for a minute or two at a time, so three minutes.
+const RATE_LIMIT_RETRIES: u32 = 180;
+const RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
+
+/// alloy's rate-limit policy with the server's backoff hint (`Retry-After`,
+/// up to 5 min in alloy) capped at [`RATE_LIMIT_BACKOFF_MS`], so the
+/// retries stay within their three minutes.
+#[derive(Clone, Copy, Debug, Default)]
+struct CappedRateLimit(RateLimitRetryPolicy);
+
+impl RetryPolicy for CappedRateLimit {
+    fn should_retry(&self, e: &TransportError) -> bool {
+        self.0.should_retry(e)
+    }
+
+    fn backoff_hint(&self, e: &TransportError) -> Option<Duration> {
+        self.0
+            .backoff_hint(e)
+            .map(|h| h.min(Duration::from_millis(RATE_LIMIT_BACKOFF_MS)))
+    }
+}
+
 /// An HTTP RPC client sending `user_agent` that backs off and retries when
 /// the RPC rate-limits (public RPCs answer bursts with 429 or -32005).
 pub fn rpc_client(url: &str, user_agent: &str) -> Result<RpcClient> {
@@ -97,7 +121,12 @@ pub fn rpc_client(url: &str, user_agent: &str) -> Result<RpcClient> {
         .unwrap_or_default();
     let is_local = Http::with_client(http.clone(), url.clone()).guess_local();
     Ok(ClientBuilder::default()
-        .layer(RetryBackoffLayer::new(10, 1000, 10_000))
+        .layer(RetryBackoffLayer::new_with_policy(
+            RATE_LIMIT_RETRIES,
+            RATE_LIMIT_BACKOFF_MS,
+            10_000,
+            CappedRateLimit::default(),
+        ))
         .transport(Http::with_client(http, url), is_local))
 }
 
@@ -971,4 +1000,78 @@ async fn read_process(
         metadata_hash: p.metadataHash.0,
         dkg,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn rate_limit_retries_outlast_a_public_rpc_refusal() {
+        assert!(u64::from(RATE_LIMIT_RETRIES) * RATE_LIMIT_BACKOFF_MS >= 150_000);
+    }
+
+    // One HTTP request off `s`: its JSON-RPC id.
+    async fn read_id(s: &mut tokio::net::TcpStream) -> serde_json::Value {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = s.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed mid-request");
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if body.len() >= len {
+                let req: serde_json::Value = serde_json::from_str(&body[..len]).unwrap();
+                return req["id"].clone();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rides_out_a_rate_limit() {
+        // Refuses twice the way a busy public RPC does, asking for an hour's
+        // pause, then answers.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen = Arc::new(AtomicU32::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let id = read_id(&mut s).await;
+                let (status, body) = if count.fetch_add(1, Ordering::SeqCst) < 2 {
+                    (
+                        "429 Too Many Requests",
+                        "<title>429</title>429 Too Many Requests".to_string(),
+                    )
+                } else {
+                    let r = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": "0x10"});
+                    ("200 OK", r.to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nretry-after: 3600\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let p = ProviderBuilder::new().connect_client(rpc_client(&url, "test").unwrap());
+        let n = tokio::time::timeout(Duration::from_secs(20), p.get_block_number())
+            .await
+            .expect("the retries honoured the hour-long Retry-After");
+        assert_eq!(n.unwrap(), 16);
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+    }
 }
