@@ -337,6 +337,9 @@ pub enum ActorError {
     /// The process no longer accepts votes.
     #[error("process closed: {0}")]
     Closed(String),
+    /// Voting opens at this unix time.
+    #[error("not open yet: voting starts at {0}")]
+    NotStarted(u64),
     /// The process is at `max_voters`; only overwrites of occupied slots fit.
     #[error("max voters reached")]
     MaxVoters,
@@ -999,6 +1002,13 @@ impl Actor {
     }
 
     fn accepting(&self) -> bool {
+        self.not_closed()
+            && self.chain_time >= self.record.onchain.start_time
+            && self.chain_time < self.end_time()
+    }
+
+    /// Active, Ready or Paused, and the head time known.
+    fn not_closed(&self) -> bool {
         // Paused still accepts: sealing gates on Ready, so the votes
         // queue and settle on resume.
         // chain_time 0 means "unknown": refuse votes until the first Head
@@ -1009,7 +1019,6 @@ impl Actor {
                 ProcessStatus::Ready | ProcessStatus::Paused
             )
             && self.chain_time != 0
-            && self.chain_time < self.end_time()
     }
 
     fn admit(&mut self, v: VerifiedVote) -> Result<(), ActorError> {
@@ -1017,6 +1026,10 @@ impl Actor {
             return Err(ActorError::WrongProcess);
         }
         if !self.accepting() {
+            let start = self.record.onchain.start_time;
+            if self.not_closed() && self.chain_time < start {
+                return Err(ActorError::NotStarted(start));
+            }
             return Err(ActorError::Closed("not accepting votes".into()));
         }
         if let Some(m) = &self.census_broken {
@@ -1248,6 +1261,11 @@ impl Actor {
         // Never seal into a closing window: the proof would land after the
         // end, revert, and strand its votes.
         if self.chain_time.saturating_add(self.settle_margin) >= self.end_time() {
+            return;
+        }
+        // Nor before the start, where the settlement reverts: admission
+        // waits for it, but a lagging head read can step back past it.
+        if self.chain_time < self.record.onchain.start_time {
             return;
         }
         let oldest = self.pending_at.first().copied().unwrap_or(u64::MAX);

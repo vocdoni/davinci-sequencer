@@ -460,6 +460,16 @@ impl FakeChain {
         i.block += 1;
     }
 
+    /// Sets the head time, backwards too (a lagging endpoint's head).
+    pub fn set_time(&self, t: u64) {
+        self.inner.lock().unwrap().time = t;
+    }
+
+    /// The process opens for votes at `t` (before the node boots).
+    pub fn set_start_time(&self, t: u64) {
+        self.inner.lock().unwrap().proc.start_time = t;
+    }
+
     pub fn fail_process(&self, n: u32) {
         self.inner.lock().unwrap().fail_process = n;
     }
@@ -806,6 +816,9 @@ pub fn revert(name: &str) -> RevertReason {
 pub fn check_transition(i: &Inner, p: &BatchPublics) -> Result<(), RevertReason> {
     if i.proc.status != ProcessStatus::Ready || i.time >= i.proc.start_time + i.proc.duration {
         return Err(revert("InvalidStatus"));
+    }
+    if i.time < i.proc.start_time {
+        return Err(revert("InvalidTimeBounds"));
     }
     if p.root_before != i.proc.state_root {
         return Err(revert("InvalidStateRoot"));

@@ -492,6 +492,105 @@ async fn paused_process_queues_votes_until_resume() {
     shutdown.cancel();
 }
 
+/// Before its start time a process refuses votes as not open yet (a sealed
+/// batch would revert `InvalidTimeBounds`); from the start it takes them.
+#[tokio::test]
+async fn votes_before_the_start_are_refused() {
+    let s = setup(2, 8, None);
+    s.chain.set_start_time(T0 + 1000);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 100);
+    let vid = v.pkg.vote_id;
+    assert!(matches!(
+        h.submit(v.clone()).await,
+        Err(ActorError::NotStarted(t)) if t == T0 + 1000
+    ));
+    assert!(!h.snapshot().await.unwrap().accepting);
+    assert_eq!(vote_status(&h, vid).await, None, "nothing stored");
+    s.chain.advance_time(1000);
+    wait_until("open at the start", async || {
+        h.snapshot().await.unwrap().accepting
+    })
+    .await;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    assert_eq!(prover.calls(), 1);
+    shutdown.cancel();
+}
+
+/// Queued votes are not sealed while the head reads before the start (a
+/// lagging endpoint after a restart): the batch could only revert.
+#[tokio::test]
+async fn no_seal_while_the_head_is_before_the_start() {
+    let s = setup(2, 8, None);
+    s.chain.set_start_time(T0);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        3,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 110 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        h.submit(v.clone()).await.unwrap();
+    }
+    shutdown.cancel();
+    drop(node);
+
+    // Restarted behind an endpoint whose head predates the start, with a
+    // batch size the two queued votes fill.
+    s.chain.set_time(T0 - 60);
+    let prover = FakeProver::open();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prover.calls(), 0, "sealed before the start");
+    assert_eq!(h.snapshot().await.unwrap().pending, 2);
+    s.chain.set_time(T0);
+    wait_until("settled from the start", async || {
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn node_without_key_does_not_finalize() {
     // Not a derived key at all.

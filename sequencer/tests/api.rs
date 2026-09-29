@@ -436,6 +436,37 @@ async fn closed_process_answers_412() {
 }
 
 #[tokio::test]
+async fn process_before_its_start_answers_412_41204() {
+    let s = setup(2, 4, None);
+    s.chain.set_start_time(T0 + 600);
+    let t = serve_with(s, FakeProver::gated(), 100, &[]).await;
+    handle(&t.node).await;
+    let p = t.client.process(&pid31()).await.unwrap();
+    assert_eq!(p.status, wire::ProcessStatus::Ready);
+    assert!(!p.is_accepting_votes);
+    let req = wire_vote(&real_vote(&t.s.env, 0, &[1, 2], 5));
+    match t.client.submit_vote(&req).await.unwrap_err() {
+        ClientError::Api {
+            status,
+            code,
+            message,
+        } => {
+            assert_eq!((status, code), (412, Some(41204)));
+            assert!(message.contains("not open yet"), "{message}");
+        }
+        e => panic!("expected an api error, got {e:?}"),
+    }
+    // Open from the start time on.
+    t.s.chain.advance_time(600);
+    wait_until("accepting at the start", async || {
+        t.client.process(&pid31()).await.unwrap().is_accepting_votes
+    })
+    .await;
+    t.client.submit_vote(&req).await.unwrap();
+    t.shutdown.cancel();
+}
+
+#[tokio::test]
 async fn max_voters_answers_412_with_its_own_code() {
     let s = setup(2, 4, None);
     s.chain.set_max_voters(1);

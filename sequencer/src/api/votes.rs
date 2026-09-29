@@ -86,7 +86,8 @@ pub(super) async fn current_proof(
 
 /// `POST /votes`. A paused process still accepts votes: sealing is
 /// gated on `ready`, so they queue locally and settle on resume; only
-/// `ended`/`canceled`/past-end refuse with 41201.
+/// `ended`/`canceled`/past-end refuse with 41201, and a process before its
+/// start time with 41204.
 pub async fn submit(
     State(st): State<AppState>,
     payload: Result<Json<VoteRequest>, JsonRejection>,

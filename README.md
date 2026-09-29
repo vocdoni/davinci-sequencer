@@ -331,12 +331,12 @@ lengths exact, and vote bodies carry no unknown fields.
 | GET | `/ping` | Liveness (`pong`). | |
 | GET | `/info` | Sequencer address (`null` for an observer), chain id, registry, ballot VK hash, both program vks, `observer`, and the counters `settledBySelf`, `syncedFromOthers`, `lostRaces`. | |
 | GET | `/processes` | Process ids this node knows. | |
-| GET | `/processes/{pid}` | On-chain parameters plus the node's view: `isAcceptingVotes`, `localStateRoot` (its committed tree root), `result` once on-chain, and `ignored`/`note` when the node refused to serve the process. | 40001, 40402 |
+| GET | `/processes/{pid}` | On-chain parameters plus the node's view: `isAcceptingVotes` (false before the start time too), `localStateRoot` (its committed tree root), `result` once on-chain, and `ignored`/`note` when the node refused to serve the process. | 40001, 40402 |
 | POST | `/processes/keys` | Body `{"processId"}`: this node's election key for that (future) process id, as `{x, y}`. The key is derived, not stored, so the same id always gets the same key. Organizers ask for the registry's `getNextProcessId(organizer)`. | 40001, 41203, 42901 |
 | GET | `/processes/{pid}/participants/{address}` | Weight and Merkle census proof, which voters need to build a ballot. Merkle census only. | 40001, 40402, 40401 (not a member, or a CSP census) |
 | GET | `/processes/{pid}/transitions` | The settled transitions: roots, tx hash, block, sender, voters, overwrites, blob count. | 40001, 40402 |
 | GET | `/processes/{pid}/transitions/{index}/blobs` | The raw blobs of one transition, `0x` hex. | 40001, 40402, 40401 |
-| POST | `/votes` | Submit a vote. A paused process still accepts votes: they queue locally and settle when the process resumes (only `ended`/`canceled`/past-end refuse with 41201). | see below |
+| POST | `/votes` | Submit a vote. A paused process still accepts votes: they queue locally and settle when the process resumes (only `ended`/`canceled`/past-end refuse with 41201, and a process before its start time with 41204). | see below |
 | GET | `/votes/{pid}/voteId/{voteId}` | Vote status. | 40001, 40402, 40401 |
 | GET | `/votes/{pid}/voteId/{voteId}/proof` | Tracker proof: the vote-id leaf under the node's committed root, which is an on-chain root. `davinci_client::api::verify_tracker` checks it. | 40001, 40402, 40401 |
 | GET | `/votes/{pid}/address/{address}` | The ballot currently stored in that voter's slot (re-encrypted). For a CSP census, only addresses this node served. | 40001, 40402, 40401 |
@@ -383,6 +383,7 @@ detail goes to the node log. A request that runs longer than 60 s gets a 408.
 | 412 | 41201 | The process does not accept votes. |
 | 412 | 41202 | Max voters reached. |
 | 412 | 41203 | Observer node. |
+| 412 | 41204 | Not open yet: the process's start time is ahead. |
 | 413 | 41301 | Body over 256 KiB. |
 | 429 | 42901 | Key generation rate limit. |
 | 429 | 42903 | Busy: vote validation at capacity or the process queue full (16384). |

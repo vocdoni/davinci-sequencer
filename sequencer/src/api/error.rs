@@ -45,6 +45,9 @@ pub enum ApiError {
     /// 412 41203: this node has no signing key and never settles.
     #[error("observer node: {0}")]
     Observer(&'static str),
+    /// 412 41204: voting opens at this unix time.
+    #[error("not open yet: voting starts at {0}")]
+    NotStarted(u64),
     /// 413 41301.
     #[error("request body too large")]
     TooLarge,
@@ -72,6 +75,7 @@ impl ApiError {
             ApiError::NotAccepting(_) => (StatusCode::PRECONDITION_FAILED, 41201),
             ApiError::MaxVoters => (StatusCode::PRECONDITION_FAILED, 41202),
             ApiError::Observer(_) => (StatusCode::PRECONDITION_FAILED, 41203),
+            ApiError::NotStarted(_) => (StatusCode::PRECONDITION_FAILED, 41204),
             ApiError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, 41301),
             ApiError::KeyRate => (StatusCode::TOO_MANY_REQUESTS, 42901),
             ApiError::Busy(_) => (StatusCode::TOO_MANY_REQUESTS, 42903),
@@ -99,6 +103,7 @@ impl From<ActorError> for ApiError {
     fn from(e: ActorError) -> Self {
         match e {
             ActorError::Closed(m) => ApiError::NotAccepting(m),
+            ActorError::NotStarted(t) => ApiError::NotStarted(t),
             ActorError::MaxVoters => ApiError::MaxVoters,
             ActorError::Duplicate(v) => ApiError::Duplicate(v),
             ActorError::SlotBusy(s) => ApiError::SlotBusy(s),
