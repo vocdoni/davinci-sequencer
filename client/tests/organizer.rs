@@ -895,3 +895,119 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// Posts a JSON-RPC body to `url`; the raw response body.
+async fn forward(url: &str, body: axum::body::Bytes) -> Vec<u8> {
+    let resp = reqwest::Client::new()
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("anvil reachable");
+    resp.bytes().await.expect("anvil body").to_vec()
+}
+
+// An RPC in front of anvil that forwards the first `eth_sendRawTransaction`
+// but answers it 429: the retry layer resends the mined transaction and anvil
+// refuses the copy. The organizer must take its own transaction as sent. Then
+// a send whose nonce another client took is refused for real, with a hash the
+// chain does not know: that one still fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_of_a_mined_transaction_is_ours() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    if std::env::var("ANVIL").as_deref() != Ok("1") {
+        eprintln!("ANVIL not set, skipping");
+        return Ok(());
+    }
+    let anvil = Anvil::at(anvil_bin()).try_spawn()?;
+    let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let url = anvil.endpoint();
+    let wallet = || {
+        ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer.clone()))
+            .connect_http(url.parse().expect("anvil url"))
+    };
+    let registry = deploy_registry(
+        &wallet(),
+        31337,
+        Address::repeat_byte(0x11),
+        release::BATCH_PROGRAM_VK,
+    )
+    .await?;
+
+    let sends = Arc::new(AtomicUsize::new(0));
+    let (up, n) = (url.clone(), sends.clone());
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |body: axum::body::Bytes| async move {
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let first = req["method"] == "eth_sendRawTransaction" && n.fetch_add(1, SeqCst) == 0;
+            let resp = forward(&up, body).await;
+            if first {
+                (axum::http::StatusCode::TOO_MANY_REQUESTS, Vec::new())
+            } else {
+                (axum::http::StatusCode::OK, resp)
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let proxy = format!("http://{}/", l.local_addr()?);
+    tokio::spawn(async move { axum::serve(l, app).await });
+
+    let org = Organizer::connect(&proxy, signer.clone(), registry)?
+        .with_receipt_timeout(std::time::Duration::from_secs(30));
+    let rpc = ProviderBuilder::new().connect_http(url.parse()?);
+    let nonce = rpc.get_transaction_count(org.address()).await?;
+    let params = NewProcess {
+        process_id: org.next_process_id().await?,
+        start_time: 0,
+        duration: 3600,
+        max_voters: 24,
+        ballot_mode: BallotMode {
+            num_fields: 4,
+            group_size: 1,
+            unique_values: false,
+            cost_exponent: 1,
+            max_value: 5,
+            min_value: 0,
+            max_value_sum: 0,
+            min_value_sum: 0,
+        },
+        census_origin: 1,
+        census_root: Fr::from(123456789u64),
+        census_contract: [0; 20],
+        census_uri: "file:///tmp/census.json".into(),
+        metadata: "ipfs://metadata".into(),
+        metadata_hash: metadata_hash(DOC),
+        key_mode: KeyMode::Sequencer(Point::generator().mul(&U256::from(4242u64))),
+    };
+    let pid = org.create_process(&params).await?.pid;
+    assert_eq!(pid, params.process_id);
+    assert_eq!(sends.load(SeqCst), 2, "the send was retried");
+    assert_eq!(rpc.get_transaction_count(org.address()).await?, nonce + 1);
+    let receipts = org.receipts();
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0].status());
+    assert_eq!(org.process(&pid).await?.status, ProcessStatus::Ready);
+
+    // Another client takes the nonce the organizer has cached next.
+    wallet()
+        .send_transaction(
+            TransactionRequest::default()
+                .with_to(Address::repeat_byte(0x33))
+                .with_value(alloy::primitives::U256::from(1u64)),
+        )
+        .await?
+        .get_receipt()
+        .await?;
+    let e = org.end_process(&pid).await.unwrap_err();
+    assert!(
+        matches!(&e, Error::Chain(m) if m.contains("nonce too low")),
+        "{e}"
+    );
+    assert_eq!(org.receipts().len(), 1);
+    assert_eq!(org.process(&pid).await?.status, ProcessStatus::Ready);
+    Ok(())
+}

@@ -8,9 +8,13 @@ use std::time::Duration;
 
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, FixedBytes, U256, keccak256};
-use alloy::providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder};
+use alloy::providers::fillers::{FillProvider, JoinFill, WalletFiller};
+use alloy::providers::utils::JoinedRecommendedFillers;
+use alloy::providers::{
+    DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder, RootProvider,
+};
 use alloy::rpc::client::{ClientBuilder, RpcClient};
-use alloy::rpc::types::TransactionReceipt;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::transports::TransportError;
@@ -343,6 +347,22 @@ fn chain_err(e: alloy::contract::Error) -> Error {
     Error::Chain(e.to_string())
 }
 
+// A send refused because this nonce is taken: by an earlier copy of the same
+// tx (geth "already known", anvil/reth "already imported", Nethermind
+// "AlreadyKnown", Besu "Known transaction") or by any mined one.
+fn raced(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "nonce too low",
+        "already known",
+        "already imported",
+        "alreadyknown",
+        "known transaction",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
+}
+
 fn check_receipt(r: &TransactionReceipt) -> Result<()> {
     if !r.status() {
         return Err(Error::Chain(format!(
@@ -366,10 +386,16 @@ fn dkg_params(mode: u8) -> DAVINCITypes::DKGParams {
     }
 }
 
+// Recommended fillers (cached nonce) plus the organizer's wallet.
+type Signing =
+    FillProvider<JoinFill<JoinedRecommendedFillers, WalletFiller<EthereumWallet>>, RootProvider>;
+
 /// Sends registry transactions from the organizer account.
 #[derive(Clone, Debug)]
 pub struct Organizer {
     registry: ProcessRegistryInstance<DynProvider>,
+    /// The registry's provider, unerased: fills and signs before sending.
+    signing: Signing,
     sender: Address,
     /// Every mined receipt, in order (gas accounting).
     receipts: Arc<Mutex<Vec<TransactionReceipt>>>,
@@ -381,12 +407,12 @@ pub struct Organizer {
 impl Organizer {
     pub fn connect(url: &str, signer: PrivateKeySigner, registry: Address) -> Result<Self> {
         let sender = signer.address();
-        let provider = ProviderBuilder::new()
+        let signing = ProviderBuilder::new()
             .wallet(EthereumWallet::from(signer))
-            .connect_client(rpc_client(url, USER_AGENT)?)
-            .erased();
+            .connect_client(rpc_client(url, USER_AGENT)?);
         Ok(Organizer {
-            registry: ProcessRegistry::new(registry, provider),
+            registry: ProcessRegistry::new(registry, signing.clone().erased()),
+            signing,
             sender,
             receipts: Arc::default(),
             created: Arc::default(),
@@ -416,6 +442,35 @@ impl Organizer {
         self.receipts.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
+    // Fills, signs and sends `tx`, then waits in `mined`. The RPC client
+    // retries a send whose answer got lost; the copy is refused once the
+    // first one is in, and the tx is ours if the chain knows its hash.
+    async fn send(&self, tx: TransactionRequest) -> Result<TransactionReceipt> {
+        let env = self
+            .signing
+            .fill(tx)
+            .await
+            .map_err(|e| chain_err(e.into()))?
+            .try_into_envelope()
+            .map_err(|e| Error::Chain(format!("transaction not signed: {e}")))?;
+        let hash = *env.tx_hash();
+        let pending = match self.signing.send_tx_envelope(env).await {
+            Ok(p) => p,
+            Err(e)
+                if raced(&e.to_string())
+                    && matches!(
+                        self.signing.get_transaction_by_hash(hash).await,
+                        Ok(Some(_))
+                    ) =>
+            {
+                tracing::warn!(%hash, error = %e, "resend refused, the chain has the tx");
+                PendingTransactionBuilder::new(self.signing.root().clone(), hash)
+            }
+            Err(e) => return Err(chain_err(e.into())),
+        };
+        self.mined(pending).await
+    }
+
     // Waits for the receipt, records it and fails on a revert.
     async fn mined(
         &self,
@@ -443,7 +498,6 @@ impl Organizer {
     async fn mined_revert(&self, hash: B256) -> Option<String> {
         use alloy::consensus::Transaction as _;
         use alloy::network::TransactionResponse as _;
-        use alloy::rpc::types::TransactionRequest;
         let p = self.registry.provider();
         let tx = p.get_transaction_by_hash(hash).await.ok()??;
         let req = TransactionRequest::default()
@@ -580,7 +634,7 @@ impl Organizer {
         );
         // Simulate first so a revert comes back with its name.
         call.call().await.map_err(chain_err)?;
-        let receipt = self.mined(call.send().await.map_err(chain_err)?).await?;
+        let receipt = self.send(call.into_transaction_request()).await?;
         let registry = *self.registry.address();
         let pid = receipt
             .logs()
@@ -668,7 +722,7 @@ impl Organizer {
             .registry
             .revealProcessKey(FixedBytes(*pid), U256::from_be_bytes(sk.to_be_bytes()));
         call.call().await.map_err(chain_err)?;
-        self.mined(call.send().await.map_err(chain_err)?).await?;
+        self.send(call.into_transaction_request()).await?;
         Ok(())
     }
 
@@ -706,7 +760,7 @@ impl Organizer {
             .registry
             .setProcessDuration(FixedBytes(*pid), U256::from(duration));
         call.call().await.map_err(chain_err)?;
-        self.mined(call.send().await.map_err(chain_err)?).await?;
+        self.send(call.into_transaction_request()).await?;
         Ok(())
     }
 
@@ -716,7 +770,7 @@ impl Organizer {
     pub async fn set_process_grace(&self, pid: &[u8; 31], secs: u32) -> Result<()> {
         let call = self.registry.setProcessGrace(FixedBytes(*pid), secs);
         call.call().await.map_err(chain_err)?;
-        self.mined(call.send().await.map_err(chain_err)?).await?;
+        self.send(call.into_transaction_request()).await?;
         Ok(())
     }
 
@@ -727,7 +781,7 @@ impl Organizer {
             .registry
             .setProcessMaxVoters(FixedBytes(*pid), U256::from(max_voters));
         call.call().await.map_err(chain_err)?;
-        self.mined(call.send().await.map_err(chain_err)?).await?;
+        self.send(call.into_transaction_request()).await?;
         Ok(())
     }
 
@@ -758,7 +812,7 @@ impl Organizer {
     async fn set_status(&self, pid: &[u8; 31], status: u8) -> Result<()> {
         let call = self.registry.setProcessStatus(FixedBytes(*pid), status);
         call.call().await.map_err(chain_err)?;
-        self.mined(call.send().await.map_err(chain_err)?).await?;
+        self.send(call.into_transaction_request()).await?;
         Ok(())
     }
 
@@ -774,7 +828,7 @@ impl Organizer {
         };
         let call = self.registry.setProcessCensus(FixedBytes(*pid), census);
         call.call().await.map_err(chain_err)?;
-        self.mined(call.send().await.map_err(chain_err)?).await?;
+        self.send(call.into_transaction_request()).await?;
         Ok(())
     }
 
@@ -790,7 +844,7 @@ impl Organizer {
         let (pid, hash) = (FixedBytes(*pid), B256::from(hash));
         let call = self.registry.setProcessMetadata(pid, uri.to_string(), hash);
         call.call().await.map_err(chain_err)?;
-        self.mined(call.send().await.map_err(chain_err)?).await?;
+        self.send(call.into_transaction_request()).await?;
         Ok(())
     }
 
