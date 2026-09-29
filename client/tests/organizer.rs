@@ -826,17 +826,24 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
     b.process_id = org2.next_process_id().await?;
     let rpc = ProviderBuilder::new().connect_http(url.parse()?);
     let _: () = rpc.raw_request("evm_setAutomine".into(), (false,)).await?;
+    // One block takes both creates. Bounded, and the block is mined and
+    // automine restored either way, so a create that never reaches the pool
+    // fails the test instead of leaving both waiting on receipts.
     let miner = || async {
-        loop {
-            let st: serde_json::Value = rpc.raw_request("txpool_status".into(), ()).await?;
-            if st["pending"] == "0x2" {
-                break;
+        let both = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let st: serde_json::Value = rpc.raw_request("txpool_status".into(), ()).await?;
+                if st["pending"] == "0x2" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+            anyhow::Ok(())
+        })
+        .await;
         let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await?;
         let _: () = rpc.raw_request("evm_setAutomine".into(), (true,)).await?;
-        anyhow::Ok(())
+        both.map_err(|_| anyhow::anyhow!("both creates never reached the pool"))?
     };
     let (ra, rb, m) = tokio::join!(org.create_process(&a), org2.create_process(&b), miner());
     m?;
