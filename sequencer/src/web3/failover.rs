@@ -98,13 +98,16 @@ fn deterministic(p: &ResponsePacket) -> bool {
     p.iter_errors().any(|e| is_deterministic(&e.message))
 }
 
+/// A JSON-RPC error meaning "this node cannot serve it now".
+pub(super) fn is_node_side(code: i64, message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    !is_deterministic(&m) && (code == -32603 || NODE_SIDE.iter().any(|s| m.contains(s)))
+}
+
 /// Why a JSON-RPC answer should fail over, if it should.
 fn node_side(p: &ResponsePacket) -> Option<String> {
     p.iter_errors()
-        .find(|e| {
-            let m = e.message.to_ascii_lowercase();
-            !is_deterministic(&m) && (e.code == -32603 || NODE_SIDE.iter().any(|s| m.contains(s)))
-        })
+        .find(|e| is_node_side(e.code, &e.message))
         .map(|e| format!("{} {}", e.code, e.message))
 }
 

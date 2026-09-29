@@ -11,6 +11,7 @@ use davinci_zkvm_sdk::release;
 
 use super::ProcessRegistry as PR;
 use super::ZiskVerifier as ZV;
+use super::failover::is_node_side;
 use super::{Contracts, Result, Web3Error, rpc_err};
 
 /// What the chain holds where the release pins apply.
@@ -153,13 +154,38 @@ impl Contracts {
             registry_chain_id: self.view(r, PR::chainIDCall {}).await?,
             rpc_chain_id: self.chain_id,
             verifier,
-            verifier_root_c: self
-                .view(verifier, ZV::getRootCVadcopFinalCall {})
-                .await
-                .map(|r| r.0)
-                .map_err(|e| e.to_string()),
+            verifier_root_c: self.verifier_root_c(verifier).await?,
             verifier_codehash: keccak256(&code).0,
         })
+    }
+
+    /// `verifier.getRootCVadcopFinal()`, or why the verifier cannot answer
+    /// it (a revert, a bad return): a mismatch. An RPC that does not answer
+    /// or cannot serve it now (a rate limit, a timeout) is an error, not a
+    /// verdict on the verifier.
+    async fn verifier_root_c(
+        &self,
+        verifier: Address,
+    ) -> Result<std::result::Result<[u8; 32], String>> {
+        let tx = TransactionRequest::default()
+            .with_to(verifier)
+            .with_input(ZV::getRootCVadcopFinalCall {}.abi_encode());
+        match self
+            .provider
+            .call(tx)
+            .block(alloy::eips::BlockId::latest())
+            .await
+        {
+            Ok(out) => Ok(ZV::getRootCVadcopFinalCall::abi_decode_returns(&out)
+                .map(|r| r.0)
+                .map_err(|e| e.to_string())),
+            Err(e) => match e.as_error_resp() {
+                Some(p) if !p.is_retry_err() && !is_node_side(p.code, &p.message) => {
+                    Ok(Err(e.to_string()))
+                }
+                _ => Err(rpc_err(format!("getRootCVadcopFinal(): {e}"))),
+            },
+        }
     }
 
     /// Fails with [`Web3Error::Release`] unless the registry and its verifier
@@ -275,6 +301,10 @@ mod tests {
         /// P256VERIFY calls still to fail with a timeout. (A 429 would rest
         /// the endpoint in the transport, which has its own tests.)
         p256_fail: std::sync::atomic::AtomicUsize,
+        /// The JSON-RPC error `getRootCVadcopFinal` answers with, if any.
+        /// It carries a Retry-After past the transport's wait, so a rate
+        /// limit fails the call at once; other errors ignore it.
+        root_c_error: Option<serde_json::Value>,
         p256_calls: std::sync::atomic::AtomicUsize,
         uas: std::sync::Mutex<Vec<String>>,
     }
@@ -285,8 +315,9 @@ mod tests {
         axum::extract::State(f): axum::extract::State<std::sync::Arc<Fake>>,
         headers: axum::http::HeaderMap,
         axum::Json(req): axum::Json<serde_json::Value>,
-    ) -> axum::Json<serde_json::Value> {
+    ) -> axum::response::Response {
         use alloy::sol_types::SolValue;
+        use axum::response::IntoResponse;
         let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
         f.uas.lock().unwrap().push(ua.unwrap_or("").to_string());
         let ok =
@@ -314,13 +345,21 @@ mod tests {
                     if failing > 0 {
                         f.p256_fail.store(failing - 1, SeqCst);
                         return axum::Json(serde_json::json!({"jsonrpc":"2.0","id":req["id"],
-                            "error":{"code":-32603,"message":"request timeout"}}));
+                            "error":{"code":-32603,"message":"request timeout"}}))
+                        .into_response();
                     }
                     let mut one = vec![0u8; 32];
                     one[31] = 1;
-                    return axum::Json(ok(hex(one)));
+                    return axum::Json(ok(hex(one))).into_response();
                 }
                 let sel: [u8; 4] = input[..4].try_into().unwrap();
+                if sel == ZV::getRootCVadcopFinalCall::SELECTOR
+                    && let Some(e) = &f.root_c_error
+                {
+                    let e = serde_json::json!({"jsonrpc":"2.0","id":req["id"],"error":e});
+                    let after = [(axum::http::header::RETRY_AFTER, "60")];
+                    return (after, axum::Json(e)).into_response();
+                }
                 let b = |x: [u8; 32]| alloy::primitives::B256::from(x).abi_encode();
                 ok(hex(match sel {
                     PR::ziskVerifierCall::SELECTOR => VERIFIER.abi_encode(),
@@ -335,7 +374,7 @@ mod tests {
             }
             m => panic!("unexpected method {m}"),
         };
-        axum::Json(out)
+        axum::Json(out).into_response()
     }
 
     async fn fake_chain(f: Fake) -> (url::Url, std::sync::Arc<Fake>) {
@@ -405,6 +444,43 @@ mod tests {
             )),
             "{err}"
         );
+    }
+
+    // A verifier that reverts is a mismatch; an RPC that refuses the call or
+    // cannot serve it now is an RPC error, not a verdict on the release.
+    #[tokio::test]
+    async fn verifier_call_failures() {
+        let registry = Address::repeat_byte(0x11);
+        for (error, rpc) in [
+            (r#"{"code":-32005,"message":"429 Too Many Requests"}"#, true),
+            (r#"{"code":-32603,"message":"internal error"}"#, true),
+            (r#"{"code":3,"message":"execution reverted"}"#, false),
+            (r#"{"code":-32015,"message":"VM execution error."}"#, false),
+        ] {
+            let (url, _) = fake_chain(Fake {
+                batch_vk: release::BATCH_PROGRAM_VK,
+                root_c_error: Some(serde_json::from_str(error).unwrap()),
+                ..Default::default()
+            })
+            .await;
+            let c = Contracts::new(std::slice::from_ref(&url), registry, None)
+                .await
+                .unwrap();
+            if rpc {
+                let err = c.check_release(&VK_HASH).await.unwrap_err();
+                assert!(
+                    matches!(&err, Web3Error::Rpc(m) if m.contains("getRootCVadcopFinal")),
+                    "{error}: {err}"
+                );
+            } else {
+                let d = c.deployed_release().await.unwrap();
+                assert_eq!(
+                    fields(&d, &VK_HASH),
+                    vec!["verifier.getRootCVadcopFinal", "verifier.codehash"],
+                    "{error}"
+                );
+            }
+        }
     }
 
     // The probe fails closed: retried with backoff, then boot is refused
