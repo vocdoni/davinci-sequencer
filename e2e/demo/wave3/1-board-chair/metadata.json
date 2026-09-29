@@ -1,0 +1,74 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Annual assembly: election of the board chair",
+    "en": "Annual assembly: election of the board chair",
+    "es": "Asamblea anual: elección de la presidencia de la junta",
+    "ca": "Assemblea anual: elecció de la presidència de la junta"
+  },
+  "description": {
+    "default": "The annual general assembly elects the chair of the board for the next two years. Four members stood as candidates. Vote from the hall or from home while the item is open; the chair of the meeting closes the vote once the last ballot is in, and the result is published shortly after.",
+    "en": "The annual general assembly elects the chair of the board for the next two years. Four members stood as candidates. Vote from the hall or from home while the item is open; the chair of the meeting closes the vote once the last ballot is in, and the result is published shortly after.",
+    "es": "La asamblea general anual elige a quien presidirá la junta los próximos dos años. Se han presentado cuatro candidaturas. Vota desde la sala o desde casa mientras el punto esté abierto; la mesa cierra la votación cuando entra la última papeleta y el resultado se publica poco después.",
+    "ca": "L'assemblea general anual escull qui presidirà la junta els propers dos anys. S'hi han presentat quatre candidatures. Vota des de la sala o des de casa mentre el punt sigui obert; la mesa tanca la votació quan entra l'última papereta i el resultat es publica poc després."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Who should chair the board?",
+        "en": "Who should chair the board?",
+        "es": "¿Quién debería presidir la junta?",
+        "ca": "Qui hauria de presidir la junta?"
+      },
+      "description": {
+        "default": "Pick one candidate.",
+        "en": "Pick one candidate.",
+        "es": "Elige una candidatura.",
+        "ca": "Tria una candidatura."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Marta Puig",
+            "en": "Marta Puig",
+            "es": "Marta Puig",
+            "ca": "Marta Puig"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Joan Riera",
+            "en": "Joan Riera",
+            "es": "Joan Riera",
+            "ca": "Joan Riera"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Laura Vidal",
+            "en": "Laura Vidal",
+            "es": "Laura Vidal",
+            "ca": "Laura Vidal"
+          },
+          "value": 2
+        },
+        {
+          "title": {
+            "default": "Sergi Camps",
+            "en": "Sergi Camps",
+            "es": "Sergi Camps",
+            "ca": "Sergi Camps"
+          },
+          "value": 3
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

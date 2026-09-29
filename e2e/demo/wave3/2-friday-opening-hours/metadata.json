@@ -1,0 +1,65 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Motion: keep the social centre open until midnight on Fridays",
+    "en": "Motion: keep the social centre open until midnight on Fridays",
+    "es": "Moción: abrir el centro social hasta medianoche los viernes",
+    "ca": "Moció: obrir el centre social fins a mitjanit els divendres"
+  },
+  "description": {
+    "default": "A member moved from the floor that the social centre stay open until midnight on Fridays from next month, with volunteers taking turns at the door. The chair opened a short vote and, once most of the hall had voted, announced that voting closes in one minute.",
+    "en": "A member moved from the floor that the social centre stay open until midnight on Fridays from next month, with volunteers taking turns at the door. The chair opened a short vote and, once most of the hall had voted, announced that voting closes in one minute.",
+    "es": "Un socio ha propuesto desde la sala que el centro social abra hasta medianoche los viernes a partir del mes que viene, con turnos de voluntarios en la puerta. La mesa ha abierto una votación breve y, cuando la mayor parte de la sala ya había votado, ha anunciado que la votación se cierra en un minuto.",
+    "ca": "Un soci ha proposat des de la sala que el centre social obri fins a mitjanit els divendres a partir del mes vinent, amb torns de voluntaris a la porta. La mesa ha obert una votació breu i, quan la major part de la sala ja havia votat, ha anunciat que la votació es tanca d'aquí a un minut."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Do you support the motion?",
+        "en": "Do you support the motion?",
+        "es": "¿Apoyas la moción?",
+        "ca": "Dones suport a la moció?"
+      },
+      "description": {
+        "default": "Pick one option.",
+        "en": "Pick one option.",
+        "es": "Elige una opción.",
+        "ca": "Tria una opció."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "In favour",
+            "en": "In favour",
+            "es": "A favor",
+            "ca": "A favor"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Against",
+            "en": "Against",
+            "es": "En contra",
+            "ca": "En contra"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Abstain",
+            "en": "Abstain",
+            "es": "Abstención",
+            "ca": "Abstenció"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

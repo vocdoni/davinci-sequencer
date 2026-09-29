@@ -1,13 +1,13 @@
 //! Demo elections on a live deployment (Gnosis by default), gated by
 //! `DAVINCI_E2E_DEMO`, one phase per run, for the election set
-//! `DAVINCI_DEMO_WAVE` names (1, the default, or 2; see
+//! `DAVINCI_DEMO_WAVE` names (1, the default, 2 or 3; see
 //! `davinci_e2e::demo::Wave`):
 //!
 //! - `prepare` draws every voter key, the CSP key and the seed behind every
 //!   ballot secret and choice into the private directory
 //!   (`DAVINCI_DEMO_DIR`, default `~/.davinci-gnosis/demo`, mode 0700), and
 //!   writes the public census and metadata files of each election into
-//!   `e2e/demo/` (the second wave under `e2e/demo/wave2/`). Run again, it
+//!   `e2e/demo/` (the later waves under `e2e/demo/wave2/` and `wave3/`). Run again, it
 //!   reuses the keys and rewrites the same files.
 //! - `run` creates the elections, their census and metadata URIs under
 //!   `DAVINCI_DEMO_BASE_URL` (the committed `e2e/demo`, e.g. on
@@ -18,7 +18,8 @@
 //!   rounds, runs the organizer actions between the first two (metadata and
 //!   census updates, reveals, pause, duration and max voters, cancels) and
 //!   the votes the nodes must refuse, ends what the organizer ends, waits for
-//!   every result and prints a table. It spawns nothing: the nodes, their
+//!   every result and prints a table. The third wave's meetings trickle their
+//!   votes in and close while the nodes hold them. It spawns nothing: the nodes, their
 //!   provers and the DKG committee are the deployment's. Progress goes to the
 //!   wave's state file in the private directory, so an interrupted run
 //!   resumes without duplicates.
@@ -1262,6 +1263,11 @@ impl Run {
                 .filter(|v| v.round == round)
                 .filter(|v| done.is_none_or(|e| e.vote(v.round, v.voter).is_none()))
                 .collect();
+            // Its close runs even when every vote is on record.
+            if round == 1 && spec.meeting() {
+                self.meet(&spec, todo).await?;
+                continue;
+            }
             if todo.is_empty() {
                 continue;
             }
@@ -1290,7 +1296,7 @@ impl Run {
                 self.save()?;
                 continue;
             }
-            self.send(&spec, todo).await?;
+            self.send(&spec, todo, None).await?;
         }
         Ok(())
     }
@@ -1325,8 +1331,13 @@ impl Run {
 
     /// Proves and sends `todo`, votes of one round of `spec` not on record,
     /// recording each as it goes. A chunked first round goes out a chunk at
-    /// a time, `CHUNK_GAP` apart.
-    async fn send(&mut self, spec: &Spec, todo: Vec<Planned>) -> Result<()> {
+    /// a time, `CHUNK_GAP` apart; with a `pace`, one vote at a time.
+    async fn send(
+        &mut self,
+        spec: &Spec,
+        todo: Vec<Planned>,
+        pace: Option<Duration>,
+    ) -> Result<()> {
         let n = spec.n;
         let pid = self.pid(n)?;
         let p = self.process(&pid).await?;
@@ -1372,10 +1383,10 @@ impl Run {
             reqs.len(),
             t.elapsed().as_secs_f64()
         );
-        let chunk = if spec.chunk > 0 && round == 1 {
-            spec.chunk
-        } else {
-            reqs.len()
+        let (chunk, gap) = match pace {
+            Some(gap) => (1, gap),
+            None if spec.chunk > 0 && round == 1 => (spec.chunk, CHUNK_GAP),
+            None => (reqs.len(), CHUNK_GAP),
         };
         let mut per_node = vec![0usize; self.nodes.len()];
         for (i, (req, (v, vid))) in reqs.iter().zip(&pending).enumerate() {
@@ -1384,9 +1395,9 @@ impl Run {
                     "election {n}: {i} of {} sent; {} more in {} s",
                     reqs.len(),
                     chunk.min(reqs.len() - i),
-                    CHUNK_GAP.as_secs()
+                    gap.as_secs()
                 );
-                tokio::time::sleep(CHUNK_GAP).await;
+                tokio::time::sleep(gap).await;
             }
             ensure!(req.vote_id == *vid, "election {n}: vote id differs");
             submit(&self.nodes[v.node], req)
@@ -1407,6 +1418,105 @@ impl Run {
                 .join(", ")
         );
         Ok(())
+    }
+
+    /// A live meeting: `todo` goes in one vote at a time, `MEETING_GAP`
+    /// apart, and the organizer closes while the nodes still hold the votes:
+    /// an END right after the last is accepted, or, after the first `after`,
+    /// the end moved to `noticeMin` from now, with the rest sent before it.
+    async fn meet(&mut self, spec: &Spec, mut todo: Vec<Planned>) -> Result<()> {
+        let n = spec.n;
+        let pid = self.pid(n)?;
+        let (step, before) = match spec.lifecycle {
+            Lifecycle::Meeting => ("end", todo.len()),
+            Lifecycle::MeetingCloses { after } => {
+                let sent = spec.round1 - todo.len();
+                ("shorten", after.saturating_sub(sent))
+            }
+            _ => bail!("election {n} is not a meeting"),
+        };
+        if !self.is_done(n, step) {
+            let late = todo.split_off(before.min(todo.len()));
+            self.send(spec, todo, Some(Duration::from_secs(demo::MEETING_GAP)))
+                .await?;
+            todo = late;
+            let held = self.held(n).await?;
+            let sent = self.state.elections.get(&n).map_or(0, |e| e.votes.len());
+            let p = self.process(&pid).await?;
+            let line = if step == "end" {
+                if is_open(p.status) {
+                    self.org
+                        .end_process(&pid)
+                        .await
+                        .with_context(|| format!("end election {n}"))?;
+                }
+                format!(
+                    "ended by the organizer right after the last of {sent} votes was accepted, \
+                     {held} of them still at the nodes"
+                )
+            } else {
+                let notice = u64::from(self.org.grace_params().await?.notice_min);
+                let now = unix_now();
+                let d = demo::shortened(p.start_time, now, notice);
+                if p.duration > d {
+                    self.org
+                        .set_process_duration(&pid, d)
+                        .await
+                        .with_context(|| format!("election {n}: end moved to {d} s"))?;
+                }
+                format!(
+                    "end moved to {} s from now (noticeMin {notice} s) after {sent} votes, \
+                     {held} of them still at the nodes",
+                    (p.start_time + d).saturating_sub(now)
+                )
+            };
+            self.done(n, step, line)?;
+        }
+        if todo.is_empty() {
+            return Ok(());
+        }
+        // The last votes of a moved end, if they make it before the end.
+        let p = self.process(&pid).await?;
+        let (now, end) = (unix_now(), p.start_time + p.duration);
+        let need = todo.len() as u64 * demo::MEETING_LATE_GAP + 20;
+        let line = if p.status == ProcessStatus::Ready && now + need < end {
+            let k = todo.len();
+            self.send(
+                spec,
+                todo,
+                Some(Duration::from_secs(demo::MEETING_LATE_GAP)),
+            )
+            .await?;
+            format!(
+                "{k} more votes accepted before the new end, the last {} s ahead of it",
+                end.saturating_sub(unix_now())
+            )
+        } else {
+            format!(
+                "{} votes not sent: the election is {}, {} s from its end",
+                todo.len(),
+                status_name(p.status),
+                end.saturating_sub(now)
+            )
+        };
+        say!("election {n}: {line}");
+        self.state.election(n).note(line);
+        self.save()
+    }
+
+    /// Votes of election `n` still at their node: sent, neither settled nor
+    /// errored.
+    async fn held(&self, n: usize) -> Result<usize> {
+        let pid = self.pid(n)?;
+        let mut held = 0;
+        for v in &self.state.elections[&n].votes {
+            if v.state != VoteState::Sent {
+                continue;
+            }
+            let s = self.nodes[v.node].vote_status(&pid, v.vote_id).await?;
+            held += usize::from(!matches!(s, VoteStatus::Settled | VoteStatus::Error));
+        }
+        Ok(held)
     }
 
     /// Waits until no vote of `round` is still on its way; an errored vote
@@ -1547,7 +1657,7 @@ impl Run {
                                 .find(|v| v.round == 2 && v.voter == x)
                                 .context("the reweighted member's second-round vote")?;
                             if self.state.election(n).vote(2, x).is_none() {
-                                self.send(&spec, vec![v]).await?;
+                                self.send(&spec, vec![v], None).await?;
                             }
                         }
                         let uri = self.url(&spec.census_path(true).context("census path")?);
@@ -2048,7 +2158,10 @@ impl Run {
             let pid = self.pid(n)?;
             let p = self.process(&pid).await?;
             match spec.lifecycle {
-                Lifecycle::Tally | Lifecycle::Later { .. } if is_open(p.status) => {
+                // A meeting the run stopped in before its END.
+                Lifecycle::Tally | Lifecycle::Later { .. } | Lifecycle::Meeting
+                    if is_open(p.status) =>
+                {
                     self.org
                         .end_process(&pid)
                         .await
@@ -2277,6 +2390,30 @@ impl Run {
             if errored > 0 {
                 notes.push(format!("election {n}: {errored} votes errored"));
             }
+            // The grace window exists so that a close loses no vote a node
+            // took before it.
+            let closed = e.closed_out();
+            if closed > 0 && spec.ended_by_organizer() {
+                bad.push(format!(
+                    "election {n}: {closed} votes errored \"process closed\" after the \
+                     organizer's close"
+                ));
+            }
+            if spec.meeting() {
+                if errored > 0 {
+                    bad.push(format!("election {n}: {errored} meeting votes errored"));
+                }
+                let end = p.start_time + p.duration;
+                notes.push(if p.last_vote_at > end {
+                    format!(
+                        "election {n}: last transition {} s after the end (grace {} s)",
+                        p.last_vote_at - end,
+                        p.grace
+                    )
+                } else {
+                    format!("election {n}: every transition landed before the end")
+                });
+            }
             for l in &e.notes {
                 notes.push(format!("election {n}: {l}"));
             }
@@ -2324,9 +2461,11 @@ impl Run {
                 }
             }
             let expected = match spec.lifecycle {
-                Lifecycle::Tally | Lifecycle::Later { .. } | Lifecycle::Timed { .. } => {
-                    ProcessStatus::Results
-                }
+                Lifecycle::Tally
+                | Lifecycle::Later { .. }
+                | Lifecycle::Timed { .. }
+                | Lifecycle::Meeting
+                | Lifecycle::MeetingCloses { .. } => ProcessStatus::Results,
                 Lifecycle::Canceled | Lifecycle::CanceledEarly { .. } => ProcessStatus::Canceled,
                 Lifecycle::Open { .. } | Lifecycle::Upcoming { .. } => ProcessStatus::Ready,
             };

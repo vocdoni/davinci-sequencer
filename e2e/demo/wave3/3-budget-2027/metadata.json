@@ -1,0 +1,65 @@
+{
+  "version": "1.1",
+  "title": {
+    "default": "Approval of the 2027 budget",
+    "en": "Approval of the 2027 budget",
+    "es": "Aprobación del presupuesto de 2027",
+    "ca": "Aprovació del pressupost del 2027"
+  },
+  "description": {
+    "default": "The board presents next year's budget to the assembly: 48,300 euros of income and 47,900 euros of spending, with the difference going to the reserve fund. The chair closes the vote once the last ballot is in. The key that opens the ballots is held by an independent committee, which decrypts only the final count.",
+    "en": "The board presents next year's budget to the assembly: 48,300 euros of income and 47,900 euros of spending, with the difference going to the reserve fund. The chair closes the vote once the last ballot is in. The key that opens the ballots is held by an independent committee, which decrypts only the final count.",
+    "es": "La junta presenta a la asamblea el presupuesto del año que viene: 48.300 euros de ingresos y 47.900 euros de gastos, y la diferencia va al fondo de reserva. La mesa cierra la votación cuando entra la última papeleta. La clave que abre las papeletas la custodia un comité independiente, que solo descifra el recuento final.",
+    "ca": "La junta presenta a l'assemblea el pressupost de l'any vinent: 48.300 euros d'ingressos i 47.900 euros de despeses, i la diferència va al fons de reserva. La mesa tanca la votació quan entra l'última papereta. La clau que obre les paperetes la custodia un comitè independent, que només desxifra el recompte final."
+  },
+  "questions": [
+    {
+      "title": {
+        "default": "Do you approve the 2027 budget?",
+        "en": "Do you approve the 2027 budget?",
+        "es": "¿Apruebas el presupuesto de 2027?",
+        "ca": "Aproves el pressupost del 2027?"
+      },
+      "description": {
+        "default": "Pick one option.",
+        "en": "Pick one option.",
+        "es": "Elige una opción.",
+        "ca": "Tria una opció."
+      },
+      "choices": [
+        {
+          "title": {
+            "default": "Approve",
+            "en": "Approve",
+            "es": "Apruebo",
+            "ca": "Aprovo"
+          },
+          "value": 0
+        },
+        {
+          "title": {
+            "default": "Reject",
+            "en": "Reject",
+            "es": "Rechazo",
+            "ca": "Rebutjo"
+          },
+          "value": 1
+        },
+        {
+          "title": {
+            "default": "Abstain",
+            "en": "Abstain",
+            "es": "Abstención",
+            "ca": "Abstenció"
+          },
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "electionPreset": {
+      "type": "single_choice"
+    }
+  }
+}

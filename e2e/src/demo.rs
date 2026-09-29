@@ -1,5 +1,5 @@
 //! Demo elections for a live deployment (`tests/demo.rs`): the election
-//! tables of both waves, the voter secrets, the public census and metadata
+//! tables of every wave, the voter secrets, the public census and metadata
 //! files, the ballots each kind of election takes, the vote plan and the
 //! resumable run state. Nothing here talks to a chain or a node.
 //!
@@ -28,6 +28,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
 pub mod wave2;
+pub mod wave3;
 
 /// Voter keys, the CSP key and the seed of the first wave, in the private
 /// directory.
@@ -40,14 +41,22 @@ pub const MINUTE: u64 = 60;
 pub const DAY: u64 = 24 * 3600;
 /// Round tags of the ballot secrets of refused votes: never a real round.
 const REFUSAL_ROUND: u8 = 10;
+/// Seconds between the votes of a meeting ([`Lifecycle::Meeting`]).
+pub const MEETING_GAP: u64 = 30;
+/// Seconds between the votes a meeting takes after its end moved.
+pub const MEETING_LATE_GAP: u64 = 10;
+/// What a moved end leaves past `noticeMin`, for the transaction to mine.
+pub const NOTICE_MARGIN: u64 = 30;
 
 /// Which set of elections a phase drives: `DAVINCI_DEMO_WAVE`, 1 (the
-/// default) or 2. Each wave keeps its own secrets, state and public
+/// default), 2 or 3. Each wave keeps its own secrets, state and public
 /// directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wave {
     One,
     Two,
+    /// A live meeting: the organizer closes while the nodes hold votes.
+    Three,
 }
 
 impl Wave {
@@ -55,7 +64,8 @@ impl Wave {
         match v.trim() {
             "" | "1" => Ok(Wave::One),
             "2" => Ok(Wave::Two),
-            v => bail!("DAVINCI_DEMO_WAVE={v:.10}: 1 or 2"),
+            "3" => Ok(Wave::Three),
+            v => bail!("DAVINCI_DEMO_WAVE={v:.10}: 1, 2 or 3"),
         }
     }
 
@@ -67,6 +77,7 @@ impl Wave {
         match self {
             Wave::One => 1,
             Wave::Two => 2,
+            Wave::Three => 3,
         }
     }
 
@@ -74,6 +85,7 @@ impl Wave {
         match self {
             Wave::One => elections(),
             Wave::Two => wave2::elections(),
+            Wave::Three => wave3::elections(),
         }
     }
 
@@ -82,6 +94,7 @@ impl Wave {
         match self {
             Wave::One => SECRETS_FILE,
             Wave::Two => "voters-wave2.json",
+            Wave::Three => "voters-wave3.json",
         }
     }
 
@@ -90,6 +103,7 @@ impl Wave {
         match self {
             Wave::One => STATE_FILE,
             Wave::Two => "state-wave2.json",
+            Wave::Three => "state-wave3.json",
         }
     }
 }
@@ -181,6 +195,13 @@ pub enum Lifecycle {
     Later { start_in: u64 },
     /// Would open `start_in` s after creation; canceled right away.
     CanceledEarly { start_in: u64 },
+    /// A live meeting: the first-round votes go in one at a time,
+    /// `MEETING_GAP` apart, and the organizer ends it right after the last
+    /// is accepted, while the nodes still hold them.
+    Meeting,
+    /// A live meeting whose end the organizer moves to `noticeMin` from now
+    /// once `after` votes are in; the rest go in before the new end.
+    MeetingCloses { after: usize },
 }
 
 /// The texts of an election in one more language, shaped like the English
@@ -709,10 +730,25 @@ impl Spec {
 
     /// Ends with results the run waits for.
     pub fn tallied(&self) -> bool {
+        self.lifecycle == Lifecycle::Tally
+            || self.meeting()
+            || matches!(
+                self.lifecycle,
+                Lifecycle::Later { .. } | Lifecycle::Timed { .. }
+            )
+    }
+
+    pub fn meeting(&self) -> bool {
         matches!(
             self.lifecycle,
-            Lifecycle::Tally | Lifecycle::Later { .. } | Lifecycle::Timed { .. }
+            Lifecycle::Meeting | Lifecycle::MeetingCloses { .. }
         )
+    }
+
+    /// The organizer ends it, or moves its end: no vote a node took before
+    /// may be lost to the close.
+    pub fn ended_by_organizer(&self) -> bool {
+        self.meeting() || matches!(self.lifecycle, Lifecycle::Tally | Lifecycle::Later { .. })
     }
 
     /// Whether the run pauses it.
@@ -886,7 +922,10 @@ impl Spec {
     /// start means the creation block).
     pub fn timing(&self, now: u64) -> (u64, u64) {
         match self.lifecycle {
-            Lifecycle::Tally | Lifecycle::Canceled => (0, TALLY_SECS),
+            Lifecycle::Tally
+            | Lifecycle::Canceled
+            | Lifecycle::Meeting
+            | Lifecycle::MeetingCloses { .. } => (0, TALLY_SECS),
             Lifecycle::Open { secs } | Lifecycle::Timed { secs } => (0, secs),
             Lifecycle::Upcoming { start_in, secs } => (now + start_in, secs),
             Lifecycle::Later { start_in } => (now + start_in, TALLY_SECS),
@@ -1001,6 +1040,10 @@ impl Spec {
                 start_in / MINUTE
             ),
             Lifecycle::CanceledEarly { .. } => "canceled before its start".into(),
+            Lifecycle::Meeting => "ended by the organizer with votes pending".into(),
+            Lifecycle::MeetingCloses { after } => {
+                format!("end moved to noticeMin ahead after {after} votes")
+            }
         }];
         for a in self.actions {
             match a {
@@ -1020,6 +1063,12 @@ impl Spec {
         }
         out.join("; ")
     }
+}
+
+/// The duration that moves the end of a process started at `start` to
+/// `notice` s (the registry's `noticeMin`) from `now`, plus [`NOTICE_MARGIN`].
+pub fn shortened(start: u64, now: u64, notice: u64) -> u64 {
+    (now + notice + NOTICE_MARGIN).saturating_sub(start)
 }
 
 /// The registry's `newProcess` checks on a ballot mode (`_validateNewProcess`
@@ -2094,6 +2143,20 @@ impl ElectionState {
         (voters, per_voter.values().sum::<u64>() - voters)
     }
 
+    /// Votes a node errored because the process closed before it settled
+    /// them: lost to the close.
+    pub fn closed_out(&self) -> usize {
+        self.votes
+            .iter()
+            .filter(|v| {
+                v.state == VoteState::Error
+                    && v.error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("process closed"))
+            })
+            .count()
+    }
+
     pub fn is_done(&self, step: &str) -> bool {
         self.done.iter().any(|d| d == step)
     }
@@ -2184,7 +2247,7 @@ mod tests {
 
     use super::*;
 
-    const WAVES: [Wave; 2] = [Wave::One, Wave::Two];
+    const WAVES: [Wave; 3] = [Wave::One, Wave::Two, Wave::Three];
 
     fn secrets_of(wave: Wave) -> Secrets {
         Secrets::generate(&wave.elections(), &mut StdRng::seed_from_u64(7)).unwrap()
@@ -2206,12 +2269,13 @@ mod tests {
         let prefix = match wave {
             Wave::One => "",
             Wave::Two => "wave2/",
+            Wave::Three => "wave3/",
         };
         for (i, s) in specs.iter().enumerate() {
             let at = format!("wave {} election {}", wave.number(), s.n);
             assert_eq!(s.n, i + 1, "{at}");
             assert!(s.dir.starts_with(&format!("{prefix}{}-", s.n)), "{at}");
-            assert_eq!(s.sdk, wave == Wave::Two, "{at}");
+            assert_eq!(s.sdk, wave != Wave::One, "{at}");
             let m = s.ballot_mode();
             assert_eq!(usize::from(m.num_fields), s.num_fields(), "{at}");
             assert_eq!(s.lean.len(), s.num_fields(), "{at}");
@@ -2273,6 +2337,25 @@ mod tests {
                     assert!(s.votes_in(1), "{at}");
                 }
                 Lifecycle::Tally => {}
+                // One round, spread over both nodes at the meeting's pace for
+                // five to ten minutes.
+                Lifecycle::Meeting | Lifecycle::MeetingCloses { .. } => {
+                    assert_eq!(s.last_round(), 1, "{at}");
+                    assert_eq!(s.route, Route::Spread, "{at}");
+                    assert_eq!(s.census, CensusKind::Static, "{at}");
+                }
+            }
+            if s.lifecycle == Lifecycle::Meeting {
+                let span = (s.round1 as u64 - 1) * MEETING_GAP;
+                assert!((5 * MINUTE..=10 * MINUTE).contains(&span), "{at}");
+            }
+            // Past the move, the last votes go in well inside Gnosis'
+            // 60 s noticeMin, and one comes after the new end.
+            if let Lifecycle::MeetingCloses { after } = s.lifecycle {
+                assert!(after >= 1 && after < s.round1, "{at}");
+                let late = (s.round1 - after) as u64;
+                assert!(late * MEETING_LATE_GAP + 20 <= 60, "{at}");
+                assert!(s.refusals().contains(&Refusal::AfterEnd), "{at}");
             }
             // A growing census lets some of its new members vote.
             if s.added() > 0 {
@@ -2331,12 +2414,16 @@ mod tests {
                 assert_eq!(s.lifecycle, Lifecycle::Tally, "{at}");
             }
         }
-        let origins: BTreeSet<_> = specs.iter().map(Spec::origin).collect();
-        assert_eq!(origins, BTreeSet::from([1, 2, 3, 4]));
         assert!(specs.iter().any(|s| s.key == KeySource::DkgAutomatic));
-        assert!(specs.iter().any(|s| s.key == KeySource::DkgLocked));
         assert!(specs.iter().any(|s| s.key == KeySource::Node(0)));
         assert!(specs.iter().any(|s| s.key == KeySource::Node(1)));
+        // The meeting is about closing with votes pending, not coverage.
+        if wave == Wave::Three {
+            return;
+        }
+        let origins: BTreeSet<_> = specs.iter().map(Spec::origin).collect();
+        assert_eq!(origins, BTreeSet::from([1, 2, 3, 4]));
+        assert!(specs.iter().any(|s| s.key == KeySource::DkgLocked));
     }
 
     #[test]
@@ -2346,6 +2433,7 @@ mod tests {
         }
         assert_eq!(Wave::One.elections().len(), 8);
         assert!((18..=22).contains(&Wave::Two.elections().len()));
+        assert_eq!(Wave::Three.elections().len(), 3);
     }
 
     #[test]
@@ -2353,9 +2441,16 @@ mod tests {
         assert_eq!(Wave::parse("").unwrap(), Wave::One);
         assert_eq!(Wave::parse("1").unwrap(), Wave::One);
         assert_eq!(Wave::parse(" 2 ").unwrap(), Wave::Two);
-        assert!(Wave::parse("3").is_err());
-        assert_ne!(Wave::One.secrets_file(), Wave::Two.secrets_file());
-        assert_ne!(Wave::One.state_file(), Wave::Two.state_file());
+        assert_eq!(Wave::parse("3").unwrap(), Wave::Three);
+        assert!(Wave::parse("4").is_err());
+        let files: BTreeSet<_> = WAVES
+            .iter()
+            .flat_map(|w| [w.secrets_file(), w.state_file()])
+            .collect();
+        assert_eq!(files.len(), 2 * WAVES.len());
+        for w in WAVES {
+            assert_eq!(Wave::parse(&w.number().to_string()).unwrap(), w);
+        }
         assert_eq!(Wave::One.secrets_file(), SECRETS_FILE);
         assert_eq!(Wave::One.state_file(), STATE_FILE);
     }
@@ -2461,6 +2556,75 @@ mod tests {
                 s.n
             );
         }
+    }
+
+    /// The third wave is an assembly: the organizer closes three votes while
+    /// the nodes hold them, one by moving the end a minute ahead.
+    #[test]
+    fn third_wave_is_a_live_meeting() {
+        let specs = Wave::Three.elections();
+        let ended = |k: KeySource| {
+            specs
+                .iter()
+                .any(|s| s.key == k && s.lifecycle == Lifecycle::Meeting)
+        };
+        assert!(ended(KeySource::Node(0)) && ended(KeySource::DkgAutomatic));
+        let moved: Vec<_> = specs
+            .iter()
+            .filter(|s| matches!(s.lifecycle, Lifecycle::MeetingCloses { .. }))
+            .collect();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].key, KeySource::Node(1));
+        for s in &specs {
+            assert!(
+                s.tallied() && s.ended_by_organizer() && s.meeting(),
+                "{}",
+                s.n
+            );
+            assert!((12..=16).contains(&s.round1), "{}", s.n);
+            assert_eq!(s.timing(1_000), (0, TALLY_SECS));
+            let codes: Vec<_> = s.i18n.iter().map(|l| l.code).collect();
+            assert_eq!(codes, ["es", "ca"], "{}", s.n);
+        }
+        // A minute's notice plus the margin, from the start.
+        assert_eq!(shortened(1_000, 5_000, 60), 4_000 + 60 + NOTICE_MARGIN);
+        assert_eq!(shortened(9_000, 5_000, 60), 0);
+        // The earlier waves' lifecycles keep their meaning.
+        for s in Wave::Two.elections() {
+            assert!(!s.meeting(), "{}", s.n);
+            assert_eq!(
+                s.ended_by_organizer(),
+                matches!(s.lifecycle, Lifecycle::Tally | Lifecycle::Later { .. }),
+                "{}",
+                s.n
+            );
+        }
+    }
+
+    /// Only a vote the node errored because the process closed counts as
+    /// lost to the close.
+    #[test]
+    fn closed_out_votes_are_counted() {
+        let mut e = ElectionState::default();
+        let vote = |state, error: Option<&str>| VoteRecord {
+            round: 1,
+            voter: 0,
+            node: 0,
+            vote_id: 1,
+            fields: vec![1],
+            state,
+            error: error.map(Into::into),
+        };
+        e.votes = vec![
+            vote(VoteState::Settled, None),
+            vote(VoteState::Sent, None),
+            vote(VoteState::Error, Some("census changed, recast")),
+        ];
+        assert_eq!(e.closed_out(), 0);
+        e.votes.push(vote(VoteState::Error, Some("process closed")));
+        e.votes
+            .push(vote(VoteState::Error, Some("process closed: ended")));
+        assert_eq!(e.closed_out(), 2);
     }
 
     #[test]

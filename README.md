@@ -1142,9 +1142,24 @@ takes two to three and a half hours, more when the provers are busy: a round
 waits for its lone votes, the reweighted member's vote sits alone for the solo
 wait, and the timed elections run 135 to 150 minutes so they outlast round 2.
 
-To run both waves again on a new registry, move `state.json` and
-`state-wave2.json` aside (keep the `voters*.json` files, which hold the keys)
-and run with the same `DAVINCI_DEMO_BASE_URL`: the census and metadata files
+**Third wave.** `DAVINCI_DEMO_WAVE=3` is a live meeting that shows the grace
+window (`davinci_e2e::demo::wave3`, keys in `voters-wave3.json`, state in
+`state-wave3.json`, files in `e2e/demo/wave3/`). Its three votes run one after
+another, each voter 30 s after the last, spread over both nodes, which hold
+them for their 15 min batch time. The board-chair election (16 voters, a node
+key) ends by the organizer right after the last vote is accepted. The motion
+(12 voters, the other node's key) moves its end to `noticeMin` plus 30 s from
+now after nine votes, the other three arrive 10 s apart before the new end,
+and one more after it is refused (412/41201). The budget approval (12 voters,
+a DKG key) ends like the first and is decrypted by the committee. Every vote
+must settle within the grace: the report fails if any vote errors, in
+particular with `process closed`, and states how long after the end the last
+transition landed. The wave takes 30 to 45 minutes, up to an hour when the
+provers are busy.
+
+To run the waves again on a new registry, move `state.json`,
+`state-wave2.json` and `state-wave3.json` aside (keep the `voters*.json`
+files, which hold the keys) and run with the same `DAVINCI_DEMO_BASE_URL`: the census and metadata files
 already published at that commit are reused, since neither depends on the
 registry.
 

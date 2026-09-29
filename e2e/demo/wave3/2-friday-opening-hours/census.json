@@ -1,0 +1,56 @@
+{
+  "participants": [
+    {
+      "key": "0xbabe9d99f608f0d61cedde4d39550a17d13bd428",
+      "weight": "1"
+    },
+    {
+      "key": "0x17056d2f1b0dab70f6484a86bec2e62b56e94400",
+      "weight": "1"
+    },
+    {
+      "key": "0x6d5ba7ad92dd570956a1cb486ff5fdb53c8eb062",
+      "weight": "1"
+    },
+    {
+      "key": "0xb779679d0c611bf677b46b28eab8a43ab1d2f1a8",
+      "weight": "1"
+    },
+    {
+      "key": "0x073e9b2da35ed00686cbaa8bacf92c6cce08e6ff",
+      "weight": "1"
+    },
+    {
+      "key": "0xdf4926094b98115e69a195a19224603246fdcaaf",
+      "weight": "1"
+    },
+    {
+      "key": "0x858e99cafbc475b5a241c7bf790f959a79e7e77f",
+      "weight": "1"
+    },
+    {
+      "key": "0x7bdeed66702175ea2b569a18d4dd814c3406e651",
+      "weight": "1"
+    },
+    {
+      "key": "0xfe6c2c4540988426343559b7bcdf58e42529096d",
+      "weight": "1"
+    },
+    {
+      "key": "0xab33528f804257fe802699891b17dcd587064381",
+      "weight": "1"
+    },
+    {
+      "key": "0x4e35732cf4743df35717289a81fd9ebaca6d24d4",
+      "weight": "1"
+    },
+    {
+      "key": "0x1460c63d8dacae6f22737d194bedf3e602cceaf4",
+      "weight": "1"
+    },
+    {
+      "key": "0xe3c318bc0ef992c7b77629e684634c3729253a2a",
+      "weight": "1"
+    }
+  ]
+}
