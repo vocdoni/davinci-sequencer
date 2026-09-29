@@ -41,6 +41,10 @@ const NODE_SIDE: &[&str] = &[
     "no state available",
     // Pocket: calls tagged or defaulted to "pending".
     "pending state is not supported",
+    // Pruned public endpoints refusing older ranges, e.g. blockreq's -32601
+    // "public endpoint only serves recent blocks (last 1024)".
+    "recent blocks",
+    "archive",
 ];
 
 /// JSON-RPC errors that mean "you are asking too often"; they rest the
@@ -442,11 +446,18 @@ mod tests {
 
     #[tokio::test]
     async fn node_side_errors_fail_over() {
-        let replies: [Reply; 4] = [
+        let replies: [Reply; 5] = [
             |r| error(r, StatusCode::OK, "historical state is not available"),
             |r| error(r, StatusCode::OK, "Rate limit exceeded"),
             |r| {
                 let e = json!({"code":-32002,"message":"No state available for block 0x1f2e"});
+                (
+                    StatusCode::OK,
+                    json!({"jsonrpc":"2.0","id":r["id"],"error":e}),
+                )
+            },
+            |r| {
+                let e = json!({"code":-32601,"message":"public endpoint only serves recent blocks (last 1024). Register for historical / archive access."});
                 (
                     StatusCode::OK,
                     json!({"jsonrpc":"2.0","id":r["id"],"error":e}),
