@@ -316,6 +316,10 @@ impl Contracts {
     }
 
     // Polls the receipts of every hash sent at this nonce until one shows up.
+    // The transport waits out a short rate limit inside a read; one that
+    // fails anyway (a longer limit, every endpoint down) says nothing about
+    // a tx already out, so it keeps polling. Only a failure at the deadline
+    // is returned.
     async fn wait_any(
         &self,
         hashes: &[B256],
@@ -325,19 +329,23 @@ impl Contracts {
         // 100 ms, doubling up to 2 s: fast on dev chains, light on real ones.
         let mut poll = Duration::from_millis(100);
         loop {
+            let mut failed = None;
             for h in hashes {
-                if let Some(r) = self
-                    .provider
-                    .get_transaction_receipt(*h)
-                    .await
-                    .map_err(rpc_err)?
-                {
-                    return Ok(Some(r));
+                match self.provider.get_transaction_receipt(*h).await {
+                    Ok(Some(r)) => return Ok(Some(r)),
+                    Ok(None) => {}
+                    Err(e) => failed = Some(e),
                 }
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Ok(None);
+                return match failed {
+                    Some(e) => Err(rpc_err(e)),
+                    None => Ok(None),
+                };
+            }
+            if let Some(e) = failed {
+                tracing::debug!(error = %e, "receipt read failed; still waiting");
             }
             tokio::time::sleep(poll.min(deadline - now)).await;
             poll = (poll * 2).min(Duration::from_secs(2));

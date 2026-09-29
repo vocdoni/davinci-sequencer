@@ -1081,6 +1081,130 @@ async fn same_block_race_names_the_loser() {
     assert_eq!((p.batch_number, p.voters_count), (2, 4));
 }
 
+// The only RPC rate-limits the receipt read of a tx already sent for longer
+// than the transport waits on a resting endpoint, so the read fails: the
+// node keeps waiting on the tx instead of giving the settlement up as failed
+// (and later taking its own transition for another sequencer's).
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_wait_rides_out_a_rate_limit() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::Ordering::SeqCst;
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let secret = SecretString::new(hex::encode(key.to_bytes()));
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(BALLOT_VK_HASH),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    let registry = deploy(&deployer, code).await;
+
+    // Forwards everything to anvil but answers the first receipt read 429,
+    // with a Retry-After past the 10 s a request waits for a resting
+    // endpoint: the transport rests it and fails the read at once.
+    const RETRY_AFTER: u64 = 12;
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (up, n) = (url.clone(), reads.clone());
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |body: axum::body::Bytes| async move {
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if req["method"] == "eth_getTransactionReceipt" && n.fetch_add(1, SeqCst) == 0 {
+                return (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::RETRY_AFTER, RETRY_AFTER.to_string())],
+                    b"429 Too Many Requests".to_vec(),
+                )
+                    .into_response();
+            }
+            let resp = reqwest::Client::new()
+                .post(up.clone())
+                .header("content-type", "application/json")
+                .body(body.to_vec())
+                .send()
+                .await
+                .unwrap();
+            (
+                axum::http::StatusCode::OK,
+                resp.bytes().await.unwrap().to_vec(),
+            )
+                .into_response()
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy: url::Url = format!("http://{}/", l.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await });
+
+    let c = Contracts::new(&[proxy], registry, Some(&secret))
+        .await
+        .unwrap();
+    let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+    let t = std::time::Instant::now();
+    let (pid, r) = c
+        .create_process(&NewProcess {
+            status: ProcessStatus::Ready,
+            start_time: 0,
+            duration: 3600,
+            max_voters: 10,
+            ballot_mode: BallotMode {
+                num_fields: NF,
+                group_size: 1,
+                unique_values: false,
+                cost_exponent: 1,
+                max_value: 5,
+                min_value: 0,
+                max_value_sum: 20,
+                min_value_sum: 0,
+            },
+            census: OnchainCensus {
+                origin: 1,
+                root: [1u8; 32],
+                uri: "file:///tmp/census.json".into(),
+                contract_address: [0u8; 20],
+            },
+            metadata: "ipfs://meta".into(),
+            metadata_hash: metadata_hash(META_DOC),
+            enc_key: pk,
+        })
+        .await
+        .unwrap();
+    assert!(
+        t.elapsed() >= Duration::from_secs(RETRY_AFTER),
+        "{:?}",
+        t.elapsed()
+    );
+    // The refused read and one after the rest; none reached the RPC during it.
+    assert_eq!(reads.load(SeqCst), 2);
+    assert_eq!(r.replacements, 0);
+    assert_eq!(c.process(&pid).await.unwrap().max_voters, 10);
+}
+
 alloy::sol! {
     #[sol(rpc)]
     interface IMockDKG {
