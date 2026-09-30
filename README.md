@@ -223,6 +223,14 @@ its `Retry-After` (up to 5 minutes) or else 1 s doubling on each limit in a row
 (up to a minute). Requests skip resting endpoints; when all of them rest, a
 request waits for the first one back, up to 10 s, and past that fails without
 asking.
+Transactions are the exception: `eth_sendRawTransaction` goes to every endpoint
+not resting at once (20 s each), and the first to take it, or to answer that it
+already holds it, answers. The nonce is read from the current endpoint but
+never below the node's own last mined transaction, since a load-balanced
+backend can lag; a receipt timeout with the chain's count below that nonce
+(a reorg) steps it back down. A "nonce too low" that no send of the node
+explains waits a few blocks for a receipt of its own, then re-reads the nonce
+and re-signs the same transaction, up to three times.
 A beacon API fails over on a connection error, 429 or 5xx. A 404 (a slot pruned
 there) is asked once of the next beacon, without switching, so an archive
 beacon listed second can serve old blobs. At boot every RPC must report

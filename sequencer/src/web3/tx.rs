@@ -7,7 +7,7 @@ use alloy::eips::eip4844::Blob as AlloyBlob;
 use alloy::eips::eip4844::env_settings::EnvKzgSettings;
 use alloy::eips::eip7594::BlobTransactionSidecarVariant;
 use alloy::network::{NetworkTransactionBuilder, TransactionBuilder, TransactionBuilder4844};
-use alloy::primitives::{B256, Bytes, FixedBytes};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Log, TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use super::ProcessRegistry as PR;
 use super::contracts::Contracts;
+use super::failover::{ALL_RESTING, known_tx};
 use super::{Result, RevertReason, TxReceipt, Web3Error, rpc_err};
 
 const ERROR_STRING: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
@@ -109,12 +110,41 @@ fn build_sidecar(
 
 /// Sends made before a replacement round gives up.
 const MAX_ATTEMPTS: u32 = 4;
+/// Nonce re-reads after a "nonce too low" no send of ours explains.
+const MAX_REREADS: u32 = 3;
+/// Longest a "nonce too low" waits for a receipt of ours at that nonce
+/// before the tx moves on: about three Gnosis blocks.
+const RACE_WAIT: Duration = Duration::from_secs(15);
 
 /// The sender's memory across sends: a tx of ours that never got mined and
-/// sits at `nonce` with these fees. The next send replaces it.
+/// sits at `nonce` with these fees (the next send replaces it), every hash
+/// sent since the last receipt (any may still land), and the highest nonce
+/// of ours seen mined.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SendState {
     stuck: Option<Fees>,
+    sent: Vec<B256>,
+    mined: Option<u64>,
+}
+
+impl SendState {
+    // The nonce to send at: the RPC's mined count, never below one of ours
+    // known mined (a lagging endpoint reads low) nor below a stuck tx.
+    fn next_nonce(&self, rpc: u64) -> u64 {
+        let floor = self.mined.map_or(0, |m| m.saturating_add(1));
+        rpc.max(floor).max(self.stuck.map_or(0, |s| s.nonce))
+    }
+
+    // A tx of ours now holds this nonce at this price.
+    fn hold(&mut self, fees: Fees, hash: B256) {
+        self.stuck = Some(fees);
+        self.sent.push(hash);
+    }
+
+    fn unstick(&mut self) {
+        self.stuck = None;
+        self.sent.clear();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,20 +182,42 @@ pub(crate) fn sidecar_version_error(msg: &str) -> bool {
     .any(|p| m.contains(p))
 }
 
-/// A send refused because this nonce is taken: by an earlier send of ours, or
-/// by this very tx (geth "already known", anvil/reth "already imported",
-/// Nethermind "AlreadyKnown", Besu "Known transaction").
+/// A send refused because this nonce is taken: mined, or by this very tx
+/// ([`known_tx`]).
 fn raced(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("nonce too low") || known_tx(msg)
+}
+
+/// The count a geth-style "nonce too low" names ("next nonce K", "state: K").
+fn named_count(msg: &str) -> Option<u64> {
     let m = msg.to_ascii_lowercase();
-    [
-        "nonce too low",
-        "already known",
-        "already imported",
-        "alreadyknown",
-        "known transaction",
-    ]
-    .iter()
-    .any(|p| m.contains(p))
+    let at = ["next nonce", "state:"]
+        .iter()
+        .find_map(|k| m.find(k).map(|i| i + k.len()))?;
+    let digits: String = m[at..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// A send refused for a nonce gap; the node wants a lower nonce first.
+fn gapped(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("nonce too high") || m.contains("gap")
+}
+
+/// A send no node answered though the tx may be in: a POST that timed out or
+/// lost its answer, a gateway error, a garbled body. Not a 4xx (refused at
+/// the door) nor every endpoint resting (none asked).
+fn maybe_sent(e: &RpcError<TransportErrorKind>) -> bool {
+    match e {
+        RpcError::Transport(TransportErrorKind::HttpError(h)) => h.status >= 500,
+        RpcError::Transport(k) => !k.to_string().contains(ALL_RESTING),
+        RpcError::DeserError { .. } => true,
+        _ => false,
+    }
 }
 
 fn underpriced(msg: &str) -> bool {
@@ -370,11 +422,29 @@ impl Contracts {
         blob_base_fee(&self.provider).await
     }
 
+    async fn count(&self, from: Address) -> Result<u64> {
+        self.provider
+            .get_transaction_count(from)
+            .latest()
+            .await
+            .map_err(rpc_err)
+    }
+
+    async fn nonce(&self, from: Address, state: &SendState) -> Result<u64> {
+        Ok(state.next_nonce(self.count(from).await?))
+    }
+
     /// The node's only way to send: one tx at a time from its key. Fills
     /// nonce (the mined count, so a tx of ours stuck in the pool gets
-    /// replaced), gas and fees; on a receipt timeout resends at the same nonce
-    /// with bumped fees, up to `MAX_ATTEMPTS` times. A refused sidecar version
-    /// is retried once with the other one.
+    /// replaced, never below a nonce of ours seen mined), gas and fees; on a
+    /// receipt timeout resends at the same nonce with bumped fees, up to
+    /// `MAX_ATTEMPTS` times. A refused sidecar version is retried once with
+    /// the other one; a "nonce too low" no send of ours explains re-reads the
+    /// nonce and re-signs, up to `MAX_REREADS` times.
+    ///
+    /// A send may land twice (an acceptance lost everywhere, then a re-sign
+    /// at the next nonce), so only calls whose second copy reverts belong
+    /// here; a second `newProcess` is a second process (test harnesses only).
     pub(super) async fn send(
         &self,
         tx: TransactionRequest,
@@ -391,14 +461,12 @@ impl Contracts {
             Some(b) => Some(self.sidecar(b, self.cell_proofs()).await?),
             None => None,
         };
-        let nonce = p
-            .get_transaction_count(from)
-            .latest()
-            .await
-            .map_err(rpc_err)?;
+        let mut nonce = self.nonce(from, &state).await?;
         if state.stuck.is_some_and(|s| s.nonce != nonce) {
-            state.stuck = None;
+            state.unstick();
         }
+        // This call's hashes are `state.sent[mine..]`.
+        let mine = state.sent.len();
         let (max_fee, priority, blob_fee) = self.fees_now(blobs.is_some()).await?;
         let mut fees = Fees {
             nonce,
@@ -425,6 +493,7 @@ impl Contracts {
         let mut version_retried = false;
         let mut v1 = self.cell_proofs();
         let mut attempt = 0;
+        let mut rereads = 0;
         while attempt < MAX_ATTEMPTS {
             attempt += 1;
             let mut req = tx.clone();
@@ -442,16 +511,23 @@ impl Contracts {
                 .await
                 .map_err(|e| Web3Error::Rpc(format!("signing: {e}")))?;
             let hash = *env.tx_hash();
+            let mut gap = None;
             match p.send_tx_envelope(env).await {
                 Ok(_) => {
                     hashes.push(hash);
-                    // A tx of ours now holds this nonce at this price, whatever
-                    // happens below (fees only go up between attempts).
-                    state.stuck = Some(fees);
+                    // Whatever happens below (fees only go up between attempts).
+                    state.hold(fees, hash);
                     if version_retried {
                         // The other version was accepted: use it from now on.
                         self.cell_proofs.store(v1, Ordering::Relaxed);
                     }
+                }
+                // No node answered, but the tx may be in: wait for it like
+                // an accepted one.
+                Err(e) if maybe_sent(&e) => {
+                    tracing::warn!(nonce, error = %e, "send unanswered, waiting for its receipt");
+                    hashes.push(hash);
+                    state.hold(fees, hash);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -476,23 +552,94 @@ impl Contracts {
                         continue;
                     }
                     let raced = raced(&msg);
-                    // After an RPC failover the send may have reached the
-                    // failed endpoint too: this very tx may be pooled or mined.
-                    let ours =
-                        raced && matches!(p.get_transaction_by_hash(hash).await, Ok(Some(_)));
+                    // An endpoint holding this very tx took it, like an
+                    // acceptance (Nethermind's answer may outlive the pool
+                    // entry: then a receipt timeout and a replacement). After
+                    // an RPC failover the send may have reached the failed
+                    // endpoint too: it may be pooled or mined.
+                    let ours = known_tx(&msg)
+                        || raced && matches!(p.get_transaction_by_hash(hash).await, Ok(Some(_)));
                     if ours {
                         hashes.push(hash);
-                        state.stuck = Some(fees);
+                        state.hold(fees, hash);
+                    } else if raced && hashes.is_empty() {
+                        // Nothing sent at this nonce in this call holds it.
+                        // It may be ours after all (an acceptance lost in
+                        // the broadcast), or an earlier send may be: wait a
+                        // few blocks for either before moving on.
+                        let mut ask = state.sent.clone();
+                        ask.push(hash);
+                        let wait = self.receipt_timeout.min(RACE_WAIT);
+                        if let Some(r) = self.wait_any(&ask, wait).await? {
+                            let this = ask[mine..].contains(&r.transaction_hash);
+                            state.unstick();
+                            state.mined = state.mined.max(Some(nonce));
+                            if !this {
+                                return Err(Web3Error::Rpc(format!(
+                                    "nonce {nonce} went to an earlier tx of ours, {}",
+                                    r.transaction_hash
+                                )));
+                            }
+                            drop(state);
+                            return self.finish(r, tx, ask.len() - mine).await;
+                        }
+                        if rereads == MAX_REREADS {
+                            return Err(self.classify(&e));
+                        }
+                        // The nonce was read from a lagging endpoint and is
+                        // mined: the same tx goes out at the next one.
+                        rereads += 1;
+                        let named = named_count(&msg).and_then(|k| k.checked_sub(1));
+                        state.mined = state.mined.max(Some(nonce)).max(named);
+                        let next = self.nonce(from, &state).await?;
+                        tracing::warn!(nonce, next, "nonce too low, resending at a fresh nonce");
+                        nonce = next;
+                        fees.nonce = next;
+                        tx.set_nonce(next);
+                        if state.stuck.is_some_and(|s| s.nonce != nonce) {
+                            state.stuck = None;
+                        }
+                        attempt -= 1;
+                        continue;
+                    } else if gapped(&msg) {
+                        gap = Some(e);
                     } else if !raced || hashes.is_empty() {
                         return Err(self.classify(&e));
                     }
                     // A send of ours at this nonce is in the pool or mined: keep waiting on it.
                 }
             }
-            if let Some(r) = self.wait_any(&hashes, self.receipt_timeout).await? {
-                state.stuck = None;
+            if gap.is_none()
+                && let Some(r) = self.wait_any(&hashes, self.receipt_timeout).await?
+            {
+                state.unstick();
+                state.mined = state.mined.max(Some(nonce));
                 drop(state);
                 return self.finish(r, tx, hashes.len()).await;
+            }
+            // Nothing mined at our nonce while a lower one is free: the floor
+            // is wrong (a reorg took a tx of ours) or the read lags. Step
+            // down; if it lags, the refusal there raises the floor back. The
+            // hashes sent stay in `state.sent`: one may still land.
+            let count = self.count(from).await?;
+            if count < nonce {
+                tracing::warn!(nonce, count, "nonce above the chain's count, stepping down");
+                state.stuck = None;
+                state.mined = count.checked_sub(1);
+                hashes.clear();
+                nonce = count;
+                tx.set_nonce(count);
+                let (m, pr, bl) = self.fees_now(blobs.is_some()).await?;
+                fees = Fees {
+                    nonce,
+                    max_fee: m,
+                    priority: pr,
+                    blob_fee: bl,
+                };
+                continue;
+            }
+            if let Some(e) = gap {
+                return Err(self.classify(&e));
             }
             tracing::warn!(nonce, attempt, "no receipt yet, replacing with higher fees");
             let (m, pr, bl) = self.fees_now(blobs.is_some()).await?;
@@ -854,6 +1001,306 @@ mod tests {
         // No endpoint can run it: nothing named, retried the same way.
         let (e, _) = verdict(Replay::NoBlock, Replay::NoBlock).await;
         assert!(matches!(e, Web3Error::Lost { .. }), "{e}");
+    }
+
+    /// A one-account chain for `send`: a tx at the next nonce is mined at
+    /// once, a lower one refused "nonce too low", a higher one queued until
+    /// the gap fills. Nonce reads answer from `reads` first (a lagging
+    /// backend), then the true count.
+    #[derive(Default)]
+    struct Chain {
+        count: u64,
+        reads: std::collections::VecDeque<u64>,
+        /// Answer the next send "already known" (mined all the same).
+        known: bool,
+        /// Answers of the next sends the chain took: lost (`None`, an HTTP
+        /// 503) or replaced by a refusal.
+        lose: std::collections::VecDeque<Option<&'static str>>,
+        /// Pool sends without mining them.
+        hold: bool,
+        /// Refuse a gap "nonce too high" instead of queueing it.
+        no_gaps: bool,
+        /// Refuse "nonce too low" without naming the count (Nethermind).
+        bare: bool,
+        /// Nonce and calldata of every tx sent, refused ones included.
+        sent: Vec<(u64, Bytes)>,
+        pool: std::collections::BTreeMap<u64, B256>,
+        mined: Vec<B256>,
+    }
+
+    type Shared = std::sync::Arc<std::sync::Mutex<Chain>>;
+
+    impl Chain {
+        fn mine(&mut self) {
+            while let Some(h) = self.pool.remove(&self.count) {
+                self.mined.push(h);
+                self.count += 1;
+            }
+        }
+    }
+
+    // `None` drops the answer with a 503.
+    fn answer(c: &mut Chain, req: &serde_json::Value) -> Option<serde_json::Value> {
+        use alloy::consensus::{Transaction, TxEnvelope};
+        use alloy::eips::eip2718::Decodable2718;
+        use serde_json::json;
+        let ok = |v: serde_json::Value| json!({"jsonrpc": "2.0", "id": req["id"], "result": v});
+        let err = |m: &str| json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": m}});
+        Some(match req["method"].as_str().unwrap_or_default() {
+            "eth_getTransactionCount" => {
+                ok(format!("{:#x}", c.reads.pop_front().unwrap_or(c.count)).into())
+            }
+            "eth_feeHistory" => ok(
+                json!({"oldestBlock": "0x10", "baseFeePerGas": ["0x7", "0x7"],
+                "gasUsedRatio": [0.5], "reward": [["0x1"]]}),
+            ),
+            "eth_estimateGas" => ok("0x5208".into()),
+            "eth_sendRawTransaction" => {
+                let raw = hex::decode(req["params"][0].as_str().unwrap().trim_start_matches("0x"))
+                    .unwrap();
+                let env = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+                let n = env.nonce();
+                c.sent.push((n, env.input().clone()));
+                if n < c.count {
+                    return Some(match c.bare {
+                        true => err("nonce too low"),
+                        false => err(&format!(
+                            "nonce too low: next nonce {}, tx nonce {n}",
+                            c.count
+                        )),
+                    });
+                }
+                if n > c.count && c.no_gaps {
+                    return Some(err("nonce too high"));
+                }
+                c.pool.insert(n, *env.tx_hash());
+                if !c.hold {
+                    c.mine();
+                }
+                if let Some(lost) = c.lose.pop_front() {
+                    return lost.map(err);
+                }
+                if std::mem::take(&mut c.known) {
+                    return Some(err("already known"));
+                }
+                ok(env.tx_hash().to_string().into())
+            }
+            "eth_getTransactionReceipt" => {
+                let h: B256 = req["params"][0].as_str().unwrap().parse().unwrap();
+                if !c.mined.contains(&h) {
+                    return Some(ok(serde_json::Value::Null));
+                }
+                let zero = alloy::primitives::Address::ZERO.to_string();
+                ok(json!({"transactionHash": h, "transactionIndex": "0x0",
+                    "blockHash": B256::repeat_byte(9), "blockNumber": "0x11", "from": zero,
+                    "to": zero, "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208",
+                    "effectiveGasPrice": "0x8", "contractAddress": null, "logs": [],
+                    "logsBloom": format!("0x{}", "00".repeat(256)), "type": "0x2", "status": "0x1"}))
+            }
+            // The lookup lags: a tx is known nowhere.
+            "eth_getTransactionByHash" => ok(serde_json::Value::Null),
+            m => panic!("unexpected {m}"),
+        })
+    }
+
+    async fn chain_stub(chain: Shared) -> url::Url {
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                match answer(&mut chain.lock().unwrap(), &req) {
+                    Some(v) => Json(v).into_response(),
+                    None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}").parse().unwrap()
+    }
+
+    // A signing node on a `Chain` at `count`.
+    async fn sender(count: u64) -> (Contracts, Shared) {
+        let key =
+            alloy::signers::local::PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).unwrap();
+        let chain = Shared::new(
+            Chain {
+                count,
+                ..Default::default()
+            }
+            .into(),
+        );
+        let mut c = contracts_at(chain_stub(chain.clone()).await);
+        c.receipt_timeout = Duration::from_millis(300);
+        c.signer = Some(key.address());
+        c.wallet = Some(key.into());
+        (c, chain)
+    }
+
+    fn call(data: &[u8]) -> TransactionRequest {
+        TransactionRequest::default()
+            .with_to(Address::repeat_byte(1))
+            .with_input(data.to_vec())
+    }
+
+    fn sent(chain: &Shared) -> Vec<(u64, Vec<u8>)> {
+        let c = chain.lock().unwrap();
+        c.sent.iter().map(|(n, d)| (*n, d.to_vec())).collect()
+    }
+
+    // A nonce read from a backend behind our own last mined tx: the send
+    // goes out above it, without a refused try.
+    #[tokio::test]
+    async fn a_lagging_nonce_read_stays_above_our_last_mined() {
+        let (c, chain) = sender(5).await;
+        c.send(call(&[1]), None).await.unwrap();
+        chain.lock().unwrap().reads.push_back(3);
+        c.send(call(&[2]), None).await.unwrap();
+        assert_eq!(sent(&chain), [(5, vec![1]), (6, vec![2])]);
+    }
+
+    // A stuck tx of ours is replaced at its nonce even when the read lags.
+    #[test]
+    fn next_nonce_keeps_the_floor_and_the_stuck_nonce() {
+        let fees = |nonce| Fees {
+            nonce,
+            max_fee: 1,
+            priority: 1,
+            blob_fee: 0,
+        };
+        let s = SendState::default();
+        assert_eq!(s.next_nonce(4), 4);
+        let s = SendState {
+            mined: Some(6),
+            ..Default::default()
+        };
+        assert_eq!((s.next_nonce(3), s.next_nonce(9)), (7, 9));
+        let s = SendState {
+            stuck: Some(fees(8)),
+            mined: Some(6),
+            ..Default::default()
+        };
+        assert_eq!((s.next_nonce(3), s.next_nonce(9)), (8, 9));
+    }
+
+    // "nonce too low" for a tx the chain does not know: the nonce is re-read
+    // and the same calldata re-signed at it, and the caller sees a receipt.
+    #[tokio::test]
+    async fn a_nonce_too_low_is_reread_and_resent() {
+        let (c, chain) = sender(5).await;
+        chain.lock().unwrap().reads.push_back(3);
+        let (r, _) = c.send(call(&[7, 7]), None).await.unwrap();
+        assert_eq!(r.replacements, 0);
+        assert_eq!(sent(&chain), [(3, vec![7, 7]), (5, vec![7, 7])]);
+
+        // A refusal naming the count goes there in one step.
+        let (c, chain) = sender(10).await;
+        chain.lock().unwrap().reads.extend([3; 4]);
+        c.send(call(&[8]), None).await.unwrap();
+        assert_eq!(sent(&chain), [(3, vec![8]), (10, vec![8])]);
+
+        // Bounded: without it, a read that keeps lagging gives up after the
+        // re-reads.
+        let (c, chain) = sender(10).await;
+        chain.lock().unwrap().bare = true;
+        chain.lock().unwrap().reads.extend([3; 4]);
+        let e = c.send(call(&[8]), None).await.unwrap_err();
+        assert!(e.to_string().contains("nonce too low"), "{e}");
+        let nonces: Vec<u64> = sent(&chain).iter().map(|s| s.0).collect();
+        assert_eq!(nonces, [3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn unanswered_sends_are_maybe_sent() {
+        let t = |k: TransportErrorKind| maybe_sent(&RpcError::Transport(k));
+        assert!(t(TransportErrorKind::Custom(
+            "broadcast send timed out".into()
+        )));
+        assert!(t(TransportErrorKind::HttpError(
+            alloy::transports::HttpError {
+                status: 503,
+                body: String::new()
+            }
+        )));
+        assert!(!t(TransportErrorKind::HttpError(
+            alloy::transports::HttpError {
+                status: 413,
+                body: String::new()
+            }
+        )));
+        assert!(!t(TransportErrorKind::Custom(ALL_RESTING.into())));
+    }
+
+    #[test]
+    fn a_refusal_names_the_count() {
+        let geth = "nonce too low: address 0xab, tx: 3 state: 10";
+        let reth = "nonce too low: next nonce 10, tx nonce 3";
+        assert_eq!((named_count(geth), named_count(reth)), (Some(10), Some(10)));
+        assert_eq!(named_count("nonce too low"), None);
+    }
+
+    // A reorg took our last mined tx: the floor would send past the chain's
+    // count forever. A receipt timeout (or a gap refused) steps it down.
+    #[tokio::test]
+    async fn the_floor_comes_down_after_a_reorg() {
+        for no_gaps in [false, true] {
+            let (c, chain) = sender(5).await;
+            c.send(call(&[1]), None).await.unwrap();
+            {
+                let mut ch = chain.lock().unwrap();
+                (ch.count, ch.no_gaps) = (5, no_gaps);
+                ch.mined.clear();
+            }
+            c.send(call(&[2]), None).await.unwrap();
+            assert_eq!(
+                sent(&chain),
+                [(5, vec![1]), (6, vec![2]), (5, vec![2])],
+                "no_gaps {no_gaps}"
+            );
+        }
+    }
+
+    // The chain took the tx but its answer was lost: in a 503, or behind a
+    // "nonce too low" from an endpoint that saw it mined. Its receipt, not
+    // a second copy at the next nonce.
+    #[tokio::test]
+    async fn a_lost_acceptance_waits_for_its_receipt() {
+        for lost in [None, Some("nonce too low: next nonce 6, tx nonce 5")] {
+            let (c, chain) = sender(5).await;
+            chain.lock().unwrap().lose.push_back(lost);
+            c.send(call(&[4]), None).await.unwrap();
+            assert_eq!(sent(&chain), [(5, vec![4])], "{lost:?}");
+        }
+    }
+
+    // A stuck tx of ours got mined, the read lags: the nonce is taken by it,
+    // and new calldata is not blindly resent at the next one.
+    #[tokio::test]
+    async fn a_nonce_taken_by_an_earlier_tx_of_ours_is_not_resent() {
+        let (c, chain) = sender(5).await;
+        chain.lock().unwrap().hold = true;
+        let e = c.send(call(&[1]), None).await.unwrap_err();
+        assert!(matches!(e, Web3Error::Stuck { nonce: 5, .. }), "{e}");
+        {
+            let mut ch = chain.lock().unwrap();
+            ch.hold = false;
+            ch.mine();
+            ch.reads.push_back(5);
+        }
+        let e = c.send(call(&[2]), None).await.unwrap_err();
+        assert!(e.to_string().contains("earlier tx of ours"), "{e}");
+        assert_eq!(sent(&chain).last(), Some(&(5, vec![2])));
+    }
+
+    // An endpoint already holding this very tx took it: wait for its receipt.
+    #[tokio::test]
+    async fn an_already_known_send_is_ours() {
+        let (c, chain) = sender(5).await;
+        chain.lock().unwrap().known = true;
+        c.send(call(&[3]), None).await.unwrap();
+        assert_eq!(sent(&chain), [(5, vec![3])]);
     }
 
     #[tokio::test]

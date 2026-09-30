@@ -11,6 +11,10 @@
 //! endpoint, for its `Retry-After` or a doubling backoff. Requests skip
 //! resting endpoints, and when every one rests they wait for the first back
 //! (up to [`MAX_RATE_WAIT`]) instead of failing or asking again.
+//!
+//! `eth_sendRawTransaction` is the exception: it goes to every endpoint not
+//! resting at once, see [`Failover::broadcast`]: a signed tx is the same on
+//! every node, and one slow endpoint must not hold up the answer.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,6 +65,12 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 /// the process actors and the monitor await some reads inline.
 const MAX_RATE_WAIT: Duration = Duration::from_secs(10);
 
+/// The error of a request no endpoint was asked: all rest after a rate limit.
+pub(super) const ALL_RESTING: &str = "every RPC endpoint is resting after a rate limit";
+
+/// Longest a broadcast `eth_sendRawTransaction` waits on one endpoint.
+const BROADCAST_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Answers another endpoint would give too; they win over [`NODE_SIDE`] and
 /// -32603 (some clients wrap a revert in an internal error).
 const DETERMINISTIC: &[&str] = &[
@@ -90,6 +100,21 @@ pub(crate) fn host(u: &Url) -> String {
         (Some(h), None) => h.to_string(),
         _ => "?".into(),
     }
+}
+
+/// A send refused because the node holds this very tx: geth "already known",
+/// anvil/reth "already imported", Nethermind "AlreadyKnown", Besu "Known
+/// transaction".
+pub(super) fn known_tx(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "already known",
+        "already imported",
+        "alreadyknown",
+        "known transaction",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
 }
 
 fn is_deterministic(msg: &str) -> bool {
@@ -303,11 +328,8 @@ impl Failover {
                     .map(|t| t - now)
                     .filter(|w| waited + *w <= MAX_RATE_WAIT);
                 let Some(wait) = wait else {
-                    return last.unwrap_or_else(|| {
-                        Err(TransportErrorKind::custom_str(
-                            "every RPC endpoint is resting after a rate limit",
-                        ))
-                    });
+                    return last
+                        .unwrap_or_else(|| Err(TransportErrorKind::custom_str(ALL_RESTING)));
                 };
                 tokio::time::sleep(wait).await;
                 waited += wait;
@@ -352,6 +374,70 @@ impl Failover {
             last = Some(res);
         }
     }
+
+    // Sends a tx to every endpoint not resting (all resting: the sticky path).
+    // The first to take it or to hold it already answers; the others finish in
+    // the background. Without one, the most telling refusal: "nonce too low",
+    // another deterministic one, then the first failure.
+    async fn broadcast(self, req: RequestPacket) -> Result<ResponsePacket, TransportError> {
+        let now = Instant::now();
+        let live: Vec<usize> = (0..self.endpoints.len())
+            .filter(|i| self.endpoints[*i].resting(now).is_none())
+            .collect();
+        if live.is_empty() {
+            return self.send(req).await;
+        }
+        let req = Arc::new(req);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(live.len());
+        for i in live {
+            let (f, req, tx) = (self.clone(), req.clone(), tx.clone());
+            tokio::spawn(async move {
+                let ep = &f.endpoints[i];
+                let sent = Instant::now();
+                let posted =
+                    tokio::time::timeout(BROADCAST_TIMEOUT, post(&f.client, &ep.url, &req))
+                        .await
+                        .unwrap_or_else(|_| Posted {
+                            status: 0,
+                            retry_after: None,
+                            res: Err(TransportErrorKind::custom_str("broadcast send timed out")),
+                        });
+                let ok = (200..300).contains(&posted.status);
+                if posted.status == 429 || posted.res.as_ref().is_ok_and(rate_limited) {
+                    ep.limit(posted.retry_after);
+                } else if ok && posted.res.as_ref().is_ok_and(|p| node_side(p).is_none()) {
+                    ep.answered(sent);
+                }
+                let _ = tx.send((ep.host.clone(), ok, posted.res)).await;
+            });
+        }
+        drop(tx);
+        let mut best: Option<(u8, Result<ResponsePacket, TransportError>)> = None;
+        while let Some((host, ok, res)) = rx.recv().await {
+            let rank = match &res {
+                Ok(p) if ok && p.first_error_code().is_none() => return res,
+                Ok(p) if p.iter_errors().any(|e| known_tx(&e.message)) => return res,
+                Ok(p)
+                    if p.iter_errors()
+                        .any(|e| e.message.to_ascii_lowercase().contains("nonce too low")) =>
+                {
+                    0
+                }
+                Ok(p) if deterministic(p) => 1,
+                _ => 2,
+            };
+            if let Err(e) = &res {
+                tracing::debug!(%host, error = %e, "broadcast send failed");
+            }
+            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                best = Some((rank, res));
+            }
+        }
+        best.map_or_else(
+            || Err(TransportErrorKind::custom_str("broadcast got no answer")),
+            |(_, res)| res,
+        )
+    }
 }
 
 impl Service<RequestPacket> for Failover {
@@ -364,7 +450,11 @@ impl Service<RequestPacket> for Failover {
     }
 
     fn call(&mut self, req: RequestPacket) -> Self::Future {
-        Box::pin(self.clone().send(req))
+        let tx = matches!(&req, RequestPacket::Single(r) if r.method() == "eth_sendRawTransaction");
+        match tx && self.endpoints.len() > 1 {
+            true => Box::pin(self.clone().broadcast(req)),
+            false => Box::pin(self.clone().send(req)),
+        }
     }
 }
 
@@ -384,12 +474,18 @@ mod tests {
 
     // A JSON-RPC stub answering every request with `reply`; counts calls.
     async fn stub(reply: Reply) -> (Url, Arc<AtomicUsize>) {
+        slow_stub(Duration::ZERO, reply).await
+    }
+
+    // `stub` answering each request after `delay`.
+    async fn slow_stub(delay: Duration, reply: Reply) -> (Url, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
         let app = axum::Router::new().route(
             "/",
             axum::routing::post(move |axum::Json(req): axum::Json<Value>| async move {
                 c.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
                 let (st, v) = reply(&req);
                 (st, axum::Json(v))
             }),
@@ -699,6 +795,64 @@ mod tests {
         ep.limit(None);
         let rest = ep.resting(Instant::now()).unwrap() - Instant::now();
         assert_eq!(rest, Duration::from_secs(1), "started over after an answer");
+    }
+
+    const TX_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn accept(req: &Value) -> (StatusCode, Value) {
+        let v = json!({"jsonrpc":"2.0","id":req["id"],"result":TX_HASH});
+        (StatusCode::OK, v)
+    }
+
+    // A send goes to every endpoint at once: the first acceptance answers,
+    // a slow endpoint and a refusal ahead of it do not hold it up.
+    #[tokio::test]
+    async fn sends_are_broadcast_and_the_first_acceptance_wins() {
+        let (slow, slow_calls) = slow_stub(Duration::from_secs(3), accept).await;
+        let (low, low_calls) = stub(|r| error(r, StatusCode::OK, "nonce too low")).await;
+        let (fast, fast_calls) = slow_stub(Duration::from_millis(200), accept).await;
+        let (f, p) = provider(&[slow, low, fast]);
+        let t = Instant::now();
+        let sent = p.send_raw_transaction(&[2, 1]).await.unwrap();
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert_eq!(sent.tx_hash().to_string(), TX_HASH);
+        assert_eq!((n(&slow_calls), n(&low_calls), n(&fast_calls)), (1, 1, 1));
+        assert_eq!(f.current(), 0, "a broadcast moves no one");
+    }
+
+    // An endpoint that already holds the tx answers at once, as taken.
+    #[tokio::test]
+    async fn an_already_known_send_answers_at_once() {
+        let (slow, _) = slow_stub(Duration::from_secs(3), accept).await;
+        let (known, _) = stub(|r| error(r, StatusCode::OK, "already known")).await;
+        let (down, _) = stub(|_| (StatusCode::SERVICE_UNAVAILABLE, json!("down"))).await;
+        let (_, p) = provider(&[slow, known, down]);
+        let t = Instant::now();
+        let e = p.send_raw_transaction(&[2, 1]).await.unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(e.to_string().contains("already known"), "{e}");
+    }
+
+    // Without an acceptance the nonce refusal wins, so the sender can tell
+    // a lagging nonce from other refusals; a rate limit still rests.
+    #[tokio::test]
+    async fn a_refused_broadcast_returns_the_nonce_refusal() {
+        let (down, _) = stub(|_| (StatusCode::SERVICE_UNAVAILABLE, json!("down"))).await;
+        let (funds, _) = stub(|r| error(r, StatusCode::OK, "insufficient funds")).await;
+        let (low, _) = stub(|r| error(r, StatusCode::OK, "nonce too low")).await;
+        let (_, p) = provider(&[down, funds, low]);
+        let e = p.send_raw_transaction(&[2, 1]).await.unwrap_err();
+        assert!(e.to_string().contains("nonce too low"), "{e}");
+
+        let (limited, limited_calls) = limiting(usize::MAX, slow_down_long).await;
+        let (good, good_calls) = stub(accept).await;
+        let (_, p) = provider(&[limited, good]);
+        for _ in 0..2 {
+            let sent = p.send_raw_transaction(&[2, 1]).await.unwrap();
+            assert_eq!(sent.tx_hash().to_string(), TX_HASH);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!((n(&limited_calls), n(&good_calls)), (1, 2));
     }
 
     #[test]
