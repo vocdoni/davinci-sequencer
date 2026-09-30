@@ -210,7 +210,7 @@ fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
 /// Drops stored censuses no process uses any more: not the root of an
 /// origin-1/2 record nor the newest update of one. Runs on the monitor loop,
 /// so it never races a bootstrap that stored a census before its record.
-// Roots of finished processes are kept (proofs stay servable); prune by LocalStatus if disk matters.
+/// Roots of finished processes are kept, so their proofs stay servable.
 async fn prune_censuses(ctx: &Ctx) {
     let mut keep: HashSet<[u8; 32]> = match ctx.updates.lock() {
         Ok(q) => q.values().map(|e| fr_to_be(&e.1)).collect(),

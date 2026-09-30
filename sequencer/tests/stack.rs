@@ -1,9 +1,9 @@
-//! Stack regression for the sync path: fetching another sequencer's blobs
-//! must fit a small stack. Deserializing the anvil response into
-//! `eip4844::Blob` (a 128 KiB by-value array) overflowed the 2 MiB tokio
-//! worker stack in debug builds and aborted every syncing node; the fix
-//! deserializes into heap `Bytes`. The 512 KiB thread here catches the
-//! by-value pattern even in the optimized test profile.
+//! Stack test for the sync path: fetching another sequencer's blobs must
+//! fit a small stack. Deserializing the anvil response into `eip4844::Blob`
+//! (a 128 KiB by-value array) overflows the 2 MiB tokio worker stack in
+//! debug builds, so the source deserializes into heap `Bytes`. The 512 KiB
+//! thread here catches the by-value pattern even in the optimized test
+//! profile.
 
 use alloy::consensus::transaction::Recovered;
 use alloy::consensus::{Signed, TxEip4844, TxEip4844Variant, TxEnvelope};

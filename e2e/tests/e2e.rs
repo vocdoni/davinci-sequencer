@@ -30,14 +30,15 @@
 //! first, the accounts must hold 0.05 native each, nodes read blobs from the
 //! beacon API, and timeouts scale by `DAVINCI_E2E_TIMEOUT_SCALE`. Opt-in
 //! extras: `DAVINCI_E2E_RESILIENCE=1` (full RPC, prover and beacon outages
-//! and an observer RPC failover, through loopback proxies) and `DAVINCI_E2E_NEGATIVE=1` (tampered replays through
-//! `eth_call`; also a standalone test). Every run ends with its gas bill.
+//! and an observer RPC failover, through loopback proxies) and
+//! `DAVINCI_E2E_NEGATIVE=1` (tampered replays through `eth_call`; also a
+//! standalone test). Every run ends with its gas bill.
 //! `DAVINCI_E2E_DKG=1` adds the DKG key modes (`davinci_e2e::dkg`): on anvil
 //! a davinci-dkg committee of three nodes with a Live epoch, deployed before
 //! the registry; live the committee of the registry adapter's manager
-//! (`DAVINCI_E2E_DKG_MANAGER` overrides it). Then,
-//! after the sequencer-key processes, an automatic, a locked and a zero-vote
-//! DKG process and the eth_call negatives around their requests.
+//! (`DAVINCI_E2E_DKG_MANAGER` overrides it). Then, after the sequencer-key
+//! processes, an automatic, a locked and a zero-vote DKG process and the
+//! eth_call negatives around their requests.
 //!
 //! Every process closes after the registry's grace window, and the last
 //! phase exercises it (`grace`): an AGM END with batches in flight, a
@@ -2130,10 +2131,9 @@ async fn results_block(net: &Net, pid: &[u8; 31]) -> Result<u64> {
 
 /// The DKG key modes, through the registry only: an automatic process
 /// ended with a batch in flight (with a ballot under another key refused),
-/// a locked one that ends by
-/// time and stays undecrypted until its organizer reveals (a wrong secret
-/// first), a zero-vote one tallied without the DKG, and the eth_call
-/// negatives around the two requests.
+/// a locked one that ends by time and stays undecrypted until its organizer
+/// reveals (a wrong secret first), a zero-vote one tallied without the DKG,
+/// and the eth_call negatives around the two requests.
 #[allow(clippy::too_many_arguments)]
 async fn dkg_processes(
     nodes: &[Node],

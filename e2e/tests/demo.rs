@@ -5,10 +5,10 @@
 //!
 //! - `prepare` draws every voter key, the CSP key and the seed behind every
 //!   ballot secret and choice into the private directory
-//!   (`DAVINCI_DEMO_DIR`, default `~/.davinci-gnosis/demo`, mode 0700), and
+//!   (`DAVINCI_DEMO_DIR`, default `~/.davinci-demo`, mode 0700), and
 //!   writes the public census and metadata files of each election into
-//!   `e2e/demo/` (the later waves under `e2e/demo/wave2/` and `wave3/`). Run again, it
-//!   reuses the keys and rewrites the same files.
+//!   `e2e/demo/` (the later waves under `e2e/demo/wave2/` and `wave3/`). Run
+//!   again, it reuses the keys and rewrites the same files.
 //! - `run` creates the elections, their census and metadata URIs under
 //!   `DAVINCI_DEMO_BASE_URL` (the committed `e2e/demo`, e.g. on
 //!   raw.githubusercontent.com at a pinned commit) and the SHA-256 of each
@@ -19,10 +19,10 @@
 //!   census updates, reveals, pause, duration and max voters, cancels) and
 //!   the votes the nodes must refuse, ends what the organizer ends, waits for
 //!   every result and prints a table. The third wave's meetings trickle their
-//!   votes in and close while the nodes hold them. It spawns nothing: the nodes, their
-//!   provers and the DKG committee are the deployment's. Progress goes to the
-//!   wave's state file in the private directory, so an interrupted run
-//!   resumes without duplicates.
+//!   votes in and close while the nodes hold them. It spawns nothing: the
+//!   nodes, their provers and the DKG committee are the deployment's.
+//!   Progress goes to the wave's state file in the private directory, so an
+//!   interrupted run resumes without duplicates.
 //!
 //! `check` proves every planned ballot, and every refused vote's, with the
 //! circom prover against a stand-in process of each election, offline; `run`

@@ -10,3 +10,6 @@
 /.env
 /sequencer.key
 /letsencrypt/
+/.env.*
+!/.env.example
+CLAUDE.md

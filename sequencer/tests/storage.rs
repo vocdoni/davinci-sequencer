@@ -500,7 +500,7 @@ fn exposed_record_roundtrips_as_one_union_list() {
     let json = serde_json::to_value(&rec).unwrap();
     let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["slots", "vote_ids"]);
-    // Survives a reopen (SCHEMA_VERSION 5 covers the new table).
+    // Survives a reopen.
     drop(db);
     let db = open(&dir);
     assert_eq!(db.exposed(&pid(1)).unwrap(), Some(rec));

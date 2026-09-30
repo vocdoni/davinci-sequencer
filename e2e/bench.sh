@@ -3,7 +3,7 @@
 # benchmark by default, the batch-size one with DAVINCI_E2E_BENCH=sizes.
 # Every DAVINCI_E2E_* variable set here is passed through, e.g.
 #
-#   DAVINCI_E2E_BENCH_PROVERS=http://127.0.0.1:8080,http://10.200.0.27:8080 e2e/bench.sh
+#   DAVINCI_E2E_BENCH_PROVERS=http://127.0.0.1:8080,http://prover2.example:8080 e2e/bench.sh
 #
 # With DAVINCI_E2E_DEMO=prepare, check or run it runs that phase of the demo
 # driver (tests/demo.rs) instead, against the live nodes for run;
@@ -13,13 +13,13 @@
 #   DAVINCI_E2E_DEMO=check e2e/bench.sh    # offline: every planned ballot proves
 #   DAVINCI_E2E_DEMO=run \
 #     DAVINCI_DEMO_BASE_URL=https://raw.githubusercontent.com/vocdoni/davinci-sequencer/<commit>/e2e/demo \
+#     DAVINCI_DEMO_ORGANIZER_KEY=/path/to/organizer.key \
 #     e2e/bench.sh
 #
 # prepare writes e2e/demo (the only writable part of the checkout). Every
-# phase keeps its secrets in DAVINCI_DEMO_DIR (default
-# ~/.davinci-gnosis/demo, created mode 0700); run also mounts the organizer
-# key file DAVINCI_DEMO_ORGANIZER_KEY (default ~/gnosis-chain-privkey.txt)
-# read-only.
+# phase keeps its secrets in DAVINCI_DEMO_DIR (default $HOME/.davinci-demo,
+# created mode 0700); run also needs the organizer key file
+# DAVINCI_DEMO_ORGANIZER_KEY, mounted read-only.
 #
 # With DAVINCI_E2E=1 it runs the acceptance test (tests/e2e.rs) instead, on
 # the released node image (NODE_IMAGE default ...:latest). With
@@ -31,8 +31,8 @@
 # are mounted read-only and passed on under their container paths:
 #
 #   DAVINCI_E2E=1 DAVINCI_E2E_LIVE=1 DAVINCI_E2E_DKG=1 DAVINCI_E2E_NEGATIVE=1 \
-#     DAVINCI_E2E_ORGANIZER_KEY=/path/org.key \
-#     DAVINCI_E2E_SEQUENCER_KEYS=/path/seq1.key,/path/seq2.key,/path/seq3.key \
+#     DAVINCI_E2E_ORGANIZER_KEY=/path/to/organizer.key \
+#     DAVINCI_E2E_SEQUENCER_KEYS=/path/to/sequencer-a.key,/path/to/sequencer-b.key,/path/to/sequencer-c.key \
 #     DAVINCI_ZKVM_URL=http://127.0.0.1:8080 e2e/bench.sh
 #
 # Host paths (defaults: siblings of this checkout): DAVINCI_ZKVM_DIR,
@@ -67,7 +67,13 @@ need_zkey() {
 need_dir "$zkvm/rust-sdk"
 mounts=(-v "$seq_dir:/work/davinci-sequencer:ro" -v "$zkvm:/work/davinci-zkvm:ro")
 if [[ -n $demo ]]; then
-    private=${DAVINCI_DEMO_DIR:-$HOME/.davinci-gnosis/demo}
+    # The organizer key first, so a run without one creates nothing.
+    if [[ $demo == run ]]; then
+        key=${DAVINCI_DEMO_ORGANIZER_KEY:-}
+        [[ -n $key ]] || { echo "DAVINCI_DEMO_ORGANIZER_KEY: set it to the organizer key file" >&2; exit 1; }
+        [[ -f $key ]] || { echo "DAVINCI_DEMO_ORGANIZER_KEY: no key file '$key'" >&2; exit 1; }
+    fi
+    private=${DAVINCI_DEMO_DIR:-$HOME/.davinci-demo}
     mkdir -p "$private" "$seq_dir/e2e/demo"
     chmod 700 "$private"
     mounts+=(-v "$private:/demo-private" -e DAVINCI_DEMO_DIR=/demo-private)
@@ -80,13 +86,11 @@ if [[ -n $demo ]]; then
             mounts+=(-v "$circom:/work/davinci-circom/artifacts:ro")
             ;;
         run)
-            key=${DAVINCI_DEMO_ORGANIZER_KEY:-$HOME/gnosis-chain-privkey.txt}
-            [[ -f $key ]] || { echo "no organizer key file $key" >&2; exit 1; }
             [[ -f $census/out/OwnedCensus.sol/OwnedCensus.json ]] \
                 || { echo "no OwnedCensus build in $census/out (forge build)" >&2; exit 1; }
             need_zkey
             mounts+=(
-                -v "$key:/demo-keys/organizer.key:ro"
+                -v "$(realpath "$key"):/demo-keys/organizer.key:ro"
                 -e DAVINCI_DEMO_ORGANIZER_KEY=/demo-keys/organizer.key
                 -v "$census:$census:ro" -e "DAVINCI_CENSUS_CONTRACT_DIR=$census"
                 -v "$circom:/work/davinci-circom/artifacts:ro"

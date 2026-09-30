@@ -1,25 +1,31 @@
 # davinci-client
 
-Rust client for a DAVINCI sequencer and its `ProcessRegistry`:
+Rust client for a DAVINCI sequencer and its `ProcessRegistry`, for organizers who create elections
+and voters who cast ballots.
 
-- `api`: the HTTP wire types, the format owner for every route of the node, and
-  `verify_tracker` for recorded-as-cast checks;
-- `SequencerClient`: a client for every route;
-- `organizer`: process lifecycle on the registry (`Organizer`), read-only
-  access (`RegistryReader`) and `verify_registry`, which checks that a registry
-  pins what this release proves;
-- `voter`: ballot encryption, vote id, inputs hash, circom inputs and the vote-id
-  signature;
-- `prover` (feature `prover`, on by default): the Groth16 ballot prover over the
-  davinci-circom `ballot_proof.wasm` and `ballot_proof_pkey.zkey`. It pulls in
-  ark-circom (arkworks 0.6) and wasmer; build with `default-features = false`
-  when only the wire types and the client are needed.
+## Overview
 
-The protocol primitives come from `davinci-zkvm-sdk` (davinci-zkvm `rust-sdk`),
-a path dependency. The node's API, key modes and census origins are described in
-the [main README](../README.md).
+- `api`: the HTTP wire types of every node route, and `verify_tracker` for recorded-as-cast
+  checks.
+- `SequencerClient`: a client for every route.
+- `networks`: the known deployments, shared with the node's `--network` presets.
+- `organizer`: the process lifecycle on the registry (`Organizer`), read-only access
+  (`RegistryReader`), and `verify_registry`, which checks that a registry pins what this release
+  proves.
+- `voter`: ballot encryption, vote id, inputs hash, circuit inputs and the vote-id signature.
+- `prover` (feature `prover`, on by default): the Groth16 ballot prover over the davinci-circom
+  `ballot_proof.wasm` and `ballot_proof_pkey.zkey`. It pulls in ark-circom (arkworks 0.6) and
+  wasmer; build with `default-features = false` when only the wire types and the client are
+  needed.
 
-## Casting a vote
+The protocol primitives come from `davinci-zkvm-sdk` (davinci-zkvm `rust-sdk`), a path
+dependency. The node's API is described in [docs/api.md](../docs/api.md), key modes in
+[docs/lifecycle.md](../docs/lifecycle.md#key-modes) and census origins in
+[docs/census.md](../docs/census.md).
+
+## Usage
+
+### Casting a vote
 
 ```rust
 use davinci_client::SequencerClient;
@@ -58,30 +64,37 @@ let root = reader.process(&pid).await?.state_root;
 assert!(verify_tracker(&tracker, &root));
 ```
 
-For a CSP census the census witness is the CSP's attestation
-(`CensusWitness::Csp`) instead of the participant proof. `prepare_vote` and
-`finish_vote` split `build_vote` for callers that prove elsewhere.
+For a CSP census the census witness is the CSP's attestation (`CensusWitness::Csp`) instead of
+the participant proof. `prepare_vote` and `finish_vote` split `build_vote` for callers that prove
+elsewhere.
 
-## Creating a process
+### Creating a process
 
-`Organizer::create_process` takes a `NewProcess` whose `process_id` is the
-registry's `next_process_id()`. For a sequencer key, fetch the key for that id
-with `SequencerClient::new_key` first; for a DKG key, pick
-`KeyMode::DkgAutomatic` or `KeyMode::DkgLocked` and keep the
-`organizer_secret` a locked process returns, since `reveal_process_key` needs it
-to unlock the results. See [Key modes](../README.md#key-modes).
+`Organizer::create_process` takes a `NewProcess` whose `process_id` is the registry's
+`next_process_id()`. For a sequencer key, fetch the key for that id with
+`SequencerClient::new_key` first. For a DKG key, pick `KeyMode::DkgAutomatic` or
+`KeyMode::DkgLocked`, and keep the `organizer_secret` a locked process returns:
+`reveal_process_key` needs it to unlock the results.
 
-`NewProcess::metadata` is the URI of the metadata document (title, question,
-what each ballot field stands for) and `metadata_hash` is
-`organizer::metadata_hash(&document)`, the SHA-256 of the exact bytes served at
-that URI, with no JSON canonicalisation. The registry refuses an empty URI or a
-zero hash. Serve the document byte for byte: reformatting it changes the hash.
-Until the process ends, `Organizer::set_process_metadata(pid, uri, hash)` points
-it at a new document (organizer only, while READY or PAUSED). A client checks a
-fetched document against `OnchainProcess::metadata_hash`.
+`NewProcess::metadata` is the URI of the metadata document (title, question, what each ballot
+field stands for) and `metadata_hash` is `organizer::metadata_hash(&document)`, the SHA-256 of the
+exact bytes served at that URI, with no JSON canonicalisation. The registry refuses an empty URI
+or a zero hash, so serve the document byte for byte: reformatting it changes the hash. Until the
+process ends, `Organizer::set_process_metadata(pid, uri, hash)` points it at a new document
+(organizer only, while ready or paused). A client checks a fetched document against
+`OnchainProcess::metadata_hash`.
 
-## Tests
+## Development
 
-`cargo test -p davinci-client` runs the offline tests. `ANVIL=1` adds the
-organizer tests against real contracts on anvil (needs `forge build` output in
-`DAVINCI_CONTRACTS_DIR`), and `CIRCOM_ARTIFACTS=<dir>` the prover tests.
+```bash
+cargo test -p davinci-client                                   # offline tests
+ANVIL=1 cargo test -p davinci-client --test organizer          # against real contracts on anvil
+CIRCOM_ARTIFACTS=<dir> cargo test -p davinci-client --test prover
+```
+
+The anvil tests need `forge build` output in `DAVINCI_CONTRACTS_DIR` (default
+`../davinci-contracts`). See [docs/testing.md](../docs/testing.md).
+
+## License
+
+GNU Affero General Public License v3.0 or later. See [LICENSE](../LICENSE).

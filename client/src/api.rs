@@ -660,8 +660,8 @@ impl ProcessStatus {
     }
 }
 
-/// Census of a process: origin 1 (Merkle, lean-IMT root) or 4 (CSP, root =
-/// CSP address as an integer).
+/// Census of a process: origins 1 to 3 (Merkle, lean-IMT root) or 4 (CSP,
+/// root = CSP address as an integer).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CensusView {

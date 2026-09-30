@@ -198,7 +198,7 @@ async fn duplicate_vote_settles_once() {
     shutdown.cancel();
 }
 
-/// An organizer END no longer closes out: the batch in flight lands in the
+/// An organizer END does not close out: the batch in flight lands in the
 /// grace, admission closes at the (collapsed) end.
 #[tokio::test]
 async fn end_event_flushes_instead_of_closing() {
@@ -407,8 +407,8 @@ async fn finalize_with_key_sets_results() {
     shutdown.cancel();
 }
 
-/// FW-1: the contract accepts results for a process paused past its
-/// end, so the key holder finalizes it like a Ready one.
+/// The contract accepts results for a process paused past its end, so
+/// the key holder finalizes it like a Ready one.
 #[tokio::test]
 async fn paused_past_end_still_finalizes() {
     let dir = TempDir::new().unwrap();
@@ -450,8 +450,8 @@ async fn paused_past_end_still_finalizes() {
     shutdown.cancel();
 }
 
-/// FW-2: a paused process still accepts votes; they queue and settle
-/// once the process resumes.
+/// A paused process still accepts votes; they queue and settle once the
+/// process resumes.
 #[tokio::test]
 async fn paused_process_queues_votes_until_resume() {
     let s = setup(2, 8, None);
@@ -941,10 +941,10 @@ async fn blob_fetch_failure_recovers_on_heartbeat() {
     shutdown.cancel();
 }
 
-/// Minor: a transition event the monitor never delivered (a gap) is
-/// replayed from the registry when a later event reveals it, resuming from
-/// the last applied transition. Tail: a vote settled by another
-/// sequencer is a duplicate here even without a local record.
+/// A transition event the monitor never delivered (a gap) is replayed
+/// from the registry when a later event reveals it, resuming from the last
+/// applied transition. A vote settled by another sequencer is then a
+/// duplicate here even without a local record.
 #[tokio::test]
 async fn gap_replay_applies_missed_transitions() {
     let s = setup(2, 8, None);
@@ -1001,7 +1001,7 @@ async fn gap_replay_applies_missed_transitions() {
     shutdown.cancel();
 }
 
-/// Minor: a transient submit failure requeues the votes and the next seal
+/// A transient submit failure requeues the votes and the next seal
 /// retries; no lost race is counted and no vote is lost.
 #[tokio::test]
 async fn transient_submit_failure_requeues_and_retries() {
@@ -1036,7 +1036,7 @@ async fn transient_submit_failure_requeues_and_retries() {
     shutdown.cancel();
 }
 
-/// Minor: a receipt timeout on a tx that actually landed commits from the
+/// A receipt timeout on a tx that actually landed commits from the
 /// transition event instead of double-proving or faking a lost race.
 #[tokio::test]
 async fn receipt_timeout_on_landed_tx_commits_from_event() {

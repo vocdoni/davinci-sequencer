@@ -1685,12 +1685,12 @@ impl Secrets {
     }
 }
 
-/// The private directory: `DAVINCI_DEMO_DIR`, default
-/// `~/.davinci-gnosis/demo`, created mode 0700.
+/// The private directory: `DAVINCI_DEMO_DIR`, default `~/.davinci-demo`,
+/// created mode 0700.
 pub fn private_dir() -> Result<PathBuf> {
     let dir = match std::env::var_os("DAVINCI_DEMO_DIR") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("HOME")?).join(".davinci-gnosis/demo"),
+        _ => PathBuf::from(std::env::var_os("HOME").context("HOME")?).join(".davinci-demo"),
     };
     open_private_dir(&dir)?;
     Ok(dir)

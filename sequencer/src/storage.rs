@@ -915,7 +915,7 @@ fn tx_push(tx: &WriteTransaction, pid: &Fr, vid: u64) -> Result<()> {
 }
 
 // Renumbers the process's queue as `vids` (those not queued yet) followed
-// by the current queue. ponytail: O(queue) rewrite, fine for the rare requeue.
+// by the current queue. An O(queue) rewrite, fine for the rare requeue.
 fn tx_prepend(tx: &WriteTransaction, pid: &Fr, vids: &[u64]) -> Result<()> {
     let mut idx = tx.open_table(PENDING_IDX).map_err(db_err)?;
     let mut t = tx.open_table(PENDING).map_err(db_err)?;

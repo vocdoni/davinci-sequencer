@@ -1,6 +1,6 @@
-//! Shared test harness: scripted fakes for the node's dependencies: a fake chain arbitrating
-//! the state root under a mutex, a fake prover returning the expected
-//! publics, and blob/clock fakes sharing the chain's state.
+//! Shared test harness: scripted fakes for the node's dependencies. A fake
+//! chain arbitrates the state root under a mutex, a fake prover returns the
+//! expected publics, and blob and clock fakes share the chain's state.
 
 // Each test binary compiles this module separately and uses a subset.
 #![allow(dead_code, unused_imports)]

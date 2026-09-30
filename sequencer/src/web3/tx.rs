@@ -958,8 +958,8 @@ mod tests {
     }
 
     // A mined revert is named from the state its block left. Replaying at
-    // `latest` on an endpoint that lags behind that block passes, which once
-    // errored the votes of a lost race as "unknown".
+    // `latest` on an endpoint that lags behind that block passes, which would
+    // error the votes of a lost race as "unknown".
     #[tokio::test]
     async fn mined_revert_is_replayed_at_its_block() {
         use alloy::sol_types::SolError;

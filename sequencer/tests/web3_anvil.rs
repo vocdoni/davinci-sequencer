@@ -993,9 +993,8 @@ async fn lagging_proxy(upstream: url::Url, lag: std::sync::Arc<Lag>) -> url::Url
     url
 }
 
-// Two sequencers settle the same root in one block (live on Gnosis in block
-// 48495639). The loser's RPC lags behind that block, so a replay at
-// `latest` passes and once left the revert unnamed, erroring the votes.
+// Two sequencers settle the same root in one block. The loser's RPC lags
+// behind that block, so a replay at `latest` passes and names nothing.
 // Replayed at the receipt's block it names InvalidStateRoot; when the RPC
 // lacks that block too, the loser gets `Lost`, never a named failure.
 #[tokio::test(flavor = "multi_thread")]
