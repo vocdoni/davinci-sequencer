@@ -97,6 +97,8 @@ pub async fn spawn_node(
         chain_id,
         provider,
         cfg.poll_interval,
+        cfg.census_sync_every,
+        cfg.confirmations,
     )?);
     let node = Node {
         processes: Arc::new(RwLock::new(HashMap::new())),

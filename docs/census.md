@@ -79,7 +79,11 @@ The contract must be append-only with fixed weights. davinci-onchain-census-cont
 uniqueness on registration and never evicts old roots.
 
 - The node indexes `CensusMemberAdded` at the confirmed head, replaying every addition against the
-  tree and its `newRoot`, and seals against the newest confirmed root.
+  tree and its `newRoot`, and seals against the newest confirmed root. Background syncs run at
+  most every `--census-sync-every`; while a contract has no confirmed snapshot yet, a waiting vote
+  or participant query syncs it on demand, best effort. Once indexed, a member added on-chain
+  becomes votable within that window at most — a `not in the census` refusal right after an
+  addition just needs a retry.
 - A reorg below the indexed block drops the index and rescans.
 - A `WeightChanged` with a non-zero previous weight, or a slot collision, marks the census unusable
   and its votes are refused.

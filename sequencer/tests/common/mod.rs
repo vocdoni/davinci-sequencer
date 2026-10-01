@@ -1612,6 +1612,10 @@ pub fn test_config_with(
         margin,
         "--census-dir",
         census_dir.to_str().unwrap(),
+        // Tests poll, they do not observe the background cadence (its own
+        // test is in census_anvil.rs).
+        "--census-sync-every",
+        "0s",
     ];
     Config::parse_args(base.iter().chain(rpc).chain(bt).chain(extra).copied()).unwrap()
 }

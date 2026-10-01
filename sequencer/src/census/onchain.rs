@@ -24,7 +24,7 @@ use davinci_zkvm_sdk::census::{CensusProof, LeanImt, census_leaf, slot_key_addre
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{CensusError, Result, TreeCache, backoff};
 use crate::storage::Db;
@@ -214,6 +214,8 @@ struct Entry {
     /// Single-flight sync.
     gate: tokio::sync::Mutex<()>,
     failed: Mutex<Option<Failure>>,
+    /// Last successful sync, for the background cadence floor.
+    last_ok: Mutex<Option<Instant>>,
     /// Trees at earlier roots.
     prefix: Mutex<TreeCache>,
 }
@@ -226,6 +228,12 @@ impl Entry {
     fn set(&self, s: Snapshot) {
         if let Ok(mut g) = self.snap.write() {
             *g = Arc::new(s);
+        }
+    }
+
+    fn mark_ok(&self) {
+        if let Ok(mut t) = self.last_ok.lock() {
+            *t = Some(Instant::now());
         }
     }
 }
@@ -249,6 +257,10 @@ pub struct OnchainIndex {
     syncing: AtomicBool,
     /// Retry delay when the target block is not served yet.
     poll: Duration,
+    /// Least time between background syncs of one contract.
+    every: Duration,
+    /// Head depth an on-demand sync targets.
+    confirmations: u64,
 }
 
 impl std::fmt::Debug for OnchainIndex {
@@ -320,9 +332,18 @@ fn decode(log: &Log) -> Result<Option<(u64, u64, CensusLog)>> {
 }
 
 impl OnchainIndex {
-    /// The index over `db`; `provider` reads the census contracts. `poll` is
-    /// the retry delay when the target block is not served yet.
-    pub fn new(db: &Db, chain_id: u64, provider: DynProvider, poll: Duration) -> Result<Self> {
+    /// The index over `db`; `provider` reads the census contracts. `poll`
+    /// is the retry delay when the target block is not served yet, `every`
+    /// the least time between background syncs of one contract, and
+    /// `confirmations` the head depth an on-demand sync targets.
+    pub fn new(
+        db: &Db,
+        chain_id: u64,
+        provider: DynProvider,
+        poll: Duration,
+        every: Duration,
+        confirmations: u64,
+    ) -> Result<Self> {
         let db = db.database();
         let tx = db.begin_write().map_err(db_err)?;
         tx.open_table(META).map_err(db_err)?;
@@ -336,6 +357,8 @@ impl OnchainIndex {
             span: AtomicU64::new(MAX_SPAN),
             syncing: AtomicBool::new(false),
             poll,
+            every,
+            confirmations,
         })
     }
 
@@ -374,6 +397,7 @@ impl OnchainIndex {
                 snap: RwLock::new(Arc::new(snap)),
                 gate: tokio::sync::Mutex::new(()),
                 failed: Mutex::new(None),
+                last_ok: Mutex::new(None),
                 prefix: Mutex::new(TreeCache::default()),
             })
         });
@@ -481,7 +505,8 @@ impl OnchainIndex {
     }
 
     /// Syncs every registered contract to the confirmed head `b`. One run
-    /// at a time; a tick that finds one running does nothing.
+    /// at a time; a tick that finds one running does nothing. A contract
+    /// that synced successfully within `every` is skipped.
     pub async fn sync_all(&self, b: u64) {
         if self.syncing.swap(true, Ordering::AcqRel) {
             return;
@@ -498,6 +523,14 @@ impl OnchainIndex {
             Err(_) => return,
         };
         for c in contracts {
+            // Within the background floor: nothing to do. A never-synced
+            // or backed-off contract is never skipped.
+            if let Some(e) = self.entry(&c)
+                && let Some(t) = e.last_ok.lock().ok().and_then(|t| *t)
+                && t.elapsed() < self.every
+            {
+                continue;
+            }
             // `sync` logs its own failures.
             let _ = self.sync(c, b).await;
         }
@@ -517,8 +550,16 @@ impl OnchainIndex {
             return Err(CensusError::Backoff(d));
         }
         let res = self.sync_inner(&e, contract, b).await;
+        self.note(&e, contract, &res);
+        res
+    }
+
+    /// Records a sync outcome on the entry: success clears the failure
+    /// backoff, a hard failure extends it, terminal and "not yet" answers
+    /// count as neither.
+    fn note(&self, e: &Entry, contract: [u8; 20], res: &Result<()>) {
         if let Ok(mut f) = e.failed.lock() {
-            match &res {
+            match res {
                 Ok(()) => *f = None,
                 // Unusable is terminal; Backoff is "not yet", not a failure.
                 Err(CensusError::Refused(_) | CensusError::Backoff(_)) => {}
@@ -534,7 +575,37 @@ impl OnchainIndex {
                 }
             }
         }
-        res
+    }
+
+    /// On-demand freshness for one contract: sync to the latest confirmed
+    /// head now, ignoring the background floor — a vote or a participant
+    /// query is waiting. The refusal checks run before the head RPC and the
+    /// head read itself counts as a failure, so request load cannot hammer
+    /// a contract the backoff has benched.
+    pub async fn ensure(&self, contract: &[u8; 20]) -> Result<()> {
+        let e = self
+            .entry(contract)
+            .ok_or_else(|| CensusError::Unknown(format!("contract 0x{}", hex::encode(contract))))?;
+        if let Some(r) = &e.snapshot().meta.unusable {
+            return Err(CensusError::Refused(r.clone()));
+        }
+        if let Some(d) = self.retry_in(contract) {
+            return Err(CensusError::Backoff(d));
+        }
+        let head = match self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+        {
+            Ok(h) => h.map(|b| b.header.number.saturating_sub(self.confirmations)),
+            Err(err) => {
+                let res = Err(rpc(err));
+                self.note(&e, *contract, &res);
+                return res;
+            }
+        };
+        self.sync(*contract, head.ok_or(CensusError::Backoff(self.poll))?)
+            .await
     }
 
     async fn sync_inner(&self, e: &Entry, contract: [u8; 20], b: u64) -> Result<()> {
@@ -555,6 +626,7 @@ impl OnchainIndex {
                 }
                 base = e.snapshot();
             } else if b <= base.meta.scanned_to {
+                e.mark_ok();
                 return Ok(());
             }
         }
@@ -578,14 +650,20 @@ impl OnchainIndex {
         let mut why = String::new();
         for _ in 0..2 {
             let logs = self.scan(contract, floor, b, need).await?;
+            let changed = !logs.is_empty();
             let (db, base2) = (self.db.clone(), base.clone());
             let out = tokio::task::spawn_blocking(move || apply(&db, &key, &base2, &logs, &target))
                 .await
                 .map_err(rpc)??;
             match out {
                 Ok(s) => {
-                    info!(contract = %hex::encode(contract), block = b, size = s.m.list.len(), "census contract synced");
+                    if changed || !base.meta.synced {
+                        info!(contract = %hex::encode(contract), block = b, size = s.m.list.len(), "census contract synced");
+                    } else {
+                        debug!(contract = %hex::encode(contract), block = b, "census contract up to date");
+                    }
                     e.set(s);
+                    e.mark_ok();
                     return Ok(());
                 }
                 Err((s, r)) if s.meta.unusable.is_some() => {
@@ -1015,7 +1093,7 @@ mod tests {
             .disable_recommended_fillers()
             .connect_http("http://127.0.0.1:1".parse().unwrap())
             .erased();
-        OnchainIndex::new(&db, 1, p, Duration::from_millis(50)).unwrap()
+        OnchainIndex::new(&db, 1, p, Duration::from_millis(50), Duration::ZERO, 0).unwrap()
     }
 
     // Applying logs stores the index; a weight change marks it unusable,
@@ -1104,5 +1182,23 @@ mod tests {
         let why = rpc("execution reverted: Error(\"x\nERROR forged line\")").to_string();
         assert!(!why.contains('\n'), "{why}");
         assert!(why.contains("x\\nERROR"), "{why}");
+    }
+
+    // On-demand sync: an unindexed contract answers without touching the
+    // network, a failing head read establishes backoff, and a backed-off
+    // contract refuses before any RPC — request load cannot hammer one.
+    #[tokio::test]
+    async fn ensure_is_bound_by_the_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let ix = index(&dir);
+        let c = [7u8; 20];
+        assert!(matches!(ix.ensure(&c).await, Err(CensusError::Unknown(_))));
+        ix.register(c).await.unwrap();
+        assert!(ix.ensure(&c).await.is_err()); // the head read fails...
+        assert!(
+            ix.retry_in(&c).is_some(),
+            "a failed head read must back off"
+        );
+        assert!(matches!(ix.ensure(&c).await, Err(CensusError::Backoff(_))));
     }
 }

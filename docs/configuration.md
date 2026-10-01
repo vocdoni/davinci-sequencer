@@ -78,6 +78,7 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--census-dir` | `DAVINCI_CENSUS_DIR` | unset | Directory `file://` census URIs may read from. Unset: `file://` is refused. |
 | `--census-allow-private` | `DAVINCI_CENSUS_ALLOW_PRIVATE` | off | Allow census downloads from loopback and private addresses (local development). |
 | `--census-max-participants` | `DAVINCI_CENSUS_MAX_PARTICIPANTS` | `4194304` | Largest census accepted. |
+| `--census-sync-every` | `DAVINCI_CENSUS_SYNC_EVERY` | `30s` | Least time between background syncs of one on-chain census contract; while a contract has no confirmed snapshot yet, a waiting vote or participant query syncs it on demand. |
 | `--keys-per-minute` | `DAVINCI_KEYS_PER_MINUTE` | `10` | `POST /processes/keys` per client IP per minute. |
 | `--ballot-vk` | `DAVINCI_BALLOT_VK` | embedded | Ballot proof verification key JSON. Its hash must equal the registry's `ballotVKHash`, or every process is ignored. |
 | `--log-level` | `DAVINCI_LOG_LEVEL` | `info` | Tracing filter; `RUST_LOG` takes precedence. |

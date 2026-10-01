@@ -65,8 +65,15 @@ async fn onchain_index_follows_the_contract() {
 
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
-    let ix =
-        OnchainIndex::new(&db, chain_id, ch.reader.clone(), Duration::from_millis(50)).unwrap();
+    let ix = OnchainIndex::new(
+        &db,
+        chain_id,
+        ch.reader.clone(),
+        Duration::from_millis(50),
+        Duration::ZERO,
+        0,
+    )
+    .unwrap();
     ix.register(c).await.unwrap();
     assert!(ix.latest(&c).is_none());
     ix.sync(c, ch.head().await).await.unwrap();
@@ -89,8 +96,15 @@ async fn onchain_index_follows_the_contract() {
 
     // Restart from redb: same state without touching the chain.
     drop(ix);
-    let ix =
-        OnchainIndex::new(&db, chain_id, ch.reader.clone(), Duration::from_millis(50)).unwrap();
+    let ix = OnchainIndex::new(
+        &db,
+        chain_id,
+        ch.reader.clone(),
+        Duration::from_millis(50),
+        Duration::ZERO,
+        0,
+    )
+    .unwrap();
     ix.register(c).await.unwrap();
     assert_eq!(assert_matches(&ix, &ch, &c, 21).await, root);
     assert_proof(&ix, &c, &early, 5).await;
@@ -153,7 +167,15 @@ async fn onchain_scan_walks_a_capped_range_in_chunks() {
     proxy.knobs.max_range.store(4, Relaxed);
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
-    let ix = OnchainIndex::new(&db, chain_id, proxy.provider(), Duration::from_millis(50)).unwrap();
+    let ix = OnchainIndex::new(
+        &db,
+        chain_id,
+        proxy.provider(),
+        Duration::from_millis(50),
+        Duration::ZERO,
+        0,
+    )
+    .unwrap();
     ix.register(c).await.unwrap();
     ix.sync(c, ch.head().await).await.unwrap();
     let root = assert_matches(&ix, &ch, &c, 4).await;
@@ -176,6 +198,64 @@ async fn onchain_scan_walks_a_capped_range_in_chunks() {
     assert!(proxy.knobs.min_from.load(Relaxed) > first);
 }
 
+// The background cadence floor: within `every` of a successful sync the
+// monitor tick does nothing even though the chain moved, and runs again
+// once it expires.
+#[tokio::test]
+async fn background_sync_respects_the_floor() {
+    if !enabled() {
+        return;
+    }
+    let ch = CensusChain::start().await;
+    let c = ch.census.into_array();
+    let chain_id = ch.reader.get_chain_id().await.unwrap();
+    ch.add(&members(0..2)).await;
+
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let ix = OnchainIndex::new(
+        &db,
+        chain_id,
+        ch.reader.clone(),
+        Duration::from_millis(50),
+        Duration::from_secs(600),
+        0,
+    )
+    .unwrap();
+    ix.register(c).await.unwrap();
+    ix.sync(c, ch.head().await).await.unwrap();
+    ch.add(&members(2..3)).await;
+    ix.sync_all(ch.head().await).await;
+    assert_eq!(ix.latest(&c).unwrap().1, 2, "floor withheld the sync");
+    drop(ix);
+
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let ix = OnchainIndex::new(
+        &db,
+        chain_id,
+        ch.reader.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+        0,
+    )
+    .unwrap();
+    ix.register(c).await.unwrap();
+    let head = ch.head().await;
+    ix.sync(c, head).await.unwrap();
+    assert_eq!(ix.latest(&c).unwrap().1, 3);
+    mine(&ch, 5).await;
+    ix.sync_all(ch.head().await).await;
+    assert_eq!(ix.latest(&c).unwrap().2, head, "floor withheld the sync");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    ix.sync_all(ch.head().await).await;
+    assert_eq!(
+        ix.latest(&c).unwrap().2,
+        ch.head().await,
+        "sync ran once the floor expired"
+    );
+}
+
 // A contract with no members is a valid, empty census: nobody is in it.
 #[tokio::test]
 async fn onchain_index_serves_an_empty_contract() {
@@ -187,8 +267,15 @@ async fn onchain_index_serves_an_empty_contract() {
     let chain_id = ch.reader.get_chain_id().await.unwrap();
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
-    let ix =
-        OnchainIndex::new(&db, chain_id, ch.reader.clone(), Duration::from_millis(50)).unwrap();
+    let ix = OnchainIndex::new(
+        &db,
+        chain_id,
+        ch.reader.clone(),
+        Duration::from_millis(50),
+        Duration::ZERO,
+        0,
+    )
+    .unwrap();
     ix.register(c).await.unwrap();
     ix.sync(c, ch.head().await).await.unwrap();
     let root = assert_matches(&ix, &ch, &c, 0).await;

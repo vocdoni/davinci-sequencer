@@ -345,6 +345,11 @@ pub struct Config {
     /// Largest census accepted, in participants.
     #[arg(long, env = "DAVINCI_CENSUS_MAX_PARTICIPANTS", default_value_t = 1 << 22)]
     pub census_max_participants: usize,
+    /// Least time between background syncs of one on-chain census contract;
+    /// while a contract has no confirmed snapshot yet, a waiting vote or
+    /// participant query syncs it on demand.
+    #[arg(long, env = "DAVINCI_CENSUS_SYNC_EVERY", default_value = "30s", value_parser = parse_duration)]
+    pub census_sync_every: Duration,
     /// Chain polling interval.
     #[arg(long, env = "DAVINCI_POLL_INTERVAL", default_value = "5s", value_parser = parse_duration)]
     pub poll_interval: Duration,
@@ -395,6 +400,7 @@ impl fmt::Debug for Config {
             .field("census_dir", &self.census_dir)
             .field("census_allow_private", &self.census_allow_private)
             .field("census_max_participants", &self.census_max_participants)
+            .field("census_sync_every", &self.census_sync_every)
             .field("poll_interval", &self.poll_interval)
             .field("heartbeat", &self.heartbeat)
             .field("prover_poll", &self.prover_poll)
@@ -607,6 +613,7 @@ mod tests {
         assert_eq!(c.rpc_url, [Url::parse("http://127.0.0.1:8545").unwrap()]);
         assert_eq!(c.start_block, None);
         assert!(c.census_dir.is_none() && !c.census_allow_private);
+        assert_eq!(c.census_sync_every, Duration::from_secs(30));
         let mut args = with_rpc();
         args.extend([
             "--batch-max",

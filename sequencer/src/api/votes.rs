@@ -63,16 +63,23 @@ pub(super) async fn current_proof(
         }
         3 => {
             let ix = &st.node.onchain;
-            ix.usable(&c.contract_address).map_err(|e| match e {
-                // A failed register at resume: the actor re-registers.
-                crate::census::onchain::UsableError::NotIndexed => {
-                    ApiError::Busy("census contract not synced yet".into())
+            // `None` = the contract is not indexed or no confirmed sync has
+            // landed yet; an unusable contract is refused for good.
+            let read = || -> Result<Option<(Fr, u64, u64)>, ApiError> {
+                match ix.usable(&c.contract_address) {
+                    // A failed register at resume: the actor re-registers.
+                    Err(crate::census::onchain::UsableError::NotIndexed) => Ok(None),
+                    Err(e) => Err(ApiError::NotAccepting(e.to_string())),
+                    Ok(()) => Ok(ix.latest(&c.contract_address)),
                 }
-                e => ApiError::NotAccepting(e.to_string()),
-            })?;
-            let (root, _, _) = ix
-                .latest(&c.contract_address)
-                .ok_or_else(|| ApiError::Busy("census contract not synced yet".into()))?;
+            };
+            // A vote or a participant query is waiting: sync the contract on
+            // demand, best effort, then read once more before Busy.
+            if read()?.is_none() {
+                let _ = ix.ensure(&c.contract_address).await;
+            }
+            let (root, _, _) =
+                read()?.ok_or_else(|| ApiError::Busy("census contract not synced yet".into()))?;
             ix.proof(&c.contract_address, &root, addr).await
         }
         _ => Ok(None),

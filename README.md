@@ -106,6 +106,7 @@ Every flag has a `DAVINCI_*` environment variable. The ones operators usually se
 | `DAVINCI_DATADIR` | `--datadir` | `~/.davinci-sequencer` | Database directory. |
 | `DAVINCI_API_PORT` | `--api-port` | `9090` | HTTP API port. |
 | `DAVINCI_BATCH_TIME` | `--batch-time` | `15m` | How long the oldest pending vote waits before its batch seals. |
+| `DAVINCI_CENSUS_SYNC_EVERY` | `--census-sync-every` | `30s` | Least time between background syncs of one on-chain census contract; while a contract has no confirmed snapshot yet, a waiting vote or participant query syncs it on demand. |
 | `DAVINCI_LOG_LEVEL` | `--log-level` | `info` | Log filter; `RUST_LOG` takes precedence. |
 
 Things to know before running a node in production:
