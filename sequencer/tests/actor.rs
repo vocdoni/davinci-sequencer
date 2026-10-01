@@ -3366,6 +3366,79 @@ async fn second_arrival_makes_the_pair_due() {
     shutdown.cancel();
 }
 
+/// The snapshot advertises the seal bound: a lone vote at the solo
+/// floor, a pair at the timer floor (both at the 0.9 jitter floor).
+#[tokio::test]
+async fn snapshot_advertises_the_seal_bound() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    // The fake clock starts at T0 and only advance_time moves it.
+    let t0 = T0;
+    let a = fake_vote(&s.env, 0, &[1, 2], 5);
+    h.submit(a).await.unwrap();
+    beats().await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(snap.pending, 1);
+    assert_eq!(snap.next_seal_not_before, Some(t0 + 270));
+    let b = fake_vote(&s.env, 1, &[2, 1], 6);
+    h.submit(b).await.unwrap();
+    beats().await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(snap.next_seal_not_before, Some(t0 + 90));
+    shutdown.cancel();
+}
+
+/// A queue at --batch-max seals without waiting for any timer: the
+/// bound collapses to now.
+#[tokio::test]
+async fn capacity_ready_queue_advertises_now() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (_node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        4,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    // The pair seals and is held in flight by the gated prover, so the
+    // queue below can grow to batch_max without sealing under it: four
+    // distinct voters, one per slot.
+    let a = fake_vote(&s.env, 0, &[1, 2], 5);
+    let b = fake_vote(&s.env, 1, &[2, 1], 6);
+    h.submit(a).await.unwrap();
+    h.submit(b).await.unwrap();
+    s.chain.advance_time(115);
+    wait_until("pair sealed", async || prover.calls() == 1).await;
+    for i in 2..6usize {
+        let v = fake_vote(&s.env, i, &[1, 2], 100 + i as u64);
+        h.submit(v).await.unwrap();
+    }
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(snap.pending, 4);
+    assert_eq!(snap.next_seal_not_before, Some(T0 + 115));
+    shutdown.cancel();
+}
+
 /// A queue that no longer fits one transaction seals the largest batch
 /// that does, without waiting for any timer.
 #[tokio::test]

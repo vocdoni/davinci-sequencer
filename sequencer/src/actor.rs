@@ -380,6 +380,9 @@ pub struct ProcessSnapshot {
     pub overwrites: u64,
     pub occupied: usize,
     pub pending: usize,
+    /// `next_seal_not_before` of the open batch; None when nothing is
+    /// pending.
+    pub next_seal_not_before: Option<u64>,
     pub in_flight: bool,
     pub status: ProcessStatus,
     pub local: LocalStatus,
@@ -1001,6 +1004,7 @@ impl Actor {
                     overwrites: c.overwrites,
                     occupied: self.state.occupied(),
                     pending: self.pending.len(),
+                    next_seal_not_before: self.next_seal_not_before(),
                     in_flight: self.in_flight.is_some(),
                     status: self.record.onchain.status,
                     local: self.record.local,
@@ -1115,6 +1119,33 @@ impl Actor {
             && self.chain_time >= self.end_time().saturating_sub(self.flush_horizon)
     }
 
+    /// Earliest the open batch can seal, for the queue as it stands: a
+    /// queue at --batch-max seals now, otherwise the timer (enough
+    /// distinct slots) or the solo expiry at the jitter floor, clamped
+    /// by the flush. New votes only bring it forward — company upgrades
+    /// a lone batch to the shorter wait — and it is not a deadline: the
+    /// jitter is private and gates (an in-flight batch, the proving
+    /// budget) can hold a seal past it. None when nothing is pending.
+    fn next_seal_not_before(&self) -> Option<u64> {
+        let oldest = self.pending_at.first().copied()?;
+        let now = self.deps.clock.now();
+        let distinct = self
+            .pending
+            .iter()
+            .map(|v| v.slot)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let due = if self.pending.len() >= self.batch_max {
+            now
+        } else if distinct < self.min_mix {
+            oldest + (self.solo_wait as f64 * 0.9).ceil() as u64
+        } else {
+            oldest + (self.batch_time as f64 * 0.9).ceil() as u64
+        };
+        let flush_at = self.end_time().saturating_sub(self.flush_horizon);
+        Some(due.min(flush_at))
+    }
+
     fn accepting(&self) -> bool {
         self.not_closed()
             && self.chain_time >= self.record.onchain.start_time
@@ -1216,6 +1247,16 @@ impl Actor {
         }
         self.pending.push(v);
         self.pending_at.push(now);
+        if self.pending.len() < self.min_mix {
+            // Say so, or a lone voter looks stuck.
+            info!(
+                pid = %hex::encode(self.pid31),
+                queued = self.pending.len(),
+                min_mix = self.min_mix,
+                earliest = ?self.next_seal_not_before(),
+                "queued below min mix"
+            );
+        }
         Ok(())
     }
 
@@ -1498,34 +1539,55 @@ impl Actor {
             self.state.set_census_root(census_root);
         }
         let max_voters = self.record.onchain.max_voters;
-        let k = match self
-            .state
-            .select_batch(&self.pending, max_voters, &self.exposed, usize::MAX)
-        {
-            Ok((refs, blocked)) => {
-                let k = refs.len();
-                // Company is the trial size (distinct admissible slots),
-                // not the queue length.
-                let seal = k >= 1
-                    && (blocked
-                        || at_max
-                        || (k >= self.min_mix && timer_due)
-                        || (k < self.min_mix && solo_due)
-                        || flush);
-                if !seal {
+        let (k, reason) =
+            match self
+                .state
+                .select_batch(&self.pending, max_voters, &self.exposed, usize::MAX)
+            {
+                Ok((refs, blocked)) => {
+                    let k = refs.len();
+                    // Company is the trial size (distinct admissible slots),
+                    // not the queue length.
+                    let seal = k >= 1
+                        && (blocked
+                            || at_max
+                            || (k >= self.min_mix && timer_due)
+                            || (k < self.min_mix && solo_due)
+                            || flush);
+                    if !seal {
+                        return;
+                    }
+                    // Several can hold at once; log the dominant one.
+                    let reason = if flush {
+                        "flush"
+                    } else if at_max {
+                        "at_max"
+                    } else if blocked {
+                        "blocked"
+                    } else if k >= self.min_mix {
+                        "timer"
+                    } else {
+                        "solo"
+                    };
+                    debug!(
+                        pid = %hex::encode(self.pid31),
+                        k,
+                        queued = self.pending.len(),
+                        reason,
+                        age,
+                        "seal attempt"
+                    );
+                    (k, reason)
+                }
+                Err(StateError::RefreshOverflow { .. }) => {
+                    self.refresh_overflow();
                     return;
                 }
-                k
-            }
-            Err(StateError::RefreshOverflow { .. }) => {
-                self.refresh_overflow();
-                return;
-            }
-            Err(e) => {
-                error!(pid = %hex::encode(self.pid31), %e, "select_batch");
-                return;
-            }
-        };
+                Err(e) => {
+                    error!(pid = %hex::encode(self.pid31), %e, "select_batch");
+                    return;
+                }
+            };
         // Time budget: the largest batch whose estimated proof plus the
         // landing margin ends before the window closes. While open, the
         // earliest legal close is an END now under a grace lowered to the
@@ -1652,6 +1714,7 @@ impl Actor {
             pid = %hex::encode(self.pid31),
             votes = vids.len(),
             overwrites = prepared.overwrites,
+            reason,
             "batch sealed"
         );
         let job = JobInput {

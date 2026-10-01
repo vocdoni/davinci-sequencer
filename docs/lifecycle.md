@@ -46,6 +46,14 @@ The actor seals a batch when one of these holds:
 
 Both waits carry a ±10% jitter, drawn once per batch.
 
+With the defaults, a batch holding at least `--min-mix` slots settles about `--batch-time` after
+its oldest vote, and a lone vote waits `--solo-wait` (both ±10% jitter) — though any later vote
+gives a waiting batch company and can seal it sooner. From `--flush-horizon` before the end the
+batching waits no longer apply: everything pending seals as the proving budget allows, through
+the grace window, so the waits cannot hold a vote past its election. `GET /processes/{pid}`
+shows `pendingVotes` and `nextSealNotBefore`, so a client can tell a vote queued for company
+from one that is stuck.
+
 A batch is also sized to the time left. Proving is estimated as `--prove-base` plus a per-vote
 cost, a moving average of the prover's measured job time that starts high. While the election is
 open, the batch holds at most the votes whose estimated proof plus `--settle-margin` ends before

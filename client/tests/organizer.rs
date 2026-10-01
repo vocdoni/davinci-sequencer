@@ -236,6 +236,8 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
         state_root: chain.state_root,
         local_state_root: None,
         synced: false,
+        pending_votes: None,
+        next_seal_not_before: None,
         voters_count: 0,
         overwritten_votes_count: 0,
         max_voters: chain.max_voters,

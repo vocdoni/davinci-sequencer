@@ -47,6 +47,8 @@ fn view(
     accepting: bool,
     local_state_root: Option<[u8; 32]>,
     synced: bool,
+    pending: Option<u64>,
+    next_seal: Option<u64>,
 ) -> Result<ProcessView, ApiError> {
     let p = &rec.onchain;
     let status = ProcessStatus::from_onchain(p.status as u8).unwrap_or(ProcessStatus::Unknown);
@@ -67,6 +69,8 @@ fn view(
         state_root: p.state_root,
         local_state_root,
         synced,
+        pending_votes: pending,
+        next_seal_not_before: next_seal,
         voters_count: p.voters_count,
         overwritten_votes_count: p.overwritten_count,
         max_voters: p.max_voters,
@@ -85,17 +89,29 @@ pub async fn get(
     let pid = parse_pid(&pid)?;
     let rec = st.node.db.process(&pid)?.ok_or(ApiError::UnknownProcess)?;
     // The actor snapshot adds the node's own view: whether it accepts
-    // votes, its committed local tree root (may lead `state_root`) and
-    // whether that root is the on-chain one.
-    let (accepting, local_root, synced) = match st.node.processes.read().await.get(&pid).cloned() {
-        Some(h) => h
-            .snapshot()
-            .await
-            .map(|s| (s.accepting, Some(s.root), s.synced))
-            .unwrap_or((false, None, false)),
-        None => (false, None, false),
-    };
-    Ok(Json(view(&rec, accepting, local_root, synced)?))
+    // votes, its committed local tree root (may lead `state_root`),
+    // whether that root is the on-chain one, and the batching queue
+    // (pending votes and the earliest the open batch can seal).
+    let (accepting, local_root, synced, pending, next_seal) =
+        match st.node.processes.read().await.get(&pid).cloned() {
+            Some(h) => h
+                .snapshot()
+                .await
+                .map(|s| {
+                    (
+                        s.accepting,
+                        Some(s.root),
+                        s.synced,
+                        Some(s.pending as u64),
+                        s.next_seal_not_before,
+                    )
+                })
+                .unwrap_or((false, None, false, None, None)),
+            None => (false, None, false, None, None),
+        };
+    Ok(Json(view(
+        &rec, accepting, local_root, synced, pending, next_seal,
+    )?))
 }
 
 /// `POST /processes/keys`: this node's key for `processId`, derived, not

@@ -291,6 +291,8 @@ fn view(m: BallotMode) -> ProcessView {
         state_root: [4; 32],
         local_state_root: None,
         synced: false,
+        pending_votes: None,
+        next_seal_not_before: None,
         voters_count: 2,
         overwritten_votes_count: 1,
         max_voters: 100,

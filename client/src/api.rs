@@ -700,6 +700,18 @@ pub struct ProcessView {
     /// This node's committed root equals the on-chain root. Absent on old nodes.
     #[serde(default)]
     pub synced: bool,
+    /// Votes queued on this node, not yet in a sealed batch. Zero with
+    /// `next_seal_not_before` absent means the queue is idle. Absent on
+    /// old nodes and where no actor owns the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_votes: Option<u64>,
+    /// Unix seconds: earliest instant the open batch can seal, for the
+    /// queue as it stands. New votes only bring it forward, and it is no
+    /// deadline — the ±10% jitter is private and gates (an in-flight
+    /// batch, the proving budget) can hold the seal past it. Absent when
+    /// nothing is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_seal_not_before: Option<u64>,
     pub voters_count: u64,
     pub overwritten_votes_count: u64,
     pub max_voters: u64,

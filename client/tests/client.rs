@@ -62,6 +62,8 @@ fn view() -> ProcessView {
         state_root: [2; 32],
         local_state_root: None,
         synced: false,
+        pending_votes: None,
+        next_seal_not_before: None,
         voters_count: 0,
         overwritten_votes_count: 0,
         max_voters: 10,

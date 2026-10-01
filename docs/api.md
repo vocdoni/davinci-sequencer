@@ -38,6 +38,8 @@ requests time out after 60 s.
 - `isAcceptingVotes`: false before the start time and from the end on;
 - `localStateRoot`: the node's committed tree root, and `synced`: whether it equals the on-chain
   root;
+- `pendingVotes` and `nextSealNotBefore`: the batching queue — how many votes wait, and the
+  earliest instant the open batch can seal (an estimate: new votes only bring it forward);
 - `result`: the tally, once it is on-chain;
 - `ignored` and `note`: set when the node refused to serve the process, with the reason.
 
