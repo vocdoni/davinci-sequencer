@@ -10,8 +10,8 @@ The workspace depends on davinci-zkvm by path, and the tests read other sibling 
 
 ```
 davinci-zkvm/                     path dependency: rust-sdk, input-gen
-davinci-contracts/                branch zkvm, forge build
-davinci-onchain-census-contract/  branch davinci-zkvm, forge build
+davinci-contracts/                forge build
+davinci-onchain-census-contract/  forge build
 davinci-circom/                   ballot circuit artifacts
 davinci-dkg/                      only for the e2e DKG scenarios
 ```

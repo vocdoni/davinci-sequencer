@@ -75,8 +75,8 @@ The registry accepts a transition's census root when the contract's `getRootBloc
 non-zero, not in the future and not before the process's creation block. At creation it refuses
 `onchainAllowAnyValidRoot = true` and a census address without code.
 
-The contract must be append-only with fixed weights. The `davinci-zkvm` branch of
-davinci-onchain-census-contract checks slot uniqueness on registration and never evicts old roots.
+The contract must be append-only with fixed weights. davinci-onchain-census-contract checks slot
+uniqueness on registration and never evicts old roots.
 
 - The node indexes `CensusMemberAdded` at the confirmed head, replaying every addition against the
   tree and its `newRoot`, and seals against the newest confirmed root.

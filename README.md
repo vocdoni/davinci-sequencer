@@ -32,9 +32,9 @@ voters ── ballots ──▶ sequencer ── batch ──▶ davinci-zkvm pr
 | Repository | Role in the stack |
 |---|---|
 | [davinci-zkvm](https://github.com/vocdoni/davinci-zkvm) | Prover service, the vote-batch and results programs, and the Rust SDK this node builds on. |
-| [davinci-contracts](https://github.com/vocdoni/davinci-contracts) (branch `zkvm`) | `ProcessRegistry`, the on-chain proof verifier and the DKG adapter. |
+| [davinci-contracts](https://github.com/vocdoni/davinci-contracts) | `ProcessRegistry`, the on-chain proof verifier and the DKG adapter. |
 | [davinci-dkg](https://github.com/vocdoni/davinci-dkg) | Threshold key committee behind DKG-key elections. |
-| [davinci-onchain-census-contract](https://github.com/vocdoni/davinci-onchain-census-contract) (branch `davinci-zkvm`) | Census contract for on-chain censuses. |
+| [davinci-onchain-census-contract](https://github.com/vocdoni/davinci-onchain-census-contract) | Census contract for on-chain censuses. |
 | [davinci-circom](https://github.com/vocdoni/davinci-circom) | Ballot circuit; clients prove ballots with its artifacts. |
 
 ## Quick start

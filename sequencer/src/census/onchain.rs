@@ -3,8 +3,8 @@
 //! size at the confirmed head, persisted in redb and shared by every process
 //! that points at the contract. Synced from the monitor tick.
 //!
-//! The contract must be append-only with fixed weights (`OnchainCensus` on
-//! the `davinci-zkvm` branch of davinci-onchain-census-contract). A weight
+//! The contract must be append-only with fixed weights (`OnchainCensus` of
+//! davinci-onchain-census-contract). A weight
 //! change or two members on one ballot slot marks the index unusable for
 //! good; logs that do not reproduce the contract's root fail closed and are
 //! retried on a backoff.

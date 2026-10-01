@@ -7,8 +7,8 @@ The tests read sibling checkouts next to this repository:
 | Checkout | Used by | Override |
 |---|---|---|
 | `../davinci-zkvm` | Everything (path dependency), the emulator runs | `CIRCUIT_ELF_PATH` for the circuit |
-| `../davinci-contracts` (branch `zkvm`, `forge build`) | Anvil tests, e2e | `DAVINCI_CONTRACTS_DIR` |
-| `../davinci-onchain-census-contract` (branch `davinci-zkvm`, `forge build`) | Census anvil tests, e2e | `DAVINCI_CENSUS_CONTRACT_DIR` |
+| `../davinci-contracts` (`forge build`) | Anvil tests, e2e | `DAVINCI_CONTRACTS_DIR` |
+| `../davinci-onchain-census-contract` (`forge build`) | Census anvil tests, e2e | `DAVINCI_CENSUS_CONTRACT_DIR` |
 | `../davinci-circom/artifacts` | Ballot proofs | `CIRCOM_ARTIFACTS` |
 | `../davinci-dkg` | e2e DKG scenarios | `DAVINCI_DKG_DIR` |
 

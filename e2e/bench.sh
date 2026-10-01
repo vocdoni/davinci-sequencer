@@ -36,7 +36,7 @@
 #     DAVINCI_ZKVM_URL=http://127.0.0.1:8080 e2e/bench.sh
 #
 # Host paths (defaults: siblings of this checkout): DAVINCI_ZKVM_DIR,
-# DAVINCI_CONTRACTS_DIR (branch zkvm, with submodules; forge writes its
+# DAVINCI_CONTRACTS_DIR (with submodules; forge writes its
 # out/ and cache there), DAVINCI_CENSUS_CONTRACT_DIR, CIRCOM_ARTIFACTS.
 # BENCH_RUNS (default ~/.cache/davinci-bench) gets the report, the log and,
 # on failure, the node logs and datadirs; BENCH_LOG overrides the log path.

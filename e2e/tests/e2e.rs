@@ -14,7 +14,7 @@
 //! (default `http://127.0.0.1:8080`), the forge project at
 //! `DAVINCI_CONTRACTS_DIR` (default `../davinci-contracts`), the census
 //! contract project at `DAVINCI_CENSUS_CONTRACT_DIR` (default
-//! `../davinci-onchain-census-contract`, branch `davinci-zkvm`) and the circom
+//! `../davinci-onchain-census-contract`) and the circom
 //! artifacts at `CIRCOM_ARTIFACTS` (default `../davinci-circom/artifacts`).
 //! The node binary is `DAVINCI_SEQUENCER_BIN` or a release build made by the
 //! test. On failure the node logs and datadirs are kept and their paths

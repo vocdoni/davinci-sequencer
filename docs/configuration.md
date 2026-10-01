@@ -1,7 +1,7 @@
 # Configuration
 
 A node needs an execution-layer RPC, a blob source (a beacon API, or anvil on a local chain), a
-`ProcessRegistry` deployed from the davinci-contracts `zkvm` branch, and a davinci-zkvm prover.
+`ProcessRegistry` deployed from davinci-contracts, and a davinci-zkvm prover.
 The first three come from the network preset, so on a known network only the signing key and the
 prover are left to configure.
 

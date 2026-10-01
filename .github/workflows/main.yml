@@ -27,8 +27,8 @@ concurrency:
 #
 #   davinci-sequencer/                this repo
 #   davinci-zkvm/                     vocdoni/davinci-zkvm@main
-#   davinci-contracts/                vocdoni/davinci-contracts@zkvm (submodules)
-#   davinci-onchain-census-contract/  vocdoni/davinci-onchain-census-contract@davinci-zkvm (submodules)
+#   davinci-contracts/                vocdoni/davinci-contracts@main (submodules)
+#   davinci-onchain-census-contract/  vocdoni/davinci-onchain-census-contract@main (submodules)
 #   davinci-circom/                   vocdoni/davinci-circom@a39a9f9 (ballot wasm/zkey in artifacts/)
 #
 # docker-build.yml checks out davinci-zkvm@main too; keep it in sync.
@@ -42,8 +42,8 @@ env:
   # most of the runner's disk and the cache.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   ZKVM_REF: main
-  CONTRACTS_REF: zkvm
-  CENSUS_CONTRACT_REF: davinci-zkvm
+  CONTRACTS_REF: main
+  CENSUS_CONTRACT_REF: main
   CIRCOM_REF: a39a9f9867bb70726ad2137ed536d75670e042b9
   ZISK_VERSION: 1.3.0-alpha
 
