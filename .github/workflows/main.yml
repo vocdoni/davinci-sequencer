@@ -88,6 +88,9 @@ jobs:
     timeout-minutes: 90
     env:
       ANVIL: "1"
+      # Scratch dirs (WorkDir) go to the container's own /tmp: the runner's
+      # per-job /github/home mount has flaked EACCES on the rootless z5.
+      TMPDIR: /tmp
       DAVINCI_CONTRACTS_DIR: ${{ github.workspace }}/davinci-contracts
       DAVINCI_CENSUS_CONTRACT_DIR: ${{ github.workspace }}/davinci-onchain-census-contract
       CIRCOM_ARTIFACTS: ${{ github.workspace }}/davinci-circom/artifacts
