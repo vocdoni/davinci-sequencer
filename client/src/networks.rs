@@ -40,6 +40,7 @@ pub const GNOSIS: Network = Network {
         "https://gnosis-rpc.publicnode.com",
         "https://gnosis-rpc.blockreq.com/v1/rpc/public",
         "https://rpc.gnosischain.com",
+        "https://gnosis.drpc.org",
     ],
     blob_source: "beacon:https://rpc-gbc.gnosischain.com",
     confirmations: 3,

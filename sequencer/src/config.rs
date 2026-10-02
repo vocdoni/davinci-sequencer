@@ -754,6 +754,7 @@ mod tests {
                 "https://gnosis-rpc.publicnode.com/",
                 "https://gnosis-rpc.blockreq.com/v1/rpc/public",
                 "https://rpc.gnosischain.com/",
+                "https://gnosis.drpc.org/",
             ]
         );
         assert_eq!(c.blob_source, g.blob_source.parse().unwrap());
