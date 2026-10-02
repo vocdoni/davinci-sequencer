@@ -129,6 +129,7 @@ pub struct Env {
 /// One election; `pk` overrides the encryption key (finalize tests use the
 /// node's derived key, `node_key`).
 pub fn env(nf: u8, n_voters: usize, pk: Option<Point>) -> Env {
+    logs();
     let (_, gen_pk) = keygen(&mut StdRng::seed_from_u64(7));
     let leaves: Vec<Fr> = (0..n_voters)
         .map(|i| census_leaf(&voter_address(i), 1).unwrap())
@@ -143,6 +144,20 @@ pub fn env(nf: u8, n_voters: usize, pk: Option<Point>) -> Env {
         ballot_vk_hash: vk_hash(),
     };
     Env { cfg, imt }
+}
+
+/// Show the node's logs in a test run when `RUST_LOG` asks for them;
+/// without it (or without a subscriber) they stay silent.
+fn logs() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var_os("RUST_LOG").is_some() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_target(false)
+                .try_init();
+        }
+    });
 }
 
 pub fn dummy_proof() -> SnarkJsProof {

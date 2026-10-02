@@ -13,7 +13,12 @@ fn main() -> anyhow::Result<()> {
     // RUST_LOG wins; --log-level / DAVINCI_LOG_LEVEL is the fallback.
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(cfg.log_level.clone()));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // `time LEVEL message key=value`, like davinci-node's zerolog console
+    // output; the message text carries the context, so no target prefix.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

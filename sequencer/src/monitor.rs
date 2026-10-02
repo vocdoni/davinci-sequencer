@@ -849,7 +849,7 @@ async fn first_transition_from(
 }
 
 fn ignore(ctx: &Ctx, mut rec: ProcessRecord, note: &str) -> Result<(), NodeError> {
-    warn!(pid = %pid_hex(&rec.pid), note, "ignoring process");
+    warn!(pid = %pid_hex(&rec.pid), note = %note, "ignoring process");
     rec.local = LocalStatus::Ignored;
     rec.note = Some(note.to_string());
     ctx.deps.db.put_process(&rec)?;

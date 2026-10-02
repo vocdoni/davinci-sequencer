@@ -66,4 +66,6 @@ tempfile.workspace = true
 k256.workspace = true
 # Real circom ballot proofs for the API tests (cached under tests/cache).
 davinci-client = { workspace = true, features = ["prover"] }
+# RUST_LOG-driven subscriber for the test harness (see common::logs).
+tracing-subscriber.workspace = true
 alloy = { workspace = true, features = ["node-bindings"] }

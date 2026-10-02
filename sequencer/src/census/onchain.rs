@@ -565,7 +565,7 @@ impl OnchainIndex {
                 Err(CensusError::Refused(_) | CensusError::Backoff(_)) => {}
                 Err(err) => {
                     let n = f.as_ref().map_or(0, |x| x.n).saturating_add(1);
-                    error!(contract = %hex::encode(contract), ?err, failures = n, "census contract sync failed");
+                    error!(contract = %format!("0x{}", hex::encode(contract)), ?err, failures = n, "census contract sync failed");
                     *f = Some(Failure {
                         at: Instant::now(),
                         n,
@@ -614,7 +614,7 @@ impl OnchainIndex {
         if base.meta.synced {
             // A block the node no longer serves counts as reorged away.
             if self.block_hash(base.meta.scanned_to).await? != Some(base.meta.scanned_hash) {
-                warn!(contract = %hex::encode(contract), block = base.meta.scanned_to, "census contract reorged; rescanning");
+                warn!(contract = %format!("0x{}", hex::encode(contract)), block = base.meta.scanned_to, "census contract reorged; rescanning");
                 // Full rescan on a deep reorg; truncate-and-replay if censuses get large.
                 let db = self.db.clone();
                 tokio::task::spawn_blocking(move || drop_rows(&db, &key))
@@ -658,16 +658,16 @@ impl OnchainIndex {
             match out {
                 Ok(s) => {
                     if changed || !base.meta.synced {
-                        info!(contract = %hex::encode(contract), block = b, size = s.m.list.len(), "census contract synced");
+                        info!(contract = %format!("0x{}", hex::encode(contract)), block = b, size = s.m.list.len(), "census contract synced");
                     } else {
-                        debug!(contract = %hex::encode(contract), block = b, "census contract up to date");
+                        debug!(contract = %format!("0x{}", hex::encode(contract)), block = b, "census contract up to date");
                     }
                     e.set(s);
                     e.mark_ok();
                     return Ok(());
                 }
                 Err((s, r)) if s.meta.unusable.is_some() => {
-                    error!(contract = %hex::encode(contract), reason = %r, "census contract unusable");
+                    error!(contract = %format!("0x{}", hex::encode(contract)), reason = %r, "census contract unusable");
                     e.set(s);
                     return Err(CensusError::Refused(r.to_string()));
                 }

@@ -1247,13 +1247,14 @@ impl Actor {
         }
         self.pending.push(v);
         self.pending_at.push(now);
+        info!(pid = %hex::encode(self.pid31), vid, "vote admitted");
         if self.pending.len() < self.min_mix {
             // Say so, or a lone voter looks stuck.
             info!(
                 pid = %hex::encode(self.pid31),
                 queued = self.pending.len(),
                 min_mix = self.min_mix,
-                earliest = ?self.next_seal_not_before(),
+                earliest = self.next_seal_not_before().unwrap_or(0),
                 "queued below min mix"
             );
         }
@@ -1573,7 +1574,7 @@ impl Actor {
                         pid = %hex::encode(self.pid31),
                         k,
                         queued = self.pending.len(),
-                        reason,
+                        reason = %reason,
                         age,
                         "seal attempt"
                     );
@@ -1714,7 +1715,7 @@ impl Actor {
             pid = %hex::encode(self.pid31),
             votes = vids.len(),
             overwrites = prepared.overwrites,
-            reason,
+            reason = %reason,
             "batch sealed"
         );
         let job = JobInput {
@@ -2282,7 +2283,7 @@ impl Actor {
             pid = %hex::encode(self.pid31),
             votes = p.expected.voters,
             overwrites = p.expected.overwrites,
-            root = %hex::encode(p.new_root),
+            root = %format!("0x{}", hex::encode(p.new_root)),
             "transition settled"
         );
         self.error_new_slots_if_full();
@@ -2544,7 +2545,7 @@ impl Actor {
         info!(
             pid = %hex::encode(self.pid31),
             votes = rec.n_votes,
-            root = %hex::encode(new_root),
+            root = %format!("0x{}", hex::encode(new_root)),
             "synced transition from another sequencer"
         );
         true
