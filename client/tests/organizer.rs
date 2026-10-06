@@ -82,7 +82,8 @@ async fn deploy_registry(
         B256::from(release::RESULTS_PROGRAM_VK),
         B256::from(release::ROOT_C_VADCOP_FINAL),
         B256::from(vk_hash),
-        Address::ZERO,
+        Address::ZERO, // _dkgManager
+        Address::ZERO, // _councilManager
     )
         .abi_encode_params();
     let mut code = registry_bytecode();
@@ -157,7 +158,8 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
         B256::from(release::RESULTS_PROGRAM_VK),
         B256::from(release::ROOT_C_VADCOP_FINAL),
         B256::from(vk_hash),
-        Address::ZERO,
+        Address::ZERO, // _dkgManager
+        Address::ZERO, // _councilManager
     )
         .abi_encode_params();
     let mut code = registry_bytecode();
@@ -705,6 +707,7 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
             B256::from(release::ROOT_C_VADCOP_FINAL),
             B256::from(vk_hash),
             mock,
+            Address::ZERO, // _councilManager
         )
             .abi_encode_params(),
     );

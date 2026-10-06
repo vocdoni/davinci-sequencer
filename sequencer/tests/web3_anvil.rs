@@ -1,6 +1,6 @@
 //! web3 layer against a real anvil (Osaka) with the zkvm ProcessRegistry,
-//! the accept-all mock verifier and, for the DKG modes, the contracts'
-//! `MockDKG`. Gated by `ANVIL=1`; needs `anvil` on PATH (or in
+//! the accept-all mock verifier and, for the DKG and Council modes, the
+//! contracts' `MockDKG` and `MockCouncilManager`. Gated by `ANVIL=1`; needs `anvil` on PATH (or in
 //! ~/.foundry/bin) and `forge build` run in `DAVINCI_CONTRACTS_DIR` (default
 //! `../../davinci-contracts` from this crate).
 
@@ -36,6 +36,14 @@ const BALLOT_VK_HASH: [u8; 32] = [0x44; 32];
 const NF: u8 = 4;
 /// Registry grace constructor args: default, floor, ceil, max total, notice.
 const GRACE_ARGS: (u32, u32, u32, u32, u32) = (10, 2, 60, 60, 5);
+/// Registry constructor args after `_dkgManager`: `_councilManager`, then the
+/// grace window.
+fn ctor_tail(council_manager: Address) -> Vec<u8> {
+    let mut v = council_manager.abi_encode();
+    v.extend(GRACE_ARGS.abi_encode_params());
+    v
+}
+
 /// The metadata document behind the `ipfs://` URIs, which nothing fetches.
 const META_DOC: &[u8] = br#"{"title":{"default":"web3 test"}}"#;
 
@@ -208,7 +216,7 @@ async fn registry_on_anvil() {
         )
             .abi_encode_params(),
     );
-    code.extend(GRACE_ARGS.abi_encode_params());
+    code.extend(ctor_tail(Address::ZERO));
     let registry = deploy(&deployer, code).await;
 
     // An observer cannot send.
@@ -625,7 +633,7 @@ async fn metadata_updates_on_anvil() {
         )
             .abi_encode_params(),
     );
-    code.extend(GRACE_ARGS.abi_encode_params());
+    code.extend(ctor_tail(Address::ZERO));
     let registry = deploy(&deployer, code).await;
     let node = Contracts::new(std::slice::from_ref(&url), registry, None)
         .await
@@ -732,7 +740,7 @@ async fn registry_must_be_the_pinned_release() {
             )
                 .abi_encode_params(),
         );
-        code.extend(GRACE_ARGS.abi_encode_params());
+        code.extend(ctor_tail(Address::ZERO));
         let r = deploy(&deployer, code).await;
         Contracts::new(std::slice::from_ref(&url), r, None)
             .await
@@ -836,7 +844,7 @@ async fn send_that_failed_over_is_maybe_sent() {
         )
             .abi_encode_params(),
     );
-    code.extend(GRACE_ARGS.abi_encode_params());
+    code.extend(ctor_tail(Address::ZERO));
     let registry = deploy(&deployer, code).await;
 
     let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1036,7 +1044,7 @@ async fn same_block_race_names_the_loser() {
         )
             .abi_encode_params(),
     );
-    code.extend(GRACE_ARGS.abi_encode_params());
+    code.extend(ctor_tail(Address::ZERO));
     let registry = deploy(&deployer, code).await;
     let lag = std::sync::Arc::new(Lag::default());
     let proxy = lagging_proxy(url.clone(), lag.clone()).await;
@@ -1214,7 +1222,7 @@ async fn receipt_wait_rides_out_a_rate_limit() {
         )
             .abi_encode_params(),
     );
-    code.extend(GRACE_ARGS.abi_encode_params());
+    code.extend(ctor_tail(Address::ZERO));
     let registry = deploy(&deployer, code).await;
 
     // Forwards everything to anvil but answers the first receipt read 429,
@@ -1363,7 +1371,7 @@ async fn dkg_results_on_anvil() {
         )
             .abi_encode_params(),
     );
-    code.extend(GRACE_ARGS.abi_encode_params());
+    code.extend(ctor_tail(Address::ZERO));
     let registry = deploy(&deployer, code).await;
     let c = Contracts::new(std::slice::from_ref(&url), registry, Some(&secret))
         .await
@@ -1627,4 +1635,262 @@ async fn dkg_results_on_anvil() {
     assert_eq!(p2.status, ProcessStatus::Results);
     assert_eq!(p2.results, vec![0u64; p2.ballot_mode.num_fields as usize]);
     assert_eq!(p2.dkg.count, 0);
+}
+
+alloy::sol! {
+    #[sol(rpc)]
+    interface IMockCouncil {
+        function newCeremony(bytes12 cid, uint256 pkX, uint256 pkY) external;
+        function allowAdapter(bytes12 cid, address adapter) external;
+        function authorizeCreator(bytes12 cid, address creator) external;
+        function setPlaintext(bytes32 requestId, uint8 field, uint64 value) external;
+        function requestIdFor(bytes12 cid, address adapter, bytes31 processId)
+            external view returns (bytes32);
+        function getRequest(bytes32 requestId) external view returns (
+            bytes12 cid, uint8 fieldCount, uint16 completedBitmap, uint16 partialBitmap,
+            uint256[4][] memory cts
+        );
+    }
+}
+
+// COUNCIL on the real registry with the contracts' MockCouncilManager: the
+// organizer binds a process to a ceremony through the client, the node
+// settles a transition, requests the decryption through the Council adapter
+// (one request, TE words, first index 0) and finalizes once every field is
+// combined; readiness comes from the Council adapter, never the DKG one.
+#[tokio::test(flavor = "multi_thread")]
+async fn council_results_on_anvil() {
+    use alloy::primitives::U256 as AU256;
+    use davinci_client::organizer::{KeyMode as OrgKeyMode, NewProcess as OrgProcess, Organizer};
+    use davinci_sequencer::web3::KeyMode;
+    use davinci_state::{CensusOrigin, ProcessConfig, ProcessState};
+    use davinci_zkvm_sdk::crypto::babyjubjub::Point;
+    use davinci_zkvm_sdk::crypto::field::{fr_to_be, u256_to_be};
+
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let secret = SecretString::new(hex::encode(key.to_bytes()));
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    let admin: PrivateKeySigner = anvil.keys()[2].clone().into();
+    let admin = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(admin))
+        .connect_http(url.clone());
+
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mock = deploy(
+        &admin,
+        bytecode("MockCouncilManager.sol/MockCouncilManager.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(common::vk_hash()),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    code.extend(ctor_tail(mock));
+    let registry = deploy(&deployer, code).await;
+    let c = Contracts::new(std::slice::from_ref(&url), registry, Some(&secret))
+        .await
+        .unwrap();
+    let adapter = c.council_adapter().await.unwrap();
+    assert!(c.dkg_adapter().await.is_err(), "no DKG manager");
+
+    // A Live ceremony under k·B8 (TE, as Council keeps it) that allows the
+    // adapter and authorizes the organizer, account 1.
+    let council = IMockCouncil::new(mock, &admin);
+    let cid = FixedBytes([0xc1; 12]);
+    let pk = Point::generator().mul(&U256::from(4_242_424u64));
+    let (px, py) = (
+        AU256::from_be_bytes(fr_to_be(&pk.x)),
+        AU256::from_be_bytes(fr_to_be(&pk.y)),
+    );
+    let organizer: PrivateKeySigner = anvil.keys()[1].clone().into();
+    for call in [
+        council.newCeremony(cid, px, py).into_transaction_request(),
+        council
+            .allowAdapter(cid, adapter)
+            .into_transaction_request(),
+        council
+            .authorizeCreator(cid, organizer.address())
+            .into_transaction_request(),
+    ] {
+        admin
+            .send_transaction(call)
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+    }
+
+    let env = common::env(NF, 8, None);
+    let census_root = env.imt.root();
+    let mode = common::ballot_mode(NF);
+    let params = |pid| OrgProcess {
+        process_id: pid,
+        start_time: 0,
+        duration: 3600,
+        max_voters: 100,
+        ballot_mode: mode,
+        census_origin: 1,
+        census_root,
+        census_contract: [0; 20],
+        census_uri: "file:///tmp/census.json".into(),
+        metadata: "ipfs://meta".into(),
+        metadata_hash: metadata_hash(META_DOC),
+        key_mode: OrgKeyMode::Council(cid.0),
+    };
+    // A creator the ceremony does not authorize: refused by name.
+    let stranger =
+        Organizer::connect(url.as_str(), anvil.keys()[3].clone().into(), registry).unwrap();
+    let e = stranger
+        .create_process(&params(stranger.next_process_id().await.unwrap()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, davinci_client::Error::Reverted(n) if n == "NotAuthorizedCreator"),
+        "{e}"
+    );
+    let org = Organizer::connect(url.as_str(), organizer, registry).unwrap();
+    let pid = org
+        .create_process(&params(org.next_process_id().await.unwrap()))
+        .await
+        .unwrap()
+        .pid;
+    let rid = council
+        .requestIdFor(cid, adapter, FixedBytes(pid))
+        .call()
+        .await
+        .unwrap();
+    let p = c.process(&pid).await.unwrap();
+    assert_eq!(p.key_mode, KeyMode::Council);
+    assert_eq!(p.dkg.epoch_id, cid.0, "dkgEpochId is the ceremony id");
+    assert_eq!(p.dkg.aid, rid.0, "dkgAid is the request id");
+    assert!(!p.dkg.requested);
+    assert_eq!(p.enc_key, pk, "the ceremony key, unconverted");
+    let read = davinci_client::organizer::RegistryReader::connect(url.as_str(), registry)
+        .unwrap()
+        .process(&pid)
+        .await
+        .unwrap();
+    let dkg = read.dkg.expect("a committee-keyed process");
+    assert!(dkg.council && !dkg.locked);
+
+    // The node's tree: genesis matches, then one real transition settles.
+    let cfg = ProcessConfig {
+        process_id: pid_fr(&pid),
+        ballot_mode: mode,
+        enc_key: p.enc_key,
+        census_origin: CensusOrigin::MerkleStatic,
+        census_root,
+        ballot_vk_hash: common::vk_hash(),
+    };
+    let env = common::Env {
+        cfg: cfg.clone(),
+        imt: env.imt,
+    };
+    let mut st = ProcessState::create(cfg, arbo::MemoryStorage::new()).unwrap();
+    assert_eq!(st.committed().root, p.state_root, "genesis root");
+    let votes: Vec<_> = (0..3)
+        .map(|i| common::fake_vote(&env, i, &[1, 2, 0, 3], 70 + i as u64))
+        .collect();
+    let b = st
+        .prepare(&votes, &mut rand::rngs::OsRng, &Default::default())
+        .unwrap();
+    let snark = batch_snark(
+        &Batch {
+            before: p.state_root,
+            after: b.new_root,
+            voters: 3,
+            overwrites: 0,
+            occupied_before: 0,
+        },
+        &fr_to_be(&census_root),
+        &b.blobs,
+    );
+    c.submit_transition(&pid, &snark, &b.blobs).await.unwrap();
+    st.commit(&b).unwrap();
+
+    let (acc, sibs) = st.dkg_results_inputs().unwrap();
+    let acc = acc.map(|x| u256_to_be(&x));
+    let rpc = ProviderBuilder::new().connect_http(url.clone());
+    advance(&rpc, 3601).await;
+    advance(&rpc, 60).await;
+    assert!(!c.dkg_results_ready(&pid).await.unwrap());
+    let r = c
+        .request_results_decryption(&pid, &acc, &sibs)
+        .await
+        .unwrap();
+    let evs = c.events(r.block, r.block).await.unwrap();
+    assert!(evs.iter().any(|e| e.kind
+        == EventKind::ResultsDecryptionRequested {
+            pid,
+            epoch_id: cid.0,
+            aid: rid.0,
+            first_index: 0,
+            count: NF,
+        }));
+    let p = c.process(&pid).await.unwrap();
+    assert_eq!(p.status, ProcessStatus::Ended);
+    assert_eq!((p.dkg.first_index, p.dkg.count), (0, NF));
+    // One request with every active field, in TE as the accumulator holds it.
+    let req = council.getRequest(rid).call().await.unwrap();
+    assert_eq!((req.cid, req.fieldCount), (cid, NF));
+    for (k, ct) in req.cts.iter().enumerate() {
+        for w in 0..4 {
+            assert_eq!(
+                ct[w],
+                AU256::from_be_bytes(acc[4 * k + w]),
+                "field {k} word {w}"
+            );
+        }
+    }
+
+    let name = |e: Web3Error| match e {
+        Web3Error::Revert(r) => r.name().unwrap_or_default().to_string(),
+        e => panic!("want a revert, got {e}"),
+    };
+    let e = c.finalize_results_from_dkg(&pid).await.unwrap_err();
+    assert_eq!(name(e), "ResultsNotReady");
+    let tally = [3u64, 6, 0, 9];
+    for (i, v) in tally.iter().enumerate() {
+        assert!(!c.dkg_results_ready(&pid).await.unwrap());
+        let call = council
+            .setPlaintext(rid, i as u8, *v)
+            .into_transaction_request();
+        admin
+            .send_transaction(call)
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+    }
+    assert!(c.dkg_results_ready(&pid).await.unwrap());
+    c.finalize_results_from_dkg(&pid).await.unwrap();
+    let p = c.process(&pid).await.unwrap();
+    assert_eq!(p.status, ProcessStatus::Results);
+    assert_eq!(p.results, tally.to_vec());
 }

@@ -2951,6 +2951,12 @@ async fn dkg_locked_waits_for_the_reveal() {
     dkg_finalizes_after_the_committee(KeyMode::DkgLocked).await;
 }
 
+// A Council key takes the same path: request once, finalize when combined.
+#[tokio::test(start_paused = true)]
+async fn council_requests_once_and_finalizes_when_ready() {
+    dkg_finalizes_after_the_committee(KeyMode::Council).await;
+}
+
 /// Another node's request lands between our read and our send: the revert
 /// counts as done, and this node still publishes the plaintexts.
 #[tokio::test(start_paused = true)]

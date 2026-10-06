@@ -24,6 +24,7 @@ use url::Url;
 use super::DAVINCITypes as T;
 use super::ProcessRegistry as PR;
 use super::adapter::DavinciDKGAdapter as AD;
+use super::council::CouncilAdapter as CA;
 use super::tx::SendState;
 use super::{
     DkgState, EventKind, GraceParams, KeyMode, NewProcess, OnchainCensus, OnchainProcess,
@@ -36,6 +37,24 @@ const ABI_JSON: &str = include_str!("../../abi/ProcessRegistry.json");
 const VERIFIER_ABI_JSON: &str = include_str!("../../abi/ZiskVerifier.json");
 /// And the DKG adapter's (`NoLiveEpoch`).
 const ADAPTER_ABI_JSON: &str = include_str!("../../abi/DavinciDKGAdapter.json");
+/// And the Council adapter's (`InvalidFieldRange`).
+const COUNCIL_ABI_JSON: &str = include_str!("../../abi/CouncilAdapter.json");
+/// Council manager errors (all argument-less) the Council adapter bubbles
+/// up through the registry: binding at creation, request admission.
+const COUNCIL_ERRORS: [&str; 12] = [
+    "UnknownCeremony",
+    "WrongPhase",
+    "NotAllowedAdapter",
+    "NotAuthorizedCreator",
+    "AlreadyBound",
+    "UnknownBinding",
+    "AlreadyRequested",
+    "BadFieldCount",
+    "NonCanonical",
+    "InvalidPoint",
+    "NotInSubgroup",
+    "UnknownRequest",
+];
 /// davinci-dkg manager and app-manager errors (all argument-less) the
 /// adapter bubbles up through the registry.
 const DKG_ERRORS: [&str; 15] = [
@@ -79,6 +98,8 @@ pub struct Contracts {
     pub(super) receipt_timeout: Duration,
     /// `dkgAdapter()`, an immutable: read once, on first DKG use.
     pub(super) dkg_adapter: Arc<tokio::sync::OnceCell<Address>>,
+    /// `councilAdapter()`, likewise.
+    pub(super) council_adapter: Arc<tokio::sync::OnceCell<Address>>,
 }
 
 impl std::fmt::Debug for Contracts {
@@ -101,16 +122,17 @@ fn exact_u64(what: &str, v: U256) -> Result<u64> {
     u64::try_from(v).map_err(|_| Web3Error::Data(format!("{what} above 64 bits")))
 }
 
-/// Custom error selectors of the registry, the ZisK verifier, the DKG
-/// adapter and the DKG contracts.
+/// Custom error selectors of the registry, the ZisK verifier, the DKG and
+/// Council adapters, and the DKG and Council contracts.
 pub(super) fn error_names() -> Result<HashMap<[u8; 4], String>> {
     let mut out = HashMap::new();
-    for name in DKG_ERRORS {
+    for name in DKG_ERRORS.iter().chain(&COUNCIL_ERRORS) {
         let h = alloy::primitives::keccak256(format!("{name}()"));
         out.insert([h[0], h[1], h[2], h[3]], name.to_string());
     }
     for (what, json) in [
         ("adapter", ADAPTER_ABI_JSON),
+        ("council adapter", COUNCIL_ABI_JSON),
         ("registry", ABI_JSON),
         ("verifier", VERIFIER_ABI_JSON),
     ] {
@@ -536,6 +558,7 @@ impl Contracts {
             send_lock: Arc::new(tokio::sync::Mutex::new(SendState::default())),
             receipt_timeout: Duration::from_secs(120),
             dkg_adapter: Arc::default(),
+            council_adapter: Arc::default(),
         })
     }
 
@@ -743,27 +766,54 @@ impl Contracts {
         Ok(*a)
     }
 
+    /// The registry's Council adapter; a config error when the COUNCIL
+    /// mode is disabled (zero address).
+    pub async fn council_adapter(&self) -> Result<Address> {
+        let a = self
+            .council_adapter
+            .get_or_try_init(|| self.view(self.registry, PR::councilAdapterCall {}))
+            .await?;
+        if *a == Address::ZERO {
+            return Err(Web3Error::Config(
+                "the registry has no Council adapter".into(),
+            ));
+        }
+        Ok(*a)
+    }
+
     /// Whether `finalizeResultsFromDKG` can run: the decryption was requested
-    /// and the committee combined every submitted ciphertext (the adapter's
-    /// `plaintexts` view). A request with no active field finalizes at once.
+    /// and the committee combined every submitted ciphertext (the `plaintexts`
+    /// view of the adapter the process's key mode routes to, as the registry
+    /// does). A request with no active field finalizes at once.
     pub async fn dkg_results_ready(&self, pid: &[u8; 31]) -> Result<bool> {
         let p = self.process(pid).await?;
-        if p.key_mode == KeyMode::Sequencer {
-            return Err(Web3Error::Data("not a DKG process".into()));
+        let (eid, aid) = (FixedBytes(p.dkg.epoch_id), FixedBytes(p.dkg.aid));
+        let (first, count) = (p.dkg.first_index, p.dkg.count.into());
+        let pending = !p.dkg.requested;
+        match p.key_mode {
+            KeyMode::Sequencer => Err(Web3Error::Data("not a DKG process".into())),
+            _ if pending => Ok(false),
+            _ if p.dkg.count == 0 => Ok(true),
+            KeyMode::DkgAutomatic | KeyMode::DkgLocked => {
+                let call = AD::plaintextsCall {
+                    eid,
+                    aid,
+                    first,
+                    count,
+                };
+                Ok(self.view(self.dkg_adapter().await?, call).await?.ready)
+            }
+            // The ceremony id and the request id; the whole request at once.
+            KeyMode::Council => {
+                let call = CA::plaintextsCall {
+                    cid: eid,
+                    requestId: aid,
+                    first,
+                    count,
+                };
+                Ok(self.view(self.council_adapter().await?, call).await?.ready)
+            }
         }
-        if !p.dkg.requested {
-            return Ok(false);
-        }
-        if p.dkg.count == 0 {
-            return Ok(true);
-        }
-        let call = AD::plaintextsCall {
-            eid: FixedBytes(p.dkg.epoch_id),
-            aid: FixedBytes(p.dkg.aid),
-            first: p.dkg.first_index,
-            count: p.dkg.count.into(),
-        };
-        Ok(self.view(self.dkg_adapter().await?, call).await?.ready)
     }
 
     /// `setProcessStatus(pid, ENDED)`.
@@ -894,6 +944,33 @@ mod tests {
             Some("MissingBlob")
         );
         for e in ["GraceOpen", "EmptyTransition", "InvalidGrace"] {
+            assert_eq!(
+                names.get(&sel(&format!("{e}()"))).map(String::as_str),
+                Some(e)
+            );
+        }
+    }
+
+    #[test]
+    fn council_mode_is_named_and_read_like_the_dkg() {
+        assert_eq!(KeyMode::try_from(3).unwrap(), KeyMode::Council);
+        assert!(KeyMode::try_from(4).is_err());
+        assert_eq!(
+            serde_json::to_string(&KeyMode::Council).unwrap(),
+            "\"council\""
+        );
+        // Both adapters answer the registry's one `plaintexts` signature.
+        assert_eq!(AD::plaintextsCall::SELECTOR, CA::plaintextsCall::SELECTOR);
+        let names = error_names().unwrap();
+        let sel = |sig: &str| <[u8; 4]>::try_from(&keccak256(sig)[..4]).unwrap();
+        for e in [
+            "CouncilDisabled",
+            "InvalidFieldRange",
+            "UnsupportedKeyMode",
+            "NotAuthorizedCreator",
+            "NotInSubgroup",
+            "AlreadyRequested",
+        ] {
             assert_eq!(
                 names.get(&sel(&format!("{e}()"))).map(String::as_str),
                 Some(e)

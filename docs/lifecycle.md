@@ -152,7 +152,7 @@ For a DKG-key process, see below.
 
 ## Key modes
 
-Every process has one of three key modes, chosen at creation. The organizer talks only to the
+Every process has one of four key modes, chosen at creation. The organizer talks only to the
 `ProcessRegistry`; the DKG sits behind it, and the circuits are the same in every mode.
 
 | Mode | Election key | Who publishes the results |
@@ -160,6 +160,7 @@ Every process has one of three key modes, chosen at creation. The organizer talk
 | Sequencer (`KeyMode::Sequencer`) | Derived by the node that answered `POST /processes/keys`. | That node, with a results proof. |
 | DKG automatic (`KeyMode::DkgAutomatic`) | A davinci-dkg committee key. | Any signing node, after the committee decrypts. |
 | DKG locked (`KeyMode::DkgLocked`) | The committee key plus an organizer key. | Any signing node, after the organizer reveals its secret and the committee decrypts. |
+| Council (`KeyMode::Council`) | The key of a Council ceremony (an invite-only committee), named by its id. | Any signing node, after the ceremony's members decrypt. |
 
 A sequencer key trusts one node with ballot secrecy: it holds a key that opens every ballot in the
 blobs, and it alone can publish the results. It suits testing and users who accept that trust.
@@ -184,6 +185,16 @@ organizer's proof of possession of `sk_org` binds it; `adapter.registrationEpoch
 which epoch to use. If the pool empties or a new epoch goes live between that read and the
 transaction, `newProcess` reverts and the client retries once.
 
+### How a Council process gets its key
+
+A registry deployed with a Council manager also creates a `CouncilAdapter`
+(`councilAdapter()`); without one, `newProcess` in this mode reverts `CouncilDisabled`. The
+process names a Live ceremony (`KeyMode::Council(ceremony_id)` in the client), whose organizer
+has allowed that adapter and authorized the creating account; the manager refuses anything else
+(`NotAllowedAdapter`, `NotAuthorizedCreator`, `WrongPhase`, `UnknownCeremony`) and the client
+does not retry. The registry stores the ceremony id as `dkgEpochId` and the request id the process
+decrypts under as `dkgAid`. Every process bound to a ceremony shares its key.
+
 ### DKG results
 
 After the grace end, any signing node sends `requestResultsDecryption(pid, accumulator,
@@ -192,7 +203,9 @@ latest state root, submits each active field's ciphertext to the committee, and 
 to ended, which only the registry can leave. That matters because the decrypted values are public
 on the DKG before they reach the registry: a process left ready could be canceled by an organizer
 who disliked the tally. The node then waits until every ciphertext is decrypted and calls
-`finalizeResultsFromDKG`, which stores the results.
+`finalizeResultsFromDKG`, which stores the results. A Council process takes the same path: the
+registry submits its active fields as one request through the Council adapter (first index 0),
+and the node asks that adapter, not the DKG one, whether the whole request is combined.
 
 Every signing node reaches both calls at about the same time, so each waits a random moment (up
 to 10 s) and sends only if a fresh read still lacks the call. A node that loses the race anyway

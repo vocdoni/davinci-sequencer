@@ -954,6 +954,7 @@ mod tests {
             send_lock: Default::default(),
             receipt_timeout: Duration::from_secs(1),
             dkg_adapter: Default::default(),
+            council_adapter: Default::default(),
         }
     }
 

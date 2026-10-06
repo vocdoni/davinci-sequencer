@@ -59,6 +59,36 @@ mod adapter {
 }
 use adapter::DavinciDKGAdapter::{self, DavinciDKGAdapterErrors};
 
+mod council {
+    alloy::sol!(
+        #[sol(all_derives)]
+        #[allow(missing_docs)]
+        CouncilAdapter,
+        "../sequencer/abi/CouncilAdapter.json"
+    );
+}
+use council::CouncilAdapter::CouncilAdapterErrors;
+
+sol! {
+    /// Council manager errors the registry bubbles up through the Council
+    /// adapter: the binding at creation, the request admission.
+    #[sol(all_derives)]
+    interface ICouncil {
+        error UnknownCeremony();
+        error WrongPhase();
+        error NotAllowedAdapter();
+        error NotAuthorizedCreator();
+        error AlreadyBound();
+        error UnknownBinding();
+        error AlreadyRequested();
+        error BadFieldCount();
+        error NonCanonical();
+        error InvalidPoint();
+        error NotInSubgroup();
+        error UnknownRequest();
+    }
+}
+
 sol! {
     /// davinci-dkg manager and app-manager errors the registry bubbles up.
     #[sol(all_derives)]
@@ -159,6 +189,11 @@ pub enum KeyMode {
     /// A pool key plus an organizer key drawn here: results stay locked until
     /// [`Organizer::reveal_process_key`].
     DkgLocked,
+    /// The key of the Council ceremony with this id (`bytes12`): its
+    /// invite-only committee decrypts the final tally. The ceremony must be
+    /// Live, allow the registry's Council adapter and authorize the
+    /// organizer's account.
+    Council([u8; 12]),
 }
 
 impl KeyMode {
@@ -168,6 +203,7 @@ impl KeyMode {
             KeyMode::Sequencer(_) => 0,
             KeyMode::DkgAutomatic => 1,
             KeyMode::DkgLocked => 2,
+            KeyMode::Council(_) => 3,
         }
     }
 }
@@ -216,6 +252,8 @@ pub struct CreatedProcess {
 pub struct DkgProcess {
     /// `DKG_LOCKED` (organizer key) rather than `DKG_AUTOMATIC`.
     pub locked: bool,
+    /// `COUNCIL`: `epoch_id` is the ceremony id and `aid` the request id.
+    pub council: bool,
     pub epoch_id: [u8; 12],
     pub aid: [u8; 32],
     /// Set by `requestResultsDecryption`.
@@ -333,7 +371,7 @@ fn err_name(d: impl std::fmt::Debug) -> String {
 }
 
 // Contract errors come back decoded by name where the ABIs know them: the
-// registry's, then the DKG adapter's and the DKG's it bubbles up.
+// registry's, then the adapters' and the DKG's and Council's they bubble up.
 fn chain_err(e: alloy::contract::Error) -> Error {
     if let Some(d) = e.as_decoded_interface_error::<ProcessRegistryErrors>() {
         return Error::Reverted(err_name(d));
@@ -342,6 +380,12 @@ fn chain_err(e: alloy::contract::Error) -> Error {
         return Error::Reverted(err_name(d));
     }
     if let Some(d) = e.as_decoded_interface_error::<IDKG::IDKGErrors>() {
+        return Error::Reverted(err_name(d));
+    }
+    if let Some(d) = e.as_decoded_interface_error::<CouncilAdapterErrors>() {
+        return Error::Reverted(err_name(d));
+    }
+    if let Some(d) = e.as_decoded_interface_error::<ICouncil::ICouncilErrors>() {
         return Error::Reverted(err_name(d));
     }
     Error::Chain(e.to_string())
@@ -537,6 +581,11 @@ impl Organizer {
     /// registration epoch and the process's aid, and returns the secret.
     /// Either DKG mode retries once on `PoolExhausted` (simulated or mined),
     /// locked mode also when the registration epoch moved meanwhile.
+    ///
+    /// `Council`: the registry binds the process to the ceremony and takes
+    /// its key. Never retried: a refused binding comes back by name
+    /// (`NotAuthorizedCreator`, `NotAllowedAdapter`, `WrongPhase`,
+    /// `UnknownCeremony`, `CouncilDisabled`).
     pub async fn create_process(&self, p: &NewProcess) -> Result<CreatedProcess> {
         let next = self.next_process_id().await?;
         if next != p.process_id {
@@ -548,8 +597,8 @@ impl Organizer {
         }
         p.ballot_mode.pack()?;
         let adapter = match p.key_mode {
-            KeyMode::Sequencer(_) => None,
-            _ => Some(self.dkg_adapter().await?),
+            KeyMode::Sequencer(_) | KeyMode::Council(_) => None,
+            KeyMode::DkgAutomatic | KeyMode::DkgLocked => Some(self.dkg_adapter().await?),
         };
         let mut retried = false;
         loop {
@@ -558,6 +607,13 @@ impl Organizer {
                     let (params, sk) = self.locked_params(a, &next).await?;
                     (params, Some(sk))
                 }
+                (KeyMode::Council(cid), _) => (
+                    DAVINCITypes::DKGParams {
+                        epochId: FixedBytes(cid),
+                        ..dkg_params(p.key_mode.id())
+                    },
+                    None,
+                ),
                 (mode, _) => (dkg_params(mode.id()), None),
             };
             match self.send_new_process(p, dkg.clone()).await {
@@ -609,7 +665,7 @@ impl Organizer {
             censusURI: p.census_uri.clone(),
             onchainAllowAnyValidRoot: false,
         };
-        // DKG modes pass (0, 0): the registry takes the committee's key.
+        // DKG and Council modes pass (0, 0): the registry takes the committee's key.
         let key = match p.key_mode {
             KeyMode::Sequencer(k) => DAVINCITypes::EncryptionKey {
                 x: U256::from_be_bytes(fr_to_be(&k.x)),
@@ -1010,7 +1066,7 @@ pub async fn verify_registry(rpc_url: &str, registry: Address) -> Result<Registr
     })
 }
 
-/// Name of a registry, verifier, DKG adapter or DKG custom error in `data`
+/// Name of a registry, verifier, adapter, DKG or Council custom error in `data`
 /// (revert data), or its selector in hex; `"empty revert"` for none.
 pub fn revert_name(data: &[u8]) -> String {
     use alloy::sol_types::{SolError, SolInterface};
@@ -1024,6 +1080,12 @@ pub fn revert_name(data: &[u8]) -> String {
         return err_name(e);
     }
     if let Ok(e) = IDKG::IDKGErrors::abi_decode(data) {
+        return err_name(e);
+    }
+    if let Ok(e) = CouncilAdapterErrors::abi_decode(data) {
+        return err_name(e);
+    }
+    if let Ok(e) = ICouncil::ICouncilErrors::abi_decode(data) {
         return err_name(e);
     }
     if data.starts_with(&IZiskVerifier::InvalidProof::SELECTOR) {
@@ -1091,8 +1153,9 @@ async fn read_process(
     };
     let dkg = match p.keyMode {
         0 => None,
-        m @ (1 | 2) => Some(DkgProcess {
+        m @ (1..=3) => Some(DkgProcess {
             locked: m == 2,
+            council: m == 3,
             epoch_id: p.dkgEpochId.0,
             aid: p.dkgAid.0,
             results_requested: p.dkgResultsRequested,

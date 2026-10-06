@@ -90,6 +90,16 @@ pub(crate) mod adapter {
     );
 }
 
+/// Own module too, for the same reason.
+pub(crate) mod council {
+    alloy::sol!(
+        #[allow(missing_docs)]
+        #[derive(Debug)]
+        CouncilAdapter,
+        "abi/CouncilAdapter.json"
+    );
+}
+
 /// Where a process's election key comes from (`DAVINCITypes.KeyMode`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +111,9 @@ pub enum KeyMode {
     DkgAutomatic = 1,
     /// Pool key plus organizer key; decryption waits for the reveal.
     DkgLocked = 2,
+    /// A Council ceremony's key; its committee decrypts the tally. The
+    /// results follow the DKG path through the registry's Council adapter.
+    Council = 3,
 }
 
 impl TryFrom<u8> for KeyMode {
@@ -110,12 +123,14 @@ impl TryFrom<u8> for KeyMode {
             0 => KeyMode::Sequencer,
             1 => KeyMode::DkgAutomatic,
             2 => KeyMode::DkgLocked,
+            3 => KeyMode::Council,
             _ => return Err(Web3Error::Data(format!("key mode {v}"))),
         })
     }
 }
 
 /// The registry's DKG bookkeeping of a process; zero in SEQUENCER mode.
+/// For COUNCIL, `epoch_id` is the ceremony id and `aid` the request id.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DkgState {
     #[serde(with = "hex::serde")]

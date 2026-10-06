@@ -230,6 +230,7 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
         B256::from(release::ROOT_C_VADCOP_FINAL),
         vk_hash,
         dkg_manager,
+        Address::ZERO, // _councilManager: no Council mode
     )
         .abi_encode_params();
     let mut code = bytecode(dir, "ProcessRegistry.sol/ProcessRegistry.json")?;
