@@ -48,7 +48,10 @@ other applications can share the committee.
 Three checks refuse a registry that pins other programs: the node's startup check,
 `davinci_client::organizer::verify_registry` for clients, and davinci-contracts'
 `script/verify_deployment.py`, which compares the deployed runtime code with a local build and
-reads back every pin. From a davinci-contracts checkout:
+reads back every pin. The client and the script also check that the DKG and Council adapters, if
+any, point back at the registry; a registry without `councilAdapter()` (this one) reads as having
+no Council adapter, and any other failure of that read fails the check. From a davinci-contracts
+checkout:
 
 ```bash
 python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \

@@ -61,13 +61,13 @@ use adapter::DavinciDKGAdapter::{self, DavinciDKGAdapterErrors};
 
 mod council {
     alloy::sol!(
-        #[sol(all_derives)]
+        #[sol(rpc, all_derives)]
         #[allow(missing_docs)]
         CouncilAdapter,
         "../sequencer/abi/CouncilAdapter.json"
     );
 }
-use council::CouncilAdapter::CouncilAdapterErrors;
+use council::CouncilAdapter::{self, CouncilAdapterErrors};
 
 sol! {
     /// Council manager errors the registry bubbles up through the Council
@@ -970,6 +970,10 @@ pub struct RegistryInfo {
     /// The DKG adapter the registry created, `None` when the DKG key modes
     /// are disabled. Callers creating DKG processes must require it.
     pub dkg_adapter: Option<Address>,
+    /// The Council adapter the registry created, `None` when the COUNCIL
+    /// mode is disabled or the registry predates it. Callers creating
+    /// Council processes must require it.
+    pub council_adapter: Option<Address>,
 }
 
 fn pin(
@@ -987,8 +991,10 @@ fn pin(
 /// Checks that `registry` settles what this release proves: the batch and
 /// results program vks, `rootCVadcopFinal`, the ballot VK hash of the embedded
 /// VK, `chainID` equal to the RPC's, and a verifier whose root and runtime code
-/// are the pinned ones. A DKG adapter, if any, must name this registry. The
-/// first mismatch comes back as [`Error::Pin`].
+/// are the pinned ones. A DKG or Council adapter, if any, must name this
+/// registry. The first mismatch comes back as [`Error::Pin`]; a
+/// `councilAdapter()` read that fails for any reason but a registry without
+/// the function is an error, never "no adapter".
 pub async fn verify_registry(rpc_url: &str, registry: Address) -> Result<RegistryInfo> {
     let provider = read_provider(rpc_url)?;
     let rpc = |e: alloy::transports::TransportError| Error::Chain(e.to_string());
@@ -1059,11 +1065,47 @@ pub async fn verify_registry(rpc_url: &str, registry: Address) -> Result<Registr
         }
         Some(adapter)
     };
+    let council_adapter = match r.councilAdapter().call().await {
+        Ok(a) if a == Address::ZERO => None,
+        Ok(a) => {
+            let back = CouncilAdapter::new(a, &provider)
+                .registry()
+                .call()
+                .await
+                .map_err(chain_err)?;
+            if back != registry {
+                return Err(pin("councilAdapter.registry", registry, back));
+            }
+            Some(a)
+        }
+        Err(e) if missing_function(&e) => None,
+        Err(e) => return Err(chain_err(e)),
+    };
     Ok(RegistryInfo {
         chain_id,
         verifier,
         dkg_adapter,
+        council_adapter,
     })
+}
+
+// What a registry from before the COUNCIL mode answers `councilAdapter()`
+// with: its dispatcher reverts without data (or, behind some nodes, the call
+// returns nothing). A transport failure, another JSON-RPC error or a revert
+// carrying data is not that.
+fn missing_function(e: &alloy::contract::Error) -> bool {
+    match e {
+        alloy::contract::Error::ZeroData(..) => true,
+        alloy::contract::Error::TransportError(t) => t.as_error_resp().is_some_and(|r| {
+            r.message
+                .to_ascii_lowercase()
+                .contains("execution reverted")
+                && r.data
+                    .as_ref()
+                    .is_none_or(|d| matches!(d.get().trim(), "\"0x\"" | "\"\"" | "null"))
+        }),
+        _ => false,
+    }
 }
 
 /// Name of a registry, verifier, adapter, DKG or Council custom error in `data`
@@ -1199,6 +1241,41 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn only_a_dataless_revert_means_no_council_adapter() {
+        use alloy::rpc::json_rpc::ErrorPayload;
+        use alloy::transports::{RpcError, TransportErrorKind};
+        let resp = |code: i64, message: &str, data: Option<&str>| {
+            alloy::contract::Error::TransportError(RpcError::ErrorResp(ErrorPayload {
+                code,
+                message: message.to_string().into(),
+                data: data.map(|d| serde_json::value::RawValue::from_string(d.into()).unwrap()),
+            }))
+        };
+        // anvil, geth and an empty data string: the function is not there.
+        assert!(missing_function(&resp(
+            3,
+            "execution reverted",
+            Some("\"0x\"")
+        )));
+        assert!(missing_function(&resp(-32000, "execution reverted", None)));
+        assert!(missing_function(&resp(
+            3,
+            "Execution reverted",
+            Some("\"\"")
+        )));
+        // A revert with data, another error or a dead endpoint: a failure.
+        assert!(!missing_function(&resp(
+            3,
+            "execution reverted",
+            Some("\"0x82b42900\"")
+        )));
+        assert!(!missing_function(&resp(-32005, "rate limited", None)));
+        assert!(!missing_function(&alloy::contract::Error::TransportError(
+            TransportErrorKind::backend_gone()
+        )));
+    }
 
     #[test]
     fn rate_limit_retries_outlast_a_public_rpc_refusal() {

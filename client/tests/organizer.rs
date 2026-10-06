@@ -67,12 +67,23 @@ async fn deploy(p: &impl Provider, code: Vec<u8>) -> anyhow::Result<Address> {
 }
 
 /// A registry pinned to the release, except for `chain_id`, `verifier` and
-/// `batch_vk`.
+/// `batch_vk`, with no DKG manager.
 async fn deploy_registry(
     p: &impl Provider,
     chain_id: u32,
     verifier: Address,
     batch_vk: [u8; 32],
+) -> anyhow::Result<Address> {
+    deploy_registry_with(p, chain_id, verifier, batch_vk, Address::ZERO).await
+}
+
+/// [`deploy_registry`] with a Council manager.
+async fn deploy_registry_with(
+    p: &impl Provider,
+    chain_id: u32,
+    verifier: Address,
+    batch_vk: [u8; 32],
+    council_manager: Address,
 ) -> anyhow::Result<Address> {
     let vk_hash = BallotVerifier::from_snarkjs_json(release::ballot_vk_json())?.vk_hash();
     let args = (
@@ -83,7 +94,7 @@ async fn deploy_registry(
         B256::from(release::ROOT_C_VADCOP_FINAL),
         B256::from(vk_hash),
         Address::ZERO, // _dkgManager
-        Address::ZERO, // _councilManager
+        council_manager,
     )
         .abi_encode_params();
     let mut code = registry_bytecode();
@@ -110,8 +121,13 @@ async fn registry_pins() -> anyhow::Result<()> {
     let good = deploy_registry(&p, 31337, verifier, vk).await?;
     let info = verify_registry(&url, good).await?;
     assert_eq!(
-        (info.chain_id, info.verifier, info.dkg_adapter),
-        (31337, verifier, None)
+        (
+            info.chain_id,
+            info.verifier,
+            info.dkg_adapter,
+            info.council_adapter
+        ),
+        (31337, verifier, None, None)
     );
 
     let pin_of = |e: Error| match e {
@@ -135,6 +151,21 @@ async fn registry_pins() -> anyhow::Result<()> {
         pin_of(verify_registry(&url, r).await.unwrap_err()),
         "verifier code hash"
     );
+
+    // A Council manager: the adapter the registry created, which names it.
+    let manager = deploy(
+        &p,
+        bytecode("MockCouncilManager.sol/MockCouncilManager.json"),
+    )
+    .await?;
+    let r = deploy_registry_with(&p, 31337, verifier, vk, manager).await?;
+    let info = verify_registry(&url, r).await?;
+    let adapter = info.council_adapter.expect("a Council adapter");
+    assert_eq!(
+        adapter,
+        ProcessRegistry::new(r, &p).councilAdapter().call().await?
+    );
+    assert_eq!(info.dkg_adapter, None);
     Ok(())
 }
 
