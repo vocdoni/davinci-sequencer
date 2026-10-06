@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::actor::{Chain, FinalizeFail, Msg, Prover};
-use crate::web3::{ProcessStatus, Web3Error};
+use crate::web3::{KeyMode, ProcessStatus, Web3Error};
 
 /// One finalize attempt: prove the results circuit, check the proof, submit.
 /// With `hold` (eager results, window still open) the checked snark goes back
@@ -97,18 +97,23 @@ enum Fail {
     Permanent(String),
     /// DKG plaintexts not there yet: poll again, not an error.
     Wait(String),
+    /// A Council ceremony that has not opened decryption: poll again on the
+    /// gate's slower pace, for as long as it takes.
+    Gate(String),
 }
 
 impl From<Fail> for FinalizeFail {
     fn from(f: Fail) -> Self {
-        let (permanent, wait, msg) = match f {
-            Fail::Transient(m) => (false, false, m),
-            Fail::Permanent(m) => (true, false, m),
-            Fail::Wait(m) => (false, true, m),
+        let (permanent, wait, gate, msg) = match f {
+            Fail::Transient(m) => (false, false, false, m),
+            Fail::Permanent(m) => (true, false, false, m),
+            Fail::Wait(m) => (false, true, false, m),
+            Fail::Gate(m) => (false, false, true, m),
         };
         FinalizeFail {
             permanent,
             wait,
+            gate,
             msg,
             dkg_requested: None,
         }
@@ -133,7 +138,10 @@ async fn jitter() {
 /// publish the plaintexts once the committee combined them all. Each call
 /// goes out after a random pause and only if a fresh read still lacks it;
 /// another node winning either step counts as done. `inputs` is `None` when
-/// the actor already saw the request on-chain. Reports through the mailbox.
+/// the actor already saw the request on-chain. A COUNCIL process is
+/// requested while its ceremony's decryption gate is closed (that ends it),
+/// but published only once the gate opens, all-zero results included.
+/// Reports through the mailbox.
 pub(crate) async fn run_finalize_dkg(
     chain: Arc<dyn Chain>,
     pid31: [u8; 31],
@@ -222,10 +230,24 @@ async fn dkg_attempt(
             }
         }
         *seen = Some(true);
-        // No active field: the request itself finalized.
+        // No active field: the request itself finalized (for COUNCIL only
+        // with the gate already open).
         if chain.process(pid31).await.map_err(transient)?.status == ProcessStatus::Results {
             return Ok(());
         }
+    }
+    // A Council ceremony opens decryption on its own schedule, possibly
+    // months after the end; until then the registry publishes nothing, not
+    // even all-zero results. Pending, never a failure.
+    if p.key_mode == KeyMode::Council
+        && !chain
+            .council_decryption_open(&p.dkg.epoch_id)
+            .await
+            .map_err(transient)?
+    {
+        return Err(Fail::Gate(
+            "the Council ceremony has not opened decryption".into(),
+        ));
     }
     if !chain.dkg_results_ready(pid31).await.map_err(transient)? {
         return Err(Fail::Wait("DKG plaintexts not combined yet".into()));
@@ -240,6 +262,11 @@ async fn dkg_attempt(
         Ok(_) => Ok(()),
         Err(Web3Error::Revert(r)) if r.name() == Some("ResultsNotReady") => {
             Err(Fail::Wait(format!("finalize: {r}")))
+        }
+        // The gate read open on a lagging endpoint, or the registry and the
+        // view disagree for a block: still pending, never latched.
+        Err(Web3Error::Revert(r)) if r.name() == Some("DecryptionNotOpen") => {
+            Err(Fail::Gate(format!("finalize: {r}")))
         }
         Err(e) => dkg_fail(chain, pid31, e, "finalize").await,
     }

@@ -2957,6 +2957,86 @@ async fn council_requests_once_and_finalizes_when_ready() {
     dkg_finalizes_after_the_committee(KeyMode::Council).await;
 }
 
+/// A zero-vote Council process whose ceremony has not opened decryption:
+/// the request lands and ends it, but nothing is published. The node keeps
+/// reading the gate on a backoff that tops out at five minutes, never
+/// latches, and finalizes the zeros once the gate opens.
+#[tokio::test(start_paused = true)]
+async fn council_zero_vote_waits_for_the_gate() {
+    let closed = |c: &FakeChain| {
+        c.set_council_gate(false);
+        c.clone()
+    };
+    let (s, _node, h, shutdown, _dir) = dkg_node(KeyMode::Council, closed, false).await;
+    wait_until("decryption requested", async || {
+        s.chain.dkg_calls().0.0 == 1
+    })
+    .await;
+    assert_eq!(s.chain.dkg_state().count, 0);
+    // An hour with the gate closed: no finalize goes out, the reads slow
+    // down (15 s doubling to 300 s: about 16 in an hour), the process stays
+    // ENDED and the actor active.
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    let reads = s.chain.council_gate_reads();
+    assert!((10..=25).contains(&reads), "{reads} gate reads in an hour");
+    assert_eq!(s.chain.dkg_calls(), ((1, 1), (0, 0)));
+    assert_eq!(s.chain.status(), ProcessStatus::Ended);
+    assert!(s.chain.results().is_empty());
+    assert_eq!(h.snapshot().await.unwrap().local, LocalStatus::Active);
+    // A day on, still capped at one read per 300 s; then the ceremony
+    // opens and the next read publishes the zeros.
+    tokio::time::sleep(Duration::from_secs(3600 * 24)).await;
+    let before = s.chain.council_gate_reads();
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert!(
+        s.chain.council_gate_reads() - before <= 13,
+        "capped at 300 s"
+    );
+    s.chain.set_council_gate(true);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results(), vec![0u64; 2]);
+    assert_eq!(s.chain.dkg_calls(), ((1, 1), (1, 1)));
+    shutdown.cancel();
+}
+
+/// A finalize the registry refuses with `DecryptionNotOpen` (the gate view
+/// read open on a lagging endpoint) is pending, not a failure: the node
+/// retries and publishes the combined tally once the gate is open.
+#[tokio::test(start_paused = true)]
+async fn council_decryption_not_open_is_retried_not_latched() {
+    let lagging = |c: &FakeChain| {
+        c.set_council_gate(false);
+        c.set_council_gate_view(Some(true));
+        c.clone()
+    };
+    let (s, _node, h, shutdown, _dir) = dkg_node(KeyMode::Council, lagging, true).await;
+    wait_until("decryption requested", async || {
+        s.chain.dkg_calls().0.0 == 1
+    })
+    .await;
+    s.chain.dkg_combine(vec![3, 5]);
+    wait_long("finalize refused twice", async || {
+        s.chain.dkg_calls().1.1 >= 2
+    })
+    .await;
+    assert_eq!(s.chain.dkg_calls().1.0, 0);
+    assert_eq!(s.chain.status(), ProcessStatus::Ended);
+    assert_eq!(h.snapshot().await.unwrap().local, LocalStatus::Active);
+    s.chain.set_council_gate(true);
+    s.chain.set_council_gate_view(None);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results(), tally(3, 5));
+    assert_eq!(s.chain.dkg_calls().0, (1, 1));
+    assert_eq!(s.chain.dkg_calls().1.0, 1);
+    shutdown.cancel();
+}
+
 /// Another node's request lands between our read and our send: the revert
 /// counts as done, and this node still publishes the plaintexts.
 #[tokio::test(start_paused = true)]

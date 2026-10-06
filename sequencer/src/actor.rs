@@ -42,6 +42,16 @@ const PENDING_CAP: usize = 16 * 1024;
 
 /// How often a DKG-mode finalizer checks for the committee's plaintexts.
 const DKG_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+/// Slowest pace of the check on a closed Council decryption gate, which can
+/// stay closed for months: from [`DKG_POLL`], doubling up to this.
+const GATE_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The wait after the `n`-th consecutive closed-gate read (1-based).
+fn gate_backoff(n: u32) -> std::time::Duration {
+    DKG_POLL
+        .saturating_mul(1 << n.saturating_sub(1).min(16))
+        .min(GATE_POLL_MAX)
+}
 
 // ------------------------------------------------------------------ traits
 
@@ -84,8 +94,12 @@ pub trait Chain: Send + Sync {
         accumulator: &[[u8; 32]; 64],
         siblings: &[[u8; 32]],
     ) -> Result<TxReceipt, Web3Error>;
-    /// DKG modes: every submitted ciphertext has a combined plaintext.
+    /// DKG modes: every submitted ciphertext has a combined plaintext (and,
+    /// for COUNCIL, the ceremony's decryption gate is open).
     async fn dkg_results_ready(&self, pid: &[u8; 31]) -> Result<bool, Web3Error>;
+    /// COUNCIL: whether ceremony `cid` has opened decryption (the Council
+    /// adapter's `isDecryptionOpen`).
+    async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error>;
     /// DKG modes: `finalizeResultsFromDKG`.
     async fn finalize_results_from_dkg(&self, pid: &[u8; 31]) -> Result<TxReceipt, Web3Error>;
 }
@@ -226,6 +240,9 @@ impl Chain for crate::web3::Contracts {
     }
     async fn dkg_results_ready(&self, pid: &[u8; 31]) -> Result<bool, Web3Error> {
         crate::web3::Contracts::dkg_results_ready(self, pid).await
+    }
+    async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error> {
+        crate::web3::Contracts::council_decryption_open(self, cid).await
     }
     async fn finalize_results_from_dkg(&self, pid: &[u8; 31]) -> Result<TxReceipt, Web3Error> {
         crate::web3::Contracts::finalize_results_from_dkg(self, pid).await
@@ -430,10 +447,12 @@ pub(crate) enum Msg {
 
 /// How a finalize attempt failed: permanent latches, transient re-arms.
 /// `wait` is not a failure: the DKG has not decrypted yet, poll again.
+/// `gate` is not one either: a Council ceremony has not opened decryption.
 /// `dkg_requested` is the request flag the attempt last saw on-chain.
 pub(crate) struct FinalizeFail {
     pub permanent: bool,
     pub wait: bool,
+    pub gate: bool,
     pub msg: String,
     pub dkg_requested: Option<bool>,
 }
@@ -721,6 +740,8 @@ struct Actor {
     /// Latched only on a permanent finalize failure (bad proof, revert).
     finalize_failed: bool,
     finalize_attempts: u32,
+    /// Consecutive attempts that found the Council decryption gate closed.
+    gate_polls: u32,
     /// Transient finalize cooldown: no new attempt before this instant.
     finalize_after: Option<tokio::time::Instant>,
     /// Prove the results during the grace (sequencer-key processes).
@@ -871,6 +892,7 @@ pub(crate) fn spawn_actor(
         finalizing: false,
         finalize_failed: false,
         finalize_attempts: 0,
+        gate_polls: 0,
         finalize_after: None,
         eager: cfg.eager_results,
         held: None,
@@ -1066,10 +1088,34 @@ impl Actor {
                         self.finalize_failed = true;
                         error!(pid = %hex::encode(self.pid31), e = ?f.msg, "finalize failed");
                     }
+                    Err(f) if f.gate => {
+                        // A Council ceremony opens decryption on its own
+                        // schedule, possibly months after the end: back off
+                        // to GATE_POLL_MAX and keep polling, never latch.
+                        self.finalize_attempts = 0;
+                        self.gate_polls = self.gate_polls.saturating_add(1);
+                        let wait = gate_backoff(self.gate_polls);
+                        self.finalize_after = Some(tokio::time::Instant::now() + wait);
+                        if self.gate_polls == 1 {
+                            info!(
+                                pid = %hex::encode(self.pid31),
+                                "results wait for the Council ceremony to open decryption"
+                            );
+                        } else {
+                            debug!(
+                                pid = %hex::encode(self.pid31),
+                                e = ?f.msg,
+                                polls = self.gate_polls,
+                                retry_in = wait.as_secs(),
+                                "Council decryption still closed"
+                            );
+                        }
+                    }
                     Err(f) if f.wait => {
                         // A locked process can wait days for its reveal: poll
                         // at a fixed pace, not an error.
                         self.finalize_attempts = 0;
+                        self.gate_polls = 0;
                         self.finalize_after = Some(tokio::time::Instant::now() + DKG_POLL);
                         debug!(pid = %hex::encode(self.pid31), e = ?f.msg, "waiting for the DKG");
                     }

@@ -212,6 +212,17 @@ to 10 s) and sends only if a fresh read still lacks the call. A node that loses 
 takes the winner's call as its own. A field whose ciphertext is the identity (a process with no
 votes) decrypts to 0 under any key, and the registry records 0 without asking the DKG.
 
+A Council ceremony also fixes when decryption may open: on a scheduled date, or when its organizer
+opens it, optionally with a fallback date. The gate can open months after the vote ends, and a
+date opens it without any transaction. Until it opens the registry publishes no result of a
+Council process, not even all zeros: the request is still accepted and ends the process, but an
+all-identity tally stays ended instead of finalizing, and `finalizeResultsFromDKG` reverts
+`DecryptionNotOpen`. The node treats a closed gate as pending, never as a failure: after the
+request it reads the gate through the Council adapter (`isDecryptionOpen`), polling 15 s at
+first and doubling up to every 5 minutes, and a `DecryptionNotOpen` revert counts the same. Once
+the gate reads open it publishes the zeros, or waits for the committee's combines at the usual
+15 s pace. The requested flag is persisted, so a restart resumes the wait without a new request.
+
 ### Client example
 
 ```rust

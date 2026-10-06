@@ -324,6 +324,13 @@ pub struct Inner {
     /// after `dkg_results_ready` says ready (`armed` once it did).
     dkg_finalize_after_ready: bool,
     dkg_finalize_armed: bool,
+    /// COUNCIL: the ceremony's decryption gate (open unless a test closes it).
+    council_gate: bool,
+    /// What `council_decryption_open` answers instead, when set (a view that
+    /// disagrees with the registry).
+    council_gate_view: Option<bool>,
+    /// `council_decryption_open` reads.
+    council_gate_reads: u64,
 }
 
 #[derive(Clone)]
@@ -405,6 +412,9 @@ impl FakeChain {
             dkg_request_on_read: None,
             dkg_finalize_after_ready: false,
             dkg_finalize_armed: false,
+            council_gate: true,
+            council_gate_view: None,
+            council_gate_reads: 0,
         };
         FakeChain {
             inner: Arc::new(Mutex::new(inner)),
@@ -715,6 +725,22 @@ impl FakeChain {
         i.proc.dkg.aid = [0xa1; 32];
     }
 
+    /// Opens or closes the COUNCIL ceremony's decryption gate.
+    pub fn set_council_gate(&self, open: bool) {
+        self.inner.lock().unwrap().council_gate = open;
+    }
+
+    /// `council_decryption_open` answers `view` whatever the gate (`None`:
+    /// the gate).
+    pub fn set_council_gate_view(&self, view: Option<bool>) {
+        self.inner.lock().unwrap().council_gate_view = view;
+    }
+
+    /// How many times the gate was read.
+    pub fn council_gate_reads(&self) -> u64 {
+        self.inner.lock().unwrap().council_gate_reads
+    }
+
     /// The committee combined every submitted ciphertext into `results`.
     pub fn dkg_combine(&self, results: Vec<u64>) {
         self.inner.lock().unwrap().dkg_plaintexts = Some(results);
@@ -893,9 +919,15 @@ fn dkg_set_results(i: &mut Inner, sender: Address, results: Vec<u64>) {
     }
 }
 
+// A COUNCIL process whose ceremony has not opened decryption.
+fn council_closed(i: &Inner) -> bool {
+    i.proc.key_mode == KeyMode::Council && !i.council_gate
+}
+
 // `requestResultsDecryption` landing: a READY/PAUSED process moves to
 // ENDED (`ProcessStatusChanged` first), the flags and event, and the
-// immediate finalize of an all-identity accumulator.
+// immediate finalize of an all-identity accumulator (for COUNCIL only with
+// the gate open).
 fn dkg_mark_requested(i: &mut Inner, sender: Address, count: u8) {
     i.proc.dkg.requested = true;
     i.proc.dkg.first_index = if count > 0 { 1 } else { 0 };
@@ -929,7 +961,7 @@ fn dkg_mark_requested(i: &mut Inner, sender: Address, count: u8) {
             count,
         },
     });
-    if count == 0 {
+    if count == 0 && !council_closed(i) {
         let nf = i.proc.ballot_mode.num_fields as usize;
         dkg_set_results(i, sender, vec![0; nf]);
     }
@@ -1257,7 +1289,11 @@ impl Chain for FakeChain {
 
     async fn dkg_results_ready(&self, _pid: &[u8; 31]) -> Result<bool, Web3Error> {
         let mut i = self.inner.lock().unwrap();
-        let ready = i.proc.dkg.requested && (i.proc.dkg.count == 0 || i.dkg_plaintexts.is_some());
+        // Through the adapter's gate view, as `Contracts` reads it.
+        let gate =
+            i.proc.key_mode != KeyMode::Council || i.council_gate_view.unwrap_or(i.council_gate);
+        let ready =
+            i.proc.dkg.requested && gate && (i.proc.dkg.count == 0 || i.dkg_plaintexts.is_some());
         if ready && std::mem::take(&mut i.dkg_finalize_after_ready) {
             i.dkg_finalize_armed = true;
         }
@@ -1288,7 +1324,15 @@ impl Chain for FakeChain {
         if i.time < grace_end(&i) {
             return r("GraceOpen");
         }
-        let Some(mut results) = i.dkg_plaintexts.clone() else {
+        if council_closed(&i) {
+            return r("DecryptionNotOpen");
+        }
+        let plaintexts = if i.proc.dkg.count == 0 {
+            Some(Vec::new())
+        } else {
+            i.dkg_plaintexts.clone()
+        };
+        let Some(mut results) = plaintexts else {
             return r("ResultsNotReady");
         };
         results.resize(i.proc.ballot_mode.num_fields as usize, 0);
@@ -1300,6 +1344,13 @@ impl Chain for FakeChain {
             gas_used: 0,
             replacements: 0,
         })
+    }
+
+    async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error> {
+        let mut i = self.inner.lock().unwrap();
+        assert_eq!(*cid, i.proc.dkg.epoch_id, "the process's ceremony");
+        i.council_gate_reads += 1;
+        Ok(i.council_gate_view.unwrap_or(i.council_gate))
     }
 }
 

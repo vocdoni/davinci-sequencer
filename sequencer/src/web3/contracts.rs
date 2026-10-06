@@ -784,7 +784,9 @@ impl Contracts {
     /// Whether `finalizeResultsFromDKG` can run: the decryption was requested
     /// and the committee combined every submitted ciphertext (the `plaintexts`
     /// view of the adapter the process's key mode routes to, as the registry
-    /// does). A request with no active field finalizes at once.
+    /// does). A request with no active field finalizes at once, except for a
+    /// COUNCIL process whose ceremony has not opened decryption: the registry
+    /// publishes nothing before the gate opens, not even all-zero results.
     pub async fn dkg_results_ready(&self, pid: &[u8; 31]) -> Result<bool> {
         let p = self.process(pid).await?;
         let (eid, aid) = (FixedBytes(p.dkg.epoch_id), FixedBytes(p.dkg.aid));
@@ -793,6 +795,7 @@ impl Contracts {
         match p.key_mode {
             KeyMode::Sequencer => Err(Web3Error::Data("not a DKG process".into())),
             _ if pending => Ok(false),
+            KeyMode::Council if !self.council_decryption_open(&p.dkg.epoch_id).await? => Ok(false),
             _ if p.dkg.count == 0 => Ok(true),
             KeyMode::DkgAutomatic | KeyMode::DkgLocked => {
                 let call = AD::plaintextsCall {
@@ -814,6 +817,17 @@ impl Contracts {
                 Ok(self.view(self.council_adapter().await?, call).await?.ready)
             }
         }
+    }
+
+    /// The decryption gate of Council ceremony `cid` (`isDecryptionOpen` on
+    /// the registry's Council adapter, which reads the manager): closed until
+    /// the ceremony's scheduled date, or its organizer's opening or fallback
+    /// date. Once open it stays open.
+    pub async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool> {
+        let call = CA::isDecryptionOpenCall {
+            cid: FixedBytes(*cid),
+        };
+        self.view(self.council_adapter().await?, call).await
     }
 
     /// `setProcessStatus(pid, ENDED)`.
@@ -970,6 +984,7 @@ mod tests {
             "NotAuthorizedCreator",
             "NotInSubgroup",
             "AlreadyRequested",
+            "DecryptionNotOpen",
         ] {
             assert_eq!(
                 names.get(&sel(&format!("{e}()"))).map(String::as_str),

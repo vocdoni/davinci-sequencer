@@ -1644,12 +1644,17 @@ alloy::sol! {
         function allowAdapter(bytes12 cid, address adapter) external;
         function authorizeCreator(bytes12 cid, address creator) external;
         function setPlaintext(bytes32 requestId, uint8 field, uint64 value) external;
+        function setDecryptionPolicy(bytes12 cid, uint8 mode, uint64 openAt, uint64 fallbackAt)
+            external;
+        function openDecryption(bytes12 cid) external;
+        function isDecryptionOpen(bytes12 cid) external view returns (bool);
         function requestIdFor(bytes12 cid, address adapter, bytes31 processId)
             external view returns (bytes32);
-        function getRequest(bytes32 requestId) external view returns (
-            bytes12 cid, uint8 fieldCount, uint16 completedBitmap, uint16 partialBitmap,
-            uint256[4][] memory cts
+        function getRequestMeta(bytes32 requestId) external view returns (
+            bytes12 cid, uint8 fieldCount, uint16 completedBitmap, uint16 partialBitmap
         );
+        function requestCts(bytes32 requestId) external view returns (uint256[4][] memory cts);
+        error DecryptionNotOpen();
     }
 }
 
@@ -1856,9 +1861,11 @@ async fn council_results_on_anvil() {
     assert_eq!(p.status, ProcessStatus::Ended);
     assert_eq!((p.dkg.first_index, p.dkg.count), (0, NF));
     // One request with every active field, in TE as the accumulator holds it.
-    let req = council.getRequest(rid).call().await.unwrap();
+    let req = council.getRequestMeta(rid).call().await.unwrap();
     assert_eq!((req.cid, req.fieldCount), (cid, NF));
-    for (k, ct) in req.cts.iter().enumerate() {
+    let cts = council.requestCts(rid).call().await.unwrap();
+    assert_eq!(cts.len(), NF as usize);
+    for (k, ct) in cts.iter().enumerate() {
         for w in 0..4 {
             assert_eq!(
                 ct[w],
@@ -1891,6 +1898,245 @@ async fn council_results_on_anvil() {
     assert!(c.dkg_results_ready(&pid).await.unwrap());
     c.finalize_results_from_dkg(&pid).await.unwrap();
     let p = c.process(&pid).await.unwrap();
+    assert_eq!(p.status, ProcessStatus::Results);
+    assert_eq!(p.results, tally.to_vec());
+}
+
+// The Council decryption gate on the real registry: with the ceremony's
+// decryption closed (Manual, no fallback), a zero-vote process and a voted
+// one are both requested and ended, but nothing publishes: readiness is
+// false, the manager refuses combines and the registry refuses the finalize
+// with `DecryptionNotOpen`, all-zero results included. Once the organizer
+// opens decryption the zeros publish at once and the tally after its
+// combines.
+#[tokio::test(flavor = "multi_thread")]
+async fn council_gate_on_anvil() {
+    use alloy::primitives::U256 as AU256;
+    use davinci_client::organizer::{KeyMode as OrgKeyMode, NewProcess as OrgProcess, Organizer};
+    use davinci_state::{CensusOrigin, ProcessConfig, ProcessState};
+    use davinci_zkvm_sdk::crypto::babyjubjub::Point;
+    use davinci_zkvm_sdk::crypto::field::{fr_to_be, u256_to_be};
+
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let secret = SecretString::new(hex::encode(key.to_bytes()));
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    let admin: PrivateKeySigner = anvil.keys()[2].clone().into();
+    let admin = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(admin))
+        .connect_http(url.clone());
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mock = deploy(
+        &admin,
+        bytecode("MockCouncilManager.sol/MockCouncilManager.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(common::vk_hash()),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    code.extend(ctor_tail(mock));
+    let registry = deploy(&deployer, code).await;
+    let c = Contracts::new(std::slice::from_ref(&url), registry, Some(&secret))
+        .await
+        .unwrap();
+    let adapter = c.council_adapter().await.unwrap();
+
+    // A Live ceremony whose decryption only its organizer opens (Manual,
+    // no fallback date), not yet.
+    let council = IMockCouncil::new(mock, &admin);
+    let cid = FixedBytes([0xc2; 12]);
+    let pk = Point::generator().mul(&U256::from(777_777u64));
+    let organizer: PrivateKeySigner = anvil.keys()[1].clone().into();
+    let send = async |call: TransactionRequest| {
+        admin
+            .send_transaction(call)
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+    };
+    for call in [
+        council
+            .newCeremony(
+                cid,
+                AU256::from_be_bytes(fr_to_be(&pk.x)),
+                AU256::from_be_bytes(fr_to_be(&pk.y)),
+            )
+            .into_transaction_request(),
+        council
+            .allowAdapter(cid, adapter)
+            .into_transaction_request(),
+        council
+            .authorizeCreator(cid, organizer.address())
+            .into_transaction_request(),
+        council
+            .setDecryptionPolicy(cid, 0, 0, 0)
+            .into_transaction_request(),
+    ] {
+        assert!(send(call).await.status());
+    }
+    assert!(!c.council_decryption_open(&cid.0).await.unwrap());
+
+    let env = common::env(NF, 8, None);
+    let census_root = env.imt.root();
+    let mode = common::ballot_mode(NF);
+    let org = Organizer::connect(url.as_str(), organizer, registry).unwrap();
+    let mut pids = Vec::new();
+    for _ in 0..2 {
+        let p = OrgProcess {
+            process_id: org.next_process_id().await.unwrap(),
+            start_time: 0,
+            duration: 3600,
+            max_voters: 100,
+            ballot_mode: mode,
+            census_origin: 1,
+            census_root,
+            census_contract: [0; 20],
+            census_uri: "file:///tmp/census.json".into(),
+            metadata: "ipfs://meta".into(),
+            metadata_hash: metadata_hash(META_DOC),
+            key_mode: OrgKeyMode::Council(cid.0),
+        };
+        pids.push(org.create_process(&p).await.unwrap().pid);
+    }
+    let (zero, voted) = (pids[0], pids[1]);
+
+    // The node's trees: nothing settles for `zero`, three votes for `voted`.
+    let state = |pid: &[u8; 31]| {
+        let cfg = ProcessConfig {
+            process_id: pid_fr(pid),
+            ballot_mode: mode,
+            enc_key: pk,
+            census_origin: CensusOrigin::MerkleStatic,
+            census_root,
+            ballot_vk_hash: common::vk_hash(),
+        };
+        (
+            cfg.clone(),
+            ProcessState::create(cfg, arbo::MemoryStorage::new()).unwrap(),
+        )
+    };
+    let (_, st_zero) = state(&zero);
+    let (cfg, mut st) = state(&voted);
+    let p = c.process(&voted).await.unwrap();
+    assert_eq!(st.committed().root, p.state_root, "genesis root");
+    let env = common::Env { cfg, imt: env.imt };
+    let votes: Vec<_> = (0..3)
+        .map(|i| common::fake_vote(&env, i, &[1, 2, 0, 3], 90 + i as u64))
+        .collect();
+    let b = st
+        .prepare(&votes, &mut rand::rngs::OsRng, &Default::default())
+        .unwrap();
+    let snark = batch_snark(
+        &Batch {
+            before: p.state_root,
+            after: b.new_root,
+            voters: 3,
+            overwrites: 0,
+            occupied_before: 0,
+        },
+        &fr_to_be(&census_root),
+        &b.blobs,
+    );
+    c.submit_transition(&voted, &snark, &b.blobs).await.unwrap();
+    st.commit(&b).unwrap();
+
+    let rpc = ProviderBuilder::new().connect_http(url.clone());
+    advance(&rpc, 3601).await;
+    advance(&rpc, 60).await;
+    let name = |e: Web3Error| match e {
+        Web3Error::Revert(r) => r.name().unwrap_or_default().to_string(),
+        e => panic!("want a revert, got {e}"),
+    };
+
+    // Both requests land with the gate closed and end the processes; the
+    // all-identity one is not finalized.
+    for (pid, st) in [(&zero, &st_zero), (&voted, &st)] {
+        let (acc, sibs) = st.dkg_results_inputs().unwrap();
+        c.request_results_decryption(pid, &acc.map(|x| u256_to_be(&x)), &sibs)
+            .await
+            .unwrap();
+    }
+    let p = c.process(&zero).await.unwrap();
+    assert_eq!(p.status, ProcessStatus::Ended, "zeros wait for the gate");
+    assert!(p.dkg.requested && p.dkg.count == 0 && p.results.is_empty());
+    let p = c.process(&voted).await.unwrap();
+    assert_eq!(p.status, ProcessStatus::Ended);
+    assert_eq!(p.dkg.count, NF);
+    let rid = FixedBytes(p.dkg.aid);
+    let meta = council.getRequestMeta(rid).call().await.unwrap();
+    assert_eq!(meta.fieldCount, NF, "admitted while closed");
+    for pid in [&zero, &voted] {
+        assert!(!c.dkg_results_ready(pid).await.unwrap());
+        let e = c.finalize_results_from_dkg(pid).await.unwrap_err();
+        assert_eq!(name(e), "DecryptionNotOpen");
+    }
+    // The manager refuses combines while closed.
+    let Err(combine) = council.setPlaintext(rid, 0, 3).call().await else {
+        panic!("a combine went through a closed gate");
+    };
+    assert!(
+        matches!(
+            combine.as_decoded_interface_error::<IMockCouncil::IMockCouncilErrors>(),
+            Some(IMockCouncil::IMockCouncilErrors::DecryptionNotOpen(_))
+        ),
+        "{combine}"
+    );
+
+    // Months later the organizer opens decryption: the zeros publish
+    // right away, the tally once the committee has combined it.
+    advance(&rpc, 182 * 24 * 3600).await;
+    assert!(!c.council_decryption_open(&cid.0).await.unwrap());
+    assert!(
+        send(council.openDecryption(cid).into_transaction_request())
+            .await
+            .status()
+    );
+    assert!(c.council_decryption_open(&cid.0).await.unwrap());
+    assert!(c.dkg_results_ready(&zero).await.unwrap());
+    c.finalize_results_from_dkg(&zero).await.unwrap();
+    let p = c.process(&zero).await.unwrap();
+    assert_eq!(p.status, ProcessStatus::Results);
+    assert_eq!(p.results, vec![0u64; NF as usize]);
+
+    assert!(!c.dkg_results_ready(&voted).await.unwrap());
+    let e = c.finalize_results_from_dkg(&voted).await.unwrap_err();
+    assert_eq!(name(e), "ResultsNotReady");
+    let tally = [3u64, 6, 0, 9];
+    for (i, v) in tally.iter().enumerate() {
+        let call = council
+            .setPlaintext(rid, i as u8, *v)
+            .into_transaction_request();
+        assert!(send(call).await.status());
+    }
+    assert!(c.dkg_results_ready(&voted).await.unwrap());
+    c.finalize_results_from_dkg(&voted).await.unwrap();
+    let p = c.process(&voted).await.unwrap();
     assert_eq!(p.status, ProcessStatus::Results);
     assert_eq!(p.results, tally.to_vec());
 }
