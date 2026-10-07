@@ -56,4 +56,4 @@ davinci-state.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 axum.workspace = true
-alloy = { workspace = true, features = ["node-bindings"] }
+alloy = { workspace = true, features = ["node-bindings", "json-rpc"] }
