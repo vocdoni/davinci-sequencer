@@ -6,28 +6,37 @@ together.
 
 ## Gnosis Chain
 
-Chain id 100, preset `gnosis`. All contracts are source-verified on gnosisscan.io; earlier
-registries on Gnosis are retired.
+Chain id 100, preset `gnosis`: registry R2, the production beta, followed since release v0.5.0.
+All contracts are source-verified on gnosisscan.io.
 
 DAVINCI contracts:
 
 | Contract | Address | Block |
 |---|---|---|
 | ZiskVerifier | `0x150547716bD6f15D872508b66b2ae7ce17677C9C` | 48504089 |
-| ProcessRegistry | `0x6702e0141B6b72bCF8C1bdff20A82A35C5502E7D` | 48504090 |
-| DavinciDKGAdapter | `0xE9559c78E7ff8c19937A0657a092A221E90CCBC3` | 48504090 |
+| ProcessRegistry | `<R2_REGISTRY>` | `<R2_BLOCK>` |
+| DavinciDKGAdapter | `<R2_DKG_ADAPTER>` | `<R2_BLOCK>` |
+| CouncilAdapter | `<R2_COUNCIL_ADAPTER>` | `<R2_BLOCK>` |
 
-DKG contracts:
+The registry creates both adapters in its constructor and reuses the verifier of R1.
+
+DKG contracts ([davinci-dkg](https://github.com/vocdoni/davinci-dkg)):
 
 | Contract | Address | Block |
 |---|---|---|
-| DKGManager | `0x9999f38ff8bf959e98ddd5d4551f82775219c01b` | 48483860 |
-| DKGAppManager | `0xd4d8f9708c380d81aec294b199081c5d2c782087` | 48483862 |
-| DKGRegistry | `0x45ab8b64633076ddc020b12d1f1325fa55f629c5` | 48483859 |
-| ContributionVerifier | `0x6d198bc613205957444b53a09bb22ed7bc650912` | 48483855 |
-| FinalizeVerifier | `0xc354ea7f3ef6db4ca0b89a1a5a6395c2d6126b38` | 48483856 |
-| PartialDecryptVerifier | `0x0f19886ee73fd74e3f88ce3a061490facd7561db` | 48483857 |
-| DecryptCombineVerifier | `0x2980e664edef91f554cc75b15cb8eeea61586644` | 48483858 |
+| DKGManager | `<DKG_MANAGER>` | `<DKG_BLOCK>` |
+| DKGAppManager | `<DKG_APP_MANAGER>` | `<DKG_BLOCK>` |
+| DKGRegistry | `<DKG_REGISTRY>` | `<DKG_BLOCK>` |
+| ContributionVerifier | `<DKG_CONTRIBUTION_VERIFIER>` | `<DKG_BLOCK>` |
+| FinalizeVerifier | `<DKG_FINALIZE_VERIFIER>` | `<DKG_BLOCK>` |
+| PartialDecryptVerifier | `<DKG_PARTIAL_DECRYPT_VERIFIER>` | `<DKG_BLOCK>` |
+| DecryptCombineVerifier | `<DKG_DECRYPT_COMBINE_VERIFIER>` | `<DKG_BLOCK>` |
+
+Council contract ([davinci-dkg-council](https://github.com/vocdoni/davinci-dkg-council)):
+
+| Contract | Address | Block |
+|---|---|---|
+| CouncilManager | `0x2f5b110864cbad4017fe8ac59111812278f5f71f` | 48627018 |
 
 Pinned values, equal to the SDK release pins:
 
@@ -41,7 +50,12 @@ Pinned values, equal to the SDK release pins:
 
 The DKG committee runs threshold 2 of 3, with epochs of 17280 blocks (a day at 5 s) and automatic
 epoch creation when a key pool is spent. Application registration on the DKGAppManager is open, so
-other applications can share the committee.
+other applications can share the committee; each registrant gets its own application ids (see
+[lifecycle.md](lifecycle.md#how-a-dkg-process-gets-its-key)).
+
+The Council manager runs the development setup of the Council circuits (`circuits-v1`, one
+contributor), so Council-mode elections on this beta trust that contributor not to forge dealings.
+A production ceremony brings a new manager, and with it a new registry.
 
 ### Verifying the deployment
 
@@ -49,13 +63,13 @@ Three checks refuse a registry that pins other programs: the node's startup chec
 `davinci_client::organizer::verify_registry` for clients, and davinci-contracts'
 `script/verify_deployment.py`, which compares the deployed runtime code with a local build and
 reads back every pin. The client and the script also check that the DKG and Council adapters, if
-any, point back at the registry; a registry without `councilAdapter()` (this one) reads as having
-no Council adapter, and any other failure of that read fails the check. From a davinci-contracts
+any, point back at the registry; a registry without `councilAdapter()` (R1) reads as having no
+Council adapter, and any other failure of that read fails the check. From a davinci-contracts
 checkout:
 
 ```bash
 python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \
-  --registry 0x6702e0141B6b72bCF8C1bdff20A82A35C5502E7D --chain-id 100 \
+  --registry <R2_REGISTRY> --chain-id 100 \
   --batch-vk  0x6cfc89d562d0b22f04478a5c15b390433eb52f1b03147030b183076260da7a10 \
   --results-vk 0x7bc8c5e9235548386a44b1885732a2a7ffb1badddc8c7fba599d07ece47be794 \
   --root-c 0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80 \
@@ -63,8 +77,19 @@ python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \
 ```
 
 Rebuilding a zkVM program changes its verification key, which needs a new registry. Deploy order:
-the DKG contracts (`DeployAll.s.sol` in davinci-dkg), then the `ProcessRegistry` (constructor:
-verifier, verification keys, DKG manager), which creates the adapter.
+the DKG contracts (`DeployAll.s.sol` in davinci-dkg) and the Council manager, then the
+`ProcessRegistry` (constructor: verifier, verification keys, DKG manager, Council manager, grace
+parameters), which creates both adapters.
+
+### Retired registries
+
+Releases up to v0.4.1 follow R1. A node on a later release opens a new database for R2 and leaves
+R1's directory in the datadir untouched (see
+[configuration.md](configuration.md#data-directory)).
+
+| Registry | ProcessRegistry | Block | DKGManager |
+|---|---|---|---|
+| R1 | `0x6702e0141B6b72bCF8C1bdff20A82A35C5502E7D` | 48504090 | `0x9999f38ff8bf959e98ddd5d4551f82775219c01b` |
 
 ### Chain notes
 
