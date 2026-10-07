@@ -9,6 +9,8 @@ together.
 Chain id 100, preset `gnosis`: registry R2, the production beta, followed since release v0.5.0.
 All contracts are source-verified on gnosisscan.io.
 
+Public sequencer: `https://sequencer2.davinci.vote`
+
 DAVINCI contracts:
 
 | Contract | Address | Block |

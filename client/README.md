@@ -72,9 +72,10 @@ elsewhere.
 
 `Organizer::create_process` takes a `NewProcess` whose `process_id` is the registry's
 `next_process_id()`. For a sequencer key, fetch the key for that id with
-`SequencerClient::new_key` first. For a DKG key, pick `KeyMode::DkgAutomatic` or
-`KeyMode::DkgLocked`, and keep the `organizer_secret` a locked process returns:
-`reveal_process_key` needs it to unlock the results.
+`SequencerClient::new_key` first. For a DKG key, pick `KeyMode::DkgAutomatic` or `KeyMode::DkgLocked`, and keep the
+`organizer_secret` a locked process returns: `reveal_process_key` needs it to unlock the results.
+For a Council key, use `KeyMode::Council(ceremony_id)` where `ceremony_id` is the 12-byte id
+(`[u8; 12]`) from the Council ceremony; results stay locked until the ceremony opens decryption.
 
 `NewProcess::metadata` is the URI of the metadata document (title, question, what each ballot
 field stands for) and `metadata_hash` is `organizer::metadata_hash(&document)`, the SHA-256 of the
