@@ -66,6 +66,9 @@ pub(crate) fn rpc_http_client() -> alloy::transports::http::reqwest::Client {
         .unwrap_or_else(|_| alloy::transports::http::reqwest::Client::new())
 }
 
+// The vendored getProcess groups Process's trailing grace/lastVoteAt into a
+// `window` tuple: 25 fields exceed alloy's 24-tuple SolType, and a static
+// tuple encodes the same. See CONTRIBUTING.md.
 alloy::sol!(
     #[allow(missing_docs, clippy::too_many_arguments)]
     #[derive(Debug)]

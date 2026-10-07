@@ -43,7 +43,16 @@ commit titles (`fix(web3): ...`, `feat(client): ...`).
   node binary never links it; only the sequencer's dev-dependency turns `prover` on.
 - `davinci-state` and `davinci-client` dev-depend on each other. Never make that a normal
   dependency.
-- The contract ABIs are vendored in `sequencer/abi/`; the client reads them from there too.
+- The contract ABIs are vendored in `sequencer/abi/`; the client reads them from there too. Each
+  file is `jq .abi` of the forge artifact, except that `ProcessRegistry.json` groups the trailing
+  `grace` and `lastVoteAt` of `getProcess`'s `Process` into a `window` tuple. `Process` has 25
+  fields, alloy's `SolType` stops at 24-tuples, and a static tuple encodes the same:
+
+  ```bash
+  jq '.abi | (.[] | select(.name == "getProcess") | .outputs[0].components) |= .[:-2] +
+    [{name: "window", type: "tuple", internalType: "struct DAVINCITypes.GraceWindow",
+      components: .[-2:]}]' out/ProcessRegistry.sol/ProcessRegistry.json
+  ```
 
 ## Conventions
 
