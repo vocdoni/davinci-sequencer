@@ -18,10 +18,13 @@ transaction carries EIP-4844 blobs holding everything needed to rebuild the elec
 any node can settle any election and a node that loses a race rebuilds from the winner's blobs.
 Without a signing key the node runs as an observer that replays and checks every transition.
 
-Each election is created with a sequencer key or a DKG key. With a sequencer key, the node that
-handed out the key decrypts the final tally and proves it with a second zkVM program. With a DKG
-key no single party holds the secret, and a [davinci-dkg](https://github.com/vocdoni/davinci-dkg)
-committee threshold-decrypts the tally.
+Each election is created with a sequencer key, a DKG key or a Council key. With a sequencer key,
+the node that handed out the key decrypts the final tally and proves it with a second zkVM
+program. With a DKG key no single party holds the secret, and a
+[davinci-dkg](https://github.com/vocdoni/davinci-dkg) committee threshold-decrypts the tally. A
+Council key belongs to an invite-only
+[davinci-dkg-council](https://github.com/vocdoni/davinci-dkg-council) ceremony, whose members
+decrypt the tally once the ceremony's decryption date opens.
 
 ```
 voters ── ballots ──▶ sequencer ── batch ──▶ davinci-zkvm prover
@@ -34,14 +37,16 @@ voters ── ballots ──▶ sequencer ── batch ──▶ davinci-zkvm pr
 | [davinci-zkvm](https://github.com/vocdoni/davinci-zkvm) | Prover service, the vote-batch and results programs, and the Rust SDK this node builds on. |
 | [davinci-contracts](https://github.com/vocdoni/davinci-contracts) | `ProcessRegistry`, the on-chain proof verifier and the DKG adapter. |
 | [davinci-dkg](https://github.com/vocdoni/davinci-dkg) | Threshold key committee behind DKG-key elections. |
+| [davinci-dkg-council](https://github.com/vocdoni/davinci-dkg-council) | Invite-only key ceremonies behind Council-key elections. |
 | [davinci-onchain-census-contract](https://github.com/vocdoni/davinci-onchain-census-contract) | Census contract for on-chain censuses. |
 | [davinci-circom](https://github.com/vocdoni/davinci-circom) | Ballot circuit; clients prove ballots with its artifacts. |
 
 ## Quick start
 
-Run a node on Gnosis with Docker Compose. You need Docker, a funded Gnosis account for the
-settlement transactions, and a davinci-zkvm prover (or a local NVIDIA GPU, see the profiles
-below).
+Run a node on Gnosis with Docker Compose. You need Docker, a Gnosis account holding a little xDAI
+for the settlement transactions, and a davinci-zkvm prover (or a local NVIDIA GPU, see the
+profiles below). Nothing else needs configuring: the defaults follow the Gnosis deployment in
+[docs/deployments.md](docs/deployments.md).
 
 ```bash
 git clone https://github.com/vocdoni/davinci-sequencer.git
@@ -50,12 +55,16 @@ cp .env.example .env
 # The key file must be readable by the container user (uid 10001).
 sudo install -o 10001 -m 0400 /path/to/hex-private-key sequencer.key
 docker compose --profile dev up -d
+docker compose --profile dev logs -f sequencer   # Ctrl-C once it serves the API
 curl -s http://localhost:9090/info
 ```
 
 Set `DAVINCI_PROVER_URL` in `.env` to your prover (the default,
-`http://host.docker.internal:8080`, is a prover published on the same host). An empty
-`sequencer.key` (`sudo install -o 10001 -m 0400 /dev/null sequencer.key`) runs an observer.
+`http://host.docker.internal:8080`, is a prover published on the same host). `/info` should show
+`"chainId": 100`, the `ProcessRegistry` of [docs/deployments.md](docs/deployments.md) as
+`processRegistry`, and your account as `sequencerAddress`. An empty `sequencer.key`
+(`sudo install -o 10001 -m 0400 /dev/null sequencer.key`) runs an observer, which follows and
+checks every election and needs neither xDAI nor a prover.
 
 | Profile | Services |
 |---|---|
