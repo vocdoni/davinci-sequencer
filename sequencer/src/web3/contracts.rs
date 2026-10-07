@@ -39,9 +39,10 @@ const VERIFIER_ABI_JSON: &str = include_str!("../../abi/ZiskVerifier.json");
 const ADAPTER_ABI_JSON: &str = include_str!("../../abi/DavinciDKGAdapter.json");
 /// And the Council adapter's (`InvalidFieldRange`).
 const COUNCIL_ABI_JSON: &str = include_str!("../../abi/CouncilAdapter.json");
-/// Council manager errors (all argument-less) the Council adapter bubbles
-/// up through the registry: binding at creation, request admission.
-const COUNCIL_ERRORS: [&str; 12] = [
+/// Council manager errors (all argument-less, `ICouncilManagerErrors`) the
+/// Council adapter bubbles up through the registry: binding at creation,
+/// request admission, the decryption gate.
+const COUNCIL_ERRORS: [&str; 13] = [
     "UnknownCeremony",
     "WrongPhase",
     "NotAllowedAdapter",
@@ -54,6 +55,7 @@ const COUNCIL_ERRORS: [&str; 12] = [
     "InvalidPoint",
     "NotInSubgroup",
     "UnknownRequest",
+    "DecryptionNotOpen",
 ];
 /// davinci-dkg manager and app-manager errors (all argument-less) the
 /// adapter bubbles up through the registry.

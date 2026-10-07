@@ -70,8 +70,9 @@ mod council {
 use council::CouncilAdapter::{self, CouncilAdapterErrors};
 
 sol! {
-    /// Council manager errors the registry bubbles up through the Council
-    /// adapter: the binding at creation, the request admission.
+    /// Council manager errors (`ICouncilManagerErrors`) the registry bubbles
+    /// up through the Council adapter: the binding at creation, the request
+    /// admission, the decryption gate.
     #[sol(all_derives)]
     interface ICouncil {
         error UnknownCeremony();
@@ -86,6 +87,7 @@ sol! {
         error InvalidPoint();
         error NotInSubgroup();
         error UnknownRequest();
+        error DecryptionNotOpen();
     }
 }
 
@@ -1275,6 +1277,15 @@ mod tests {
         assert!(!missing_function(&alloy::contract::Error::TransportError(
             TransportErrorKind::backend_gone()
         )));
+    }
+
+    #[test]
+    fn council_gate_revert_is_named() {
+        use alloy::sol_types::SolError;
+        assert_eq!(
+            revert_name(&ICouncil::DecryptionNotOpen::SELECTOR),
+            "DecryptionNotOpen"
+        );
     }
 
     #[test]
