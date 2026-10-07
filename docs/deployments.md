@@ -14,9 +14,9 @@ DAVINCI contracts:
 | Contract | Address | Block |
 |---|---|---|
 | ZiskVerifier | `0x150547716bD6f15D872508b66b2ae7ce17677C9C` | 48504089 |
-| ProcessRegistry | `<R2_REGISTRY>` | `<R2_BLOCK>` |
-| DavinciDKGAdapter | `<R2_DKG_ADAPTER>` | `<R2_BLOCK>` |
-| CouncilAdapter | `<R2_COUNCIL_ADAPTER>` | `<R2_BLOCK>` |
+| ProcessRegistry | `0x20b96e465CA7C3536B9C733571ec1eCf42b2eA21` | 48633301 |
+| DavinciDKGAdapter | `0xB74270Af067Bd75e30cC0cc6D24786EbD6816919` | 48633301 |
+| CouncilAdapter | `0x33e91518521Feb5D2A14928563dc6930Bc2F0755` | 48633301 |
 
 The registry creates both adapters in its constructor and reuses the verifier of R1.
 
@@ -24,13 +24,13 @@ DKG contracts ([davinci-dkg](https://github.com/vocdoni/davinci-dkg)):
 
 | Contract | Address | Block |
 |---|---|---|
-| DKGManager | `<DKG_MANAGER>` | `<DKG_BLOCK>` |
-| DKGAppManager | `<DKG_APP_MANAGER>` | `<DKG_BLOCK>` |
-| DKGRegistry | `<DKG_REGISTRY>` | `<DKG_BLOCK>` |
-| ContributionVerifier | `<DKG_CONTRIBUTION_VERIFIER>` | `<DKG_BLOCK>` |
-| FinalizeVerifier | `<DKG_FINALIZE_VERIFIER>` | `<DKG_BLOCK>` |
-| PartialDecryptVerifier | `<DKG_PARTIAL_DECRYPT_VERIFIER>` | `<DKG_BLOCK>` |
-| DecryptCombineVerifier | `<DKG_DECRYPT_COMBINE_VERIFIER>` | `<DKG_BLOCK>` |
+| DKGManager | `0xC6Fb38c42ed3FB35D363a702218746d5C7Da36BF` | 48632905 |
+| DKGAppManager | `0x81bac6b9aae85311741204c22cbaab96f03b567a` | 48632906 |
+| DKGRegistry | `0x393049828bc565152c223730ce67574f15a7a16a` | 48632904 |
+| ContributionVerifier | `0x67b7c4daa3db8b84e817d1a3d57cb8c40f59935f` | 48632904 |
+| FinalizeVerifier | `0x682ffa2a6e049e0dc889ceb7038fffc3bbf36d7d` | 48632904 |
+| PartialDecryptVerifier | `0x7ee28e810086590192e93e6046d90fe4e97f0f60` | 48632904 |
+| DecryptCombineVerifier | `0x1fd445c2e5700a0791ca70ac1bc3447b32acc56e` | 48632904 |
 
 Council contract ([davinci-dkg-council](https://github.com/vocdoni/davinci-dkg-council)):
 
@@ -69,11 +69,13 @@ checkout:
 
 ```bash
 python3 script/verify_deployment.py --rpc https://rpc.gnosischain.com \
-  --registry <R2_REGISTRY> --chain-id 100 \
+  --registry 0x20b96e465CA7C3536B9C733571ec1eCf42b2eA21 --chain-id 100 \
   --batch-vk  0x6cfc89d562d0b22f04478a5c15b390433eb52f1b03147030b183076260da7a10 \
   --results-vk 0x7bc8c5e9235548386a44b1885732a2a7ffb1badddc8c7fba599d07ece47be794 \
   --root-c 0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80 \
-  --ballot-vk-hash 0xbf1e6590bb1ba883d601c4d7d1c6fa2722a78590716874019db6d68fc776bb0e
+  --ballot-vk-hash 0xbf1e6590bb1ba883d601c4d7d1c6fa2722a78590716874019db6d68fc776bb0e \
+  --dkg-manager 0xC6Fb38c42ed3FB35D363a702218746d5C7Da36BF \
+  --council-manager 0x2f5b110864cbad4017fe8ac59111812278f5f71f
 ```
 
 Rebuilding a zkVM program changes its verification key, which needs a new registry. Deploy order:

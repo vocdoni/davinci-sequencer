@@ -35,11 +35,8 @@ impl Network {
 pub const GNOSIS: Network = Network {
     name: "gnosis",
     chain_id: 100,
-    // R2 placeholders, filled in once the registry is deployed. The
-    // `gnosis_preset_is_deployed` test fails on them, so CI publishes no
-    // image whose default network points nowhere.
-    registry: address!("0000000000000000000000000000000000000000"), // R2_REGISTRY
-    start_block: 0,                                                 // R2_BLOCK
+    registry: address!("20b96e465CA7C3536B9C733571ec1eCf42b2eA21"),
+    start_block: 48_633_301,
     rpc_urls: &[
         "https://gnosis-rpc.publicnode.com",
         "https://gnosis-rpc.blockreq.com/v1/rpc/public",
