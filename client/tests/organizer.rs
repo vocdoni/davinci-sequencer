@@ -860,30 +860,41 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
     let (mut a, mut b) = (locked.clone(), locked.clone());
     a.process_id = org.next_process_id().await?;
     b.process_id = org2.next_process_id().await?;
-    let rpc = ProviderBuilder::new().connect_http(url.parse()?);
+    let rpc = &ProviderBuilder::new().connect_http(url.parse()?);
     let _: () = rpc.raw_request("evm_setAutomine".into(), (false,)).await?;
+    // Waits, at most 60 s, until the pool holds `n` transactions.
+    let pooled = move |n: u64| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let st: serde_json::Value = rpc.raw_request("txpool_status".into(), ()).await?;
+                if st["pending"] == format!("{n:#x}") {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("the pool never held {n} transactions"))?
+    };
     // One block takes both creates. Bounded, and the block is mined and
     // automine restored either way, so a create that never reaches the pool
     // fails the test instead of leaving both waiting on receipts.
     let miner = || async {
-        let both = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            loop {
-                let st: serde_json::Value = rpc.raw_request("txpool_status".into(), ()).await?;
-                if st["pending"] == "0x2" {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            anyhow::Ok(())
-        })
-        .await;
+        let both = pooled(2).await;
         let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await?;
         let _: () = rpc.raw_request("evm_setAutomine".into(), (true,)).await?;
-        both.map_err(|_| anyhow::anyhow!("both creates never reached the pool"))?
+        both
     };
-    let (ra, rb, m) = tokio::join!(org.create_process(&a), org2.create_process(&b), miner());
+    // The second create starts once the first is pending, so it simulates
+    // and estimates with its rival for the key already in the pool: it must
+    // still go out and lose on-chain, not fail before sending.
+    let second = async {
+        pooled(1).await?;
+        anyhow::Ok(org2.create_process(&b).await)
+    };
+    let (ra, rb, m) = tokio::join!(org.create_process(&a), second, miner());
+    let (ra, rb) = (ra?, rb??);
     m?;
-    let (ra, rb) = (ra?, rb?);
     let mut epochs = Vec::new();
     for (o, r) in [(&org, &ra), (&org2, &rb)] {
         let p = o.process(&r.pid).await?;
@@ -920,7 +931,12 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
     a.process_id = org.next_process_id().await?;
     b.process_id = org2.next_process_id().await?;
     let _: () = rpc.raw_request("evm_setAutomine".into(), (false,)).await?;
-    let (ra, rb, m) = tokio::join!(org.create_process(&a), org2.create_process(&b), miner());
+    let second = async {
+        pooled(1).await?;
+        anyhow::Ok(org2.create_process(&b).await)
+    };
+    let (ra, rb, m) = tokio::join!(org.create_process(&a), second, miner());
+    let rb = rb?;
     m?;
     let (ok, err): (Vec<_>, Vec<_>) = [ra, rb].into_iter().partition(|r| r.is_ok());
     assert_eq!(ok.len(), 1);

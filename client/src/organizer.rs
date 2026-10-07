@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alloy::eips::BlockId;
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, FixedBytes, U256, keccak256};
 use alloy::providers::fillers::{FillProvider, JoinFill, WalletFiller};
@@ -491,7 +492,21 @@ impl Organizer {
     // Fills, signs and sends `tx`, then waits in `mined`. The RPC client
     // retries a send whose answer got lost; the copy is refused once the
     // first one is in, and the tx is ours if the chain knows its hash.
-    async fn send(&self, tx: TransactionRequest) -> Result<TransactionReceipt> {
+    //
+    // Gas is estimated on the latest block, the state the call was simulated
+    // on. alloy's filler estimates on the pending block, where a rival's
+    // pending transaction (one taking the last pool key) failed the estimate:
+    // nothing was sent, so `create_process` had no mined revert to retry on.
+    async fn send(&self, mut tx: TransactionRequest) -> Result<TransactionReceipt> {
+        if tx.gas.is_none() {
+            let gas = self
+                .signing
+                .estimate_gas(tx.clone())
+                .block(BlockId::latest())
+                .await
+                .map_err(|e| chain_err(e.into()))?;
+            tx.gas = Some(gas);
+        }
         let env = self
             .signing
             .fill(tx)
