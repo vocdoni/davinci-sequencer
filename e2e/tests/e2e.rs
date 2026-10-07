@@ -416,24 +416,38 @@ async fn setup_checks(
                 .await
                 .with_context(|| format!("{mode:?} key"))?;
         }
-        // An unrelated application from an EOA, simulated only: a random
-        // 248-bit aid is nonzero and below the field.
+        // Unrelated applications from an EOA, simulated only. An id in its
+        // own namespace (`salt << 160 | address`, 92-bit salt) registers;
+        // the id the adapter takes for the organizer's next process does
+        // not, so nobody can claim a process's id ahead of it.
         match dkg::registration_epoch(&net.rpc, w.adapter).await {
             Ok(epoch) => {
-                let mut aid = [0u8; 32];
-                aid[1..].copy_from_slice(&rand::random::<[u8; 31]>());
-                let got = negative::simulate(
-                    &net.rpc,
-                    org.address(),
-                    w.app_manager,
-                    dkg::register_app_call(epoch, aid.into()),
-                )
-                .await?;
-                ensure!(
-                    got == negative::Outcome::Ok,
-                    "registerApplication from the organizer: {got}"
-                );
-                say!("DKG setup ok: both key modes, open registration");
+                let mut own = [0u8; 32];
+                own[..12].copy_from_slice(&rand::random::<[u8; 12]>());
+                own[0] &= 0x0f;
+                own[12..].copy_from_slice(org.address().as_slice());
+                let next = org.next_process_id().await?;
+                let taken = dkg::aid_for(&net.rpc, w.adapter, next).await?;
+                for (aid, want) in [
+                    (own, negative::Outcome::Ok),
+                    (
+                        taken,
+                        negative::Outcome::Reverted("InvalidApplication".into()),
+                    ),
+                ] {
+                    let got = negative::simulate(
+                        &net.rpc,
+                        org.address(),
+                        w.app_manager,
+                        dkg::register_app_call(epoch, aid.into()),
+                    )
+                    .await?;
+                    ensure!(
+                        got == want,
+                        "registerApplication from the organizer: {got}, want {want}"
+                    );
+                }
+                say!("DKG setup ok: both key modes, open registration, ids bound to registrants");
             }
             // The two creates may have spent the epoch's last pool key.
             Err(e) => say!("DKG setup ok: both key modes; open registration not checked: {e:#}"),

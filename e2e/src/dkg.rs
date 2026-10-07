@@ -99,6 +99,7 @@ sol! {
         function manager() external view returns (address);
         function appManager() external view returns (address);
         function registrationEpoch() external view returns (bytes12);
+        function aidFor(bytes31 processId) external view returns (bytes32);
     }
 }
 
@@ -605,6 +606,16 @@ pub async fn registration_epoch(rpc: &str, adapter: Address) -> Result<EpochId> 
         .await?)
 }
 
+/// The application id `adapter` registers for process `pid`.
+pub async fn aid_for(rpc: &str, adapter: Address, pid: [u8; 31]) -> Result<[u8; 32]> {
+    let p = ProviderBuilder::new().connect_client(chain::rpc(rpc)?);
+    Ok(IDavinciDKGAdapter::new(adapter, &p)
+        .aidFor(FixedBytes(pid))
+        .call()
+        .await?
+        .0)
+}
+
 /// Longest wait for the committee's next epoch once its pool is spent: its
 /// nodes open one on their own, Live about two minutes later on Gnosis.
 const EPOCH_WAIT: Duration = Duration::from_secs(5 * 60);
@@ -693,7 +704,8 @@ pub async fn check_process_key(
 }
 
 /// `registerApplication` calldata for an automatic-mode application `aid`
-/// (nonzero, below the BN254 scalar field) in `epoch`.
+/// in `epoch`. The DKG takes ids in the sender's namespace only:
+/// `salt << 160 | sender`, with a salt below 2^92.
 pub fn register_app_call(epoch: EpochId, aid: FixedBytes<32>) -> Vec<u8> {
     use alloy::sol_types::SolCall;
     IDKGAppManager::registerApplicationCall {

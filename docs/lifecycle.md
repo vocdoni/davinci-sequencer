@@ -179,7 +179,9 @@ The registry deploys a `DavinciDKGAdapter` in its constructor, which registers w
 the only address allowed to submit ciphertexts for it. A registry deployed without a DKG manager
 has no adapter, and the DKG modes are disabled (`Error::DkgDisabled` in the client).
 
-Each process gets an application id `aid = keccak256(chainid ‖ registry ‖ pid) mod Q`. Automatic
+Each process gets an application id `aid = salt << 160 | adapter`, where `salt` is the top 92 bits
+of `keccak256(chainid ‖ registry ‖ pid)` (`adapter.aidFor(pid)`). The DKG registers an id only for
+the account in its low 160 bits, so nobody but the adapter can take a process's id. Automatic
 mode takes a free key from the newest live epoch's pool. Locked mode names its epoch, because the
 organizer's proof of possession of `sk_org` binds it; `adapter.registrationEpoch()` tells clients
 which epoch to use. If the pool empties or a new epoch goes live between that read and the

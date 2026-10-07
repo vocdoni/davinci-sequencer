@@ -83,6 +83,10 @@ a DKG mode when no single node should hold the key.
   key. When an epoch's pool is spent the committee opens the next one at once, and DKG-mode
   creation pauses for one epoch setup. The attacker pays more gas than the committee; a fee or an
   allowlist is the answer if that stops being enough.
+- An application id carries its registrant's address in its low 160 bits, and the DKG refuses an
+  id from any other account. The id of a future process is public (it follows from the
+  organizer's next process id), but only the registry's adapter can register it, so nobody can
+  block a chosen organizer's DKG-mode processes by taking their ids first.
 - Between the end and the first `requestResultsDecryption`, the organizer can still cancel a ready
   or paused process without having seen the tally, the same power it has in sequencer mode.
   Sequencers request on their first heartbeat after the grace end to keep that window short.
