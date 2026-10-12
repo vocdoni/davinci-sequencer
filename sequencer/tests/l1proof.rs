@@ -52,3 +52,23 @@ async fn live_hundred_random_blocks() {
     assert!(checked >= 95, "only {checked} blocks checked");
     eprintln!("checked {checked} blocks; a block with more than 256 txs seen: {big}");
 }
+
+#[test]
+fn stored_block_root_and_proofs() {
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/l1proof/recent.json")).unwrap();
+    let envs: Vec<Bytes> = v["envelopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().parse().unwrap())
+        .collect();
+    let want: alloy::primitives::B256 = v["transactions_root"].as_str().unwrap().parse().unwrap();
+    let hdr: Bytes = v["header_rlp"].as_str().unwrap().parse().unwrap();
+    assert_eq!(keccak256(&hdr).to_string(), v["hash"].as_str().unwrap());
+    for i in [0, envs.len() / 2, envs.len() - 1] {
+        let (root, proof) = tx_trie_proof(&envs, i);
+        assert_eq!(root, want);
+        verify_tx(root, &tx_key(i), &proof, &envs[i]).unwrap();
+    }
+}
