@@ -18,7 +18,29 @@ pub struct Network {
     pub blob_source: &'static str,
     /// Blocks behind head a node treats as final.
     pub confirmations: u64,
+    /// Where the deployment publishes transition data.
+    pub da: NetworkDa,
 }
+
+/// How a deployment publishes transition data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkDa {
+    /// Blob transactions on the registry's own chain.
+    Blobs,
+    /// Ethereum blob transactions, proven on an OP Stack chain through the
+    /// registry's `L1BlobVerifier`. `blob_source` then names Ethereum beacon APIs.
+    L1Blobs {
+        /// Ethereum's chain id.
+        l1_chain_id: u64,
+        /// The `L1Block` predeploy the verifier reads OP's origin from.
+        l1_block: Address,
+        /// Ethereum execution JSON-RPCs, in order of preference.
+        l1_rpc_urls: &'static [&'static str],
+    },
+}
+
+/// OP Stack's `L1Block` predeploy.
+pub const OP_L1_BLOCK: Address = address!("4200000000000000000000000000000000000015");
 
 impl Network {
     /// The beacon APIs of a `beacon:` blob source.
@@ -45,10 +67,37 @@ pub const GNOSIS: Network = Network {
     ],
     blob_source: "beacon:https://rpc-gbc.gnosischain.com",
     confirmations: 3,
+    da: NetworkDa::Blobs,
+};
+
+/// OP Mainnet in L1-blob mode: transitions settle on OP, their blobs live on
+/// Ethereum. Not deployed yet: the zero registry makes the node refuse this
+/// preset (`--registry` overrides it) until a release fills in the registry
+/// and its start block. The endpoint lists are provisional until then.
+pub const OPTIMISM: Network = Network {
+    name: "optimism",
+    chain_id: 10,
+    registry: Address::ZERO,
+    start_block: 0,
+    rpc_urls: &[
+        "https://optimism-rpc.publicnode.com",
+        "https://mainnet.optimism.io",
+    ],
+    // Ethereum beacon APIs: they must keep full blobs (supernodes, archives).
+    blob_source: "beacon:https://ethereum-beacon-api.publicnode.com",
+    confirmations: 1,
+    da: NetworkDa::L1Blobs {
+        l1_chain_id: 1,
+        l1_block: OP_L1_BLOCK,
+        l1_rpc_urls: &[
+            "https://ethereum-rpc.publicnode.com",
+            "https://eth.drpc.org",
+        ],
+    },
 };
 
 /// Every known deployment.
-pub const NETWORKS: &[Network] = &[GNOSIS];
+pub const NETWORKS: &[Network] = &[GNOSIS, OPTIMISM];
 
 /// The deployment a node and the tooling use unless told otherwise.
 pub const DEFAULT: &Network = &GNOSIS;
@@ -87,5 +136,25 @@ mod tests {
             assert!(!n.rpc_urls.is_empty());
             assert!(NETWORKS[i + 1..].iter().all(|m| m.name != n.name));
         }
+    }
+
+    #[test]
+    fn optimism_posts_its_blobs_on_ethereum() {
+        assert_eq!(by_name(" Optimism "), Some(&OPTIMISM));
+        assert_eq!(OPTIMISM.chain_id, 10);
+        assert_eq!(OPTIMISM.confirmations, 1);
+        let NetworkDa::L1Blobs {
+            l1_chain_id,
+            l1_block,
+            l1_rpc_urls,
+        } = OPTIMISM.da
+        else {
+            panic!("optimism must be an L1-blob preset");
+        };
+        assert_eq!((l1_chain_id, l1_block), (1, OP_L1_BLOCK));
+        assert!(!l1_rpc_urls.is_empty());
+        // Followers read the blobs from Ethereum beacon APIs.
+        assert!(!OPTIMISM.beacon_urls().is_empty());
+        assert_eq!(GNOSIS.da, NetworkDa::Blobs);
     }
 }
