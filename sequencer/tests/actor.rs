@@ -1926,6 +1926,7 @@ async fn foreign_first_transition_is_ignored_immediately() {
         voters: 1,
         overwrites: 0,
         n_blobs: 1,
+        l1: None,
     });
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();

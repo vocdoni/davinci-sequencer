@@ -489,6 +489,7 @@ async fn registry_on_anvil() {
             voters: 2 + n,
             overwrites: 0,
             n_blobs: 2,
+            l1: None,
         }
     );
 

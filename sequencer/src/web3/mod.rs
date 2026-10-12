@@ -124,6 +124,14 @@ pub struct L1Origin {
     pub hash: B256,
 }
 
+/// Where a transition's blobs are on Ethereum (`ProcessStateTransitionedL1`):
+/// the block of each versioned hash, in blob order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct L1Blobs {
+    pub blocks: Vec<u64>,
+    pub vhs: Vec<B256>,
+}
+
 /// Where a process's election key comes from (`DAVINCITypes.KeyMode`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,6 +321,7 @@ pub enum EventKind {
         max_voters: u64,
     },
     /// `voters` and `overwrites` are the process totals after the transition.
+    /// `l1` is set in L1-blob mode, from the paired `ProcessStateTransitionedL1`.
     StateTransitioned {
         pid: [u8; 31],
         sender: Address,
@@ -321,6 +330,7 @@ pub enum EventKind {
         voters: u64,
         overwrites: u64,
         n_blobs: u64,
+        l1: Option<L1Blobs>,
     },
     ResultsSet {
         pid: [u8; 31],

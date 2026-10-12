@@ -9,7 +9,7 @@ use std::time::Duration;
 use alloy::eips::BlockNumberOrTag;
 use alloy::json_abi::JsonAbi;
 use alloy::network::{EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, B256, FixedBytes, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::{Filter, Log, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
@@ -27,8 +27,8 @@ use super::adapter::DavinciDKGAdapter as AD;
 use super::council::CouncilAdapter as CA;
 use super::tx::SendState;
 use super::{
-    DkgState, EventKind, GraceParams, KeyMode, NewProcess, OnchainCensus, OnchainProcess,
-    ProcessStatus, RegistryEvent, Result, TxReceipt, Web3Error, rpc_err, rpc_provider,
+    DkgState, EventKind, GraceParams, KeyMode, L1Blobs, NewProcess, OnchainCensus, OnchainProcess,
+    ProcessStatus, RegistryDa, RegistryEvent, Result, TxReceipt, Web3Error, rpc_err, rpc_provider,
 };
 use crate::config::{Config, SecretString};
 
@@ -483,6 +483,7 @@ fn event_from_log(log: &Log) -> Result<Option<RegistryEvent>> {
                 voters: sat_u64(e.newVotersCount),
                 overwrites: sat_u64(e.newOverwrittenVotesCount),
                 n_blobs: sat_u64(e.nBlobs),
+                l1: None,
             }
         }
         PR::ProcessResultsSet::SIGNATURE_HASH => {
@@ -531,6 +532,86 @@ fn event_from_log(log: &Log) -> Result<Option<RegistryEvent>> {
         log_index,
         kind,
     }))
+}
+
+/// A `ProcessStateTransitionedL1` log, merged into its transition by [`pair_l1`].
+struct L1Event {
+    block: u64,
+    tx_hash: B256,
+    log_index: u64,
+    pid: [u8; 31],
+    blobs: L1Blobs,
+}
+
+fn l1_event_from_log(log: &Log) -> Result<Option<L1Event>> {
+    if log.removed {
+        return Ok(None);
+    }
+    let (Some(block), Some(tx_hash), Some(log_index)) =
+        (log.block_number, log.transaction_hash, log.log_index)
+    else {
+        return Err(Web3Error::Data("log without block, tx or index".into()));
+    };
+    let e = PR::ProcessStateTransitionedL1::decode_log(&log.inner)
+        .map_err(|e| Web3Error::Data(format!("event decode: {e}")))?;
+    let blocks = e
+        .l1BlockNumbers
+        .iter()
+        .map(|b| exact_u64("l1BlockNumber", *b))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(L1Event {
+        block,
+        tx_hash,
+        log_index,
+        pid: e.processId.0,
+        blobs: L1Blobs {
+            blocks,
+            vhs: e.versionedHashes.clone(),
+        },
+    }))
+}
+
+/// Merges each L1 event into the `ProcessStateTransitioned` logged right
+/// before it, in the same transaction, for the same process and blob count.
+/// With `strict` (L1-blob mode) every transition must have one.
+fn pair_l1(out: &mut [RegistryEvent], l1s: Vec<L1Event>, strict: bool) -> Result<()> {
+    for e in l1s {
+        let prev = out.iter_mut().find(|r| {
+            r.block == e.block && r.tx_hash == e.tx_hash && r.log_index + 1 == e.log_index
+        });
+        match prev {
+            Some(RegistryEvent {
+                kind:
+                    EventKind::StateTransitioned {
+                        pid, n_blobs, l1, ..
+                    },
+                ..
+            }) if *pid == e.pid
+                && l1.is_none()
+                && *n_blobs == e.blobs.vhs.len() as u64
+                && e.blobs.blocks.len() == e.blobs.vhs.len() =>
+            {
+                *l1 = Some(e.blobs);
+            }
+            _ => {
+                return Err(Web3Error::Data(format!(
+                    "ProcessStateTransitionedL1 in tx {} has no matching transition",
+                    e.tx_hash
+                )));
+            }
+        }
+    }
+    if strict
+        && let Some(r) = out
+            .iter()
+            .find(|r| matches!(r.kind, EventKind::StateTransitioned { l1: None, .. }))
+    {
+        return Err(Web3Error::Data(format!(
+            "transition in tx {} without its ProcessStateTransitionedL1",
+            r.tx_hash
+        )));
+    }
+    Ok(())
 }
 
 impl Contracts {
@@ -685,6 +766,7 @@ impl Contracts {
             PR::ProcessGraceChanged::SIGNATURE_HASH,
             PR::ProcessMaxVotersChanged::SIGNATURE_HASH,
             PR::ProcessStateTransitioned::SIGNATURE_HASH,
+            PR::ProcessStateTransitionedL1::SIGNATURE_HASH,
             PR::ProcessResultsSet::SIGNATURE_HASH,
             PR::CensusUpdated::SIGNATURE_HASH,
             PR::ProcessMetadataUpdated::SIGNATURE_HASH,
@@ -698,6 +780,7 @@ impl Contracts {
         let e0 = self.epoch.load(Ordering::SeqCst);
         let head = self.provider.get_block_number().await.map_err(rpc_err)?;
         let mut out = Vec::new();
+        let mut l1s = Vec::new();
         let mut start = from;
         while start <= to {
             let end = start.saturating_add(MAX_LOG_RANGE - 1).min(to);
@@ -710,7 +793,9 @@ impl Contracts {
                 if log.address() != self.registry {
                     continue;
                 }
-                if let Some(ev) = event_from_log(&log)? {
+                if log.topic0() == Some(&PR::ProcessStateTransitionedL1::SIGNATURE_HASH) {
+                    l1s.extend(l1_event_from_log(&log)?);
+                } else if let Some(ev) = event_from_log(&log)? {
                     out.push(ev);
                 }
             }
@@ -730,6 +815,8 @@ impl Contracts {
             )));
         }
         out.sort_by_key(|e| (e.block, e.log_index));
+        let strict = matches!(self.da.get(), Some(RegistryDa::L1Blobs { .. }));
+        pair_l1(&mut out, l1s, strict)?;
         Ok(out)
     }
 
@@ -1072,6 +1159,64 @@ mod tests {
 
     const REGISTRY: Address = Address::repeat_byte(0x11);
     const PID: [u8; 31] = [7; 31];
+
+    fn transition(block: u64, tx: u8, log_index: u64, n_blobs: u64) -> RegistryEvent {
+        RegistryEvent {
+            block,
+            tx_hash: B256::repeat_byte(tx),
+            log_index,
+            kind: EventKind::StateTransitioned {
+                pid: PID,
+                sender: Address::ZERO,
+                old_root: [1; 32],
+                new_root: [2; 32],
+                voters: 1,
+                overwrites: 0,
+                n_blobs,
+                l1: None,
+            },
+        }
+    }
+
+    fn l1_event(block: u64, tx: u8, log_index: u64, pid: [u8; 31], n: usize) -> L1Event {
+        L1Event {
+            block,
+            tx_hash: B256::repeat_byte(tx),
+            log_index,
+            pid,
+            blobs: super::super::L1Blobs {
+                blocks: vec![77; n],
+                vhs: (0..n).map(|i| B256::repeat_byte(i as u8 + 1)).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn l1_events_pair_with_their_transition() {
+        let mut out = vec![transition(5, 1, 0, 2)];
+        pair_l1(&mut out, vec![l1_event(5, 1, 1, PID, 2)], true).unwrap();
+        assert!(
+            matches!(&out[0].kind, EventKind::StateTransitioned { l1: Some(b), .. }
+                if b.blocks == [77, 77] && b.vhs.len() == 2)
+        );
+        // Another tx, another process, not right after it, another count: refused.
+        for bad in [
+            l1_event(5, 2, 1, PID, 2),
+            l1_event(5, 1, 1, [9; 31], 2),
+            l1_event(5, 1, 2, PID, 2),
+            l1_event(5, 1, 1, PID, 3),
+        ] {
+            assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![bad], false).is_err());
+        }
+        // Blocks and hashes of different lengths: refused.
+        let mut odd = l1_event(5, 1, 1, PID, 2);
+        odd.blobs.blocks.pop();
+        assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![odd], false).is_err());
+        // L1-blob mode: a transition without its L1 event fails the page;
+        // blob mode passes it through.
+        assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![], true).is_err());
+        assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![], false).is_ok());
+    }
 
     async fn node(head: u64, fail_logs: bool) -> (Url, Arc<Node>) {
         use axum::http::StatusCode;
