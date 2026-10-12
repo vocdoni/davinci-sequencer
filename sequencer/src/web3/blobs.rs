@@ -3,7 +3,10 @@
 //! checked against the transaction's versioned hash. `n_blobs` comes from
 //! the `StateTransitioned` event: the registry opened exactly that many, so
 //! a junk blob appended to the settling tx must not poison the sync.
+//! In L1-blob mode the event names Ethereum blocks and versioned hashes
+//! instead, and [`BlobSource::blobs_for_l1`] reads them from Ethereum.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -11,6 +14,7 @@ use std::time::Duration;
 use alloy::consensus::Transaction as _;
 use alloy::eips::BlockNumberOrTag;
 use alloy::eips::eip4844::env_settings::EnvKzgSettings;
+use alloy::network::TransactionResponse as _;
 use alloy::primitives::B256;
 use alloy::providers::{DynProvider, Provider};
 use async_trait::async_trait;
@@ -31,14 +35,50 @@ pub trait BlobSource: Send + Sync {
     /// its versioned hashes. Extra blobs in the tx are ignored, fewer (or a
     /// zero count) is an error.
     async fn blobs_for_tx(&self, tx: B256, block: u64, n_blobs: u64) -> Result<Vec<Blob>>;
+
+    /// L1-blob mode: the blobs with versioned hashes `vhs`, in that order,
+    /// from the Ethereum blocks `blocks` (one per hash, from
+    /// `ProcessStateTransitionedL1`), each checked against its hash.
+    async fn blobs_for_l1(&self, blocks: &[u64], vhs: &[B256]) -> Result<Vec<Blob>> {
+        let _ = (blocks, vhs);
+        Err(Web3Error::Config(
+            "this blob source cannot read Ethereum blobs".into(),
+        ))
+    }
 }
 
-/// The source the configuration names, reading transactions from `cfg.rpc_url`.
+/// The source the configuration names. It reads transactions and blocks from
+/// `cfg.rpc_url`, or from `cfg.l1_rpc_url` in L1-blob mode, where the blobs
+/// live on Ethereum.
 pub fn blob_source(cfg: &Config) -> Arc<dyn BlobSource> {
+    let rpcs = if cfg.l1_mode() {
+        &cfg.l1_rpc_url
+    } else {
+        &cfg.rpc_url
+    };
     match &cfg.blob_source {
-        BlobSourceKind::Anvil => Arc::new(AnvilBlobs::new(&cfg.rpc_url)),
-        BlobSourceKind::Beacon(urls) => Arc::new(BeaconBlobs::new(urls.clone(), &cfg.rpc_url)),
+        BlobSourceKind::Anvil => Arc::new(AnvilBlobs::new(rpcs)),
+        BlobSourceKind::Beacon(urls) => Arc::new(BeaconBlobs::new(urls.clone(), rpcs)),
     }
+}
+
+// The distinct blocks of an L1 event, in first-seen order; a malformed event
+// is an error.
+fn l1_blocks(blocks: &[u64], vhs: &[B256]) -> Result<Vec<u64>> {
+    if vhs.is_empty() || blocks.len() != vhs.len() {
+        return Err(Web3Error::Blob(format!(
+            "{} L1 blocks for {} blobs",
+            blocks.len(),
+            vhs.len()
+        )));
+    }
+    let mut out: Vec<u64> = Vec::new();
+    for b in blocks {
+        if !out.contains(b) {
+            out.push(*b);
+        }
+    }
+    Ok(out)
 }
 
 fn to_blob(b: &[u8]) -> Result<Blob> {
@@ -146,6 +186,38 @@ impl BlobSource for AnvilBlobs {
             .map(|b| to_blob(b.as_ref()))
             .collect::<Result<Vec<_>>>()?;
         match_blobs_blocking(hashes, candidates).await
+    }
+
+    async fn blobs_for_l1(&self, blocks: &[u64], vhs: &[B256]) -> Result<Vec<Blob>> {
+        let mut candidates = Vec::new();
+        for b in l1_blocks(blocks, vhs)? {
+            let blk = self
+                .provider
+                .get_block_by_number(BlockNumberOrTag::Number(b))
+                .full()
+                .await
+                .map_err(rpc_err)?
+                .ok_or_else(|| Web3Error::Blob(format!("L1 block {b} not found")))?;
+            for t in blk.transactions.txns() {
+                let carries = t
+                    .inner
+                    .blob_versioned_hashes()
+                    .is_some_and(|hs| hs.iter().any(|h| vhs.contains(h)));
+                if !carries {
+                    continue;
+                }
+                // Heap `Bytes`, as in `blobs_for_tx`.
+                let raw: Option<Vec<alloy::primitives::Bytes>> = self
+                    .provider
+                    .raw_request("anvil_getBlobsByTransactionHash".into(), (t.tx_hash(),))
+                    .await
+                    .map_err(rpc_err)?;
+                for r in raw.unwrap_or_default() {
+                    candidates.push(to_blob(r.as_ref())?);
+                }
+            }
+        }
+        match_blobs_blocking(vhs.to_vec(), candidates).await
     }
 }
 
@@ -374,6 +446,38 @@ impl BlobSource for BeaconBlobs {
             .ok_or_else(|| Web3Error::Blob(format!("block {block} not found")))?;
         self.blobs_at(b.header.timestamp, &hashes).await
     }
+
+    async fn blobs_for_l1(&self, blocks: &[u64], vhs: &[B256]) -> Result<Vec<Blob>> {
+        let distinct = l1_blocks(blocks, vhs)?;
+        let p = self
+            .provider
+            .as_ref()
+            .ok_or_else(|| Web3Error::Config("beacon source without an execution node".into()))?;
+        let mut found: HashMap<B256, Blob> = HashMap::new();
+        for b in distinct {
+            let want: Vec<B256> = vhs
+                .iter()
+                .zip(blocks)
+                .filter(|(_, x)| **x == b)
+                .map(|(h, _)| *h)
+                .collect();
+            let blk = p
+                .get_block_by_number(BlockNumberOrTag::Number(b))
+                .await
+                .map_err(rpc_err)?
+                .ok_or_else(|| Web3Error::Blob(format!("L1 block {b} not found")))?;
+            let got = self.blobs_at(blk.header.timestamp, &want).await?;
+            found.extend(want.into_iter().zip(got));
+        }
+        vhs.iter()
+            .map(|h| {
+                found
+                    .get(h)
+                    .cloned()
+                    .ok_or_else(|| Web3Error::Blob(format!("no blob for {h}")))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -383,7 +487,10 @@ mod tests {
     use axum::extract::{Path, RawQuery, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use axum::{Json, Router, routing::get};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
     use davinci_zkvm_sdk::ballot::Ballot;
     use davinci_zkvm_sdk::blob::{TransitionData, build_blobs};
     use davinci_zkvm_sdk::crypto::field::Fr;
@@ -632,5 +739,83 @@ mod tests {
         assert_eq!((*a_hits.lock().unwrap(), *b_hits.lock().unwrap()), (1, 1));
         assert_eq!(src.current.load(Ordering::Relaxed), 0);
         assert_eq!(seen.lock().unwrap().len(), before);
+    }
+
+    // An execution node serving headers with timestamp 1000 + 12·number.
+    async fn el_stub() -> Url {
+        let app = Router::new().route(
+            "/",
+            post(|Json(req): Json<serde_json::Value>| async move {
+                let id = req["id"].clone();
+                let hex_n = req["params"][0].as_str().unwrap().trim_start_matches("0x");
+                let n = u64::from_str_radix(hex_n, 16).unwrap();
+                let header = alloy::rpc::types::Header::new(alloy::consensus::Header {
+                    number: n,
+                    timestamp: 1000 + 12 * n,
+                    ..Default::default()
+                });
+                let block: alloy::rpc::types::Block = alloy::rpc::types::Block::empty(header);
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": block}))
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        Url::parse(&format!("http://{addr}/")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn l1_blobs_come_by_block_from_the_beacon() {
+        let (blobs, hashes, other) = fixture();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let beacon = serve(Beacon {
+            pool: vec![other, blobs[1].clone(), blobs[0].clone()],
+            blobs_endpoint: true,
+            claims: vec![],
+            seen: seen.clone(),
+        })
+        .await;
+        let src = BeaconBlobs::new(vec![beacon], &[el_stub().await]);
+        assert_eq!(src.blobs_for_l1(&[42, 42], &hashes).await.unwrap(), blobs);
+        let s = seen.lock().unwrap().clone();
+        assert_eq!(s.len(), 1, "one block, one request: {s:?}");
+        assert!(s[0].starts_with("blobs/42?"), "{}", s[0]);
+        // Blobs over two blocks come back in hash order.
+        assert_eq!(src.blobs_for_l1(&[43, 42], &hashes).await.unwrap(), blobs);
+    }
+
+    #[tokio::test]
+    async fn l1_blobs_fail_over_to_a_full_blob_beacon() {
+        let (blobs, hashes, _) = fixture();
+        // The first beacon keeps no blobs for the slot (not a supernode).
+        let (pruned, _) = broken(StatusCode::NOT_FOUND).await;
+        let full = serve(Beacon {
+            pool: blobs.clone(),
+            blobs_endpoint: true,
+            claims: vec![],
+            seen: Arc::new(Mutex::new(Vec::new())),
+        })
+        .await;
+        let src = BeaconBlobs::new(vec![pruned, full], &[el_stub().await]);
+        assert_eq!(src.blobs_for_l1(&[42, 42], &hashes).await.unwrap(), blobs);
+    }
+
+    #[tokio::test]
+    async fn l1_blobs_must_match_their_hashes() {
+        let (blobs, hashes, other) = fixture();
+        let beacon = serve(Beacon {
+            pool: vec![blobs[0].clone(), other],
+            blobs_endpoint: true,
+            claims: vec![],
+            seen: Arc::new(Mutex::new(Vec::new())),
+        })
+        .await;
+        let src = BeaconBlobs::new(vec![beacon], &[el_stub().await]);
+        assert!(src.blobs_for_l1(&[42, 42], &hashes).await.is_err());
+        // Malformed events: no blob, or blocks and hashes of other lengths.
+        assert!(src.blobs_for_l1(&[], &[]).await.is_err());
+        assert!(src.blobs_for_l1(&[42], &hashes).await.is_err());
+        let anvil = AnvilBlobs::new(&[Url::parse("http://127.0.0.1:1/").unwrap()]);
+        assert!(anvil.blobs_for_l1(&[42], &hashes).await.is_err());
     }
 }

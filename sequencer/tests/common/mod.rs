@@ -1590,6 +1590,27 @@ impl BlobSource for FakeBlobs {
         b.truncate(n_blobs as usize);
         Ok(b)
     }
+
+    async fn blobs_for_l1(&self, blocks: &[u64], vhs: &[B256]) -> Result<Vec<Blob>, Web3Error> {
+        let l1 = {
+            let mut i = self.0.lock().unwrap();
+            if i.fail_blobs > 0 {
+                i.fail_blobs -= 1;
+                return Err(Web3Error::Blob("scripted blob failure".into()));
+            }
+            i.l1.clone()
+        };
+        let l1 = l1.ok_or_else(|| Web3Error::Blob("no L1 attached".into()))?;
+        if vhs.is_empty() || blocks.len() != vhs.len() {
+            return Err(Web3Error::Blob("malformed L1 blob list".into()));
+        }
+        vhs.iter()
+            .map(|h| {
+                l1.blob(h)
+                    .ok_or_else(|| Web3Error::Blob(format!("no L1 blob {h}")))
+            })
+            .collect()
+    }
 }
 
 pub struct FakeClock(Arc<Mutex<Inner>>);
