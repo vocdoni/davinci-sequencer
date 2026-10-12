@@ -1,7 +1,12 @@
 //! Proof that blob transactions are in Ethereum's canonical chain, for the L1-blob DA mode: RLP
 //! headers newest first (from about the L1 head down to each blob block) and a Merkle-Patricia
 //! proof of each transaction in its block's transactions trie. `L1BlobVerifier` checks the same
-//! thing on OP against `L1Block.hash()`; `verify_local` mirrors it before a send.
+//! thing on OP against `L1Block.hash()` or a recorded origin; `verify_local` mirrors it before a send.
+//!
+//! `verify_local` is a pre-flight, not the oracle. On non-honest inputs it differs from the
+//! contract: a block number longer than 8 bytes is rejected (the contract truncates it), the last
+//! proof node must be a leaf, there is no 32-item RLP list cap, error kinds and their order
+//! differ, and there is no `MAX_AGE` check.
 
 use alloy::consensus::Header;
 use alloy::eips::eip2718::Encodable2718;
@@ -168,32 +173,34 @@ fn blob_hashes(envelope: &[u8]) -> Option<Vec<B256>> {
         .collect()
 }
 
-/// Mirrors `L1BlobVerifier.verify`: the versioned hashes in proof order and the block number of
-/// each transaction. `origin` is OP's `L1Block.hash()`.
-pub fn verify_local(p: &L1BlobProof, origin: B256) -> Result<(Vec<B256>, Vec<u64>), L1ProofError> {
+/// Mirrors `L1BlobVerifier.verify`: the versioned hashes in proof order and, parallel to them,
+/// the L1 block of the transaction holding each one. `anchor` is the hash the chain must reach:
+/// OP's current `L1Block.hash()` or a recorded origin hash.
+pub fn verify_local(p: &L1BlobProof, anchor: B256) -> Result<(Vec<B256>, Vec<u64>), L1ProofError> {
     let mut fields: Vec<(B256, B256, u64)> = Vec::with_capacity(p.headers.len());
-    let mut anchor = None;
+    let mut anchor_at = None;
     for (i, h) in p.headers.iter().enumerate() {
         let f = header_fields(h)?;
         let hash = keccak256(h);
         if i > 0 && fields.last().map(|(parent, _, _)| *parent) != Some(hash) {
             return Err(L1ProofError::BrokenChain(i));
         }
-        if anchor.is_none() && hash == origin {
-            anchor = Some(i);
+        if anchor_at.is_none() && hash == anchor {
+            anchor_at = Some(i);
         }
         fields.push(f);
     }
-    let anchor = anchor.ok_or(L1ProofError::NoAnchor(origin))?;
+    let anchor_at = anchor_at.ok_or(L1ProofError::NoAnchor(anchor))?;
     let (mut vhs, mut blocks) = (vec![], vec![]);
     for (t, tx) in p.txs.iter().enumerate() {
-        if tx.header_index < anchor || tx.header_index >= p.headers.len() {
+        if tx.header_index < anchor_at || tx.header_index >= p.headers.len() {
             return Err(L1ProofError::AboveOrigin(t));
         }
         let (_, root, number) = fields[tx.header_index];
         let value = proven_value(root, &tx.key, &tx.proof)?;
-        vhs.extend(blob_hashes(&value).ok_or(L1ProofError::NotBlobTx(t))?);
-        blocks.push(number);
+        let hashes = blob_hashes(&value).ok_or(L1ProofError::NotBlobTx(t))?;
+        blocks.extend(std::iter::repeat_n(number, hashes.len()));
+        vhs.extend(hashes);
     }
     Ok((vhs, blocks))
 }

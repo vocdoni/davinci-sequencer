@@ -16,7 +16,7 @@ use std::time::Duration;
 alloy::sol! {
     struct TxProof { uint256 headerIndex; bytes key; bytes[] proof; }
     struct L1Proof { bytes[] headers; TxProof[] txs; }
-    function verify(L1Proof p) external view returns (bytes32[] vhs, uint256[] txBlocks);
+    function verify(L1Proof p) external view returns (bytes32[] vhs, uint256[] blobBlocks);
     function number() external view returns (uint64);
     function hash() external view returns (bytes32);
 }
@@ -92,7 +92,7 @@ async fn check_once<P: Provider>(op: &P, verifier: Address, proof: &L1BlobProof)
         .await
         .map_err(g("eth_call verify"))?;
     let r = verifyCall::abi_decode_returns(&out).map_err(g("decode verify"))?;
-    let got_blocks: Vec<u64> = r.txBlocks.iter().map(|b| b.to::<u64>()).collect();
+    let got_blocks: Vec<u64> = r.blobBlocks.iter().map(|b| b.to::<u64>()).collect();
     if r.vhs != vhs || got_blocks != blocks {
         return Err(format!(
             "on-chain result differs: vhs {:?} vs {vhs:?}, blocks {got_blocks:?} vs {blocks:?}",
@@ -104,7 +104,7 @@ async fn check_once<P: Provider>(op: &P, verifier: Address, proof: &L1BlobProof)
         .block(at.into())
         .await
         .map_err(g("estimateGas"))?;
-    println!("  ok at origin {n}: vhs {vhs:?} tx blocks {blocks:?} estimateGas {gas}");
+    println!("  ok at origin {n}: vhs {vhs:?} blob blocks {blocks:?} estimateGas {gas}");
     Ok(Outcome { origin: n, gas })
 }
 
