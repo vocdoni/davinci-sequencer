@@ -56,7 +56,7 @@ fn versioned_hashes(blobs: &TransitionBlobs) -> Vec<B256> {
         .collect()
 }
 
-fn check_shape(blobs: &TransitionBlobs) -> Result<()> {
+pub(super) fn check_shape(blobs: &TransitionBlobs) -> Result<()> {
     let n = blobs.blobs.len();
     if n == 0
         || blobs.commitments.len() != n
@@ -73,7 +73,7 @@ fn check_shape(blobs: &TransitionBlobs) -> Result<()> {
 
 /// v1 (cell proofs) or v0 sidecar over the transition's blobs, checked
 /// against the transition's commitments.
-fn build_sidecar(
+pub(super) fn build_sidecar(
     cell_proofs: bool,
     blobs: &TransitionBlobs,
 ) -> Result<BlobTransactionSidecarVariant> {
@@ -203,7 +203,7 @@ fn named_count(msg: &str) -> Option<u64> {
 }
 
 /// A send refused for a nonce gap; the node wants a lower nonce first.
-fn gapped(msg: &str) -> bool {
+pub(super) fn gapped(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("nonce too high") || m.contains("gap")
 }
@@ -211,7 +211,7 @@ fn gapped(msg: &str) -> bool {
 /// A send no node answered though the tx may be in: a POST that timed out or
 /// lost its answer, a gateway error, a garbled body. Not a 4xx (refused at
 /// the door) nor every endpoint resting (none asked).
-fn maybe_sent(e: &RpcError<TransportErrorKind>) -> bool {
+pub(super) fn maybe_sent(e: &RpcError<TransportErrorKind>) -> bool {
     match e {
         RpcError::Transport(TransportErrorKind::HttpError(h)) => h.status >= 500,
         RpcError::Transport(k) => !k.to_string().contains(ALL_RESTING),
@@ -220,7 +220,7 @@ fn maybe_sent(e: &RpcError<TransportErrorKind>) -> bool {
     }
 }
 
-fn underpriced(msg: &str) -> bool {
+pub(super) fn underpriced(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("underpriced") || m.contains("fee too low") || m.contains("fee cap")
 }
@@ -725,7 +725,7 @@ fn replay_verdict(
 
 /// `eth_blobBaseFee`, or the next block's blob fee from `eth_feeHistory`
 /// on RPCs without the former (rpc.gnosischain.com answers -32601).
-async fn blob_base_fee<P: Provider>(p: &P) -> Result<u128> {
+pub(super) async fn blob_base_fee<P: Provider>(p: &P) -> Result<u128> {
     let direct = match p.get_blob_base_fee().await {
         Ok(fee) => return Ok(fee),
         Err(e) => e,
@@ -940,22 +940,7 @@ mod tests {
 
     // A read-only registry handle over `url`, without the boot checks.
     fn contracts_at(url: url::Url) -> Contracts {
-        let (provider, epoch) = crate::web3::failover_provider(&[url]);
-        Contracts {
-            provider,
-            epoch,
-            registry: alloy::primitives::Address::repeat_byte(1),
-            signer: None,
-            wallet: None,
-            chain_id: 1,
-            cell_proofs: Default::default(),
-            blob_cap: None,
-            errors: std::sync::Arc::new(crate::web3::contracts::error_names().unwrap()),
-            send_lock: Default::default(),
-            receipt_timeout: Duration::from_secs(1),
-            dkg_adapter: Default::default(),
-            council_adapter: Default::default(),
-        }
+        Contracts::at(url)
     }
 
     // A mined revert is named from the state its block left. Replaying at

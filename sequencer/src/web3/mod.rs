@@ -4,6 +4,7 @@
 mod blobs;
 mod contracts;
 mod failover;
+mod l1op;
 pub mod l1proof;
 mod release;
 mod tx;
@@ -21,8 +22,10 @@ pub use blobs::{
 pub use contracts::{
     Contracts, MAX_LOG_RANGE, endpoints_chain_id as rpc_chain_id, probe_osaka, resolve_blob_cap,
 };
+pub use davinci_client::organizer::RegistryDa;
 use failover::Failover;
 pub(crate) use failover::host;
+pub use l1op::revert_message;
 pub use release::{DeployedRelease, Mismatch};
 
 /// `User-Agent` of every outgoing HTTP request: some public RPCs answer 403
@@ -102,6 +105,23 @@ pub(crate) mod council {
         CouncilAdapter,
         "abi/CouncilAdapter.json"
     );
+}
+
+/// Own module: the verifier ABI declares its own `IL1BlobVerifier` structs.
+pub(crate) mod l1v {
+    alloy::sol!(
+        #[allow(missing_docs)]
+        #[derive(Debug)]
+        L1BlobVerifier,
+        "abi/L1BlobVerifier.json"
+    );
+}
+
+/// OP's L1 origin: `L1Block.number()` and `hash()`, read at one OP block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct L1Origin {
+    pub number: u64,
+    pub hash: B256,
 }
 
 /// Where a process's election key comes from (`DAVINCITypes.KeyMode`).

@@ -39,6 +39,8 @@ const VERIFIER_ABI_JSON: &str = include_str!("../../abi/ZiskVerifier.json");
 const ADAPTER_ABI_JSON: &str = include_str!("../../abi/DavinciDKGAdapter.json");
 /// And the Council adapter's (`InvalidFieldRange`).
 const COUNCIL_ABI_JSON: &str = include_str!("../../abi/CouncilAdapter.json");
+/// And `L1BlobVerifier`'s (`L1OriginMismatch`, `TxTooOld`, the RLP errors).
+const L1_VERIFIER_ABI_JSON: &str = include_str!("../../abi/L1BlobVerifier.json");
 /// Council manager errors (all argument-less, `ICouncilManagerErrors`) the
 /// Council adapter bubbles up through the registry: binding at creation,
 /// request admission, the decryption gate.
@@ -102,6 +104,8 @@ pub struct Contracts {
     pub(super) dkg_adapter: Arc<tokio::sync::OnceCell<Address>>,
     /// `councilAdapter()`, likewise.
     pub(super) council_adapter: Arc<tokio::sync::OnceCell<Address>>,
+    /// The registry's DA mode, an immutable: read once (`da_mode`).
+    pub(super) da: Arc<tokio::sync::OnceCell<super::RegistryDa>>,
 }
 
 impl std::fmt::Debug for Contracts {
@@ -124,8 +128,8 @@ fn exact_u64(what: &str, v: U256) -> Result<u64> {
     u64::try_from(v).map_err(|_| Web3Error::Data(format!("{what} above 64 bits")))
 }
 
-/// Custom error selectors of the registry, the ZisK verifier, the DKG and
-/// Council adapters, and the DKG and Council contracts.
+/// Custom error selectors of the registry, the ZisK verifier, the L1 blob
+/// verifier, the DKG and Council adapters, and the DKG and Council contracts.
 pub(super) fn error_names() -> Result<HashMap<[u8; 4], String>> {
     let mut out = HashMap::new();
     for name in DKG_ERRORS.iter().chain(&COUNCIL_ERRORS) {
@@ -137,6 +141,7 @@ pub(super) fn error_names() -> Result<HashMap<[u8; 4], String>> {
         ("council adapter", COUNCIL_ABI_JSON),
         ("registry", ABI_JSON),
         ("verifier", VERIFIER_ABI_JSON),
+        ("l1 blob verifier", L1_VERIFIER_ABI_JSON),
     ] {
         let abi: JsonAbi = serde_json::from_str(json)
             .map_err(|e| Web3Error::Config(format!("{what} ABI: {e}")))?;
@@ -207,9 +212,57 @@ pub async fn probe_osaka<P: Provider>(p: &P) -> Result<bool> {
 /// the probe fails too: true for EIP-7594 cell proofs.
 fn known_chain_cell_proofs(chain_id: u64) -> Option<bool> {
     match chain_id {
-        100 | 10200 => Some(true), // Gnosis, Chiado: Osaka
+        100 | 10200 => Some(true),    // Gnosis, Chiado: Osaka
+        1 | 11_155_111 => Some(true), // Ethereum, Sepolia: Osaka
         _ => None,
     }
+}
+
+/// The chain's blob limit per transaction (`eth_config`, if an endpoint
+/// serves it) and whether its blob transactions carry EIP-7594 cell proofs:
+/// `eth_config`, else the P256VERIFY probe, else the known-chain table.
+pub(super) async fn blob_support(
+    rpcs: &[Url],
+    provider: &DynProvider,
+    chain_id: u64,
+) -> Result<(Option<usize>, bool)> {
+    // Endpoints lacking eth_config are common: ask each before the probe.
+    let mut eth_config = Err(TransportErrorKind::custom_str("no RPC endpoint"));
+    for u in rpcs {
+        eth_config = rpc_provider(std::slice::from_ref(u))
+            .raw_request("eth_config".into(), ())
+            .await;
+        if eth_config.is_ok() {
+            break;
+        }
+    }
+    let blob_cap = eth_config_blob_cap(&eth_config);
+    let cell_proofs = match &eth_config {
+        Ok(v) => eth_config_osaka(v),
+        Err(e) => {
+            tracing::warn!(error = %e, "eth_config unavailable: probing P256VERIFY for Osaka");
+            match (
+                probe_osaka(provider).await,
+                known_chain_cell_proofs(chain_id),
+            ) {
+                (Ok(v), _) => v,
+                (Err(e), Some(v)) => {
+                    tracing::warn!(error = %e, chain_id, cell_proofs = v,
+                        "P256VERIFY probe failed: sidecar version from the known-chain table");
+                    v
+                }
+                (Err(e), None) => {
+                    return Err(Web3Error::Config(format!(
+                        "blob sidecar version unknown: no eth_config and the P256VERIFY probe failed ({e})"
+                    )));
+                }
+            }
+        }
+    };
+    if !cell_proofs {
+        tracing::info!("pre-Osaka chain: blob transactions carry v0 sidecars");
+    }
+    Ok((blob_cap, cell_proofs))
 }
 
 /// `eth_chainId` of every endpoint: another chain is fatal and named, an
@@ -481,9 +534,16 @@ fn event_from_log(log: &Log) -> Result<Option<RegistryEvent>> {
 }
 
 impl Contracts {
-    /// Connects with the node configuration.
+    /// Connects with the node configuration. In L1-blob mode this chain
+    /// never carries blobs, so its blob support is not probed.
     pub async fn connect(cfg: &Config) -> Result<Self> {
-        Self::new(&cfg.rpc_url, cfg.registry, cfg.privkey.as_ref()).await
+        Self::open(
+            &cfg.rpc_url,
+            cfg.registry,
+            cfg.privkey.as_ref(),
+            !cfg.l1_mode(),
+        )
+        .await
     }
 
     /// Connects to `rpcs` (in order of preference, with sticky failover).
@@ -494,6 +554,17 @@ impl Contracts {
         rpcs: &[Url],
         registry: Address,
         privkey: Option<&SecretString>,
+    ) -> Result<Self> {
+        Self::open(rpcs, registry, privkey, true).await
+    }
+
+    /// [`Contracts::new`]; `blobs` false skips the blob-support probe (the
+    /// sidecar version and the blob cap stay unknown).
+    pub async fn open(
+        rpcs: &[Url],
+        registry: Address,
+        privkey: Option<&SecretString>,
+        blobs: bool,
     ) -> Result<Self> {
         let (wallet, signer) = match privkey {
             Some(k) => {
@@ -511,42 +582,11 @@ impl Contracts {
         if code.is_empty() {
             return Err(Web3Error::Config(format!("no contract at {registry}")));
         }
-        // Endpoints lacking eth_config are common: ask each before the probe.
-        let mut eth_config = Err(TransportErrorKind::custom_str("no RPC endpoint"));
-        for u in rpcs {
-            eth_config = rpc_provider(std::slice::from_ref(u))
-                .raw_request("eth_config".into(), ())
-                .await;
-            if eth_config.is_ok() {
-                break;
-            }
-        }
-        let blob_cap = eth_config_blob_cap(&eth_config);
-        let cell_proofs = match &eth_config {
-            Ok(v) => eth_config_osaka(v),
-            Err(e) => {
-                tracing::warn!(error = %e, "eth_config unavailable: probing P256VERIFY for Osaka");
-                match (
-                    probe_osaka(&provider).await,
-                    known_chain_cell_proofs(chain_id),
-                ) {
-                    (Ok(v), _) => v,
-                    (Err(e), Some(v)) => {
-                        tracing::warn!(error = %e, chain_id, cell_proofs = v,
-                            "P256VERIFY probe failed: sidecar version from the known-chain table");
-                        v
-                    }
-                    (Err(e), None) => {
-                        return Err(Web3Error::Config(format!(
-                            "blob sidecar version unknown: no eth_config and the P256VERIFY probe failed ({e})"
-                        )));
-                    }
-                }
-            }
+        let (blob_cap, cell_proofs) = if blobs {
+            blob_support(rpcs, &provider, chain_id).await?
+        } else {
+            (None, false)
         };
-        if !cell_proofs {
-            tracing::info!("pre-Osaka chain: blob transactions carry v0 sidecars");
-        }
         Ok(Contracts {
             provider,
             epoch,
@@ -561,6 +601,7 @@ impl Contracts {
             receipt_timeout: Duration::from_secs(120),
             dkg_adapter: Arc::default(),
             council_adapter: Arc::default(),
+            da: Arc::default(),
         })
     }
 
@@ -846,6 +887,30 @@ impl Contracts {
 }
 
 #[cfg(test)]
+impl Contracts {
+    /// A read-only handle on `url` without the boot checks (unit tests).
+    pub(super) fn at(url: Url) -> Contracts {
+        let (provider, epoch) = super::failover_provider(&[url]);
+        Contracts {
+            provider,
+            epoch,
+            registry: Address::repeat_byte(1),
+            signer: None,
+            wallet: None,
+            chain_id: 1,
+            cell_proofs: Default::default(),
+            blob_cap: None,
+            errors: Arc::new(error_names().unwrap()),
+            send_lock: Default::default(),
+            receipt_timeout: Duration::from_secs(1),
+            dkg_adapter: Default::default(),
+            council_adapter: Default::default(),
+            da: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, keccak256};
     use alloy::rpc::json_rpc::ErrorPayload;
@@ -888,7 +953,9 @@ mod tests {
         assert!(!p256_probe_mode(&high));
         assert_eq!(known_chain_cell_proofs(100), Some(true));
         assert_eq!(known_chain_cell_proofs(10200), Some(true));
-        assert_eq!(known_chain_cell_proofs(1), None);
+        assert_eq!(known_chain_cell_proofs(1), Some(true));
+        assert_eq!(known_chain_cell_proofs(11_155_111), Some(true));
+        assert_eq!(known_chain_cell_proofs(31337), None);
     }
 
     #[test]

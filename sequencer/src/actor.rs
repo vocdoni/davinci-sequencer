@@ -32,9 +32,10 @@ use crate::config::Config;
 use crate::keys::KeyStore;
 use crate::metrics::Metrics;
 use crate::storage::{Db, LocalStatus, ProcessRecord, StoredVote, VoteStatus, fr_hex};
+use crate::web3::l1proof::L1BlobProof;
 use crate::web3::{
-    BlobSource, EventKind, GraceParams, KeyMode, OnchainProcess, ProcessStatus, RegistryEvent,
-    RevertReason, TxReceipt, Web3Error,
+    BlobSource, EventKind, GraceParams, KeyMode, L1Origin, OnchainProcess, ProcessStatus,
+    RegistryEvent, RevertReason, TxReceipt, Web3Error,
 };
 
 /// Votes an actor holds in memory before sealing; beyond it submits are refused.
@@ -51,6 +52,10 @@ fn gate_backoff(n: u32) -> std::time::Duration {
     DKG_POLL
         .saturating_mul(1 << n.saturating_sub(1).min(16))
         .min(GATE_POLL_MAX)
+}
+
+fn not_l1() -> Web3Error {
+    Web3Error::Config("the registry is not in L1-blob mode".into())
 }
 
 // ------------------------------------------------------------------ traits
@@ -102,6 +107,34 @@ pub trait Chain: Send + Sync {
     async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error>;
     /// DKG modes: `finalizeResultsFromDKG`.
     async fn finalize_results_from_dkg(&self, pid: &[u8; 31]) -> Result<TxReceipt, Web3Error>;
+    /// L1-blob mode: OP's L1 origin (`L1Block` read at one block).
+    async fn l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        Err(not_l1())
+    }
+    /// L1-blob mode: `record()` on the verifier; the origin it stored.
+    async fn record_l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        Err(not_l1())
+    }
+    /// L1-blob mode: the pre-flight `eth_call` of `submitStateTransitionL1`.
+    async fn simulate_transition_l1(
+        &self,
+        _pid: &[u8; 31],
+        _snark: &PlonkSnark,
+        _blobs: &TransitionBlobs,
+        _proof: &L1BlobProof,
+    ) -> Result<(), RevertReason> {
+        Err(RevertReason::Rpc(not_l1().to_string()))
+    }
+    /// L1-blob mode: `submitStateTransitionL1`.
+    async fn submit_transition_l1(
+        &self,
+        _pid: &[u8; 31],
+        _snark: &PlonkSnark,
+        _blobs: &TransitionBlobs,
+        _proof: &L1BlobProof,
+    ) -> Result<TxReceipt, Web3Error> {
+        Err(not_l1())
+    }
 }
 
 /// `permanent` marks failures retrying cannot fix: the proving job itself
@@ -246,6 +279,30 @@ impl Chain for crate::web3::Contracts {
     }
     async fn finalize_results_from_dkg(&self, pid: &[u8; 31]) -> Result<TxReceipt, Web3Error> {
         crate::web3::Contracts::finalize_results_from_dkg(self, pid).await
+    }
+    async fn l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        crate::web3::Contracts::l1_origin(self).await
+    }
+    async fn record_l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        crate::web3::Contracts::record_l1_origin(self).await
+    }
+    async fn simulate_transition_l1(
+        &self,
+        pid: &[u8; 31],
+        snark: &PlonkSnark,
+        blobs: &TransitionBlobs,
+        proof: &L1BlobProof,
+    ) -> Result<(), RevertReason> {
+        crate::web3::Contracts::simulate_transition_l1(self, pid, snark, blobs, proof).await
+    }
+    async fn submit_transition_l1(
+        &self,
+        pid: &[u8; 31],
+        snark: &PlonkSnark,
+        blobs: &TransitionBlobs,
+        proof: &L1BlobProof,
+    ) -> Result<TxReceipt, Web3Error> {
+        crate::web3::Contracts::submit_transition_l1(self, pid, snark, blobs, proof).await
     }
 }
 

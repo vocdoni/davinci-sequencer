@@ -503,7 +503,7 @@ mod tests {
         assert_eq!(f.p256_calls.load(SeqCst), 3);
         // Failing on every try: boot refused, not v0.
         let (url, f) = fake_chain(Fake {
-            chain_id: 1,
+            chain_id: 31337,
             p256_fail: AtomicUsize::new(usize::MAX),
             ..Default::default()
         })
