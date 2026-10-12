@@ -839,6 +839,7 @@ fn settle_foreign(i: &mut Inner, b: &davinci_state::PreparedBatch) -> u64 {
             voters,
             overwrites,
             n_blobs: b.blobs.blobs.len() as u64,
+            l1: None,
         },
     });
     block
@@ -1151,6 +1152,7 @@ impl Chain for FakeChain {
                 voters: i.proc.voters_count,
                 overwrites: i.proc.overwritten_count,
                 n_blobs: blobs.blobs.len() as u64,
+                l1: None,
             },
         };
         i.events.push(ev);
