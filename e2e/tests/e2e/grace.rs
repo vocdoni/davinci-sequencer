@@ -80,7 +80,7 @@ async fn block_time(rpc: &str, n: u64) -> Result<u64> {
 
 /// A two-hour sequencer-key process on process 1's census, keyed by
 /// `nodes[key]`, once every node lists it.
-async fn create(
+pub(super) async fn create(
     nodes: &[Node],
     org: &Organizer,
     reader: &RegistryReader,
@@ -98,7 +98,7 @@ async fn create(
 }
 
 /// Round-1 ballots of `voters`, then `extra` (voter, round) pairs, proved.
-fn ballots(
+pub(super) fn ballots(
     prover: &BallotProver,
     tag: u64,
     p: &OnchainProcess,
@@ -119,7 +119,7 @@ fn ballots(
 }
 
 /// Submits `reqs` of `voters` (round `round`) to `node(v)`.
-async fn send(
+pub(super) async fn send(
     nodes: &[Node],
     what: &str,
     voters: impl IntoIterator<Item = usize>,

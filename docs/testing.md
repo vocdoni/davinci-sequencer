@@ -71,6 +71,20 @@ prover, and drives these elections through them:
   backlog that extends the window round by round, and one that hits `graceMaxTotal`, with queued
   revotes and a node failover on the way.
 
+With `DAVINCI_E2E_DA=l1-blobs` the same scenario runs in L1-blob mode. The registry settles on the
+usual anvil (the OP side) through an `L1BlobVerifier` that reads a `MockL1Block`, and the blobs
+go to a second anvil (the Ethereum side: chain id 1, Osaka, 2 s blocks). An origin relayer in the
+harness copies the Ethereum block `DAVINCI_E2E_L1_LAG` (default 6) blocks behind the head into
+`MockL1Block`, as OP's derivation would. Each sequencer posts from its own Ethereum key (accounts
+5 to 7 of that anvil), every node reads blobs from the Ethereum anvil, and the scenario adds a
+node killed while its blob transaction waits in the paused Ethereum pool: after the restart it
+proves the batch again and replaces the pending transaction at its nonce with every fee doubled.
+DKG processes are refused (their key modes are not on OP Stack chains). With
+`DAVINCI_E2E_NEGATIVE=1` the L1 settlement is replayed tampered: blob mode's entry point
+(`WrongDAMode`), a broken header chain (`BrokenHeaderChain`), a transaction proof of another trie
+(`MerkleTrie: invalid root hash`), a swapped commitment (`InvalidBlobsDigest`), an extra blob
+(`BlobCountMismatch`) and a flipped proof byte (`InvalidProof`).
+
 Every process closes after its grace window, and the harness checks the boundaries through
 `eth_call`: the results call reverts `GraceOpen` in the block before the grace end, and a
 transition in the block after it reverts `InvalidTimeBounds`.
@@ -80,8 +94,9 @@ The nodes run with short timers (`BATCH_MAX=8`, `BATCH_TIME=3s`, `SOLO_WAIT=9s`,
 parameters are sized for real proofs (`davinci_e2e::chain::GRACE_ARGS`).
 
 ```bash
-make e2e                                     # log in /tmp/davinci-e2e.log
-DAVINCI_SEQUENCER_BIN=/path/to/bin make e2e  # use a prebuilt node binary
+make e2e E2E_LOG=$HOME/.cache/davinci-e2e/e2e.log                              # blob mode
+DAVINCI_E2E_DA=l1-blobs make e2e E2E_LOG=$HOME/.cache/davinci-e2e/e2e-l1.log   # L1-blob mode
+DAVINCI_SEQUENCER_BIN=/path/to/bin make e2e                                     # a prebuilt node binary
 ```
 
 `make e2e` runs the test in a memory-capped systemd scope (`E2E_MEMORY`, default `16G`; the log
@@ -97,6 +112,8 @@ prover. On failure the node logs, anvil log and datadirs are kept and their path
 | Variable | Effect |
 |---|---|
 | `DAVINCI_E2E_SETUP=1` | Runs only the part before the nodes: chain, contracts, processes and ballots. Needs neither the prover nor the node binary. |
+| `DAVINCI_E2E_DA=l1-blobs` | L1-blob mode, see above. With `DAVINCI_E2E_SETUP=1` it also checks that the relayer moves `MockL1Block` and that blob mode's entry point reverts `WrongDAMode`. |
+| `DAVINCI_E2E_L1_BLOCK_TIME`, `DAVINCI_E2E_L1_LAG` | L1-blob mode on anvil: the Ethereum anvil's block time (default 2 s) and the relayer's lag (default 6 blocks, at most 48). |
 | `DAVINCI_E2E_GRACE_ONLY=1` | Runs only the grace window phase. |
 | `DAVINCI_E2E_DKG=1` | Adds a DKG automatic process ended with a batch in flight, a locked one decrypted after the reveal, and a zero-vote one. On anvil the harness deploys the DKG contracts and runs three `davinci-dkg-node` operators, built from `DAVINCI_DKG_DIR` unless `DAVINCI_E2E_DKG_NODE_BIN` is set; their circuit artifacts (about 1.1 GB) go to `DAVINCI_E2E_DKG_ARTIFACTS`. |
 | `DAVINCI_E2E_NEGATIVE=1` | Replays settled transactions, tampered, through `eth_call` and requires each to revert with the expected error. |
