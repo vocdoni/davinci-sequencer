@@ -14,7 +14,7 @@ use alloy::sol_types::{SolEvent, SolValue};
 use davinci_client::Error;
 use davinci_client::api::{CensusView, ProcessId, ProcessStatus, ProcessView};
 use davinci_client::organizer::{
-    KeyMode, NewProcess, Organizer, OrganizerSecret, ProcessRegistry, RegistryReader,
+    KeyMode, NewProcess, Organizer, OrganizerSecret, ProcessRegistry, RegistryDa, RegistryReader,
     metadata_hash, verify_registry,
 };
 use davinci_zkvm_sdk::ballot::BallotMode;
@@ -67,23 +67,33 @@ async fn deploy(p: &impl Provider, code: Vec<u8>) -> anyhow::Result<Address> {
 }
 
 /// A registry pinned to the release, except for `chain_id`, `verifier` and
-/// `batch_vk`, with no DKG manager.
+/// `batch_vk`, with no DKG manager, in blob mode.
 async fn deploy_registry(
     p: &impl Provider,
     chain_id: u32,
     verifier: Address,
     batch_vk: [u8; 32],
 ) -> anyhow::Result<Address> {
-    deploy_registry_with(p, chain_id, verifier, batch_vk, Address::ZERO).await
+    deploy_registry_with(
+        p,
+        chain_id,
+        verifier,
+        batch_vk,
+        Address::ZERO,
+        Address::ZERO,
+    )
+    .await
 }
 
-/// [`deploy_registry`] with a Council manager.
+/// [`deploy_registry`] with a Council manager and an L1 blob verifier (zero:
+/// blob mode).
 async fn deploy_registry_with(
     p: &impl Provider,
     chain_id: u32,
     verifier: Address,
     batch_vk: [u8; 32],
     council_manager: Address,
+    l1_blob_verifier: Address,
 ) -> anyhow::Result<Address> {
     let vk_hash = BallotVerifier::from_snarkjs_json(release::ballot_vk_json())?.vk_hash();
     let args = (
@@ -100,7 +110,7 @@ async fn deploy_registry_with(
     let mut code = registry_bytecode();
     code.extend_from_slice(&args);
     code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
-    code.extend_from_slice(&Address::ZERO.abi_encode()); // _l1BlobVerifier: blob mode
+    code.extend_from_slice(&l1_blob_verifier.abi_encode());
     deploy(p, code).await
 }
 
@@ -121,6 +131,7 @@ async fn registry_pins() -> anyhow::Result<()> {
 
     let good = deploy_registry(&p, 31337, verifier, vk).await?;
     let info = verify_registry(&url, good).await?;
+    assert_eq!(info.da, RegistryDa::Blobs);
     assert_eq!(
         (
             info.chain_id,
@@ -159,7 +170,7 @@ async fn registry_pins() -> anyhow::Result<()> {
         bytecode("MockCouncilManager.sol/MockCouncilManager.json"),
     )
     .await?;
-    let r = deploy_registry_with(&p, 31337, verifier, vk, manager).await?;
+    let r = deploy_registry_with(&p, 31337, verifier, vk, manager, Address::ZERO).await?;
     let info = verify_registry(&url, r).await?;
     let adapter = info.council_adapter.expect("a Council adapter");
     assert_eq!(
@@ -167,6 +178,21 @@ async fn registry_pins() -> anyhow::Result<()> {
         ProcessRegistry::new(r, &p).councilAdapter().call().await?
     );
     assert_eq!(info.dkg_adapter, None);
+
+    // L1-blob mode: the verifier and the L1Block it reads come back.
+    let l1_block = deploy(&p, bytecode("MockL1Block.sol/MockL1Block.json")).await?;
+    let mut code = bytecode("L1BlobVerifier.sol/L1BlobVerifier.json");
+    code.extend_from_slice(&l1_block.abi_encode());
+    let l1v = deploy(&p, code).await?;
+    let r = deploy_registry_with(&p, 31337, verifier, vk, Address::ZERO, l1v).await?;
+    let info = verify_registry(&url, r).await?;
+    assert_eq!(
+        info.da,
+        RegistryDa::L1Blobs {
+            verifier: l1v,
+            l1_block
+        }
+    );
     Ok(())
 }
 
