@@ -20,7 +20,7 @@ the RPC list, the blob source and the confirmations.
 | `gnosis` | 100 | `https://gnosis-rpc.publicnode.com`, `https://gnosis-rpc.blockreq.com/v1/rpc/public`, `https://rpc.gnosischain.com` | `beacon:https://rpc-gbc.gnosischain.com` | 3 |
 | `optimism` | 10 | `https://optimism-rpc.publicnode.com`, `https://mainnet.optimism.io` | `beacon:https://ethereum-beacon-api.publicnode.com` (Ethereum) | 1 |
 
-The `optimism` preset is in L1-blob mode and is not deployed yet: its registry is the zero address, so `--network optimism` refuses to start without `--registry` until a release fills it in.
+The `optimism` preset is in L1-blob mode: its transitions settle on OP Mainnet and its blobs go to Ethereum, see [L1-blob mode](#l1-blob-mode) and [deployments.md](deployments.md#op-mainnet).
 
 The registry of each network is listed in [deployments.md](deployments.md).
 
