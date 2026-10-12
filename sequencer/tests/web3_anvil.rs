@@ -36,11 +36,12 @@ const BALLOT_VK_HASH: [u8; 32] = [0x44; 32];
 const NF: u8 = 4;
 /// Registry grace constructor args: default, floor, ceil, max total, notice.
 const GRACE_ARGS: (u32, u32, u32, u32, u32) = (10, 2, 60, 60, 5);
-/// Registry constructor args after `_dkgManager`: `_councilManager`, then the
-/// grace window.
+/// Registry constructor args after `_dkgManager`: `_councilManager`, the grace
+/// window, then `_l1BlobVerifier` (zero: blob mode).
 fn ctor_tail(council_manager: Address) -> Vec<u8> {
     let mut v = council_manager.abi_encode();
     v.extend(GRACE_ARGS.abi_encode_params());
+    v.extend(Address::ZERO.abi_encode());
     v
 }
 

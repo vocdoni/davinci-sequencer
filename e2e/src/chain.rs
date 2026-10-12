@@ -236,6 +236,7 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
     let mut code = bytecode(dir, "ProcessRegistry.sol/ProcessRegistry.json")?;
     code.extend_from_slice(&args);
     code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
+    code.extend_from_slice(&Address::ZERO.abi_encode()); // _l1BlobVerifier: blob mode
     let registry = deploy_code(&provider, code)
         .await
         .context("deploy ProcessRegistry")?;

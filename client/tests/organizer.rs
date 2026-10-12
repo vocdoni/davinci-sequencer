@@ -100,6 +100,7 @@ async fn deploy_registry_with(
     let mut code = registry_bytecode();
     code.extend_from_slice(&args);
     code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
+    code.extend_from_slice(&Address::ZERO.abi_encode()); // _l1BlobVerifier: blob mode
     deploy(p, code).await
 }
 
@@ -196,6 +197,7 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
     let mut code = registry_bytecode();
     code.extend_from_slice(&args);
     code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
+    code.extend_from_slice(&Address::ZERO.abi_encode()); // _l1BlobVerifier: blob mode
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(url.parse()?);
@@ -743,6 +745,7 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
             .abi_encode_params(),
     );
     code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
+    code.extend_from_slice(&Address::ZERO.abi_encode()); // _l1BlobVerifier: blob mode
     let registry = deploy(&p, code).await?;
     let info = verify_registry(&url, registry).await?;
     assert!(info.dkg_adapter.is_some(), "registry has a DKG adapter");
