@@ -18,11 +18,13 @@ use davinci_client::organizer::ProcessRegistry;
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
 
-/// anvil's default dev accounts 0..=8 (public test keys). Account 0 deploys
+/// anvil's default dev accounts 0..=9 (public test keys). Account 0 deploys
 /// and organizes; 1..=3 sign the nodes' settlements; 4 owns the census
 /// contract (its own nonces, apart from the organizer's cached ones); 5..=7
-/// are the DKG operators and 8 deploys the DKG (`crate::dkg`).
-pub const DEV_KEYS: [&str; 9] = [
+/// are the DKG operators and 8 deploys the DKG (`crate::dkg`). In L1-blob
+/// mode 9 moves the OP anvil's `MockL1Block` and, on the Ethereum anvil,
+/// 5..=7 are the sequencers' blob keys (`crate::l1`).
+pub const DEV_KEYS: [&str; 10] = [
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
     "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
     "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
@@ -32,6 +34,7 @@ pub const DEV_KEYS: [&str; 9] = [
     "92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e",
     "4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
     "dbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97",
+    "2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6",
 ];
 
 sol! {
@@ -67,7 +70,8 @@ pub fn ballot_vk_hash() -> Result<[u8; 32]> {
     Ok(BallotVerifier::from_snarkjs_json(release::ballot_vk_json())?.vk_hash())
 }
 
-/// anvil with Osaka and 1 s blocks; its output goes to `log`. Killed on drop.
+/// anvil with Osaka and 1 s blocks (or `block_time`); its output goes to
+/// `log`. Killed on drop.
 pub struct Anvil {
     child: Child,
     pub url: String,
@@ -83,17 +87,22 @@ impl Drop for Anvil {
 
 impl Anvil {
     pub async fn start(log: &Path) -> Result<Anvil> {
+        Anvil::start_with(log, 1, None).await
+    }
+
+    /// [`Anvil::start`] with a block every `block_time` seconds and, if
+    /// given, chain id `chain_id` (anvil's default is 31337).
+    pub async fn start_with(log: &Path, block_time: u64, chain_id: Option<u64>) -> Result<Anvil> {
         let port = free_port()?;
         let out = File::create(log)?;
-        let child = Command::new(foundry_tool("anvil"))
-            .args([
-                "--hardfork",
-                "osaka",
-                "--block-time",
-                "1",
-                "--host",
-                "127.0.0.1",
-            ])
+        let mut cmd = Command::new(foundry_tool("anvil"));
+        if let Some(id) = chain_id {
+            cmd.args(["--chain-id", &id.to_string()]);
+        }
+        let child = cmd
+            .args(["--hardfork", "osaka", "--block-time"])
+            .arg(block_time.to_string())
+            .args(["--host", "127.0.0.1"])
             .args(["--port", &port.to_string()])
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
@@ -187,6 +196,10 @@ pub struct Deployment {
     pub registry: Address,
     /// The registry's `DavinciDKGAdapter`; zero without a `dkg_manager`.
     pub dkg_adapter: Address,
+    /// L1-blob mode: the registry's `L1BlobVerifier` and the `MockL1Block`
+    /// it reads OP's origin from; zero in blob mode.
+    pub l1_blob_verifier: Address,
+    pub l1_block: Address,
 }
 
 /// Grace immutables of the anvil registry, in seconds: `defaultGrace,
@@ -200,6 +213,17 @@ pub const GRACE_ARGS: (u32, u32, u32, u32, u32) = (120, 40, 180, 240, 5);
 /// the release vks, the ballot VK hash and [`GRACE_ARGS`], with `dkg_manager`
 /// (zero disables the DKG key modes), then reads the pins back.
 pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deployment> {
+    deploy_with(url, dir, dkg_manager, false).await
+}
+
+/// [`deploy`] in L1-blob mode, for an OP-like anvil: `MockL1Block`, then an
+/// `L1BlobVerifier` that reads it, then the registry on that verifier. No
+/// DKG: its key modes are not on OP Stack chains.
+pub async fn deploy_l1(url: &str, dir: &Path) -> Result<Deployment> {
+    deploy_with(url, dir, Address::ZERO, true).await
+}
+
+async fn deploy_with(url: &str, dir: &Path, dkg_manager: Address, l1: bool) -> Result<Deployment> {
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer(0)?))
         .connect_client(rpc(url)?)
@@ -221,6 +245,24 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
         "the verifier's rootCVadcopFinal {root_c} is not the release pin"
     );
 
+    // Blob mode deploys nothing more, so its addresses stay what they were.
+    let (l1_block, l1_blob_verifier) = if l1 {
+        let mock = deploy_code(
+            &provider,
+            bytecode(dir, "MockL1Block.sol/MockL1Block.json")?,
+        )
+        .await
+        .context("deploy MockL1Block")?;
+        let mut code = bytecode(dir, "L1BlobVerifier.sol/L1BlobVerifier.json")?;
+        code.extend_from_slice(&mock.abi_encode());
+        let v = deploy_code(&provider, code)
+            .await
+            .context("deploy L1BlobVerifier")?;
+        (mock, v)
+    } else {
+        (Address::ZERO, Address::ZERO)
+    };
+
     let vk_hash = B256::from(ballot_vk_hash()?);
     let args = (
         u32::try_from(chain_id)?,
@@ -236,7 +278,7 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
     let mut code = bytecode(dir, "ProcessRegistry.sol/ProcessRegistry.json")?;
     code.extend_from_slice(&args);
     code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
-    code.extend_from_slice(&Address::ZERO.abi_encode()); // _l1BlobVerifier: blob mode
+    code.extend_from_slice(&l1_blob_verifier.abi_encode()); // zero: blob mode
     let registry = deploy_code(&provider, code)
         .await
         .context("deploy ProcessRegistry")?;
@@ -256,6 +298,7 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
             r.noticeMin().call().await?,
         ) == GRACE_ARGS
     );
+    ensure!(r.l1BlobVerifier().call().await? == l1_blob_verifier);
     let dkg_adapter = r.dkgAdapter().call().await?;
     ensure!(
         (dkg_adapter == Address::ZERO) == (dkg_manager == Address::ZERO),
@@ -266,6 +309,8 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
         verifier,
         registry,
         dkg_adapter,
+        l1_blob_verifier,
+        l1_block,
     })
 }
 
