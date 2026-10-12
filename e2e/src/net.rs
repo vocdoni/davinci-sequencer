@@ -10,6 +10,9 @@
 //! Unset, they default to the Gnosis deployment of `davinci_client::networks`.
 //! With `DAVINCI_E2E_DKG=1`, `DAVINCI_E2E_DKG_MANAGER` names the external
 //! committee's DKGManager. Unset, it is the manager of the registry's adapter.
+//!
+//! `DAVINCI_E2E_DA=l1-blobs` runs the registry in L1-blob mode, see
+//! [`crate::l1`]: on anvil a second, Ethereum-like anvil and an origin relayer.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,11 +22,12 @@ use alloy::primitives::{Address, U256, utils::format_ether};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail, ensure};
-use davinci_client::networks::GNOSIS;
-use davinci_client::organizer::{Organizer, verify_registry};
+use davinci_client::networks::{GNOSIS, OP_L1_BLOCK};
+use davinci_client::organizer::{Organizer, RegistryDa, verify_registry};
 
 use crate::chain::{self, Anvil, DEV_KEYS};
 use crate::dkg::{self, DkgStack, DkgWiring};
+use crate::l1::{self, L1Net};
 use crate::node::NodeConfig;
 
 /// Least balance each funded account needs for a live run (0.05 xDAI).
@@ -143,6 +147,12 @@ pub struct Net {
     /// The committee's nodes on anvil. Declared before `anvil` so they die
     /// first.
     pub dkg_stack: Option<DkgStack>,
+    /// L1-blob mode: Ethereum, the sequencers' Ethereum keys and, on anvil,
+    /// the Ethereum anvil and its relayer. Declared before `anvil`: the
+    /// relayer writes to it.
+    pub l1: Option<L1Net>,
+    /// Least native balance of each funded account ([`Net::check_balances`]).
+    pub min_balance: U256,
     pub anvil: Option<Anvil>,
 }
 
@@ -165,6 +175,32 @@ impl Net {
             "chain {} registry {} verifier {} (pins ok)",
             net.chain_id, net.registry, info.verifier
         );
+        match (net.l1.as_mut(), info.da) {
+            (None, RegistryDa::Blobs) => {}
+            (Some(l1), RegistryDa::L1Blobs { verifier, l1_block }) => {
+                if l1.anvil.is_some() {
+                    ensure!(
+                        (verifier, l1_block) == (l1.verifier, l1.l1_block),
+                        "registry verifier {verifier} on L1Block {l1_block}, deployed {} on {}",
+                        l1.verifier,
+                        l1.l1_block
+                    );
+                } else {
+                    ensure!(
+                        l1_block == OP_L1_BLOCK,
+                        "the registry's verifier reads L1Block at {l1_block}, not OP's predeploy"
+                    );
+                }
+                (l1.verifier, l1.l1_block) = (verifier, l1_block);
+                eprintln!("L1-blob mode: L1BlobVerifier {verifier} on L1Block {l1_block}");
+            }
+            (None, da) => {
+                bail!("the registry is in L1-blob mode ({da:?}): set DAVINCI_E2E_DA=l1-blobs")
+            }
+            (Some(_), RegistryDa::Blobs) => {
+                bail!("L1-blob mode asked for, but the registry is in blob mode")
+            }
+        }
         if dkg::enabled() {
             let manager = match (&net.dkg_stack, std::env::var("DAVINCI_E2E_DKG_MANAGER")) {
                 (Some(s), _) => s.deployment.manager,
@@ -236,11 +272,18 @@ impl Net {
             poll: env_or("DAVINCI_E2E_POLL", "5s"),
             dkg: None,
             dkg_stack: None,
+            l1: None,
+            min_balance: U256::from(MIN_BALANCE),
             anvil: None,
         })
     }
 
     async fn anvil(dir: &Path) -> Result<Net> {
+        let l1_mode = l1::enabled()?;
+        ensure!(
+            !(l1_mode && dkg::enabled()),
+            "DAVINCI_E2E_DKG: the DKG key modes are not on OP Stack chains (L1-blob mode)"
+        );
         let contracts = chain::contracts_dir();
         chain::forge_build(&contracts)?;
         let anvil = Anvil::start(&dir.join("anvil.log")).await?;
@@ -254,7 +297,13 @@ impl Net {
         let manager = dkg_stack
             .as_ref()
             .map_or(Address::ZERO, |d| d.deployment.manager);
-        let dep = chain::deploy(&anvil.url, &contracts, manager).await?;
+        let (dep, l1) = if l1_mode {
+            let dep = chain::deploy_l1(&anvil.url, &contracts).await?;
+            let l1 = l1::anvil_net(dir, &anvil.url, &dep).await?;
+            (dep, Some(l1))
+        } else {
+            (chain::deploy(&anvil.url, &contracts, manager).await?, None)
+        };
         let keys = dir.join("keys");
         std::fs::create_dir_all(&keys)?;
         let mut sequencers = Vec::new();
@@ -279,6 +328,8 @@ impl Net {
             poll: "1s".into(),
             dkg: None,
             dkg_stack,
+            l1,
+            min_balance: U256::from(MIN_BALANCE),
             anvil: Some(anvil),
         })
     }
@@ -309,7 +360,8 @@ impl Net {
     }
 
     /// Prints each funded account's address and balance; fails below
-    /// [`MIN_BALANCE`] (the first `n_seq` sequencers only).
+    /// `min_balance` (the first `n_seq` sequencers only). In L1-blob mode also
+    /// their Ethereum keys.
     pub async fn check_balances(&self, n_seq: usize) -> Result<()> {
         ensure!(
             self.sequencers.len() >= n_seq,
@@ -327,16 +379,19 @@ impl Net {
         for (who, a) in accounts {
             let b = p.get_balance(a).await?;
             eprintln!("{who:<12} {a} balance {}", format_ether(b));
-            if b < U256::from(MIN_BALANCE) {
+            if b < self.min_balance {
                 low.push(format!("{who} {a}"));
             }
         }
         if !low.is_empty() {
             bail!(
                 "below {} native: {}",
-                format_ether(U256::from(MIN_BALANCE)),
+                format_ether(self.min_balance),
                 low.join(", ")
             );
+        }
+        if let Some(l1) = &self.l1 {
+            l1.check_balances(n_seq).await?;
         }
         Ok(())
     }
@@ -376,6 +431,22 @@ impl Net {
             c.flush_horizon = None;
             c.prove_base = None;
             c.settle_margin = Some("20s".into());
+        }
+        if let Some(l1) = &self.l1 {
+            c.l1_rpc_url = Some(l1.rpc.clone());
+            c.l1_send_rpc_url = l1.send_rpc.clone();
+            c.l1_privkey_file = seq
+                .map(|i| {
+                    l1.keys
+                        .get(i)
+                        .map(|(p, _)| p.clone())
+                        .context("no Ethereum key for this sequencer")
+                })
+                .transpose()?;
+            c.l1_max_post_fee = l1.max_post_fee.clone();
+            // A landing also waits for OP's origin to pass the blob block:
+            // about lag x block time on anvil, 90-100 s on OP Mainnet.
+            c.settle_margin = Some(if self.live { "120s" } else { "15s" }.into());
         }
         c.start_block = self.start_block;
         Ok(c)

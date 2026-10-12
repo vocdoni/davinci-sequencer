@@ -47,7 +47,7 @@ arbo also has fuzz targets: `cd arbo && cargo +nightly fuzz run <target>`.
 
 `.github/workflows/main.yml` checks the siblings out next to this repository at the refs listed at
 the top of the workflow. It runs fmt and clippy, `cargo test --workspace` with `ANVIL=1`, the
-e2e setup phase (`DAVINCI_E2E_SETUP=1`), the emulator dry runs on a CPU-only ZisK, and the Docker
+e2e setup phase (`DAVINCI_E2E_SETUP=1`) in blob mode and in L1-blob mode, the emulator dry runs on a CPU-only ZisK, and the Docker
 build. No job needs a GPU prover. Branch pushes publish the image under the branch name; a release
 tag `vX.Y.Z` publishes `:vX.Y.Z` and moves `:latest` to it, while prerelease tags do not.
 

@@ -52,6 +52,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use alloy::primitives::{Bytes, FixedBytes};
+use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, bail, ensure};
 use davinci_client::Error as ClientError;
 use davinci_client::api::{
@@ -59,7 +61,7 @@ use davinci_client::api::{
 };
 use davinci_client::organizer::{
     CreatedProcess, KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret,
-    RegistryReader, merkle_census,
+    ProcessRegistry, RegistryReader, merkle_census,
 };
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::Voter;
@@ -68,6 +70,7 @@ use davinci_e2e::chain;
 use davinci_e2e::cost::{self, TxCost};
 use davinci_e2e::dkg::{self, DkgWiring};
 use davinci_e2e::fixture as fx;
+use davinci_e2e::l1;
 use davinci_e2e::negative;
 use davinci_e2e::net::{self, Net};
 use davinci_e2e::node::{self, Metrics, Node, NodeConfig, WorkDir};
@@ -400,6 +403,32 @@ async fn setup_checks(
     voters[4].prepare_vote(&p3, &fx::choices(4, 1), w, fx::WEIGHT, k)?;
     say!("dynamic census setup ok");
     bill.extend(c.receipts().iter().map(|(l, r)| TxCost::of(l.clone(), r)));
+
+    // L1-blob mode: OP's origin follows Ethereum, and blob mode's entry
+    // point is refused before anything else is read.
+    if let Some(l1) = &net.l1 {
+        let origin = l1::check_origin(&net.rpc, l1).await?;
+        let blob_call = ProcessRegistry::submitStateTransitionCall {
+            processId: FixedBytes(p1.id),
+            publicValues: Bytes::new(),
+            proofBytes: Bytes::new(),
+            commitments: Vec::new(),
+            ys: Vec::new(),
+            kzgProofs: Vec::new(),
+        };
+        let got = negative::simulate(
+            &net.rpc,
+            org.address(),
+            net.registry,
+            blob_call.abi_encode(),
+        )
+        .await?;
+        ensure!(
+            got == negative::Outcome::Reverted("WrongDAMode".into()),
+            "submitStateTransition on an L1-mode registry: {got}"
+        );
+        say!("L1-blob setup ok: OP origin at Ethereum block {origin}, blob entry point refused");
+    }
 
     // DKG: both modes take the committee's key (the locked one through the
     // real PoP check), and registration stays open to any account.

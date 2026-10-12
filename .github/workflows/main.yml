@@ -165,6 +165,15 @@ jobs:
           DAVINCI_E2E_SETUP: "1"
         run: cargo test -p davinci-e2e --test e2e --locked setup_without_nodes -- --nocapture
 
+      # The same in L1-blob mode: a second (Ethereum-like) anvil, the origin
+      # relayer and the registry on an L1BlobVerifier.
+      - name: Run e2e setup (L1-blob mode)
+        working-directory: davinci-sequencer
+        env:
+          DAVINCI_E2E_SETUP: "1"
+          DAVINCI_E2E_DA: l1-blobs
+        run: cargo test -p davinci-e2e --test e2e --locked setup_without_nodes -- --nocapture
+
   emulator:
     name: Emulator
     runs-on: [self-hosted]
