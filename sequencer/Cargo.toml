@@ -38,6 +38,8 @@ tokio-util = { workspace = true, features = ["rt"] }
 tower = { workspace = true }
 alloy = { workspace = true, features = [
     "std",
+    "trie",
+    "rlp",
     "contract",
     "provider-http",
     "rpc-types",
