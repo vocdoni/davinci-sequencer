@@ -32,11 +32,14 @@ a skip line and pass, so check the output before assuming they ran.
 |---|---|---|
 | `ZISKEMU=1 cargo test -p davinci-state --test dryrun -- --test-threads=1` | `ziskemu` and the circuit ELF | Rust-built transitions through the real circuit on the emulator, all 64 outputs compared. No GPU. |
 | `ANVIL=1 cargo test -p davinci-sequencer --test web3_anvil` | anvil, davinci-contracts build | One- and two-blob transitions and results on a real registry. |
+| `ANVIL=1 cargo test -p davinci-sequencer --test web3_anvil l1_blob_mode` | anvil, davinci-contracts build with `L1BlobVerifier` and `MockL1Block` | L1-blob mode on two anvils: blob post, settlement, recorded anchor, origin mismatch, reorg re-post, dropped-post replacement. |
 | `ANVIL=1 cargo test -p davinci-client --test organizer` | anvil, davinci-contracts build | The organizer against a real registry. |
 | `ANVIL=1 cargo test -p davinci-sequencer --test census_anvil` (and `--test api`) | anvil, census contract build | The on-chain census index: incremental sync, restart, reorg, origin-3 votes. |
 | `CIRCOM_ARTIFACTS=<dir> cargo test -p davinci-client --test prover` | circom artifacts | The ballot prover. |
 | `cargo test -p arbo --features sdk-poseidon` | nothing extra | arbo's circom Poseidon vectors. |
 | `ARBO_BENCH_1M=1 cargo bench -p arbo` | nothing extra | arbo benchmarks with the 1M-leaf rows. |
+
+`--test l1da` (poster and settle loop) and `--test actor_l1` (the actor in L1-blob mode) run on scripted fakes with no gate.
 
 arbo also has fuzz targets: `cd arbo && cargo +nightly fuzz run <target>`.
 

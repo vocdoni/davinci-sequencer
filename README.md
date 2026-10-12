@@ -112,6 +112,8 @@ Every flag has a `DAVINCI_*` environment variable. The ones operators usually se
 | `DAVINCI_NETWORK` | `--network` | `gnosis` | Network preset, or `custom` with explicit chain settings. |
 | `DAVINCI_RPC_URL` | `--rpc-url` | network | Execution-layer JSON-RPC endpoints, comma-separated for failover. |
 | `DAVINCI_BLOB_SOURCE` | `--blob-source` | network | `beacon:<url>[,<url>...]`, or `anvil` on a local chain. |
+| `DAVINCI_L1_RPC_URL` | `--l1-rpc-url` | network | L1-blob mode (OP Stack registries): Ethereum JSON-RPC endpoints. |
+| `DAVINCI_L1_PRIVKEY_FILE` | `--l1-privkey-file` | unset | L1-blob mode: the dedicated Ethereum key that posts blobs. |
 | `DAVINCI_DATADIR` | `--datadir` | `~/.davinci-sequencer` | Database directory. |
 | `DAVINCI_API_PORT` | `--api-port` | `9090` | HTTP API port. |
 | `DAVINCI_BATCH_TIME` | `--batch-time` | `15m` | How long the oldest pending vote waits before its batch seals. |
