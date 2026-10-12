@@ -110,3 +110,43 @@ was included within one or two OP blocks.
 About 38 µETH on Ethereum (seven blob transactions, about 0.10 USD) and under 1 µETH on OP
 (deployment and seven settlements). Balances after the runs: 0.003703 ETH on Ethereum,
 0.001807 ETH on OP.
+
+## Review (Fable 5.1) and next steps
+
+The results validate the core claim; the SSZ path (header padded to 8 leaves, body field 11 of
+16, list of 4096 with length mix-in, gindex `27·8192 + index`) holds for Deneb, Electra and
+Fulu. What production needs beyond the PoC:
+
+- **Fork robustness without a kill switch.** EIP-7732 (ePBS) moves `blob_kzg_commitments` out of
+  the beacon block body, so the beacon-layout proof breaks there, and an upgradable verifier
+  behind a timelock would be a governance key. Alternative to evaluate: prove through the
+  execution layer. OP's `L1Block` predeploy exposes the L1 origin's block hash; the contract
+  checks the RLP header (keccak equals `L1Block.hash()`, walking `parentHash` back a few headers
+  if needed), takes `transactionsRoot` (header field 4), verifies a Merkle-Patricia proof of the
+  type-3 transaction and reads its `blob_versioned_hashes` (field 10), then opens each commitment
+  with `0x0A` as today. Header fields are only appended at forks and the type-3 format is frozen,
+  so this survives ePBS and needs no beacon API on the critical path; about +30-60k gas.
+  Open detail: `L1Block` only holds the current origin, so a settlement that lands just after the
+  origin advances reverts and must be resent (or the hash must be recorded on OP beforehand).
+- **Settlement deadline (beacon path).** OP's 4788 buffer covers about 4.5 h; a transition not
+  settled within that window after its blob's block must re-post the blob. The execution-layer
+  path removes this limit.
+- **Production contract:** take `rootBefore` from `publicValues` and compare the digest with
+  `REG_BLOBS_DIGEST` (the PoC only computes them).
+- **Blob groups across transactions.** Each commitment is proven on its own, so one transition's
+  blobs may span several L1 transactions or blocks; that lifts the 6-blob-per-transaction cap to
+  the guest's `MAX_BLOBS = 32` (about 4 MB, ~2,000 votes at 16 fields) for one PLONK verification.
+- **Sequencer:** a dedicated L1 account for blob transactions, one in flight (the blob pool
+  requires a 100 % fee bump to replace and forbids nonce gaps), blob fee cap at least 2× the
+  current fee, a per-transition fee ceiling to wait out spikes within the grace window, and blob
+  sources for followers beyond supernode beacon APIs (own archive, peers; bytes are
+  self-authenticating against the commitment). Build inclusion proofs locally rather than relying
+  on `blob_sidecars`, which only supernodes serve after PeerDAS.
+- **Posting policy:** posting the blobs at proving start reveals nothing blob mode does not already
+  publish, costs at most one wasted blob transaction (0.003-0.008 USD) when a proof fails, and
+  saved 60-80 s per transition in the PoC. Owner decision.
+
+Suggested next steps: (1) a short PoC phase 2 with the execution-layer proof (RLP header + MPT
+transaction proof) and a two-transaction blob group, measured on OP Mainnet; (2) a new spec for a
+deploy-time registry mode "L1 blobs + OP settlement" next to today's BLOBHASH mode, no zkVM
+change; (3) sequencer support.
