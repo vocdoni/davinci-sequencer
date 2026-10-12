@@ -348,6 +348,9 @@ pub struct Inner {
     /// The next L1 settlement "lands" with neither an event nor a state
     /// change: an OP reorg took it.
     vanish_l1_submit: bool,
+    /// While set, an L1 settlement lands (state and event) but its receipt
+    /// waits here: the event can beat the sender's receipt.
+    l1_submit_gate: Option<Arc<Semaphore>>,
 }
 
 #[derive(Clone)]
@@ -439,6 +442,7 @@ impl FakeChain {
             l1_last_headers: 0,
             l1_last: None,
             vanish_l1_submit: false,
+            l1_submit_gate: None,
         };
         FakeChain {
             inner: Arc::new(Mutex::new(inner)),
@@ -470,6 +474,17 @@ impl FakeChain {
     /// The next L1 settlement returns a receipt but never lands.
     pub fn vanish_next_l1_submit(&self) {
         self.inner.lock().unwrap().vanish_l1_submit = true;
+    }
+
+    /// Holds the receipts of landed L1 settlements until called with false.
+    pub fn gate_l1_submits(&self, on: bool) {
+        let mut i = self.inner.lock().unwrap();
+        if let Some(g) = i.l1_submit_gate.take() {
+            g.close();
+        }
+        if on {
+            i.l1_submit_gate = Some(Arc::new(Semaphore::new(0)));
+        }
     }
 
     pub fn with_signer(&self, byte: u8) -> FakeChain {
@@ -1516,48 +1531,68 @@ impl Chain for FakeChain {
         };
         let p = BatchPublics::from_public_values(&snark.public_values)
             .map_err(|e| Web3Error::Data(e.to_string()))?;
-        let mut i = self.inner.lock().unwrap();
-        if i.fail_submits > 0 {
-            i.fail_submits -= 1;
-            return Err(Web3Error::Rpc("scripted submit failure".into()));
+        let (rc, gate) = {
+            let mut i = self.inner.lock().unwrap();
+            let rc = land_l1(&mut i, pid, sender, &p, blobs, proof)?;
+            (rc, i.l1_submit_gate.clone())
+        };
+        if let Some(g) = gate {
+            // Closed (opened by the test) or held until the job is dropped.
+            let _ = g.acquire().await;
         }
-        if let Some(b) = i.race_submit.take() {
-            let block = settle_foreign(&mut i, &b);
-            if check_transition(&i, &p).is_err() {
-                return Err(Web3Error::Lost {
-                    tx_hash: B256::repeat_byte(0x10),
-                    block,
-                });
-            }
-        }
-        check_transition(&i, &p).map_err(Web3Error::Revert)?;
-        let blocks = check_l1_proof(&i, blobs, proof).map_err(Web3Error::Revert)?;
-        if std::mem::take(&mut i.vanish_l1_submit) {
-            return Ok(TxReceipt {
-                tx_hash: B256::repeat_byte(0x77),
-                block: i.block,
-                gas_used: 0,
-                replacements: 0,
+        Ok(rc)
+    }
+}
+
+// `submitStateTransitionL1` on the fake registry.
+fn land_l1(
+    i: &mut Inner,
+    pid: &[u8; 31],
+    sender: Address,
+    p: &BatchPublics,
+    blobs: &TransitionBlobs,
+    proof: &L1BlobProof,
+) -> Result<TxReceipt, Web3Error> {
+    if i.fail_submits > 0 {
+        i.fail_submits -= 1;
+        return Err(Web3Error::Rpc("scripted submit failure".into()));
+    }
+    if let Some(b) = i.race_submit.take() {
+        let block = settle_foreign(i, &b);
+        if check_transition(i, p).is_err() {
+            return Err(Web3Error::Lost {
+                tx_hash: B256::repeat_byte(0x10),
+                block,
             });
         }
-        let l1 = L1Blobs {
-            blocks,
-            vhs: blobs
-                .versioned_hashes
-                .iter()
-                .map(|h| B256::from(*h))
-                .collect(),
-        };
-        i.l1_last_headers = proof.headers.len();
-        i.l1_last = Some(l1.clone());
-        let tx = land(&mut i, pid, sender, &p, blobs.blobs.len() as u64, Some(l1));
-        Ok(TxReceipt {
-            tx_hash: tx,
+    }
+    check_transition(i, p).map_err(Web3Error::Revert)?;
+    let blocks = check_l1_proof(i, blobs, proof).map_err(Web3Error::Revert)?;
+    if std::mem::take(&mut i.vanish_l1_submit) {
+        return Ok(TxReceipt {
+            tx_hash: B256::repeat_byte(0x77),
             block: i.block,
             gas_used: 0,
             replacements: 0,
-        })
+        });
     }
+    let l1 = L1Blobs {
+        blocks,
+        vhs: blobs
+            .versioned_hashes
+            .iter()
+            .map(|h| B256::from(*h))
+            .collect(),
+    };
+    i.l1_last_headers = proof.headers.len();
+    i.l1_last = Some(l1.clone());
+    let tx = land(i, pid, sender, p, blobs.blobs.len() as u64, Some(l1));
+    Ok(TxReceipt {
+        tx_hash: tx,
+        block: i.block,
+        gas_used: 0,
+        replacements: 0,
+    })
 }
 
 pub struct FakeBlobs(Arc<Mutex<Inner>>);

@@ -207,9 +207,9 @@ pub struct L1Rpc {
     chain_id: u64,
     signer: Option<Address>,
     wallet: Option<EthereumWallet>,
+    /// Flipped by every sidecar-version refusal: an endpoint set mixing
+    /// versions (around a fork) may want either.
     cell_proofs: AtomicBool,
-    /// The sidecar version was switched once after a refusal.
-    switched: AtomicBool,
     blob_cap: Option<usize>,
     /// The last sidecar built (one post at a time): its replacements reuse it.
     sidecar: tokio::sync::Mutex<Option<(B256, bool, Arc<BlobTransactionSidecarVariant>)>>,
@@ -228,7 +228,7 @@ impl std::fmt::Debug for L1Rpc {
 
 impl L1Rpc {
     /// Connects to `rpcs` and, for blob sends, `send` (empty: `rpcs`). Fails
-    /// if an endpoint set is on another chain or none answers; fixes the
+    /// if an endpoint set is on another chain or none answers; picks the
     /// sidecar version and reads the blob cap of this chain.
     pub async fn connect(
         rpcs: &[Url],
@@ -270,7 +270,6 @@ impl L1Rpc {
             signer,
             wallet,
             cell_proofs: AtomicBool::new(cell_proofs),
-            switched: AtomicBool::new(false),
             blob_cap,
             sidecar: Default::default(),
         })
@@ -411,10 +410,8 @@ impl L1Chain for L1Rpc {
         match send_error(&e) {
             None => Ok(()),
             Some(L1SendError::Sidecar(m)) => {
-                // Once: the next signature uses the other version.
-                if !self.switched.swap(true, Ordering::Relaxed) {
-                    self.cell_proofs.fetch_xor(true, Ordering::Relaxed);
-                }
+                // The next signature uses the other version.
+                self.cell_proofs.fetch_xor(true, Ordering::Relaxed);
                 Err(L1SendError::Sidecar(m))
             }
             Some(e) => Err(e),

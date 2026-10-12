@@ -19,8 +19,8 @@ use crate::web3::{L1Chain, L1Origin, TxReceipt};
 
 pub use post::{PostError, Posted, Poster, REPLACE_AFTER};
 pub use settle::{
-    Anchor, CURRENT_MAX_HEADERS, GONE_POLLS, L1_MAX_AGE, MAX_L1_PROOF_HEADERS, MAX_PROOF_RETRIES,
-    MAX_REPOSTS, REORG_MARGIN, TOP_ABOVE_ORIGIN, choose_anchor, settle,
+    Anchor, CURRENT_MAX_HEADERS, GONE_FOR, L1_MAX_AGE, MAX_L1_PROOF_HEADERS, MAX_PROOF_RETRIES,
+    MAX_REPOSTS, PROOF_FAIL_FOR, REORG_MARGIN, TOP_ABOVE_ORIGIN, choose_anchor, settle,
 };
 
 /// The Ethereum side of a node in L1-blob mode.

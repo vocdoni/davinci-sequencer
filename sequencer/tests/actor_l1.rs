@@ -165,7 +165,9 @@ async fn l1_dropped_post_is_replaced_after_three_blocks() {
     shutdown.cancel();
 }
 
-#[tokio::test]
+// Paused: whether the poster or the settle loop sees the reorg first, the
+// latter waits GONE_FOR before posting again.
+#[tokio::test(start_paused = true)]
 async fn l1_reorged_post_is_posted_again() {
     let s = setup(2, 8, None);
     let l1 = FakeL1::new();
@@ -180,7 +182,7 @@ async fn l1_reorged_post_is_posted_again() {
     l1.reorg(1);
     assert_eq!(l1.mined_posts(), 0);
     prover.release(10);
-    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    wait_long("settled", async || all_settled(&h, &vids).await).await;
     let sends = l1.sends();
     assert_eq!(sends.len(), 2);
     assert_eq!(sends[1].nonce, first.nonce, "the freed nonce");
@@ -321,5 +323,65 @@ async fn l1_settlement_that_never_shows_is_rolled_back() {
     assert_eq!(l1.mined_posts(), 2);
     assert_eq!(s.chain.voters(), 3);
     assert_eq!(node.metrics.settled_by_self.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn l1_late_event_keeps_the_landed_flight() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
+    // The landing's events stay out of the event pages for now.
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    let vids = submit(&h, &s, 0..3, 900).await;
+    wait_long("landed", async || s.chain.voters() == 3).await;
+    // Twice past LANDED_EVENT_WAIT (90 s), the registry showing the new root.
+    tokio::time::sleep(Duration::from_secs(200)).await;
+    assert!(h.snapshot().await.unwrap().in_flight, "the flight is kept");
+    assert!(!all_settled(&h, &vids).await);
+    assert_eq!(node.metrics.settled_by_self.load(Ordering::SeqCst), 0);
+    // The event arrives: the flight commits, nothing is proved or posted again.
+    s.chain.hide_block(None);
+    s.chain.set_replay_all(true);
+    s.chain.set_head_block(s.chain.head_block() + 1);
+    wait_long("settled", async || all_settled(&h, &vids).await).await;
+    s.chain.set_replay_all(false);
+    assert_eq!(node.metrics.settled_by_self.load(Ordering::SeqCst), 1);
+    assert_eq!(prover.calls(), 1, "no rollback, no re-prove");
+    assert_eq!(l1.sends().len(), 1, "no re-post");
+    assert_eq!(s.chain.voters(), 3);
+    assert_eq!(node.db.transitions(&pid_fr()).unwrap().len(), 1);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn l1_event_before_the_receipt_commits_once() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
+    // The settlement lands and its event is out while submit_transition_l1
+    // still waits for its receipt.
+    s.chain.gate_l1_submits(true);
+    let vids = submit(&h, &s, 0..3, 1000).await;
+    wait_until("committed at the event", async || {
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(node.metrics.settled_by_self.load(Ordering::SeqCst), 1);
+    assert!(!h.snapshot().await.unwrap().in_flight);
+    // The dropped flight cancelled the job mid-send; the next batch settles.
+    s.chain.gate_l1_submits(false);
+    let next = submit(&h, &s, 3..6, 1100).await;
+    wait_until("next batch settled", async || all_settled(&h, &next).await).await;
+    assert_eq!(node.metrics.settled_by_self.load(Ordering::SeqCst), 2);
+    assert_eq!(s.chain.voters(), 6);
+    assert_eq!(node.db.transitions(&pid_fr()).unwrap().len(), 2);
+    assert_eq!((prover.calls(), l1.mined_posts()), (2, 2));
     shutdown.cancel();
 }
