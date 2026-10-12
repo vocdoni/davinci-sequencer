@@ -244,6 +244,11 @@ impl FakeL1 {
         self.lock().drop_next = n;
     }
 
+    /// The L1 node drops pending `tx` from its pool (an eviction).
+    pub fn forget(&self, tx: B256) {
+        self.lock().pool.retain(|_, t| t.hash != tx);
+    }
+
     pub fn refuse_next(&self, n: u32) {
         self.lock().refuse_next = n;
     }
@@ -459,6 +464,11 @@ impl L1Chain for FakeL1 {
             block,
             index: index as u64,
         }))
+    }
+
+    async fn tx_known(&self, tx: B256) -> Result<bool, Web3Error> {
+        let i = self.lock();
+        Ok(i.pool.values().any(|t| t.hash == tx) || locate(&i, &tx).is_some())
     }
 
     // `l1proof::build` on this chain's blocks.

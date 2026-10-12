@@ -172,6 +172,8 @@ pub trait L1Chain: Send + Sync {
     async fn send_blob_tx(&self, tx: &SignedBlobTx) -> std::result::Result<(), L1SendError>;
     /// Where `tx` is mined; `None` while pending or unknown.
     async fn receipt(&self, tx: B256) -> Result<Option<L1Receipt>>;
+    /// Whether the L1 node knows `tx`, pending or mined.
+    async fn tx_known(&self, tx: B256) -> Result<bool>;
     /// The L1 proof of `txs` with headers from `top` down to the oldest of
     /// their blocks.
     async fn build_proof(&self, txs: &[B256], top: u64) -> Result<L1BlobProof>;
@@ -430,6 +432,15 @@ impl L1Chain for L1Rpc {
                 index: r.transaction_index?,
             })
         }))
+    }
+
+    async fn tx_known(&self, tx: B256) -> Result<bool> {
+        let t = self
+            .provider
+            .get_transaction_by_hash(tx)
+            .await
+            .map_err(rpc_err)?;
+        Ok(t.is_some())
     }
 
     async fn build_proof(&self, txs: &[B256], top: u64) -> Result<L1BlobProof> {

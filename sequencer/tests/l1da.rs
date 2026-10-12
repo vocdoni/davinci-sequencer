@@ -8,6 +8,7 @@ use davinci_sequencer::l1da::{
     GONE_FOR, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, PROOF_FAIL_FOR, PostError, Poster,
     Posting, Settled, settle,
 };
+use davinci_sequencer::storage::L1PostRecord;
 use davinci_sequencer::web3::L1Chain;
 use davinci_sequencer::web3::L1Receipt;
 use davinci_sequencer::web3::L1SendError;
@@ -308,6 +309,52 @@ async fn an_observer_start_keeps_the_records() {
     assert_eq!(l1.mined_posts(), 1);
 }
 
+// A pending post of an earlier run, recorded at the market price, under a
+// cap that fits that price but not its doubling.
+async fn pending_record_under_a_tight_cap(l1: &FakeL1, db: &Db) -> L1PostRecord {
+    let cap = L1Fees::offer(&l1.market()).cost(1) * 3 / 2;
+    l1.set_auto_mine(false);
+    let p = poster(l1, db, cap);
+    let b = blobs(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let e = p.post(&PID, &ROOT, &b, deadline).await.unwrap_err();
+    assert!(matches!(e, PostError::Deadline), "{e}");
+    l1.set_auto_mine(true);
+    db.l1_posts().unwrap().pop().unwrap()
+}
+
+#[tokio::test]
+async fn a_pending_post_the_l1_node_forgot_does_not_price_the_next() {
+    let l1 = FakeL1::new();
+    let (_dir, db) = fresh_db();
+    let rec = pending_record_under_a_tight_cap(&l1, &db).await;
+    // Evicted: nothing of ours holds nonce 0 any more.
+    l1.forget(rec.tx_hash);
+    let cap = L1Fees::offer(&l1.market()).cost(1) * 3 / 2;
+    let p = poster(&l1, &db, cap);
+    let posted = p.post(&PID, &ROOT, &blobs(2), soon()).await.unwrap();
+    assert_eq!(posted.nonce, rec.nonce);
+    let s = l1.sends();
+    assert_eq!(s.len(), 2, "{s:?}");
+    assert_eq!(s[1].fees, L1Fees::offer(&l1.market()), "the market price");
+    assert_eq!(l1.block_of(&rec.tx_hash), None);
+    assert_eq!(l1.mined_posts(), 1);
+    assert!(db.l1_posts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_pending_post_still_known_keeps_the_fee_cap() {
+    let l1 = FakeL1::new();
+    let (_dir, db) = fresh_db();
+    let rec = pending_record_under_a_tight_cap(&l1, &db).await;
+    let cap = L1Fees::offer(&l1.market()).cost(1) * 3 / 2;
+    let p = poster(&l1, &db, cap);
+    let e = p.post(&PID, &ROOT, &blobs(2), soon()).await.unwrap_err();
+    assert!(matches!(e, PostError::FeeCap { .. }), "{e}");
+    assert_eq!(l1.sends().len(), 1, "nothing sent past the cap");
+    assert_eq!(db.l1_posts().unwrap(), vec![rec]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_lagging_receipt_does_not_free_the_nonce() {
     let l1 = FakeL1::new();
@@ -535,6 +582,9 @@ impl L1Chain for Lagging {
             return Ok(None);
         }
         self.inner.receipt(tx).await
+    }
+    async fn tx_known(&self, tx: B256) -> Result<bool, Web3Error> {
+        self.inner.tx_known(tx).await
     }
     async fn build_proof(&self, txs: &[B256], top: u64) -> Result<L1BlobProof, Web3Error> {
         self.inner.build_proof(txs, top).await
