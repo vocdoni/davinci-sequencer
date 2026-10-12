@@ -211,6 +211,7 @@ async fn start(
         clock: Arc::new(SystemClock),
         grace,
         tasks,
+        l1: None,
     };
     let addr = format!("{}:{}", cfg.api_host, cfg.api_port);
     let node = spawn_node(cfg, deps, shutdown).await?;
