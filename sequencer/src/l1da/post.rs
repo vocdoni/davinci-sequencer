@@ -129,6 +129,18 @@ impl Poster {
         Ok(())
     }
 
+    /// Whether the L1 node knows the recorded tx or one this post sent at
+    /// `nonce`; a failed read counts as known.
+    async fn any_known(&self, r: &L1PostRecord, sent: &[(u64, B256)], nonce: u64) -> bool {
+        let ours = sent.iter().filter(|(k, _)| *k == nonce).map(|(_, h)| h);
+        for h in std::iter::once(&r.tx_hash).chain(ours) {
+            if !matches!(self.l1.tx_known(*h).await, Ok(false)) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Puts back `prev` in place of the record of a send refused at the
     /// door: that send holds no nonce, so its fees must not price the next.
     fn restore(
@@ -172,16 +184,28 @@ impl Poster {
         let n = vhs.len();
         let mut refusals = 0u32;
         let mut sidecar_retried = false;
+        // Every send of this post that reached the pool, with its nonce.
+        let mut sent: Vec<(u64, B256)> = Vec::new();
         'nonce: loop {
             let nonce = self.l1.nonce().await?;
             if nonce > 0 && last.as_ref().is_some_and(|r| r.nonce < nonce) {
                 // Mined (or replaced by a tx of ours): nothing left to replace.
                 self.db.remove_l1_posts_upto(nonce - 1)?;
             }
-            let mut fees = L1Fees::offer(&self.l1.fees().await?);
+            let market = L1Fees::offer(&self.l1.fees().await?);
+            let mut fees = market;
             if let Some(r) = last.as_ref().filter(|r| r.nonce == nonce) {
                 // A tx of ours may hold this nonce: outbid it.
                 fees = fees.max_each(r.fees.doubled());
+                // Past the cap, a record whose txs the L1 node forgot
+                // (evicted) would refuse every post at this nonce for good.
+                if self.within_cap(&fees, n).is_err() && !self.any_known(r, &sent, nonce).await {
+                    warn!(nonce, tx = %r.tx_hash,
+                        "the recorded L1 post is unknown to the L1 node; pricing from the market");
+                    self.db.remove_l1_post(nonce)?;
+                    *last = None;
+                    fees = market;
+                }
             }
             self.within_cap(&fees, n)?;
             let mut hashes: Vec<B256> = Vec::new();
@@ -209,11 +233,13 @@ impl Poster {
                 match self.l1.send_blob_tx(&tx).await {
                     Ok(()) => {
                         hashes.push(tx.hash);
+                        sent.push((nonce, tx.hash));
                         prev = last.clone();
                     }
                     Err(L1SendError::Unanswered(e)) => {
                         warn!(nonce, error = %e, "L1 send unanswered; waiting for its receipt");
                         hashes.push(tx.hash);
+                        sent.push((nonce, tx.hash));
                         prev = last.clone();
                     }
                     Err(L1SendError::Sidecar(e)) if !sidecar_retried => {
