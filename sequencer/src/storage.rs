@@ -527,6 +527,15 @@ impl Db {
             .collect()
     }
 
+    /// Drops the record at `nonce`.
+    pub fn remove_l1_post(&self, nonce: u64) -> Result<()> {
+        self.write(|tx| {
+            let mut t = tx.open_table(L1_POSTS).map_err(db_err)?;
+            t.remove(nonce.to_be_bytes().as_slice()).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
     /// Drops the records at or below `nonce`: mined.
     pub fn remove_l1_posts_upto(&self, nonce: u64) -> Result<()> {
         self.write(|tx| {

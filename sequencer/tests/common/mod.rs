@@ -6,7 +6,9 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod anvil;
+pub mod l1;
 
+pub use l1::{FakeL1, L1Send};
 pub use std::collections::HashMap;
 pub use std::path::{Path, PathBuf};
 pub use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,8 +27,9 @@ pub use davinci_sequencer::keys::KeyStore;
 pub use davinci_sequencer::monitor::{Node, spawn_node};
 pub use davinci_sequencer::storage::{Db, LocalStatus, VoteStatus};
 pub use davinci_sequencer::web3::{
-    BlobSource, DkgState, EventKind, GraceParams, KeyMode, OnchainCensus, OnchainProcess,
-    ProcessStatus, RegistryEvent, RevertReason, TxReceipt, Web3Error,
+    BlobSource, DkgState, EventKind, GraceParams, KeyMode, L1Blobs, L1Fees, L1Market, L1Origin,
+    OnchainCensus, OnchainProcess, ProcessStatus, RegistryEvent, RevertReason, TxReceipt,
+    Web3Error,
 };
 pub use davinci_state::{CensusOrigin, ProcessConfig, VerifiedVote, VotePackage, genesis_root};
 pub use davinci_zkvm_sdk::ballot::{
