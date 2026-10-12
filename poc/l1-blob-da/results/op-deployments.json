@@ -1,0 +1,23 @@
+{
+  "chain_id": 10,
+  "deploy": {
+    "block": 158118025,
+    "cost_wei": "50860738872",
+    "effective_gas_price": "10933",
+    "gas_used": 1003618,
+    "l1BaseFeeScalar": "0x146b",
+    "l1BlobBaseFee": "0x6d4e3a",
+    "l1BlobBaseFeeScalar": "0xf79c5",
+    "l1Fee": "0x949855fee",
+    "l1GasPrice": "0x6f35030",
+    "l1GasUsed": "0x927f",
+    "l1_fee_wei": "39888183278",
+    "l2_fee_wei": "10972555594",
+    "operator_fee_wei": "0",
+    "status": 1
+  },
+  "poc": "0x06713Ec6797A6EBCbf94bB897cD6cDdA6618Cd4e",
+  "program_vk": "0x6cfc89d562d0b22f04478a5c15b390433eb52f1b03147030b183076260da7a10",
+  "root_c": "0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80",
+  "verifier": "0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c"
+}
