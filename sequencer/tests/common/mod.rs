@@ -8,6 +8,8 @@
 pub mod anvil;
 pub mod l1;
 
+use davinci_sequencer::l1da::L1_MAX_AGE;
+use davinci_sequencer::web3::l1proof::{L1BlobProof, verify_local};
 pub use l1::{FakeL1, L1Send};
 pub use std::collections::HashMap;
 pub use std::path::{Path, PathBuf};
@@ -334,6 +336,18 @@ pub struct Inner {
     council_gate_view: Option<bool>,
     /// `council_decryption_open` reads.
     council_gate_reads: u64,
+    /// L1-blob mode: the Ethereum the verifier reads its origin from.
+    l1: Option<FakeL1>,
+    /// Origins stored with `record()`: number -> hash.
+    l1_recorded: HashMap<u64, B256>,
+    l1_records: u64,
+    l1_simulates: u64,
+    /// The last L1 settlement: its proof's headers and its blobs' place.
+    l1_last_headers: usize,
+    l1_last: Option<L1Blobs>,
+    /// The next L1 settlement "lands" with neither an event nor a state
+    /// change: an OP reorg took it.
+    vanish_l1_submit: bool,
 }
 
 #[derive(Clone)]
@@ -418,11 +432,44 @@ impl FakeChain {
             council_gate: true,
             council_gate_view: None,
             council_gate_reads: 0,
+            l1: None,
+            l1_recorded: HashMap::new(),
+            l1_records: 0,
+            l1_simulates: 0,
+            l1_last_headers: 0,
+            l1_last: None,
+            vanish_l1_submit: false,
         };
         FakeChain {
             inner: Arc::new(Mutex::new(inner)),
             signer: Some(Address::repeat_byte(0xa1)),
         }
+    }
+
+    /// Puts the registry in L1-blob mode over `l1`.
+    pub fn attach_l1(&self, l1: &FakeL1) {
+        self.inner.lock().unwrap().l1 = Some(l1.clone());
+    }
+
+    pub fn l1_records(&self) -> u64 {
+        self.inner.lock().unwrap().l1_records
+    }
+
+    pub fn l1_simulates(&self) -> u64 {
+        self.inner.lock().unwrap().l1_simulates
+    }
+
+    pub fn l1_last_headers(&self) -> usize {
+        self.inner.lock().unwrap().l1_last_headers
+    }
+
+    pub fn l1_last(&self) -> Option<L1Blobs> {
+        self.inner.lock().unwrap().l1_last.clone()
+    }
+
+    /// The next L1 settlement returns a receipt but never lands.
+    pub fn vanish_next_l1_submit(&self) {
+        self.inner.lock().unwrap().vanish_l1_submit = true;
     }
 
     pub fn with_signer(&self, byte: u8) -> FakeChain {
@@ -829,6 +876,19 @@ fn settle_foreign(i: &mut Inner, b: &davinci_state::PreparedBatch) -> u64 {
     i.block += 1;
     let tx = B256::repeat_byte(0x5e);
     i.blobs.insert(tx, b.blobs.blobs.clone());
+    // L1-blob mode: the winner posted its blobs on Ethereum.
+    let l1 = i.l1.clone().map(|l1| {
+        let vhs: Vec<B256> = b
+            .blobs
+            .versioned_hashes
+            .iter()
+            .map(|h| B256::from(*h))
+            .collect();
+        L1Blobs {
+            blocks: vec![l1.post_foreign(&b.blobs); vhs.len()],
+            vhs,
+        }
+    });
     let (block, voters, overwrites) = (i.block, i.proc.voters_count, i.proc.overwritten_count);
     i.events.push(RegistryEvent {
         block,
@@ -842,10 +902,83 @@ fn settle_foreign(i: &mut Inner, b: &davinci_state::PreparedBatch) -> u64 {
             voters,
             overwrites,
             n_blobs: b.blobs.blobs.len() as u64,
-            l1: None,
+            l1,
         },
     });
     block
+}
+
+// A transition of ours lands: state, counters and its event. Returns the tx.
+fn land(
+    i: &mut Inner,
+    pid: &[u8; 31],
+    sender: Address,
+    p: &BatchPublics,
+    n_blobs: u64,
+    l1: Option<L1Blobs>,
+) -> B256 {
+    i.last_census_root = Some(p.census_root);
+    i.proc.state_root = p.root_after;
+    i.proc.last_vote_at = i.time;
+    i.proc.voters_count += p.voters as u64;
+    i.proc.overwritten_count += p.overwrites as u64;
+    i.proc.batch_number += 1;
+    i.block += 1;
+    i.submits += 1;
+    let mut h = [0u8; 32];
+    h[..8].copy_from_slice(&(0x7788_0000 + i.submits).to_be_bytes());
+    let tx = B256::from(h);
+    let ev = RegistryEvent {
+        block: i.block,
+        tx_hash: tx,
+        log_index: 0,
+        kind: EventKind::StateTransitioned {
+            pid: *pid,
+            sender,
+            old_root: p.root_before,
+            new_root: p.root_after,
+            voters: i.proc.voters_count,
+            overwrites: i.proc.overwritten_count,
+            n_blobs,
+            l1,
+        },
+    };
+    i.events.push(ev);
+    tx
+}
+
+/// `L1BlobVerifier.verify` and the registry's count and opening checks: the
+/// proof anchors at the current origin or a recorded one; returns the block
+/// of each blob.
+fn check_l1_proof(
+    i: &Inner,
+    blobs: &TransitionBlobs,
+    proof: &L1BlobProof,
+) -> Result<Vec<u64>, RevertReason> {
+    let l1 = i.l1.as_ref().ok_or_else(|| revert("WrongDAMode"))?;
+    let origin = l1.origin();
+    let (vhs, blocks) = std::iter::once(origin.hash)
+        .chain(i.l1_recorded.values().copied())
+        .find_map(|anchor| verify_local(proof, anchor).ok())
+        .ok_or_else(|| revert("L1OriginMismatch"))?;
+    if blocks
+        .iter()
+        .any(|b| origin.number.saturating_sub(*b) > L1_MAX_AGE)
+    {
+        return Err(revert("TxTooOld"));
+    }
+    let want: Vec<B256> = blobs
+        .versioned_hashes
+        .iter()
+        .map(|h| B256::from(*h))
+        .collect();
+    if vhs.len() != want.len() {
+        return Err(revert("BlobCountMismatch"));
+    }
+    if vhs != want {
+        return Err(revert("InvalidBlobOpening"));
+    }
+    Ok(blocks)
 }
 
 /// `Sha256SmtLib.verifyInclusion`, as the registry runs it.
@@ -1131,34 +1264,8 @@ impl Chain for FakeChain {
             }
         }
         check_transition(&i, &p).map_err(Web3Error::Revert)?;
-        i.last_census_root = Some(p.census_root);
-        i.proc.state_root = p.root_after;
-        i.proc.last_vote_at = i.time;
-        i.proc.voters_count += p.voters as u64;
-        i.proc.overwritten_count += p.overwrites as u64;
-        i.proc.batch_number += 1;
-        i.block += 1;
-        i.submits += 1;
-        let mut h = [0u8; 32];
-        h[..8].copy_from_slice(&(0x7788_0000 + i.submits).to_be_bytes());
-        let tx = B256::from(h);
+        let tx = land(&mut i, pid, sender, &p, blobs.blobs.len() as u64, None);
         i.blobs.insert(tx, blobs.blobs.clone());
-        let ev = RegistryEvent {
-            block: i.block,
-            tx_hash: tx,
-            log_index: 0,
-            kind: EventKind::StateTransitioned {
-                pid: *pid,
-                sender,
-                old_root: p.root_before,
-                new_root: p.root_after,
-                voters: i.proc.voters_count,
-                overwrites: i.proc.overwritten_count,
-                n_blobs: blobs.blobs.len() as u64,
-                l1: None,
-            },
-        };
-        i.events.push(ev);
         if i.timeout_submits > 0 {
             // The tx landed (root moved, event queued) but the receipt
             // never came back to the sender.
@@ -1356,6 +1463,100 @@ impl Chain for FakeChain {
         assert_eq!(*cid, i.proc.dkg.epoch_id, "the process's ceremony");
         i.council_gate_reads += 1;
         Ok(i.council_gate_view.unwrap_or(i.council_gate))
+    }
+
+    async fn l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        let l1 = self.inner.lock().unwrap().l1.clone();
+        l1.map(|l| l.origin())
+            .ok_or_else(|| Web3Error::Config("not an L1-blob registry".into()))
+    }
+
+    async fn record_l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        let mut i = self.inner.lock().unwrap();
+        let o =
+            i.l1.as_ref()
+                .map(|l| l.origin())
+                .ok_or_else(|| Web3Error::Config("not an L1-blob registry".into()))?;
+        i.l1_recorded.insert(o.number, o.hash);
+        i.l1_records += 1;
+        i.block += 1;
+        Ok(o)
+    }
+
+    async fn simulate_transition_l1(
+        &self,
+        _pid: &[u8; 31],
+        snark: &PlonkSnark,
+        blobs: &TransitionBlobs,
+        proof: &L1BlobProof,
+    ) -> Result<(), RevertReason> {
+        let p = BatchPublics::from_public_values(&snark.public_values)
+            .map_err(|e| RevertReason::Rpc(e.to_string()))?;
+        let mut i = self.inner.lock().unwrap();
+        i.l1_simulates += 1;
+        if let Some((name, n)) = &mut i.revert_simulate
+            && *n > 0
+        {
+            *n -= 1;
+            return Err(revert(name));
+        }
+        check_transition(&i, &p)?;
+        check_l1_proof(&i, blobs, proof).map(|_| ())
+    }
+
+    async fn submit_transition_l1(
+        &self,
+        pid: &[u8; 31],
+        snark: &PlonkSnark,
+        blobs: &TransitionBlobs,
+        proof: &L1BlobProof,
+    ) -> Result<TxReceipt, Web3Error> {
+        let Some(sender) = self.signer else {
+            return Err(Web3Error::NoSigner);
+        };
+        let p = BatchPublics::from_public_values(&snark.public_values)
+            .map_err(|e| Web3Error::Data(e.to_string()))?;
+        let mut i = self.inner.lock().unwrap();
+        if i.fail_submits > 0 {
+            i.fail_submits -= 1;
+            return Err(Web3Error::Rpc("scripted submit failure".into()));
+        }
+        if let Some(b) = i.race_submit.take() {
+            let block = settle_foreign(&mut i, &b);
+            if check_transition(&i, &p).is_err() {
+                return Err(Web3Error::Lost {
+                    tx_hash: B256::repeat_byte(0x10),
+                    block,
+                });
+            }
+        }
+        check_transition(&i, &p).map_err(Web3Error::Revert)?;
+        let blocks = check_l1_proof(&i, blobs, proof).map_err(Web3Error::Revert)?;
+        if std::mem::take(&mut i.vanish_l1_submit) {
+            return Ok(TxReceipt {
+                tx_hash: B256::repeat_byte(0x77),
+                block: i.block,
+                gas_used: 0,
+                replacements: 0,
+            });
+        }
+        let l1 = L1Blobs {
+            blocks,
+            vhs: blobs
+                .versioned_hashes
+                .iter()
+                .map(|h| B256::from(*h))
+                .collect(),
+        };
+        i.l1_last_headers = proof.headers.len();
+        i.l1_last = Some(l1.clone());
+        let tx = land(&mut i, pid, sender, &p, blobs.blobs.len() as u64, Some(l1));
+        Ok(TxReceipt {
+            tx_hash: tx,
+            block: i.block,
+            gas_used: 0,
+            replacements: 0,
+        })
     }
 }
 

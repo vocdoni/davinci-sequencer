@@ -4,7 +4,15 @@
 mod common;
 
 use common::*;
-use davinci_sequencer::l1da::{PostError, Poster};
+use davinci_sequencer::l1da::{
+    GONE_POLLS, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, PostError, Poster, Posting, Settled,
+    settle,
+};
+use davinci_sequencer::web3::L1Chain;
+use davinci_sequencer::web3::L1Receipt;
+use davinci_sequencer::web3::L1SendError;
+use davinci_sequencer::web3::SignedBlobTx;
+use davinci_sequencer::web3::l1proof::L1BlobProof;
 use davinci_zkvm_sdk::ballot::Ballot;
 use davinci_zkvm_sdk::blob::{TransitionData, build_blobs};
 use davinci_zkvm_sdk::limits::VOTE_ID_MIN;
@@ -210,4 +218,255 @@ async fn a_record_of_another_sender_is_ignored_and_dropped() {
     let s = l1.sends();
     assert_eq!(s[before].fees, L1Fees::offer(&l1.market()));
     assert_eq!(s.len(), before + 1);
+}
+
+/// FakeChain in L1 mode over a FakeL1, a poster on a fresh database, and a
+/// one-vote batch on the chain's root with the snark FakeProver returns.
+struct Rig {
+    s: TestSetup,
+    l1: FakeL1,
+    da: L1Da,
+    snark: PlonkSnark,
+    blobs: TransitionBlobs,
+    _dir: TempDir,
+}
+
+fn rig() -> Rig {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    s.chain.attach_l1(&l1);
+    let (dir, db) = fresh_db();
+    let da = L1Da::new(
+        Arc::new(l1.clone()),
+        db,
+        u128::MAX,
+        Duration::from_millis(5),
+    )
+    .unwrap();
+    let blobs = blobs(9);
+    let p = BatchPublics {
+        ok: true,
+        fail_mask: 0,
+        root_before: s.chain.root(),
+        root_after: [0x42; 32],
+        voters: 1,
+        overwrites: 0,
+        census_root: [0; 32],
+        blobs_digest: blobs.digest,
+        n_blobs: blobs.blobs.len() as u32,
+        occupied_before: 0,
+        nproofs: 1,
+        n_public: 3,
+        log_n: 0,
+    };
+    let snark = PlonkSnark {
+        program_vk: release::BATCH_PROGRAM_VK,
+        root_c_vadcop_final: release::ROOT_C_VADCOP_FINAL,
+        public_values: encode_batch(&p),
+        proof_bytes: vec![0; 768],
+    };
+    Rig {
+        s,
+        l1,
+        da,
+        snark,
+        blobs,
+        _dir: dir,
+    }
+}
+
+impl Rig {
+    fn job(&self) -> L1Job<'_> {
+        L1Job {
+            pid: pid31(),
+            root_before: self.s.chain.root(),
+            blobs: &self.blobs,
+            deadline: soon(),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    async fn posting(&self, job: &L1Job<'_>) -> Posting {
+        Posting {
+            post: self
+                .da
+                .poster
+                .post(&job.pid, &job.root_before, job.blobs, job.deadline)
+                .await,
+            recorded: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn settle_lands_with_the_l1_blocks() {
+    let r = rig();
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let posted = *posting.post.as_ref().unwrap();
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.s.chain.root(), [0x42; 32]);
+    assert_eq!(
+        r.s.chain.l1_last().unwrap().blocks,
+        vec![posted.block; r.blobs.blobs.len()]
+    );
+    assert!(r.s.chain.l1_last_headers() <= 3);
+    assert_eq!(r.s.chain.l1_records(), 0);
+}
+
+#[tokio::test]
+async fn settle_gives_up_after_bounded_origin_mismatches() {
+    let r = rig();
+    r.s.chain.revert_simulates("L1OriginMismatch", 100);
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("L1OriginMismatch")),
+        "{out:?}"
+    );
+    assert_eq!(r.s.chain.l1_simulates(), u64::from(MAX_PROOF_RETRIES) + 1);
+    assert_eq!(r.l1.mined_posts(), 1, "a mismatch never re-posts");
+}
+
+#[tokio::test]
+async fn a_recorded_origin_anchors_a_deep_proof() {
+    let r = rig();
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let n = posting.post.as_ref().unwrap().block;
+    r.l1.pin_origin(Some(n));
+    let rec = r.s.chain.record_l1_origin().await.unwrap();
+    assert_eq!(rec.number, n);
+    r.l1.mine(30);
+    r.l1.pin_origin(Some(n + 30));
+    let posting = Posting {
+        recorded: Some(rec),
+        ..posting
+    };
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.s.chain.l1_last_headers(), 1, "headers n..=n, not 33");
+    assert_eq!(r.l1.mined_posts(), 1);
+}
+
+#[tokio::test]
+async fn a_proof_too_deep_without_a_record_reposts() {
+    let r = rig();
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let n = posting.post.as_ref().unwrap().block;
+    r.l1.mine(80);
+    r.l1.pin_origin(Some(n + 70));
+    let driver = async {
+        wait_until("re-posted", async || r.l1.mined_posts() == 2).await;
+        r.l1.pin_origin(None);
+    };
+    let (out, ()) = tokio::join!(settle(&r.da, &r.s.chain, &job, &r.snark, posting), driver);
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let second = r.l1.sends().last().unwrap().hash;
+    let m = r.l1.block_of(&second).unwrap();
+    assert!(m > n + 70);
+    assert_eq!(r.s.chain.l1_last().unwrap().blocks[0], m);
+}
+
+#[tokio::test]
+async fn tx_too_old_reposts() {
+    let r = rig();
+    r.s.chain.revert_simulates("TxTooOld", 1);
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.l1.mined_posts(), 2);
+}
+
+/// An Ethereum whose receipt reads come back empty a few times first.
+struct Lagging {
+    inner: FakeL1,
+    misses: Mutex<u32>,
+}
+
+#[async_trait]
+impl L1Chain for Lagging {
+    fn sender(&self) -> Option<Address> {
+        self.inner.sender()
+    }
+    async fn head(&self) -> Result<u64, Web3Error> {
+        self.inner.head().await
+    }
+    async fn nonce(&self) -> Result<u64, Web3Error> {
+        self.inner.nonce().await
+    }
+    async fn fees(&self) -> Result<L1Market, Web3Error> {
+        self.inner.fees().await
+    }
+    async fn sign_blob_tx(
+        &self,
+        nonce: u64,
+        fees: &L1Fees,
+        blobs: &TransitionBlobs,
+    ) -> Result<SignedBlobTx, Web3Error> {
+        self.inner.sign_blob_tx(nonce, fees, blobs).await
+    }
+    async fn send_blob_tx(&self, tx: &SignedBlobTx) -> Result<(), L1SendError> {
+        self.inner.send_blob_tx(tx).await
+    }
+    async fn receipt(&self, tx: B256) -> Result<Option<L1Receipt>, Web3Error> {
+        let miss = {
+            let mut m = self.misses.lock().unwrap();
+            let miss = *m > 0;
+            *m = m.saturating_sub(1);
+            miss
+        };
+        if miss {
+            return Ok(None);
+        }
+        self.inner.receipt(tx).await
+    }
+    async fn build_proof(&self, txs: &[B256], top: u64) -> Result<L1BlobProof, Web3Error> {
+        self.inner.build_proof(txs, top).await
+    }
+}
+
+#[tokio::test]
+async fn a_lagging_receipt_does_not_repost() {
+    let mut r = rig();
+    // Poster and settle loop share the lagging view; two misses < GONE_POLLS.
+    let lag = Arc::new(Lagging {
+        inner: r.l1.clone(),
+        misses: Mutex::new(0),
+    });
+    let (dir, db) = fresh_db();
+    r.da = L1Da::new(lag.clone(), db, u128::MAX, Duration::from_millis(5)).unwrap();
+    r._dir = dir;
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    *lag.misses.lock().unwrap() = GONE_POLLS - 1;
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(
+        r.l1.mined_posts(),
+        1,
+        "a receipt read as null twice is not gone"
+    );
+}
+
+#[tokio::test]
+async fn reposts_are_bounded() {
+    let r = rig();
+    r.s.chain.revert_simulates("TxTooOld", 100);
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("re-posts")),
+        "{out:?}"
+    );
+    assert_eq!(
+        r.l1.mined_posts(),
+        1 + MAX_REPOSTS as usize,
+        "the fourth re-post ends the settle"
+    );
 }
