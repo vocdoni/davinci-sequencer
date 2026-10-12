@@ -18,6 +18,9 @@ the RPC list, the blob source and the confirmations.
 | Network | Chain | RPCs | Blob source | Confirmations |
 |---|---|---|---|---|
 | `gnosis` | 100 | `https://gnosis-rpc.publicnode.com`, `https://gnosis-rpc.blockreq.com/v1/rpc/public`, `https://rpc.gnosischain.com` | `beacon:https://rpc-gbc.gnosischain.com` | 3 |
+| `optimism` | 10 | `https://optimism-rpc.publicnode.com`, `https://mainnet.optimism.io` | `beacon:https://ethereum-beacon-api.publicnode.com` (Ethereum) | 1 |
+
+The `optimism` preset is in L1-blob mode and is not deployed yet: its registry is the zero address, so `--network optimism` refuses to start without `--registry` until a release fills it in.
 
 The registry of each network is listed in [deployments.md](deployments.md).
 
@@ -53,6 +56,11 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--registry` | `DAVINCI_REGISTRY` | network | `ProcessRegistry` address. |
 | `--rpc-url` | `DAVINCI_RPC_URL` | network | Execution-layer JSON-RPC; a comma-separated list for failover. |
 | `--blob-source` | `DAVINCI_BLOB_SOURCE` | network | `beacon:<url>[,<url>...]` (beacon APIs) or `anvil` (`anvil_getBlobsByTransactionHash` on the RPC). |
+| `--l1-rpc-url` | `DAVINCI_L1_RPC_URL` | network | L1-blob mode: Ethereum execution JSON-RPCs, comma-separated for failover. Set exactly when the registry has an `L1BlobVerifier`. |
+| `--l1-send-rpc-url` | `DAVINCI_L1_SEND_RPC_URL` | `--l1-rpc-url` | Endpoints that only receive the blob transactions. A 6-blob send is about 1.5 MB; many public RPCs refuse such bodies. |
+| `--l1-privkey-file` | `DAVINCI_L1_PRIVKEY_FILE` | unset | File with the hex key of the dedicated Ethereum account that posts blobs. A signing node in L1-blob mode needs it. |
+| (env only) | `DAVINCI_L1_PRIVKEY` | unset | The same key, from the environment. |
+| `--l1-max-post-fee` | `DAVINCI_L1_MAX_POST_FEE` | `0.001eth` | Most one blob post may cost at the fees it offers (`<wei>`, `<n>gwei`, `<n>eth`); above it the node waits for cheaper fees. |
 | `--start-block` | `DAVINCI_START_BLOCK` | network | First block a fresh deployment scans for registry events. Ignored once the deployment has scanned. Progress is saved every 5,000 blocks. |
 | `--confirmations` | `DAVINCI_CONFIRMATIONS` | network, else `2` | Blocks behind head treated as final. Raise it with load-balanced RPCs whose backends lag. |
 | `--prover-url` | `DAVINCI_PROVER_URL` | `http://127.0.0.1:8080` | davinci-zkvm prover service. |
@@ -94,6 +102,27 @@ arguments. The key is never printed and is zeroed on drop.
 Without a key the node is an observer. It follows every process, replays every transition from
 its blobs and serves every read, but never settles or finalizes. It refuses `POST /votes` and
 `POST /processes/keys` with 412/41203, and `/info` reports `"observer": true`.
+
+## L1-blob mode
+
+A registry with an `L1BlobVerifier` (OP Stack chains) settles on OP and keeps its blobs on
+Ethereum. Such a node needs, besides the OP settings:
+
+- `--l1-rpc-url`: Ethereum execution RPCs. They post the blob transactions, serve the headers and
+  block transactions the L1 proofs are built from, and the block timestamps followers map to
+  beacon slots.
+- `--blob-source beacon:<url>,...`: Ethereum beacon APIs that keep full blobs (or `anvil` for a
+  local L1 anvil at `--l1-rpc-url`).
+- A dedicated Ethereum key (`--l1-privkey-file` or `DAVINCI_L1_PRIVKEY`) for signing nodes.
+  Nothing else may send from that account: the blob pool forbids nonce gaps, caps pending
+  transactions per account and wants every fee doubled to replace one. Fund it on Ethereum; a
+  post costs about 21,000 gas plus 131,072 blob gas per blob. If you change the key, post records
+  of the old account are dropped at start.
+- `--l1-send-rpc-url` when the read RPCs refuse large bodies.
+
+At boot the node checks the Ethereum chain id and the verifier's `L1Block` address against the
+network (the `optimism` preset expects chain 1 and `0x4200000000000000000000000000000000000015`),
+and sizes batches with Ethereum's blob limit. Observers need no Ethereum key.
 
 ## Data directory
 

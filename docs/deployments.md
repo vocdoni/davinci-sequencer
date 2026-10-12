@@ -4,6 +4,24 @@ Contract addresses and pinned values of the deployments the `--network` presets 
 release that moves a preset to a new registry updates this file and `client/src/networks.rs`
 together.
 
+## OP Mainnet (pending)
+
+Chain id 10, preset `optimism`, L1-blob mode: transitions settle on OP Mainnet and their blobs
+live in Ethereum blob transactions. Not deployed yet: the preset's registry is the zero address,
+so `--network optimism` refuses to start without `--registry`. The deployment fills this section
+and `client/src/networks.rs` together.
+
+| Contract | Address | Block |
+|---|---|---|
+| ZiskVerifier | `0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c` (codehash equal to the pinned one) | |
+| L1BlobVerifier | not deployed | |
+| ProcessRegistry | not deployed | |
+
+`L1BlobVerifier` reads OP's L1 origin from the `L1Block` predeploy
+`0x4200000000000000000000000000000000000015`. Consumers of OP transitions (SDKs, explorers) read
+`ProcessStateTransitionedL1` for the Ethereum blocks and versioned hashes; there is no `BLOBHASH`
+on OP.
+
 ## Gnosis Chain
 
 Chain id 100, preset `gnosis`: registry R2, the production beta, followed since release v0.5.0.

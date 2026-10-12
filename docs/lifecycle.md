@@ -96,6 +96,50 @@ on its committed root, and requires the result to equal the event's `newRoot`. Q
 id is now in the tree become `settled`. Gaps are replayed from the registry logs. Every node
 stores the transitions and blobs it sees and serves them under `/processes/{pid}/transitions`.
 
+## L1-blob mode (OP Stack)
+
+A registry deployed with an `L1BlobVerifier` settles on an OP Stack chain while its blobs live in
+Ethereum blob transactions. The node reads `l1BlobVerifier()` at boot and refuses to start when
+its configuration disagrees: `--l1-rpc-url` set for a blob-mode registry, or missing for an
+L1-mode one. A signing node also needs its dedicated Ethereum key.
+
+Each batch:
+
+1. Seals and builds its blobs as in blob mode.
+2. Posts the blobs on Ethereum while it is proved: one type-3 transaction from the node's
+   Ethereum account to itself, EIP-7594 sidecar, at most six blobs. The account sends one
+   transaction at a time; a later post waits until the earlier one is mined. The tip is at least
+   0.001 gwei, the max fee twice the base fee plus the tip, the blob fee twice the blob base fee.
+   A transaction not mined after 3 Ethereum blocks is replaced at its nonce with every fee
+   doubled. A post whose worst-case cost would pass `--l1-max-post-fee` (or that L1 refuses) is
+   retried while the proof runs, waiting for cheaper fees, up to the grace end.
+3. If OP's L1 origin (`L1Block.number()`) reaches the blob block before the proof is ready, the
+   node calls `record()` on the verifier once, which stores that origin on OP.
+4. With the proof ready, waits until the blob transaction has one Ethereum block on top and OP's
+   origin reached it, then builds the L1 proof: Ethereum headers from at most two blocks above the
+   origin down to the blob block while that is at most 16 headers; else from the recorded origin
+   down; else up to 64 headers from the current origin. Deeper than that, or 7,200 blocks behind
+   the origin, it posts the blobs again.
+5. Checks the proof locally, simulates `submitStateTransitionL1` on OP and sends it (gas estimate
+   plus 20 %). `L1OriginMismatch` (the origin moved past the proof, or the node's Ethereum RPC is
+   behind OP's origin) rebuilds the proof from fresh reads, at most 5 times, then the votes go back
+   to the queue.
+6. A blob transaction that disappears (dropped, or reorged out of Ethereum) is posted again. A
+   missing receipt counts as gone only after 3 polls, since a lagging endpoint reads the same.
+   Re-posts are capped at 3 per batch; then the votes go back to the queue.
+7. Commits when its `ProcessStateTransitioned` event reaches `--confirmations`, not at the receipt:
+   OP's unsafe blocks reorg with Ethereum. If the event is still missing after 90 s, the node
+   looks at the registry: while it still shows the settlement's root the node keeps waiting (no
+   needless re-prove); once the root is gone the settlement is rolled back and its votes
+   requeued, like a lost race.
+
+The registry emits `ProcessStateTransitionedL1(processId, l1BlockNumbers, versionedHashes)` right
+after `ProcessStateTransitioned`; the node merges the two and fetches the blobs from Ethereum:
+beacon APIs by slot (`--blob-source beacon:`, Ethereum beacons in this mode), or the L1 anvil.
+After PeerDAS only beacon nodes that keep full blobs (supernodes, archives) serve them, so list
+several. Each node stores and serves the blobs under `/processes/{pid}/transitions/{index}/blobs`
+as in blob mode. A lost race wastes the loser's blob transaction (a few cents at most).
+
 ## The end and the grace window
 
 Admission closes at the election's end time, or when the process is ended or canceled.
@@ -253,3 +297,12 @@ The per-batch seed and refresh selection exist only in memory for one batch, by 
 restart, votes that were in a batch (`aggregated` or `processed`) go back to `pending` and the
 node syncs from the chain. If its own transaction landed before the crash, those votes settle
 through that sync without being proved again.
+
+In L1-blob mode the node records each Ethereum blob transaction, with the sending account, before
+sending it and drops the record once it is mined. After a restart the batch is proved again (its
+secrets died with the process) and its first post replaces a still-pending transaction at its
+nonce with doubled fees instead of queueing behind it. Records of another account (a rotated L1
+key) are dropped at start. A transaction mined before the crash is wasted.
+
+A datadir written by the previous release (storage schema 8) is upgraded in place on first start:
+schema 9 only adds the `l1_posts` table.
