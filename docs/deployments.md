@@ -4,23 +4,32 @@ Contract addresses and pinned values of the deployments the `--network` presets 
 release that moves a preset to a new registry updates this file and `client/src/networks.rs`
 together.
 
-## OP Mainnet (pending)
+## OP Mainnet
 
 Chain id 10, preset `optimism`, L1-blob mode: transitions settle on OP Mainnet and their blobs
-live in Ethereum blob transactions. Not deployed yet: the preset's registry is the zero address,
-so `--network optimism` refuses to start without `--registry`. The deployment fills this section
-and `client/src/networks.rs` together.
+live in Ethereum blob transactions. Deployed on 2026-10-12 from davinci-contracts commit
+`e7de916`; davinci-contracts' `deployments/10.json` holds the verified record. Not
+source-verified on an explorer yet.
 
 | Contract | Address | Block |
 |---|---|---|
-| ZiskVerifier | `0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c` (codehash equal to the pinned one) | |
-| L1BlobVerifier | not deployed | |
-| ProcessRegistry | not deployed | |
+| ZiskVerifier | `0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c` (reused; code hash the pinned `0x82385a40…5566`) | |
+| L1BlobVerifier | `0x3B95BC14F43ed8Addb83F84D10A949De74eE7529` | 158125136 |
+| ProcessRegistry | `0x8b63fAE96948D69CF92Eb40e4EE0fCE40962267d` | 158125136 |
+
+Pins are the release values listed under Gnosis Chain below. No DKG or Council adapter: those key
+modes are not on OP Stack chains yet. The grace window is the production default (180 s, floor
+150 s, ceiling 600 s, at most 1800 s past the end; 60 s shorten notice).
 
 `L1BlobVerifier` reads OP's L1 origin from the `L1Block` predeploy
 `0x4200000000000000000000000000000000000015`. Consumers of OP transitions (SDKs, explorers) read
 `ProcessStateTransitionedL1` for the Ethereum blocks and versioned hashes; there is no `BLOBHASH`
-on OP.
+on OP. The preset reads Ethereum from `https://ethereum-rpc.publicnode.com` and
+`https://eth.drpc.org`: publicnode refuses request bodies above about 1 MB, dRPC takes the 1.5 MB
+six-blob sends, and the node sends a blob transaction to every endpoint. Followers fetch blobs
+from `https://ethereum-beacon-api.publicnode.com`, which served full blobs for recent and day-old
+slots when the preset was filled in; production nodes should add a beacon node of their own that
+keeps full blobs.
 
 ## Gnosis Chain
 

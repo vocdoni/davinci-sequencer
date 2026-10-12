@@ -71,14 +71,14 @@ pub const GNOSIS: Network = Network {
 };
 
 /// OP Mainnet in L1-blob mode: transitions settle on OP, their blobs live on
-/// Ethereum. Not deployed yet: the zero registry makes the node refuse this
-/// preset (`--registry` overrides it) until a release fills in the registry
-/// and its start block. The endpoint lists are provisional until then.
+/// Ethereum (deployed 2026-10-12, see docs/deployments.md). Blob sends need an
+/// Ethereum RPC that takes 1.5 MB bodies: publicnode refuses them, dRPC takes
+/// them, and the node sends to every L1 endpoint at once.
 pub const OPTIMISM: Network = Network {
     name: "optimism",
     chain_id: 10,
-    registry: Address::ZERO,
-    start_block: 0,
+    registry: address!("8b63fAE96948D69CF92Eb40e4EE0fCE40962267d"),
+    start_block: 158_125_136,
     rpc_urls: &[
         "https://optimism-rpc.publicnode.com",
         "https://mainnet.optimism.io",
@@ -136,6 +136,12 @@ mod tests {
             assert!(!n.rpc_urls.is_empty());
             assert!(NETWORKS[i + 1..].iter().all(|m| m.name != n.name));
         }
+    }
+
+    #[test]
+    fn optimism_preset_is_deployed() {
+        assert_ne!(OPTIMISM.registry, Address::ZERO, "optimism registry unset");
+        assert_ne!(OPTIMISM.start_block, 0, "optimism start block unset");
     }
 
     #[test]
