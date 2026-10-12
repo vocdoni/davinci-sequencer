@@ -5,8 +5,8 @@ mod common;
 
 use common::*;
 use davinci_sequencer::l1da::{
-    GONE_POLLS, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, PostError, Poster, Posting, Settled,
-    settle,
+    GONE_FOR, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, PROOF_FAIL_FOR, PostError, Poster,
+    Posting, Settled, settle,
 };
 use davinci_sequencer::web3::L1Chain;
 use davinci_sequencer::web3::L1Receipt;
@@ -42,6 +42,11 @@ fn poster(l1: &FakeL1, db: &Db, cap: u128) -> Poster {
 
 fn soon() -> tokio::time::Instant {
     tokio::time::Instant::now() + Duration::from_secs(20)
+}
+
+// For the paused-time tests that wait out GONE_FOR or PROOF_FAIL_FOR.
+fn later() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(600)
 }
 
 fn fresh_db() -> (TempDir, Db) {
@@ -220,6 +225,103 @@ async fn a_record_of_another_sender_is_ignored_and_dropped() {
     assert_eq!(s.len(), before + 1);
 }
 
+#[tokio::test]
+async fn a_refused_send_does_not_price_the_next_one() {
+    let l1 = FakeL1::new();
+    let (_dir, db) = fresh_db();
+    let p = poster(&l1, &db, u128::MAX);
+    // Refused at the door (a 413 or 429 of a public endpoint), twice.
+    l1.refuse_next(2);
+    for _ in 0..2 {
+        let e = p.post(&PID, &ROOT, &blobs(1), soon()).await.unwrap_err();
+        assert!(matches!(e, PostError::L1(_)), "{e}");
+        assert!(
+            db.l1_posts().unwrap().is_empty(),
+            "no record of a refused send"
+        );
+    }
+    let posted = p.post(&PID, &ROOT, &blobs(1), soon()).await.unwrap();
+    assert_eq!(posted.nonce, 0);
+    let s = l1.sends();
+    assert_eq!(s.len(), 1, "{s:?}");
+    assert_eq!(
+        s[0].fees,
+        L1Fees::offer(&l1.market()),
+        "priced from the market"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_replacement_keeps_the_pooled_record() {
+    let l1 = FakeL1::new();
+    let (_dir, db) = fresh_db();
+    // Pooled, never mined: after 3 blocks the post is replaced.
+    l1.hold(true);
+    let p = poster(&l1, &db, u128::MAX);
+    let b = blobs(1);
+    let (e, ()) = tokio::join!(p.post(&PID, &ROOT, &b, later()), async {
+        wait_until("first send", async || l1.sends().len() == 1).await;
+        l1.refuse_next(1);
+    });
+    assert!(matches!(e, Err(PostError::L1(_))), "{e:?}");
+    let first = l1.sends()[0].clone();
+    // The record is the pooled transaction's, not the refused replacement's.
+    let rec = db.l1_posts().unwrap();
+    assert_eq!(rec.len(), 1);
+    assert_eq!((rec[0].tx_hash, rec[0].fees), (first.hash, first.fees));
+    l1.hold(false);
+    let posted = p.post(&PID, &ROOT, &b, later()).await.unwrap();
+    assert_eq!(posted.nonce, first.nonce);
+    let s = l1.sends();
+    assert_eq!(s.len(), 2, "{s:?}");
+    assert_eq!(
+        s[1].fees,
+        first.fees.doubled(),
+        "one doubling over the pool"
+    );
+}
+
+#[tokio::test]
+async fn an_observer_start_keeps_the_records() {
+    let l1 = FakeL1::new();
+    let (_dir, db) = fresh_db();
+    // No blocks: the post stays pending.
+    l1.set_auto_mine(false);
+    let p1 = poster(&l1, &db, u128::MAX);
+    let b = blobs(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let e = p1.post(&PID, &ROOT, &b, deadline).await.unwrap_err();
+    assert!(matches!(e, PostError::Deadline), "{e}");
+    drop(p1);
+    let rec = db.l1_posts().unwrap();
+    assert_eq!(rec.len(), 1);
+    // A start without the L1 key leaves the record alone...
+    drop(poster(&l1.observer(), &db, u128::MAX));
+    assert_eq!(db.l1_posts().unwrap(), rec);
+    // ...for the next start with the key, which replaces its transaction.
+    l1.set_auto_mine(true);
+    let p = poster(&l1, &db, u128::MAX);
+    let posted = p.post(&PID, &ROOT, &blobs(2), soon()).await.unwrap();
+    assert_eq!(posted.nonce, rec[0].nonce);
+    let last = l1.sends().pop().unwrap();
+    assert_eq!(last.fees, rec[0].fees.doubled());
+    assert_eq!(l1.mined_posts(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lagging_receipt_does_not_free_the_nonce() {
+    let l1 = FakeL1::new();
+    let (_dir, db) = fresh_db();
+    let lag = Arc::new(Lagging::new(&l1));
+    let p = Poster::new(lag.clone(), db.clone(), u128::MAX, Duration::from_secs(1)).unwrap();
+    // The nonce count moves past ours while our receipt reads as unknown.
+    lag.lag_for(Duration::from_secs(20));
+    let posted = p.post(&PID, &ROOT, &blobs(1), later()).await.unwrap();
+    let s = l1.sends();
+    assert_eq!(s.len(), 1, "no second post at the next nonce: {s:?}");
+    assert_eq!((posted.nonce, posted.tx), (0, s[0].hash));
+}
+
 /// FakeChain in L1 mode over a FakeL1, a poster on a fresh database, and a
 /// one-vote batch on the chain's root with the snark FakeProver returns.
 struct Rig {
@@ -232,17 +334,17 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    rig_with(Duration::from_millis(5))
+}
+
+// `poll` paces the poster and the settle loop; FakeL1 mines a block per
+// poll, so 12 s is Ethereum's pace.
+fn rig_with(poll: Duration) -> Rig {
     let s = setup(2, 8, None);
     let l1 = FakeL1::new();
     s.chain.attach_l1(&l1);
     let (dir, db) = fresh_db();
-    let da = L1Da::new(
-        Arc::new(l1.clone()),
-        db,
-        u128::MAX,
-        Duration::from_millis(5),
-    )
-    .unwrap();
+    let da = L1Da::new(Arc::new(l1.clone()), db, u128::MAX, poll).unwrap();
     let blobs = blobs(9);
     let p = BatchPublics {
         ok: true,
@@ -382,10 +484,24 @@ async fn tx_too_old_reposts() {
     assert_eq!(r.l1.mined_posts(), 2);
 }
 
-/// An Ethereum whose receipt reads come back empty a few times first.
+/// An Ethereum whose receipt reads come back empty for a while (a lagging
+/// load-balanced endpoint).
 struct Lagging {
     inner: FakeL1,
-    misses: Mutex<u32>,
+    until: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Lagging {
+    fn new(l1: &FakeL1) -> Self {
+        Lagging {
+            inner: l1.clone(),
+            until: Mutex::new(None),
+        }
+    }
+
+    fn lag_for(&self, d: Duration) {
+        *self.until.lock().unwrap() = Some(tokio::time::Instant::now() + d);
+    }
 }
 
 #[async_trait]
@@ -414,13 +530,8 @@ impl L1Chain for Lagging {
         self.inner.send_blob_tx(tx).await
     }
     async fn receipt(&self, tx: B256) -> Result<Option<L1Receipt>, Web3Error> {
-        let miss = {
-            let mut m = self.misses.lock().unwrap();
-            let miss = *m > 0;
-            *m = m.saturating_sub(1);
-            miss
-        };
-        if miss {
+        let until = *self.until.lock().unwrap();
+        if until.is_some_and(|t| tokio::time::Instant::now() < t) {
             return Ok(None);
         }
         self.inner.receipt(tx).await
@@ -430,26 +541,74 @@ impl L1Chain for Lagging {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_lagging_receipt_does_not_repost() {
-    let mut r = rig();
-    // Poster and settle loop share the lagging view; two misses < GONE_POLLS.
-    let lag = Arc::new(Lagging {
-        inner: r.l1.clone(),
-        misses: Mutex::new(0),
-    });
+    let poll = Duration::from_secs(1);
+    let mut r = rig_with(poll);
+    // Poster and settle loop share the lagging view.
+    let lag = Arc::new(Lagging::new(&r.l1));
     let (dir, db) = fresh_db();
-    r.da = L1Da::new(lag.clone(), db, u128::MAX, Duration::from_millis(5)).unwrap();
+    r.da = L1Da::new(lag.clone(), db, u128::MAX, poll).unwrap();
     r._dir = dir;
-    let job = r.job();
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
     let posting = r.posting(&job).await;
-    *lag.misses.lock().unwrap() = GONE_POLLS - 1;
+    lag.lag_for(GONE_FOR - 2 * poll);
     let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
     assert!(matches!(out, Settled::Landed(_)), "{out:?}");
     assert_eq!(
         r.l1.mined_posts(),
         1,
-        "a receipt read as null twice is not gone"
+        "a receipt read as null for less than GONE_FOR is not gone"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_vanished_post_is_gone_after_gone_for() {
+    let r = rig_with(Duration::from_secs(1));
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
+    let posting = r.posting(&job).await;
+    // An Ethereum reorg drops the blob transaction's block.
+    r.l1.reorg(1);
+    assert_eq!(r.l1.mined_posts(), 0);
+    let early = async {
+        tokio::time::sleep(GONE_FOR - Duration::from_secs(1)).await;
+        assert_eq!(r.l1.sends().len(), 1, "posted again before GONE_FOR");
+    };
+    let (out, ()) = tokio::join!(settle(&r.da, &r.s.chain, &job, &r.snark, posting), early);
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.l1.sends().len(), 2);
+    assert_eq!(r.l1.mined_posts(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_proof_failing_past_proof_fail_for_reposts_once() {
+    let r = rig_with(Duration::from_secs(12));
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
+    let posting = r.posting(&job).await;
+    // Proofs fail a little longer than PROOF_FAIL_FOR.
+    r.l1.fail_proofs_for(PROOF_FAIL_FOR + Duration::from_secs(5));
+    let early = async {
+        tokio::time::sleep(PROOF_FAIL_FOR - Duration::from_secs(1)).await;
+        assert_eq!(r.l1.sends().len(), 1, "posted again before PROOF_FAIL_FOR");
+    };
+    let (out, ()) = tokio::join!(settle(&r.da, &r.s.chain, &job, &r.snark, posting), early);
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let s = r.l1.sends();
+    assert_eq!(s.len(), 2, "one re-post: {s:?}");
+    assert_eq!(r.l1.mined_posts(), 2);
+    assert_eq!(
+        r.s.chain.l1_last().unwrap().blocks[0],
+        r.l1.block_of(&s[1].hash).unwrap(),
+        "settled with the second post"
     );
 }
 

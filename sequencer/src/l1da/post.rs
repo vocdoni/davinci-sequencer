@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use super::GONE_FOR;
 use crate::storage::{Db, L1PostRecord, StorageError};
 use crate::web3::{L1Chain, L1Fees, L1SendError, Web3Error};
 
@@ -79,25 +80,31 @@ pub struct Poster {
 
 impl Poster {
     /// Picks up the newest record an earlier run left: if that transaction
-    /// is still pending, the first post replaces it.
+    /// is still pending, the first post replaces it. Without an L1 key the
+    /// records are left alone.
     pub fn new(
         l1: Arc<dyn L1Chain>,
         db: Db,
         fee_cap: u128,
         poll: Duration,
     ) -> Result<Self, StorageError> {
-        let me = l1.sender().map(|a| a.0.0);
-        let mut mine = Vec::new();
-        for r in db.l1_posts()? {
-            if Some(r.from) == me {
-                mine.push(r);
-            } else {
-                warn!(nonce = r.nonce, tx = %r.tx_hash,
-                    "dropping an L1 post record of another sender (the L1 key changed)");
-                db.remove_l1_post(r.nonce)?;
+        // An observer posts nothing: its records stay for a run with the key.
+        let last = match l1.sender() {
+            None => None,
+            Some(me) => {
+                let mut mine = Vec::new();
+                for r in db.l1_posts()? {
+                    if r.from == me.0.0 {
+                        mine.push(r);
+                    } else {
+                        warn!(nonce = r.nonce, tx = %r.tx_hash,
+                            "dropping an L1 post record of another sender (the L1 key changed)");
+                        db.remove_l1_post(r.nonce)?;
+                    }
+                }
+                mine.into_iter().max_by_key(|r| r.nonce)
             }
-        }
-        let last = mine.into_iter().max_by_key(|r| r.nonce);
+        };
         if let Some(r) = &last {
             info!(nonce = r.nonce, tx = %r.tx_hash,
                 "L1 post of an earlier run on record; the next post replaces it if still pending");
@@ -119,6 +126,22 @@ impl Poster {
                 cap: self.fee_cap,
             });
         }
+        Ok(())
+    }
+
+    /// Puts back `prev` in place of the record of a send refused at the
+    /// door: that send holds no nonce, so its fees must not price the next.
+    fn restore(
+        &self,
+        last: &mut Option<L1PostRecord>,
+        prev: Option<&L1PostRecord>,
+        nonce: u64,
+    ) -> Result<(), StorageError> {
+        match prev {
+            Some(r) if r.nonce == nonce => self.db.put_l1_post(r)?,
+            _ => self.db.remove_l1_post(nonce)?,
+        }
+        *last = prev.cloned();
         Ok(())
     }
 
@@ -162,6 +185,9 @@ impl Poster {
             }
             self.within_cap(&fees, n)?;
             let mut hashes: Vec<B256> = Vec::new();
+            // The record a refused send falls back to: the newest one that
+            // something of ours in the pool stands behind.
+            let mut prev = last.clone();
             'send: loop {
                 if Instant::now() >= deadline {
                     return Err(PostError::Deadline);
@@ -181,10 +207,14 @@ impl Poster {
                 self.db.put_l1_post(&rec)?;
                 *last = Some(rec);
                 match self.l1.send_blob_tx(&tx).await {
-                    Ok(()) => hashes.push(tx.hash),
+                    Ok(()) => {
+                        hashes.push(tx.hash);
+                        prev = last.clone();
+                    }
                     Err(L1SendError::Unanswered(e)) => {
                         warn!(nonce, error = %e, "L1 send unanswered; waiting for its receipt");
                         hashes.push(tx.hash);
+                        prev = last.clone();
                     }
                     Err(L1SendError::Sidecar(e)) if !sidecar_retried => {
                         sidecar_retried = true;
@@ -197,11 +227,13 @@ impl Poster {
                             return Err(PostError::L1(e));
                         }
                         // Something of ours holds the nonce: double until it is outbid.
+                        prev = last.clone();
                         fees = fees.doubled();
                         self.within_cap(&fees, n)?;
                         continue 'send;
                     }
                     Err(L1SendError::NonceTaken(e) | L1SendError::Gap(e)) => {
+                        self.restore(&mut last, prev.as_ref(), nonce)?;
                         refusals += 1;
                         if refusals > MAX_REFUSALS {
                             return Err(PostError::L1(e));
@@ -213,11 +245,13 @@ impl Poster {
                         // A send of ours at this nonce may be the one mined: wait for it.
                     }
                     Err(e @ (L1SendError::Sidecar(_) | L1SendError::Refused(_))) => {
+                        self.restore(&mut last, prev.as_ref(), nonce)?;
                         return Err(PostError::L1(e.to_string()));
                     }
                 }
                 let mut since: Option<u64> = None;
-                let mut taken = false;
+                // Since when the account's nonce passed ours with no receipt of ours.
+                let mut taken: Option<Instant> = None;
                 loop {
                     for h in &hashes {
                         match self.l1.receipt(*h).await {
@@ -238,8 +272,8 @@ impl Poster {
                             Err(e) => debug!(error = %e, "L1 receipt read failed; still waiting"),
                         }
                     }
-                    if taken {
-                        // Re-checked: none of ours is mined at this nonce.
+                    if taken.is_some_and(|t| t.elapsed() >= GONE_FOR) {
+                        // Re-checked for GONE_FOR: none of ours is mined at this nonce.
                         refusals += 1;
                         if refusals > MAX_REFUSALS {
                             return Err(PostError::L1(format!(
@@ -256,7 +290,11 @@ impl Poster {
                     if Instant::now() >= deadline {
                         return Err(PostError::Deadline);
                     }
-                    if let Ok(head) = self.l1.head().await {
+                    // Taken: a lagging endpoint may not show our receipt yet, so
+                    // only look again.
+                    if taken.is_none()
+                        && let Ok(head) = self.l1.head().await
+                    {
                         let start = *since.get_or_insert(head);
                         if head >= start + REPLACE_AFTER
                             && let (Ok(count), Ok(market)) =
@@ -264,7 +302,7 @@ impl Poster {
                         {
                             if count > nonce {
                                 // Ours may have been mined since the receipt pass: look again first.
-                                taken = true;
+                                taken = Some(Instant::now());
                                 continue;
                             }
                             let up = fees.doubled().max_each(L1Fees::offer(&market));

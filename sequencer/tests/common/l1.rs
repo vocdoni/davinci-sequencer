@@ -57,6 +57,10 @@ struct L1Inner {
     auto_mine: bool,
     /// The next N accepted sends are lost.
     drop_next: u32,
+    /// The next N sends are refused at the door (never reach the chain).
+    refuse_next: u32,
+    /// `build_proof` fails until then.
+    proofs_fail_until: Option<tokio::time::Instant>,
     sends: Vec<L1Send>,
     /// Sets the blocks of a reorg apart from the ones they replace.
     epoch: u8,
@@ -170,6 +174,8 @@ impl FakeL1 {
             hold: false,
             auto_mine: true,
             drop_next: 0,
+            refuse_next: 0,
+            proofs_fail_until: None,
             sends: Vec::new(),
             epoch: 0,
         };
@@ -236,6 +242,15 @@ impl FakeL1 {
 
     pub fn drop_next(&self, n: u32) {
         self.lock().drop_next = n;
+    }
+
+    pub fn refuse_next(&self, n: u32) {
+        self.lock().refuse_next = n;
+    }
+
+    /// `build_proof` fails for `d` from now (a lagging or pruning endpoint).
+    pub fn fail_proofs_for(&self, d: std::time::Duration) {
+        self.lock().proofs_fail_until = Some(tokio::time::Instant::now() + d);
     }
 
     pub fn market(&self) -> L1Market {
@@ -393,6 +408,10 @@ impl L1Chain for FakeL1 {
     // every fee.
     async fn send_blob_tx(&self, tx: &SignedBlobTx) -> Result<(), L1SendError> {
         let mut i = self.lock();
+        if i.refuse_next > 0 {
+            i.refuse_next -= 1;
+            return Err(L1SendError::Refused("413 payload too large".into()));
+        }
         let t = i
             .signed
             .get(&tx.hash)
@@ -445,6 +464,11 @@ impl L1Chain for FakeL1 {
     // `l1proof::build` on this chain's blocks.
     async fn build_proof(&self, txs: &[B256], top: u64) -> Result<L1BlobProof, Web3Error> {
         let i = self.lock();
+        if i.proofs_fail_until
+            .is_some_and(|t| tokio::time::Instant::now() < t)
+        {
+            return Err(Web3Error::Rpc("scripted proof failure".into()));
+        }
         let located = txs
             .iter()
             .map(|h| locate(&i, h).ok_or_else(|| Web3Error::Rpc(format!("no receipt for {h}"))))

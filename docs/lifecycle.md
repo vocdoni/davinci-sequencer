@@ -125,8 +125,9 @@ Each batch:
    behind OP's origin) rebuilds the proof from fresh reads, at most 5 times, then the votes go back
    to the queue.
 6. A blob transaction that disappears (dropped, or reorged out of Ethereum) is posted again. A
-   missing receipt counts as gone only after 3 polls, since a lagging endpoint reads the same.
-   Re-posts are capped at 3 per batch; then the votes go back to the queue.
+   missing receipt counts as gone only after 36 s, since a lagging endpoint reads the same. A
+   proof that cannot be built or anchored for 60 s also posts the blobs again. Re-posts are
+   capped at 3 per batch; then the votes go back to the queue.
 7. Commits when its `ProcessStateTransitioned` event reaches `--confirmations`, not at the receipt:
    OP's unsafe blocks reorg with Ethereum. If the event is still missing after 90 s, the node
    looks at the registry: while it still shows the settlement's root the node keeps waiting (no

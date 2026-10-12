@@ -3,6 +3,8 @@
 //! accepts it, check it locally, simulate and send. The blobs are posted
 //! again when their transaction is gone or the proof would be too deep.
 
+use std::time::Duration;
+
 use alloy::primitives::B256;
 use davinci_zkvm_sdk::client::PlonkSnark;
 use tokio::time::Instant;
@@ -26,12 +28,15 @@ pub const MAX_L1_PROOF_HEADERS: u64 = 64;
 /// `L1BlobVerifier.MAX_AGE`: how far behind the origin a proven
 /// transaction's block may be.
 pub const L1_MAX_AGE: u64 = 7200;
-/// Proof rebuilds (after `L1OriginMismatch` or a local anchor miss) before
-/// the batch goes back to the queue.
+/// Proof rebuilds after `L1OriginMismatch`, and pre-flight RPC failures,
+/// before the batch goes back to the queue.
 pub const MAX_PROOF_RETRIES: u32 = 5;
-/// Polls a mined post may read as unknown (a lagging endpoint) before it
-/// counts as gone.
-pub const GONE_POLLS: u32 = 3;
+/// How long a mined post may read as unknown before it counts as gone:
+/// load-balanced endpoints lag a block or two (12 s each).
+pub const GONE_FOR: Duration = Duration::from_secs(36);
+/// How long building or anchoring the L1 proof may keep failing before the
+/// blobs are posted again (a fresh blob block usually fixes it).
+pub const PROOF_FAIL_FOR: Duration = Duration::from_secs(60);
 /// Re-posts of the blobs in one settlement before the batch goes back to the
 /// queue (each is an L1 blob transaction).
 pub const MAX_REPOSTS: u32 = 3;
@@ -113,10 +118,11 @@ macro_rules! repost {
 /// Settles `job`'s proved batch on OP. Waits (within the deadline) for the
 /// blob transaction to have [`REORG_MARGIN`] blocks on top and for OP's
 /// origin to reach it, then sends the transition with an L1 proof anchored by
-/// [`choose_anchor`]. A vanished blob transaction, a too-deep proof or
-/// `TxTooOld` post the blobs again; `L1OriginMismatch` rebuilds the proof
-/// from fresh reads, up to [`MAX_PROOF_RETRIES`] times. Other reverts end the
-/// job with their name, as in blob mode.
+/// [`choose_anchor`]. A vanished blob transaction, a too-deep proof, one
+/// that fails to build or anchor for [`PROOF_FAIL_FOR`], or `TxTooOld` post
+/// the blobs again; `L1OriginMismatch` rebuilds the proof from fresh reads,
+/// up to [`MAX_PROOF_RETRIES`] times. Other reverts end the job with their
+/// name, as in blob mode.
 pub async fn settle(
     da: &L1Da,
     chain: &dyn Chain,
@@ -141,7 +147,10 @@ pub async fn settle(
     let mut recorded = posting.recorded;
     let mut retries = 0u32;
     let mut reposts = 0u32;
-    let mut gone = 0u32;
+    // Since when the post's receipt reads as unknown.
+    let mut gone: Option<Instant> = None;
+    // Since when the proof of this post fails to build or anchor.
+    let mut proof_failing: Option<Instant> = None;
     loop {
         if job.cancel.is_cancelled() {
             return Settled::Transient("flight aborted".into());
@@ -159,6 +168,7 @@ pub async fn settle(
                 Ok(p) => {
                     post = Some(p);
                     recorded = None;
+                    proof_failing = None;
                     p
                 }
                 Err(e @ (PostError::Deadline | PostError::NoSigner | PostError::Storage(_))) => {
@@ -174,17 +184,19 @@ pub async fn settle(
         };
         let rc = match da.l1.receipt(p.tx).await {
             Ok(Some(rc)) => {
-                gone = 0;
+                gone = None;
                 rc
             }
-            Ok(None) if gone < GONE_POLLS => {
-                gone += 1;
-                warn!(%pid, tx = %p.tx, gone, "L1 blob transaction not found; re-checking");
+            Ok(None) if gone.is_none_or(|t| t.elapsed() < GONE_FOR) => {
+                if gone.is_none() {
+                    gone = Some(Instant::now());
+                    warn!(%pid, tx = %p.tx, "L1 blob transaction not found; re-checking");
+                }
                 pause_or_abort!(da, job);
                 continue;
             }
             Ok(None) => {
-                gone = 0;
+                gone = None;
                 repost!(reposts, "the blob transaction is gone");
                 warn!(%pid, tx = %p.tx, "L1 blob transaction gone (dropped or reorged out); posting again");
                 post = None;
@@ -222,27 +234,36 @@ pub async fn settle(
                 continue;
             }
         };
-        let proof = match da.l1.build_proof(&[p.tx], top).await {
-            Ok(proof) => proof,
+        let built = match da.l1.build_proof(&[p.tx], top).await {
+            Ok(proof) => match verify_local(&proof, anchor) {
+                Ok((vhs, _)) if vhs == want => Ok(proof),
+                Ok(_) => {
+                    return Settled::Failed("the L1 blob transaction carries other blobs".into());
+                }
+                Err(e) => Err(format!("the L1 proof does not anchor: {e}")),
+            },
+            Err(e) => Err(format!("the L1 proof build failed: {e}")),
+        };
+        let proof = match built {
+            Ok(proof) => {
+                proof_failing = None;
+                proof
+            }
+            // A lagging or pruning endpoint: retry each poll; past the
+            // window a new blob block usually helps.
+            Err(e) if proof_failing.is_some_and(|t| t.elapsed() >= PROOF_FAIL_FOR) => {
+                repost!(reposts, "the L1 proof could not be built or anchored");
+                warn!(%pid, error = %e, "the L1 proof kept failing; posting the blobs again");
+                post = None;
+                continue;
+            }
             Err(e) => {
-                warn!(%pid, error = %e, "L1 proof build failed");
+                proof_failing.get_or_insert_with(Instant::now);
+                warn!(%pid, error = %e, "retrying the L1 proof");
                 pause_or_abort!(da, job);
                 continue;
             }
         };
-        match verify_local(&proof, anchor) {
-            Ok((vhs, _)) if vhs == want => {}
-            Ok(_) => return Settled::Failed("the L1 blob transaction carries other blobs".into()),
-            Err(e) => {
-                retries += 1;
-                if retries > MAX_PROOF_RETRIES {
-                    return Settled::Transient(format!("L1 proof does not anchor: {e}"));
-                }
-                warn!(%pid, error = %e, "L1 proof does not anchor; rebuilding");
-                pause_or_abort!(da, job);
-                continue;
-            }
-        }
         let refused = match chain
             .simulate_transition_l1(&job.pid, snark, job.blobs, &proof)
             .await
