@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::web3::OnchainProcess;
 
 /// Bump on any incompatible change to a table layout or record encoding.
-pub const SCHEMA_VERSION: u64 = 8;
+pub const SCHEMA_VERSION: u64 = 9;
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The database file inside its directory.
 pub const DB_FILE: &str = "sequencer.redb";
@@ -53,6 +53,11 @@ const VOTE_ADDR: Bytes = TableDefinition::new("vote_addr");
 // pid -> `ExposedRecord`: slots a sealed batch exposed, until every
 // recorded vote settles or errors.
 const EXPOSED: Bytes = TableDefinition::new("exposed");
+// nonce (BE8) -> `L1PostRecord`: blob transactions of the node's Ethereum
+// account not yet seen mined (L1-blob mode).
+const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
+/// The last schema this build upgrades in place: 9 only added `l1_posts`.
+const UPGRADES_FROM: u64 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -174,6 +179,26 @@ pub struct TransitionRecord {
 pub struct ExposedRecord {
     pub slots: Vec<u64>,
     pub vote_ids: Vec<u64>,
+}
+
+/// A blob transaction the node signed on Ethereum (L1-blob mode), written
+/// before it is sent and dropped once mined, so a restart replaces it at its
+/// nonce instead of queueing behind it. Holds nothing secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct L1PostRecord {
+    #[serde(with = "hex::serde")]
+    pub pid: [u8; 31],
+    #[serde(with = "hex::serde")]
+    pub root_before: [u8; 32],
+    pub nonce: u64,
+    pub tx_hash: alloy::primitives::B256,
+    pub fees: crate::web3::L1Fees,
+    pub vhs: Vec<alloy::primitives::B256>,
+    /// Unix seconds.
+    pub posted_at: u64,
+    /// The L1 account that sent the post.
+    #[serde(with = "hex::serde")]
+    pub from: [u8; 20],
 }
 
 /// Shared handle to the node's database. Cloning is cheap.
@@ -320,6 +345,11 @@ impl Db {
                         .map_err(db_err)?;
                 }
                 Some(v) if v == SCHEMA_VERSION => {}
+                // Additive: the new table is opened below.
+                Some(UPGRADES_FROM) => {
+                    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)
+                        .map_err(db_err)?;
+                }
                 Some(v) => {
                     return Err(StorageError::Schema {
                         found: v,
@@ -341,6 +371,7 @@ impl Db {
                 VOTE_ADDR,
                 META_BYTES,
                 EXPOSED,
+                L1_POSTS,
             ] {
                 tx.open_table(t).map_err(db_err)?;
             }
@@ -478,6 +509,38 @@ impl Db {
         self.write(|tx| {
             let mut t = tx.open_table(EXPOSED).map_err(db_err)?;
             t.remove(pid_key(pid).as_slice()).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Records a blob transaction before it is sent; a replacement at the
+    /// same nonce overwrites the record.
+    pub fn put_l1_post(&self, r: &L1PostRecord) -> Result<()> {
+        self.put(L1_POSTS, &r.nonce.to_be_bytes(), &encode(r)?)
+    }
+
+    /// Every recorded blob transaction, by nonce.
+    pub fn l1_posts(&self) -> Result<Vec<L1PostRecord>> {
+        self.scan(L1_POSTS, &[], 8)?
+            .iter()
+            .map(|(_, v)| decode("l1_posts", v))
+            .collect()
+    }
+
+    /// Drops the records at or below `nonce`: mined.
+    pub fn remove_l1_posts_upto(&self, nonce: u64) -> Result<()> {
+        self.write(|tx| {
+            let mut t = tx.open_table(L1_POSTS).map_err(db_err)?;
+            let (lo, hi) = ([0u8; 8], nonce.to_be_bytes());
+            let keys: Vec<Vec<u8>> = t
+                .range(lo.as_slice()..=hi.as_slice())
+                .map_err(db_err)?
+                .map(|r| r.map(|(k, _)| k.value().to_vec()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?;
+            for k in keys {
+                t.remove(k.as_slice()).map_err(db_err)?;
+            }
             Ok(())
         })
     }
@@ -834,7 +897,7 @@ fn adopt_flat(datadir: &Path, dir: &Path, chain_id: u64, registry: &[u8; 20]) ->
         "its deployment is unknown (no process to tell it by)"
     } else if prefixes.iter().any(|p| Some(*p) != ours) {
         "it belongs to another deployment"
-    } else if schema != Some(SCHEMA_VERSION) {
+    } else if !matches!(schema, Some(SCHEMA_VERSION | UPGRADES_FROM)) {
         "its schema version is not this build's"
     } else {
         ""
