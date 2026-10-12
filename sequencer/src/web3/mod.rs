@@ -4,6 +4,7 @@
 mod blobs;
 mod contracts;
 mod failover;
+mod l1;
 mod l1op;
 pub mod l1proof;
 mod release;
@@ -25,6 +26,10 @@ pub use contracts::{
 pub use davinci_client::organizer::RegistryDa;
 use failover::Failover;
 pub(crate) use failover::host;
+pub use l1::{
+    BLOB_TX_GAS, GAS_PER_BLOB, L1Chain, L1Fees, L1Market, L1Receipt, L1Rpc, L1SendError, MIN_TIP,
+    SignedBlobTx,
+};
 pub use l1op::revert_message;
 pub use release::{DeployedRelease, Mismatch};
 
