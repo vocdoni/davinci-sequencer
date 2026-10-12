@@ -4,6 +4,7 @@
 mod blobs;
 mod contracts;
 mod failover;
+pub mod l1proof;
 mod release;
 mod tx;
 
