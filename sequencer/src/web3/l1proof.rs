@@ -3,11 +3,11 @@
 //! proof of each transaction in its block's transactions trie. `L1BlobVerifier` checks the same
 //! thing on OP against `L1Block.hash()`; `verify_local` mirrors it before a send.
 
-use alloy::consensus::{Header, Transaction};
-use alloy::eips::eip2718::{Decodable2718, Encodable2718};
+use alloy::consensus::Header;
+use alloy::eips::eip2718::Encodable2718;
 use alloy::primitives::{B256, Bytes, keccak256};
 use alloy::providers::Provider;
-use alloy::rlp::{Decodable, Encodable};
+use alloy::rlp::{Decodable, Encodable, Header as RlpHeader};
 use alloy::trie::proof::{ProofRetainer, verify_proof};
 use alloy::trie::{HashBuilder, Nibbles};
 
@@ -105,18 +105,67 @@ pub fn verify_tx(
     .map_err(|e| L1ProofError::BadProof(e.to_string()))
 }
 
-/// The fields of a header RLP the verifier reads: (parentHash, transactionsRoot, number).
-fn header_fields(rlp: &[u8]) -> Result<(B256, B256, u64), L1ProofError> {
-    let h = Header::decode(&mut &rlp[..]).map_err(|e| L1ProofError::BadHeader(e.to_string()))?;
-    Ok((h.parent_hash, h.transactions_root, h.number))
+/// The whole encoded items of an RLP list that spans all of `buf`.
+fn rlp_items(buf: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut b = buf;
+    let h = RlpHeader::decode(&mut b).ok()?;
+    if !h.list || h.payload_length != b.len() {
+        return None;
+    }
+    let mut items = vec![];
+    while !b.is_empty() {
+        let start = b;
+        let h = RlpHeader::decode(&mut b).ok()?;
+        b = b.get(h.payload_length..)?;
+        items.push(&start[..start.len() - b.len()]);
+    }
+    Some(items)
 }
 
-/// Versioned hashes of a type-3 envelope, or `None` for any other type.
+/// The payload of an encoded RLP string item.
+fn rlp_str(item: &[u8]) -> Option<&[u8]> {
+    let mut b = item;
+    let h = RlpHeader::decode(&mut b).ok()?;
+    (!h.list).then_some(b)
+}
+
+/// The fields of a header RLP the verifier reads by index: (parentHash, transactionsRoot, number).
+fn header_fields(rlp: &[u8]) -> Result<(B256, B256, u64), L1ProofError> {
+    let bad = |m: &str| L1ProofError::BadHeader(m.to_string());
+    let items = rlp_items(rlp).ok_or_else(|| bad("not an rlp list"))?;
+    if items.len() < 9 {
+        return Err(bad("fewer than 9 items"));
+    }
+    let hash = |i: usize| {
+        rlp_str(items[i])
+            .filter(|b| b.len() == 32)
+            .map(B256::from_slice)
+            .ok_or_else(|| bad("hash is not 32 bytes"))
+    };
+    let number = rlp_str(items[8])
+        .filter(|b| b.len() <= 8)
+        .ok_or_else(|| bad("bad block number"))?;
+    let number = number.iter().fold(0u64, |n, b| n << 8 | *b as u64);
+    Ok((hash(0)?, hash(4)?, number))
+}
+
+/// Versioned hashes of a type-3 envelope (`0x03 ++ rlp([.., blobVersionedHashes, ..])`), or
+/// `None` for anything else.
 fn blob_hashes(envelope: &[u8]) -> Option<Vec<B256>> {
-    let tx = alloy::consensus::TxEnvelope::decode_2718(&mut &envelope[..]).ok()?;
-    tx.blob_versioned_hashes()
-        .map(|v| v.to_vec())
-        .filter(|v| !v.is_empty())
+    let (&ty, body) = envelope.split_first()?;
+    let items = rlp_items(body).filter(|i| ty == 0x03 && i.len() >= 11)?;
+    let hashes = rlp_items(items[10])?;
+    if hashes.is_empty() {
+        return None;
+    }
+    hashes
+        .into_iter()
+        .map(|h| {
+            rlp_str(h)
+                .filter(|b| b.len() == 32 && b[0] == 0x01)
+                .map(B256::from_slice)
+        })
+        .collect()
 }
 
 /// Mirrors `L1BlobVerifier.verify`: the versioned hashes in proof order and the block number of
@@ -237,6 +286,67 @@ pub async fn build<P: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RLP list of already-encoded items.
+    fn list(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload: Vec<u8> = items.concat();
+        let mut out = vec![];
+        RlpHeader {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut out);
+        out.extend(payload);
+        out
+    }
+
+    fn string(b: &[u8]) -> Vec<u8> {
+        alloy::rlp::encode(b)
+    }
+
+    fn envelope(ty: u8, first_byte: u8) -> Vec<u8> {
+        let mut vh = [7u8; 32];
+        vh[0] = first_byte;
+        let mut items: Vec<Vec<u8>> = (0..10).map(|i| string(&[i])).collect();
+        items.push(list(&[string(&vh)]));
+        items.push(string(b"sig"));
+        [vec![ty], list(&items)].concat()
+    }
+
+    #[test]
+    fn header_fields_by_index() {
+        let h = Header {
+            number: 123,
+            parent_hash: B256::repeat_byte(1),
+            transactions_root: B256::repeat_byte(2),
+            ..Default::default()
+        };
+        let mut rlp = vec![];
+        h.encode(&mut rlp);
+        assert_eq!(
+            header_fields(&rlp).unwrap(),
+            (B256::repeat_byte(1), B256::repeat_byte(2), 123)
+        );
+        let short = list(&(0..8).map(|i| string(&[i])).collect::<Vec<_>>());
+        assert!(matches!(
+            header_fields(&short),
+            Err(L1ProofError::BadHeader(_))
+        ));
+        assert!(matches!(
+            header_fields(&rlp[..rlp.len() - 1]),
+            Err(L1ProofError::BadHeader(_))
+        ));
+    }
+
+    #[test]
+    fn blob_hashes_by_index() {
+        let got = blob_hashes(&envelope(3, 1)).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0][0], 1);
+        assert_eq!(blob_hashes(&envelope(3, 2)), None);
+        assert_eq!(blob_hashes(&envelope(2, 1)), None);
+        assert_eq!(blob_hashes(&[]), None);
+    }
 
     #[test]
     fn tx_key_encodings() {
