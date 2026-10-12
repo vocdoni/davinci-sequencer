@@ -146,6 +146,8 @@ macro_rules! say {
 
 #[path = "e2e/grace.rs"]
 mod grace;
+#[path = "e2e/l1_restart.rs"]
+mod l1_restart;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e() -> Result<()> {
@@ -527,10 +529,23 @@ async fn costs(net: &Net, org: &Organizer, mut extra: Vec<TxCost>) -> Result<Str
         let label = format!("results {}", ProcessId(t.pid));
         all.push(cost::fetch(&net.rpc, label, t.tx).await?);
     }
-    Ok(cost::report(
-        &format!("gas bill, chain {}", net.chain_id),
-        &all,
-    ))
+    // L1-blob mode: the Ethereum blob transactions behind the settlements
+    // (not the replaced or lost ones), paid in ETH on Ethereum.
+    let mut title = format!("gas bill, chain {}", net.chain_id);
+    if let Some(l1) = &net.l1 {
+        title.push_str(" and Ethereum");
+        for p in l1::posts(&net.rpc, l1.read_rpc(), net.registry, from)
+            .await?
+            .into_iter()
+            .filter(|p| created.contains(&p.pid))
+        {
+            for tx in p.l1_txs {
+                let label = format!("L1 blobs {}", ProcessId(p.pid));
+                all.push(cost::fetch(l1.read_rpc(), label, tx).await?);
+            }
+        }
+    }
+    Ok(cost::report(&title, &all))
 }
 
 /// A vote expected to settle on `node`.
@@ -904,6 +919,10 @@ async fn scenario(dir: &Path) -> Result<()> {
     let ballot_prover = tokio::task::spawn_blocking(fx::load_prover);
 
     let net = Net::open(dir).await?;
+    ensure!(
+        !(net.live && net.l1.is_some()),
+        "the full scenario does not run live in L1-blob mode: use DAVINCI_E2E_OP_LIVE=1"
+    );
     net.check_balances(OBS).await?;
     let dep_chain_id = net.chain_id;
     let registry = net.registry;
@@ -979,7 +998,9 @@ async fn scenario(dir: &Path) -> Result<()> {
     // The nodes size transitions from eth_config: 2 blobs on Gnosis.
     for n in &nodes {
         match n.logged_blob_cap() {
-            Some(c) if net.live => ensure!(c == 2, "{}: blob cap {c}, want 2", n.name),
+            Some(c) if net.live && net.l1.is_none() => {
+                ensure!(c == 2, "{}: blob cap {c}, want 2", n.name)
+            }
             Some(c) => say!("{}: blob cap {c}", n.name),
             None => say!("{}: no blob cap in its log", n.name),
         }
@@ -1370,6 +1391,22 @@ async fn scenario(dir: &Path) -> Result<()> {
             "all nodes and the observer report the results; {t1} transitions p1, {t2} p2; {}",
             show_metrics(&nodes, &all_metrics(&nodes).await?)
         );
+
+        // L1-blob mode: a node killed with its blob post pending on Ethereum.
+        if net.l1.is_some() {
+            l1_restart::kill_after_post(
+                &mut nodes,
+                &seq_cfgs,
+                &bin,
+                &net,
+                &org,
+                &reader,
+                (&p1, &tree),
+                &prover,
+            )
+            .await
+            .context("L1 restart with a pending post")?;
+        }
 
         // Dynamic censuses on the same chain, prover and nodes.
         onchain_census(
