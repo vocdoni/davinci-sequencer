@@ -4,9 +4,10 @@
 
 use davinci_sequencer::keys::KeyStore;
 use davinci_sequencer::storage::{
-    DB_FILE, Db, ExposedRecord, LocalStatus, ProcessRecord, SCHEMA_VERSION_KEY, StorageError,
-    StoredVote, TransitionRecord, VoteStatus, deployment_dir, pid_prefix,
+    DB_FILE, Db, ExposedRecord, L1PostRecord, LocalStatus, ProcessRecord, SCHEMA_VERSION_KEY,
+    StorageError, StoredVote, TransitionRecord, VoteStatus, deployment_dir, pid_prefix,
 };
+use davinci_sequencer::web3::L1Fees;
 use davinci_sequencer::web3::{DkgState, KeyMode, OnchainCensus, OnchainProcess, ProcessStatus};
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::blob::{BLOB_SIZE, Blob};
@@ -625,4 +626,69 @@ fn flat_layout_of_another_schema_stays() {
     let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
     assert!(db.processes().unwrap().is_empty());
     assert!(dir.path().join(DB_FILE).exists());
+}
+
+fn post(nonce: u64, fee: u128) -> L1PostRecord {
+    L1PostRecord {
+        pid: [3; 31],
+        root_before: [4; 32],
+        nonce,
+        tx_hash: alloy::primitives::B256::repeat_byte(nonce as u8),
+        fees: L1Fees {
+            max_fee: fee,
+            tip: 1_000_000,
+            blob_fee: 2,
+        },
+        vhs: vec![alloy::primitives::B256::repeat_byte(1)],
+        posted_at: 1_700_000_000,
+        from: [5; 20],
+    }
+}
+
+#[test]
+fn l1_posts_round_trip_by_nonce() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    assert!(db.l1_posts().unwrap().is_empty());
+    db.put_l1_post(&post(7, 10)).unwrap();
+    db.put_l1_post(&post(5, 10)).unwrap();
+    // A replacement at the same nonce overwrites its record.
+    db.put_l1_post(&post(7, 20)).unwrap();
+    let got = db.l1_posts().unwrap();
+    assert_eq!(got, vec![post(5, 10), post(7, 20)]);
+    // Fees above u64 survive the JSON encoding.
+    db.put_l1_post(&post(9, u128::from(u64::MAX) * 4)).unwrap();
+    drop(db);
+    let db = open(&dir);
+    assert_eq!(db.l1_posts().unwrap().len(), 3);
+    db.remove_l1_posts_upto(7).unwrap();
+    assert_eq!(
+        db.l1_posts().unwrap(),
+        vec![post(9, u128::from(u64::MAX) * 4)]
+    );
+}
+
+#[test]
+fn a_schema_8_file_upgrades_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(&dir);
+        db.put_process(&process(3)).unwrap();
+        db.set_meta_u64(SCHEMA_VERSION_KEY, 8).unwrap();
+    }
+    let db = open(&dir);
+    assert_eq!(db.meta_u64(SCHEMA_VERSION_KEY).unwrap(), Some(9));
+    assert_eq!(db.process(&pid(3)).unwrap(), Some(process(3)));
+    db.put_l1_post(&post(1, 1)).unwrap();
+    drop(db);
+    // Older versions are still refused.
+    {
+        let db = open(&dir);
+        db.set_meta_u64(SCHEMA_VERSION_KEY, 7).unwrap();
+    }
+    let err = Db::open(&dir.path().join("sequencer.redb")).err().unwrap();
+    assert!(
+        matches!(err, StorageError::Schema { found: 7, .. }),
+        "{err}"
+    );
 }
