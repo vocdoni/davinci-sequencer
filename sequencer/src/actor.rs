@@ -34,7 +34,7 @@ use crate::metrics::Metrics;
 use crate::storage::{Db, LocalStatus, ProcessRecord, StoredVote, VoteStatus, fr_hex};
 use crate::web3::l1proof::L1BlobProof;
 use crate::web3::{
-    BlobSource, EventKind, GraceParams, KeyMode, L1Origin, OnchainProcess, ProcessStatus,
+    BlobSource, EventKind, GraceParams, KeyMode, L1Blobs, L1Origin, OnchainProcess, ProcessStatus,
     RegistryEvent, RevertReason, TxReceipt, Web3Error,
 };
 
@@ -218,6 +218,8 @@ pub struct Deps {
     /// Actor and monitor tasks; `api::run` awaits it on shutdown so the
     /// database handle is released before the process exits.
     pub tasks: tokio_util::task::TaskTracker,
+    /// L1-blob mode: the Ethereum side (poster, proofs); `None` in blob mode.
+    pub l1: Option<Arc<crate::l1da::L1Da>>,
 }
 
 #[async_trait]
@@ -728,6 +730,10 @@ pub(crate) enum JobOutcome {
 /// before the flight is rolled back (covers a reorg dropping the tx).
 const LANDED_EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Longest an L1-blob job waits for Ethereum and OP's origin when the grace
+/// end is far or unbounded.
+const L1_JOB_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
 /// Consecutive ticks the landing-time read may stay stale (failing, or a
 /// root behind the events) before the node warns and counts a stall; it
 /// warns again every as many ticks.
@@ -746,6 +752,9 @@ struct Flight {
     /// Set when the settlement tx landed but the receipt read failed: if the
     /// confirmed chain never shows our root by this instant, roll back.
     landed_deadline: Option<tokio::time::Instant>,
+    /// Cancels the job when the flight is dropped (rollback, requeue,
+    /// shutdown), so an L1-blob job stops waiting on Ethereum.
+    _abort: tokio_util::sync::DropGuard,
 }
 
 struct Actor {
@@ -1433,14 +1442,26 @@ impl Actor {
         if self.in_flight.as_ref().is_some_and(|f| {
             f.landed_deadline
                 .is_some_and(|d| tokio::time::Instant::now() >= d)
-        }) && let Some(f) = self.in_flight.take()
+        }) && let Some(mut f) = self.in_flight.take()
         {
-            warn!(
-                pid = %hex::encode(self.pid31),
-                "landed settlement never confirmed; rolling back and requeueing"
-            );
-            self.rollback_flight(&f);
-            self.requeue_flight(f);
+            // L1-blob mode commits every landing at its event: a late page
+            // of events is not a lost settlement while the chain still
+            // shows our root. Keep waiting on it.
+            if self.deps.l1.is_some()
+                && let Ok(p) = self.deps.contracts.process(&self.pid31).await
+                && p.state_root == f.prepared.new_root
+            {
+                debug!(pid = %hex::encode(self.pid31), "settlement on-chain, its event still pending");
+                f.landed_deadline = Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+                self.in_flight = Some(f);
+            } else {
+                warn!(
+                    pid = %hex::encode(self.pid31),
+                    "landed settlement never confirmed; rolling back and requeueing"
+                );
+                self.rollback_flight(&f);
+                self.requeue_flight(f);
+            }
         }
         // A pinned-but-unconfirmed root (commit failure on a shallow
         // receipt): if the chain still does not show it, re-read the real
@@ -1821,6 +1842,9 @@ impl Actor {
             reason = %reason,
             "batch sealed"
         );
+        let cancel = CancellationToken::new();
+        // The grace end known now; it only moves later.
+        let left = std::time::Duration::from_secs(self.grace_end().saturating_sub(now));
         let job = JobInput {
             generation: self.generation,
             pid31: self.pid31,
@@ -1835,6 +1859,9 @@ impl Actor {
             nf,
             n: vids.len(),
             prove_base: self.prove_base,
+            l1: self.deps.l1.clone(),
+            deadline: tokio::time::Instant::now() + left.min(L1_JOB_CAP),
+            cancel: cancel.clone(),
         };
         self.in_flight = Some(Flight {
             generation: self.generation,
@@ -1842,6 +1869,7 @@ impl Actor {
             votes: selected,
             votes_at,
             landed_deadline: None,
+            _abort: cancel.drop_guard(),
         });
         tokio::spawn(run_job(job));
     }
@@ -2176,6 +2204,15 @@ impl Actor {
         };
         let vids = f.prepared.vote_ids.clone();
         match outcome {
+            JobOutcome::Landed(rc) if self.deps.l1.is_some() => {
+                // L1-blob mode: OP's unsafe blocks reorg with Ethereum, so the
+                // settlement commits at its confirmed event; one that never
+                // shows is rolled back by tick() and requeued.
+                info!(pid = %hex::encode(self.pid31), tx = %rc.tx_hash, block = rc.block,
+                    "settlement mined; committing at its event");
+                f.landed_deadline = Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+                self.in_flight = Some(f);
+            }
             JobOutcome::Landed(rc) => self.commit_flight(f, rc.tx_hash.0, rc.block),
             JobOutcome::Guest(mask) => {
                 self.rollback_flight(&f);
@@ -2459,10 +2496,19 @@ impl Actor {
                 old_root,
                 new_root,
                 n_blobs,
+                l1,
                 ..
             } => {
-                self.on_transition(ev.block, ev.tx_hash.0, sender, old_root, new_root, n_blobs)
-                    .await;
+                self.on_transition(
+                    ev.block,
+                    ev.tx_hash.0,
+                    sender,
+                    old_root,
+                    new_root,
+                    n_blobs,
+                    l1,
+                )
+                .await;
             }
             EventKind::CensusUpdated { root, uri, .. } => {
                 let moved = root != self.record.onchain.census.root;
@@ -2501,6 +2547,7 @@ impl Actor {
         info!(pid = %hex::encode(self.pid31), "process finalized");
     }
 
+    #[allow(clippy::too_many_arguments)] // the event's fields, as routed
     async fn on_transition(
         &mut self,
         block: u64,
@@ -2509,6 +2556,7 @@ impl Actor {
         old_root: [u8; 32],
         new_root: [u8; 32],
         n_blobs: u64,
+        l1: Option<L1Blobs>,
     ) {
         // Every landing (replays included, harmlessly) moves the grace end.
         self.vote_at_stale = true;
@@ -2552,7 +2600,7 @@ impl Actor {
         self.record.onchain.state_root = new_root;
         self.put_record();
         if old_root == committed {
-            self.apply_sync(block, tx_hash, sender, old_root, new_root, n_blobs)
+            self.apply_sync(block, tx_hash, sender, old_root, new_root, n_blobs, l1)
                 .await;
             return;
         }
@@ -2576,6 +2624,7 @@ impl Actor {
 
     /// Applies a foreign transition from its DA blobs. Returns whether it
     /// applied; failures leave the target root in place for `maybe_resync`.
+    #[allow(clippy::too_many_arguments)] // the event's fields, as routed
     async fn apply_sync(
         &mut self,
         block: u64,
@@ -2584,15 +2633,21 @@ impl Actor {
         old_root: [u8; 32],
         new_root: [u8; 32],
         n_blobs: u64,
+        l1: Option<L1Blobs>,
     ) -> bool {
         // Only the first n_blobs blobs: the count the registry checked. An
-        // appended junk blob would otherwise fail every decode forever.
-        let blobs = match self
-            .deps
-            .blobs
-            .blobs_for_tx(alloy::primitives::B256::from(tx_hash), block, n_blobs)
-            .await
-        {
+        // appended junk blob would otherwise fail every decode forever. In
+        // L1-blob mode the event names the Ethereum blobs themselves.
+        let fetched = match &l1 {
+            None => {
+                self.deps
+                    .blobs
+                    .blobs_for_tx(alloy::primitives::B256::from(tx_hash), block, n_blobs)
+                    .await
+            }
+            Some(l) => self.deps.blobs.blobs_for_l1(&l.blocks, &l.vhs).await,
+        };
+        let blobs = match fetched {
             Ok(b) => b,
             Err(e) => {
                 error!(pid = %hex::encode(self.pid31), ?e, "blob fetch failed");
@@ -2678,11 +2733,20 @@ impl Actor {
                 old_root,
                 new_root,
                 n_blobs,
+                l1,
                 ..
             } = ev.kind
                 && old_root == self.state.committed().root
                 && !self
-                    .apply_sync(ev.block, ev.tx_hash.0, sender, old_root, new_root, n_blobs)
+                    .apply_sync(
+                        ev.block,
+                        ev.tx_hash.0,
+                        sender,
+                        old_root,
+                        new_root,
+                        n_blobs,
+                        l1,
+                    )
                     .await
             {
                 return;
@@ -2855,6 +2919,12 @@ struct JobInput {
     nf: u8,
     n: usize,
     prove_base: f64,
+    /// L1-blob mode: the Ethereum side; `None` in blob mode.
+    l1: Option<Arc<crate::l1da::L1Da>>,
+    /// L1-blob mode: no settlement after this.
+    deadline: tokio::time::Instant,
+    /// Fired when the actor drops the flight.
+    cancel: CancellationToken,
 }
 
 async fn run_job(job: JobInput) {
@@ -2870,6 +2940,41 @@ async fn run_job(job: JobInput) {
 }
 
 async fn job_inner(job: JobInput) -> JobOutcome {
+    let Some(l1) = job.l1.clone() else {
+        let snark = match proved(&job).await {
+            Ok(s) => s,
+            Err(o) => return o,
+        };
+        return settle_blobs(&job, &snark).await;
+    };
+    // L1-blob mode: the blobs go to Ethereum while the batch is proved; the
+    // flight's end (rollback, shutdown) cancels the job.
+    let lj = crate::l1da::L1Job {
+        pid: job.pid31,
+        root_before: job.expected.root_before,
+        blobs: &job.blobs,
+        deadline: job.deadline,
+        cancel: job.cancel.clone(),
+    };
+    let work = async {
+        let (proved, posting) = crate::l1da::with_post(&l1, &*job.chain, &lj, proved(&job)).await;
+        let snark = match proved {
+            Ok(s) => s,
+            Err(o) => return o,
+        };
+        crate::l1da::settle(&l1, &*job.chain, &lj, &snark, posting)
+            .await
+            .into()
+    };
+    tokio::select! {
+        _ = job.cancel.cancelled() => JobOutcome::Transient("flight aborted".into()),
+        o = work => o,
+    }
+}
+
+/// Proves the batch and checks the proof against the prepared batch and the
+/// release pins.
+async fn proved(job: &JobInput) -> Result<PlonkSnark, JobOutcome> {
     let t0 = job.clock.now();
     let (got, snark) = match job.prover.prove_batch(&job.request, &job.expected).await {
         Ok((got, snark, proving)) => {
@@ -2881,24 +2986,34 @@ async fn job_inner(job: JobInput) -> JobOutcome {
             (got, snark)
         }
         // Transport/queue trouble is retried; a failed job never is.
-        Err(e) if !e.permanent => return JobOutcome::Transient(e.to_string()),
-        Err(e) => return JobOutcome::Failed(e.to_string()),
+        Err(e) if !e.permanent => return Err(JobOutcome::Transient(e.to_string())),
+        Err(e) => return Err(JobOutcome::Failed(e.to_string())),
     };
     if !got.ok || got.fail_mask != 0 {
-        return JobOutcome::Guest(got.fail_mask);
+        return Err(JobOutcome::Guest(got.fail_mask));
     }
     if got != job.expected {
-        return JobOutcome::Failed("proved publics do not match the prepared batch".into());
+        return Err(JobOutcome::Failed(
+            "proved publics do not match the prepared batch".into(),
+        ));
     }
     match BatchPublics::from_public_values(&snark.public_values) {
         Ok(pv) if pv == job.expected => {}
-        _ => return JobOutcome::Failed("snark public values do not match the batch".into()),
+        _ => {
+            return Err(JobOutcome::Failed(
+                "snark public values do not match the batch".into(),
+            ));
+        }
     }
     if snark.program_vk != release::BATCH_PROGRAM_VK {
-        return JobOutcome::Failed("program vk is not the pinned batch circuit vk".into());
+        return Err(JobOutcome::Failed(
+            "program vk is not the pinned batch circuit vk".into(),
+        ));
     }
     if snark.root_c_vadcop_final != release::ROOT_C_VADCOP_FINAL {
-        return JobOutcome::Failed("root_c_vadcop_final is not the pinned setup".into());
+        return Err(JobOutcome::Failed(
+            "root_c_vadcop_final is not the pinned setup".into(),
+        ));
     }
     let _ = job
         .tx
@@ -2906,9 +3021,14 @@ async fn job_inner(job: JobInput) -> JobOutcome {
             generation: job.generation,
         })
         .await;
+    Ok(snark)
+}
+
+/// Blob mode: the pre-flight `eth_call`, then the blob transaction.
+async fn settle_blobs(job: &JobInput, snark: &PlonkSnark) -> JobOutcome {
     if let Err(r) = job
         .chain
-        .simulate_transition(&job.pid31, &snark, &job.blobs)
+        .simulate_transition(&job.pid31, snark, &job.blobs)
         .await
     {
         return match r {
@@ -2918,13 +3038,26 @@ async fn job_inner(job: JobInput) -> JobOutcome {
     }
     match job
         .chain
-        .submit_transition(&job.pid31, &snark, &job.blobs)
+        .submit_transition(&job.pid31, snark, &job.blobs)
         .await
     {
         Ok(rc) => JobOutcome::Landed(rc),
         Err(Web3Error::Revert(r)) => JobOutcome::Reverted(r.name().unwrap_or("revert").to_string()),
         Err(e @ Web3Error::Lost { .. }) => JobOutcome::Lost(e.to_string()),
         Err(e) => JobOutcome::Transient(e.to_string()),
+    }
+}
+
+impl From<crate::l1da::Settled> for JobOutcome {
+    fn from(s: crate::l1da::Settled) -> Self {
+        use crate::l1da::Settled as S;
+        match s {
+            S::Landed(rc) => JobOutcome::Landed(rc),
+            S::Reverted(name) => JobOutcome::Reverted(name),
+            S::Lost(e) => JobOutcome::Lost(e),
+            S::Transient(e) => JobOutcome::Transient(e),
+            S::Failed(e) => JobOutcome::Failed(e),
+        }
     }
 }
 

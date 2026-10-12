@@ -1956,8 +1956,40 @@ pub async fn start_node_tracked(
         clock: Arc::new(FakeClock(chain.inner.clone())),
         grace: chain.grace_params(),
         tasks: tasks.clone(),
+        l1: None,
     };
     (spawn_node(cfg, deps, shutdown).await.unwrap(), tasks)
+}
+
+/// [`start_node`] in L1-blob mode: `chain` reads OP's origin from `l1`, which
+/// also takes the node's blob posts (no fee cap).
+#[allow(clippy::too_many_arguments)]
+pub async fn start_l1_node(
+    db: Db,
+    datadir: &Path,
+    s: &TestSetup,
+    chain: FakeChain,
+    l1: FakeL1,
+    prover: Arc<FakeProver>,
+    batch_max: usize,
+    shutdown: CancellationToken,
+) -> Node {
+    chain.attach_l1(&l1);
+    let cfg = test_config(datadir, &s.census_dir, batch_max, "0s");
+    let da =
+        davinci_sequencer::l1da::L1Da::new(Arc::new(l1), db.clone(), u128::MAX, cfg.poll_interval)
+            .unwrap();
+    let deps = Deps {
+        db,
+        contracts: Arc::new(chain.clone()),
+        prover,
+        blobs: Arc::new(FakeBlobs(chain.inner.clone())),
+        clock: Arc::new(FakeClock(chain.inner.clone())),
+        grace: chain.grace_params(),
+        tasks: tokio_util::task::TaskTracker::new(),
+        l1: Some(Arc::new(da)),
+    };
+    spawn_node(cfg, deps, shutdown).await.unwrap()
 }
 
 pub async fn wait_until(what: &str, mut f: impl AsyncFnMut() -> bool) {
