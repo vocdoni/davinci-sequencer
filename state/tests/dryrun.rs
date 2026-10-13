@@ -344,24 +344,66 @@ fn csp_batch_accepted() {
     assert_accepted(&b);
 }
 
+/// One commitment fewer (when there is more than one) or more than the
+/// transition's blobs: the guest sets `FAIL_KZG` (bit 18) and nothing else.
+fn assert_blob_count_bound(b: &davinci_state::PreparedBatch) {
+    let n = b.request.kzg.as_ref().unwrap().commitments.len();
+    for want in [n - 1, n + 1].into_iter().filter(|w| *w > 0) {
+        let mut bad = b.request.clone();
+        let c = &mut bad.kzg.as_mut().unwrap().commitments;
+        let last = c[n - 1].clone();
+        c.resize(want, last);
+        let got = run_guest(&bad);
+        assert!(
+            !got.ok && got.fail_mask == 1 << 18,
+            "{want} commitments: mask {:#x}",
+            got.fail_mask
+        );
+    }
+}
+
 #[test]
-fn multi_blob_batch_accepted() {
+fn blob_boundary_batches_accepted() {
     if !gated() {
         return;
     }
-    // 16 fields, 125 votes: 4286 cells, two blobs.
-    let env = env(16, 125);
-    let mut st = new_state(&env);
-    // Values within the mode's max_value (5) and sum cap.
+    // 16 fields, values within the mode's max_value (5) and sum cap.
+    let env = env(16, 127);
     let fields: Vec<u64> = (0..16).map(|i| i % 6).collect();
-    let votes: Vec<_> = (0..125)
+
+    // 126 new votes: T = 1 + 63 + 4032 = 4096, one full blob.
+    let mut st = new_state(&env);
+    let votes: Vec<_> = (0..126)
         .map(|i| real_vote(&env, i, &fields, 60 + i as u64))
         .collect();
     let b = st
         .prepare(&votes, &mut StdRng::seed_from_u64(24), &none())
         .unwrap();
-    assert!(b.expected.n_blobs >= 2, "n_blobs {}", b.expected.n_blobs);
+    assert_eq!(b.expected.n_blobs, 1);
     assert_accepted(&b);
+    assert_blob_count_bound(&b);
+
+    // One vote and 126 refreshes: T = 1 + 32 + 4064 = 4097, one cell in a
+    // second blob. The committed votes never reach the guest (fake proofs).
+    let mut st = new_state(&env);
+    let first: Vec<_> = (1..127)
+        .map(|i| fake_vote(&env, i, &fields, 700 + i as u64))
+        .collect();
+    let b = st
+        .prepare(&first, &mut StdRng::seed_from_u64(28), &none())
+        .unwrap();
+    st.commit(&b).unwrap();
+    let must: BTreeSet<u64> = (1..127)
+        .map(|i| slot_key_address(&voter_address(i)))
+        .collect();
+    let vote = [real_vote(&env, 0, &fields, 60)];
+    let b = st
+        .prepare(&vote, &mut StdRng::seed_from_u64(29), &must)
+        .unwrap();
+    assert_eq!(b.refresh_slots().len(), 126);
+    assert_eq!(b.expected.n_blobs, 2);
+    assert_accepted(&b);
+    assert_blob_count_bound(&b);
 }
 
 #[test]
@@ -370,20 +412,20 @@ fn two_blob_cap_batch_accepted() {
         return;
     }
     // Gnosis takes two blobs per block. 200 committed voters (fake proofs)
-    // make each new vote bring a refresh, so the 125 votes of
-    // `multi_blob_batch_accepted` (cached proofs) no longer all fit.
-    let env = env(16, 325);
+    // make each new vote bring a refresh, so two blobs hold 126 of these
+    // 127 votes (cached proofs, shared with `blob_boundary_batches_accepted`).
+    let env = env(16, 327);
     let mut st = new_state(&env);
     let mut rng = StdRng::seed_from_u64(27);
     let fields: Vec<u64> = (0..16).map(|i| i % 6).collect();
-    let first: Vec<_> = (125..325)
+    let first: Vec<_> = (127..327)
         .map(|i| fake_vote(&env, i, &fields, 400 + i as u64))
         .collect();
     let b = st.prepare(&first, &mut rng, &none()).unwrap();
     st.commit(&b).unwrap();
 
     st.set_blob_cap(2).unwrap();
-    let pending: Vec<_> = (0..125)
+    let pending: Vec<_> = (0..127)
         .map(|i| real_vote(&env, i, &fields, 60 + i as u64))
         .collect();
     let sel: Vec<VerifiedVote> = st
@@ -393,11 +435,7 @@ fn two_blob_cap_batch_accepted() {
         .into_iter()
         .cloned()
         .collect();
-    assert!(
-        !sel.is_empty() && sel.len() < pending.len(),
-        "no shrink: {}",
-        sel.len()
-    );
+    assert_eq!(sel.len(), 126);
     let b = st.prepare(&sel, &mut rng, &none()).unwrap();
     assert_eq!(b.blobs.blobs.len(), 2);
     assert_eq!(b.expected.n_blobs, 2);

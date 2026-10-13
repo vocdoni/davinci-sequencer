@@ -3175,8 +3175,8 @@ mod tests {
         assert_eq!(nf, 16);
         assert_eq!(blob_count(s.chunk, s.chunk, nf), 2);
         let steady = max_votes_for_cap(nf, 0, s.chunk, 2);
+        assert_eq!(steady, 126);
         assert!(steady < s.chunk, "{steady}");
-        assert!(steady > s.chunk / 2);
         // The revotes come with refreshes too.
         assert!(s.revotes >= 50 && s.round1 / s.chunk >= 3);
     }
