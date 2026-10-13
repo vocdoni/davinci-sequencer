@@ -3,6 +3,7 @@
 
 use davinci_e2e::bench::ballots::{self, SHARD};
 use davinci_e2e::bench::r#gen::{GenOpts, gen_wave};
+use davinci_e2e::bench::merge::{Verify, merge_wave};
 use davinci_e2e::bench::plan::{ElectionSpec, NodeId, Plan, Seed};
 use davinci_e2e::fixture as fx;
 use davinci_zkvm_sdk::ballot::address_to_fr;
@@ -85,4 +86,16 @@ fn gen_two_hosts_offline() {
         let st = gen_wave(camp, &plan, 1, &seed, &prover, &opts(h)).unwrap();
         assert_eq!((st.skipped, st.ballots), (st.shards, 0));
     }
+
+    // The merge verifies every proof, then rejects a swapped one.
+    let idx = merge_wave(camp, &plan, 1, &seed, Verify::Full).unwrap();
+    assert_eq!(idx.values().map(|i| i.ballots).sum::<usize>(), ballots_n);
+    let s0 = &all[0];
+    let path = ballots::shard_path(camp, 1, s0);
+    let (meta, mut recs) = ballots::read_shard(&path).unwrap();
+    let pr = &mut recs[0].req.ballot_proof;
+    pr.pi_a = pr.pi_c.clone();
+    ballots::write_shard(&path, &recs, meta).unwrap();
+    let err = merge_wave(camp, &plan, 1, &seed, Verify::Full).unwrap_err();
+    assert!(format!("{err:#}").contains("proof"), "{err:#}");
 }
