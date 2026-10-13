@@ -407,12 +407,12 @@ fn select_batch_respects_a_lower_blob_cap() {
 
 #[test]
 fn exposed_refreshes_above_a_lower_blob_cap_are_refused() {
-    // 250 exposed 16-field slots fit next to one vote in six blobs, not two.
+    // 260 exposed 16-field slots fit next to one vote in six blobs, not two.
     let env = env(16, 301);
     let mut st = committed_state(&env, 300);
     let vote = vec![fake_vote(&env, 300, &[1], 910_000)];
-    let must = slots_of(0..250);
-    assert!(blob_count(1, 251, 16) <= TX_BLOB_CAP && blob_count(1, 251, 16) > 2);
+    let must = slots_of(0..260);
+    assert!(blob_count(1, 261, 16) <= TX_BLOB_CAP && blob_count(1, 261, 16) > 2);
     let b = st
         .prepare(&vote, &mut StdRng::seed_from_u64(15), &must)
         .unwrap();
@@ -575,7 +575,7 @@ fn refresh_top_up_is_uniform() {
 #[test]
 fn select_batch_shrinks_for_exposed_refreshes() {
     // 900 occupied 16-field slots, 400 new voters waiting. One update is
-    // 33 cells, so six blobs carry about 743 updates.
+    // 32 cells and a quarter of an integer cell, so six blobs carry about 760.
     let env = env(16, 1300);
     let mut st = committed_state(&env, 900);
     let pending: Vec<VerifiedVote> = (900..1300)

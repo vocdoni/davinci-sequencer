@@ -753,7 +753,6 @@ mod tests {
         let t = TransitionData {
             vote_ids: (0..500).map(|i| VOTE_ID_MIN + i).collect(),
             updates: (0..500).map(|i| (0x10 + i, Ballot::identity())).collect(),
-            accumulator: Ballot::identity(),
             num_fields: 4,
         };
         build_blobs(&t, &Fr::from(3u64), &[4u8; 32]).unwrap()

@@ -459,7 +459,6 @@ mod tests {
 
     use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::transports::HttpError;
-    use davinci_zkvm_sdk::ballot::Ballot;
     use davinci_zkvm_sdk::blob::{TransitionData, build_blobs};
     use davinci_zkvm_sdk::crypto::field::Fr;
     use davinci_zkvm_sdk::limits::VOTE_ID_MIN;
@@ -601,7 +600,6 @@ mod tests {
         let t = TransitionData {
             vote_ids: vec![VOTE_ID_MIN + 1],
             updates: vec![],
-            accumulator: Ballot::identity(),
             num_fields: 1,
         };
         build_blobs(&t, &Fr::from(7u64), &[2u8; 32]).unwrap()

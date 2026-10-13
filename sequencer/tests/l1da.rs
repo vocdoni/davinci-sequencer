@@ -14,7 +14,6 @@ use davinci_sequencer::web3::L1Receipt;
 use davinci_sequencer::web3::L1SendError;
 use davinci_sequencer::web3::SignedBlobTx;
 use davinci_sequencer::web3::l1proof::L1BlobProof;
-use davinci_zkvm_sdk::ballot::Ballot;
 use davinci_zkvm_sdk::blob::{TransitionData, build_blobs};
 use davinci_zkvm_sdk::limits::VOTE_ID_MIN;
 
@@ -25,7 +24,6 @@ fn blobs(seed: u8) -> TransitionBlobs {
     let t = TransitionData {
         vote_ids: vec![VOTE_ID_MIN + u64::from(seed)],
         updates: vec![],
-        accumulator: Ballot::identity(),
         num_fields: 1,
     };
     build_blobs(&t, &Fr::from(u64::from(seed)), &[seed; 32]).unwrap()

@@ -433,7 +433,6 @@ impl<S: Storage> ProcessState<S> {
         let tdata = TransitionData {
             vote_ids: vote_ids.clone(),
             updates,
-            accumulator: net,
             num_fields: nf,
         };
         let blobs = blob::build_blobs(&tdata, &cfg.process_id, old_root)?;

@@ -340,7 +340,6 @@ async fn registry_on_anvil() {
     let t1 = TransitionData {
         vote_ids: vec![VOTE_ID_MIN + 42, VOTE_ID_MIN + 7],
         updates: vec![(0x12, some_ballot(&pk, 1)), (0x11, some_ballot(&pk, 2))],
-        accumulator: some_ballot(&pk, 3),
         num_fields: NF,
     };
     let root1 = [0x91u8; 32];
@@ -411,13 +410,12 @@ async fn registry_on_anvil() {
     }
 
     // Second transition: two blobs, occupied_before = the first batch's voters.
-    let n = 460u64;
+    let n = 500u64;
     let t2 = TransitionData {
         vote_ids: (0..n).map(|i| VOTE_ID_MIN + 1000 + i).collect(),
         updates: (0..n)
             .map(|i| (0x20 + i, Ballot([Ciphertext::IDENTITY; 16])))
             .collect(),
-        accumulator: some_ballot(&pk, 4),
         num_fields: NF,
     };
     let blobs2 = build_blobs(&t2, &pid_fr(&pid), &root1).unwrap();
@@ -1109,7 +1107,6 @@ async fn same_block_race_names_the_loser() {
                     (0x10 + 2 * tag as u64, some_ballot(&pk, tag as u64)),
                     (0x11 + 2 * tag as u64, some_ballot(&pk, 9 + tag as u64)),
                 ],
-                accumulator: some_ballot(&pk, 20 + tag as u64),
                 num_fields: NF,
             };
             let blobs = build_blobs(&t, &pid_fr(&pid), &p.state_root).unwrap();
@@ -2371,7 +2368,6 @@ mod l1_blob_mode {
                 (0x100 + seed, some_ballot(pk, seed)),
                 (0x101 + seed, some_ballot(pk, seed + 1)),
             ],
-            accumulator: some_ballot(pk, seed + 2),
             num_fields: NF,
         };
         let blobs = build_blobs(&t, &pid_fr(pid), &before).unwrap();

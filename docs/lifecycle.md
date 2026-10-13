@@ -93,8 +93,9 @@ race, puts the votes back in the queue, syncs, and builds the next batch on the 
 race costs only the gas of the reverted transaction.
 
 For a transition another node sent, the node fetches the blobs, matches them against the
-transaction's versioned hashes, decodes the vote ids, slot updates and accumulator, applies them
-on its committed root, and requires the result to equal the event's `newRoot`. Queued votes whose
+transaction's versioned hashes, decodes the vote ids and slot updates, recomputes the Results
+accumulator from the ballots it already holds (the blobs do not carry it), applies them on its
+committed root, and requires the result to equal the event's `newRoot`. Queued votes whose
 id is now in the tree become `settled`. Gaps are replayed from the registry logs. Every node
 stores the transitions and blobs it sees and serves them under `/processes/{pid}/transitions`.
 

@@ -2,7 +2,7 @@
 //! content (`decode_blobs`) and check it reaches the published root.
 
 use arbo::Storage;
-use davinci_zkvm_sdk::ballot::{ballot_leaf_hash, leaf_value_bytes};
+use davinci_zkvm_sdk::ballot::{Ballot, ballot_leaf_hash, leaf_value_bytes};
 use davinci_zkvm_sdk::blob::TransitionData;
 use davinci_zkvm_sdk::limits::{BALLOT_MAX, BALLOT_MIN, KEY_RESULTS, VOTE_ID_MIN};
 
@@ -11,10 +11,32 @@ use crate::error::Error;
 use crate::process::{Committed, ProcessState};
 
 impl<S: Storage> ProcessState<S> {
+    /// The Results ballot after `t` on the committed state: the committed
+    /// accumulator plus, per update, the new ballot minus the slot's stored
+    /// one (the identity for a slot not yet occupied). The guest's
+    /// `old + votes - overwritten + refresh deltas`, grouped by slot: every
+    /// overwritten or refreshed ballot it subtracts is the leaf this node
+    /// stored under the same root. Complete twisted-Edwards adds on canonical
+    /// coordinates, so no subgroup check; the caller's root check binds it.
+    pub fn results_after(&self, t: &TransitionData) -> Result<Ballot, Error> {
+        let mut acc = self.committed.accumulator;
+        for (i, (slot, new)) in t.updates.iter().enumerate() {
+            let old = if self.occupied.binary_search(slot).is_ok() {
+                self.slot_ballot(*slot)?.ok_or_else(|| {
+                    Error::Invalid(format!("update {i}: occupied slot has no stored ballot"))
+                })?
+            } else {
+                Ballot::identity()
+            };
+            acc = acc.add(new).sub(&old);
+        }
+        Ok(acc)
+    }
+
     /// Applies a transition another sequencer proved: vote-id leaves, slot
-    /// updates and the results leaf from `t`, then requires the tree to land
-    /// on `new_root` (the root the accepted proof published). The blob does
-    /// not say which updates were overwrites, so `w = votes - new slots`.
+    /// updates and the recomputed results leaf, then requires the tree to
+    /// land on `new_root` (the root the accepted proof published). The blob
+    /// does not say which updates were overwrites, so `w = votes - new slots`.
     pub fn apply_synced(&mut self, t: &TransitionData, new_root: [u8; 32]) -> Result<(), Error> {
         let old_root = self.tree.root();
         if old_root != self.committed.root {
@@ -36,6 +58,7 @@ impl<S: Storage> ProcessState<S> {
                 t.num_fields
             )));
         }
+        let accumulator = self.results_after(t)?;
         for &vid in &t.vote_ids {
             if vid < VOTE_ID_MIN {
                 return Err(Error::Invalid(format!("vote id {vid:#x} below 2^63")));
@@ -62,7 +85,7 @@ impl<S: Storage> ProcessState<S> {
         }
         self.tree.update_with_proof(
             &key_bytes(KEY_RESULTS),
-            &leaf_value_bytes(&ballot_leaf_hash(&t.accumulator)),
+            &leaf_value_bytes(&ballot_leaf_hash(&accumulator)),
         )?;
 
         let got = self.tree.root();
@@ -79,7 +102,7 @@ impl<S: Storage> ProcessState<S> {
             root: new_root,
             voters: self.committed.voters + t.vote_ids.len() as u64,
             overwrites: self.committed.overwrites + w as u64,
-            accumulator: t.accumulator,
+            accumulator,
         };
         let mut occ = self.occupied.clone();
         occ.extend_from_slice(&new_slots);

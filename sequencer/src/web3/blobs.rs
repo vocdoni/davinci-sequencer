@@ -504,7 +504,6 @@ mod tests {
         let t = TransitionData {
             vote_ids: (0..500).map(|i| VOTE_ID_MIN + i).collect(),
             updates: (0..500).map(|i| (0x10 + i, Ballot::identity())).collect(),
-            accumulator: Ballot::identity(),
             num_fields: 4,
         };
         let b = build_blobs(&t, &Fr::from(7u64), &[1u8; 32]).unwrap();
@@ -512,7 +511,6 @@ mod tests {
         let other = TransitionData {
             vote_ids: vec![VOTE_ID_MIN + 1],
             updates: vec![],
-            accumulator: Ballot::identity(),
             num_fields: 1,
         };
         let o = build_blobs(&other, &Fr::from(7u64), &[2u8; 32]).unwrap();
