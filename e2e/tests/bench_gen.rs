@@ -6,7 +6,7 @@ use davinci_e2e::bench::r#gen::{GenOpts, gen_wave};
 use davinci_e2e::bench::merge::{Verify, merge_wave};
 use davinci_e2e::bench::plan::{ElectionSpec, NodeId, Plan, Seed};
 use davinci_e2e::fixture as fx;
-use davinci_zkvm_sdk::ballot::address_to_fr;
+use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr};
 use davinci_zkvm_sdk::census::{eth_address, vote_id_recover};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
@@ -92,10 +92,18 @@ fn gen_two_hosts_offline() {
     assert_eq!(idx.values().map(|i| i.ballots).sum::<usize>(), ballots_n);
     let s0 = &all[0];
     let path = ballots::shard_path(camp, 1, s0);
-    let (meta, mut recs) = ballots::read_shard(&path).unwrap();
+    let (meta, good) = ballots::read_shard(&path).unwrap();
+    let mut recs = good.clone();
     let pr = &mut recs[0].req.ballot_proof;
     pr.pi_a = pr.pi_c.clone();
-    ballots::write_shard(&path, &recs, meta).unwrap();
+    ballots::write_shard(&path, &recs, meta.clone()).unwrap();
     let err = merge_wave(camp, &plan, 1, &seed, Verify::Full).unwrap_err();
     assert!(format!("{err:#}").contains("proof"), "{err:#}");
+
+    // A tampered ballot under an intact proof is caught offline too.
+    let mut recs = good;
+    recs[0].req.ballot = Ballot::identity();
+    ballots::write_shard(&path, &recs, meta).unwrap();
+    let err = merge_wave(camp, &plan, 1, &seed, Verify::Full).unwrap_err();
+    assert!(format!("{err:#}").contains("ballot"), "{err:#}");
 }

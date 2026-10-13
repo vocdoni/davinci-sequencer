@@ -5,10 +5,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use davinci_client::api::CensusProofWire;
 use davinci_client::api::Fr;
+use davinci_client::organizer::OnchainProcess;
 use davinci_client::organizer::RegistryReader;
-use davinci_zkvm_sdk::ballot::address_to_fr;
-use davinci_zkvm_sdk::census::{eth_address, vote_id_recover};
+use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, encrypt_ballot, inputs_hash, vote_id};
+use davinci_zkvm_sdk::census::{CspProof, csp_recover, eth_address, vote_id_recover};
+use davinci_zkvm_sdk::crypto::field::{fr_from_dec, fr_to_be};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
 use serde::{Deserialize, Serialize};
@@ -48,6 +51,30 @@ fn proof_ok(r: &BallotRecord, v: &BallotVerifier) -> Result<()> {
     Ok(())
 }
 
+/// The ballot, vote id and inputs hash a voter's record must carry, from the
+/// same functions `Voter::prepare_vote` uses.
+pub fn binding(e: &Election, seed: &Seed, round: u8, voter: u32) -> Result<(Ballot, u64, Fr)> {
+    let p = e.snap.onchain()?;
+    let tag = &e.spec.tag;
+    let key = seed.voter_key(tag, voter);
+    let addr = address_to_fr(&eth_address(key.verifying_key()));
+    let pid = e.snap.pid.to_fr();
+    let k = seed.vote_k(tag, voter, round);
+    let fields = seed.choices(tag, voter, round, e.spec.nf);
+    let ballot = encrypt_ballot(&p.encryption_key, &fields, &k, p.ballot_mode.num_fields);
+    let vid = vote_id(&pid, &addr, &k);
+    let ih = inputs_hash(
+        &pid,
+        &p.ballot_mode,
+        &p.encryption_key,
+        &addr,
+        vid,
+        &ballot,
+        &Fr::from(WEIGHT),
+    )?;
+    Ok((ballot, vid, ih))
+}
+
 /// One record against the plan and the seed: its pid, voter address,
 /// choices, weight and vote-id signature, and with a verifier its proof.
 pub fn check_record(
@@ -79,6 +106,41 @@ pub fn check_record(
     let got = vote_id_recover(q.vote_id, &q.signature())
         .map_err(|e| anyhow!("{who}: vote id signature: {e}"))?;
     ensure!(got == want, "{who}: vote id signed by another key");
+    let (ballot, vid, ih) = binding(e, seed, r.round, r.voter)?;
+    ensure!(
+        q.ballot == ballot,
+        "{who}: ballot is not the seed's under the plan's key and mode"
+    );
+    ensure!(q.vote_id == vid, "{who}: vote id is not the seed's");
+    ensure!(
+        q.ballot_inputs_hash == ih,
+        "{who}: inputs hash is not the seed's"
+    );
+    if e.snap.census_origin == 4 {
+        let Some(CensusProofWire::Csp(c)) = &q.census_proof else {
+            bail!("{who}: CSP election without a CSP attestation");
+        };
+        ensure!(
+            c.index == u64::from(r.voter),
+            "{who}: CSP index {} is not the voter's",
+            c.index
+        );
+        let att = CspProof {
+            r: c.r,
+            s: c.s,
+            recid: c.recid,
+            address: q.address,
+            weight: q.weight,
+            index: c.index,
+        };
+        let signer = csp_recover(&e.snap.pid.to_fr(), &att)
+            .map_err(|x| anyhow!("{who}: CSP attestation: {x}"))?;
+        let root = fr_to_be(&fr_from_dec(&e.snap.census_root).map_err(|x| anyhow!("{x}"))?);
+        ensure!(
+            root[..12] == [0u8; 12] && root[12..] == signer,
+            "{who}: CSP attestation is not signed by the census root's CSP"
+        );
+    }
     if let Some(v) = v {
         proof_ok(r, v)?;
     }
@@ -142,7 +204,6 @@ pub fn merge_wave(
                     r.round,
                     r.voter
                 );
-                check_record(e, seed, r, None)?;
                 if let Some(prev) =
                     vote_ids.insert(r.req.vote_id, (r.tag.clone(), r.round, r.voter))
                 {
@@ -168,6 +229,12 @@ pub fn merge_wave(
         }
         recs.sort_by_key(|r| (r.round, r.voter));
         merged.push((tag.clone(), recs));
+    }
+    // After the vote-id scan, so a repeated id is named as such.
+    for (e, (_, recs)) in w.elections.iter().zip(&merged) {
+        for r in recs {
+            check_record(e, seed, r, None)?;
+        }
     }
 
     if let Some(vf) = &verifier {
@@ -223,8 +290,22 @@ pub fn merge_wave(
     Ok(index)
 }
 
-/// Live: every planned process is on the registry with the snapshot's
-/// pid, key, mode and origin (and root, except origin 3 where it moves).
+/// Whether the registry's process is the one the plan snapshots: pid, key,
+/// mode and origin, and the root except for origin 3, where it moves.
+pub fn snapshot_matches(e: &Election, p: &OnchainProcess) -> Result<()> {
+    let mut live = ProcSnap::of(p);
+    if e.snap.census_origin == 3 {
+        live.census_root = e.snap.census_root.clone();
+    }
+    ensure!(
+        live == e.snap,
+        "{}: the registry's process differs from the plan's snapshot",
+        e.spec.tag
+    );
+    Ok(())
+}
+
+/// Live: every planned process is on the registry as snapshotted.
 pub async fn check_snapshots(plan: &Plan, wave: u32, rpc: &str) -> Result<()> {
     let reader = RegistryReader::connect(rpc, plan.registry)?;
     for e in &plan.wave(wave)?.elections {
@@ -232,15 +313,7 @@ pub async fn check_snapshots(plan: &Plan, wave: u32, rpc: &str) -> Result<()> {
             .process(&e.snap.pid.0)
             .await
             .with_context(|| format!("read process of {}", e.spec.tag))?;
-        let mut live = ProcSnap::of(&p);
-        if e.snap.census_origin == 3 {
-            live.census_root = e.snap.census_root.clone();
-        }
-        ensure!(
-            live == e.snap,
-            "{}: the registry's process differs from the plan's snapshot",
-            e.spec.tag
-        );
+        snapshot_matches(e, &p)?;
     }
     Ok(())
 }
@@ -250,6 +323,7 @@ mod tests {
     use super::*;
     use crate::bench::ballots::{ShardMeta, fake_req, write_shard};
     use crate::bench::plan::{ElectionSpec, NodeId};
+    use davinci_zkvm_sdk::ballot::Ballot;
     use davinci_zkvm_sdk::census::vote_id_sign;
 
     fn plan(seed: &Seed) -> Plan {
@@ -271,6 +345,8 @@ mod tests {
         let key = seed.voter_key(&e.spec.tag, voter);
         let mut req = fake_req(vid, eth_address(key.verifying_key()));
         req.process_id = e.snap.pid;
+        let (ballot, vid, ih) = binding(e, seed, round, voter).unwrap();
+        (req.ballot, req.vote_id, req.ballot_inputs_hash) = (ballot, vid, ih);
         let sig = vote_id_sign(&key, vid);
         req.signature[..32].copy_from_slice(&sig.r);
         req.signature[32..64].copy_from_slice(&sig.s);
@@ -290,7 +366,7 @@ mod tests {
         p: &Plan,
         seed: &Seed,
         skip: Option<usize>,
-        vid: impl Fn(&BallotRecord) -> u64,
+        tweak: impl Fn(&mut BallotRecord),
     ) {
         let w = p.wave(1).unwrap();
         for (i, s) in ballots::shards(w, seed, SHARD).iter().enumerate() {
@@ -304,8 +380,8 @@ mod tests {
                 .filter(|(r, v)| *r == s.round && (s.from..s.to).contains(v))
                 .map(|(r, v)| {
                     let mut x = rec(e, seed, r, v, 0);
-                    x.req.vote_id = vid(&x);
-                    rec(e, seed, r, v, x.req.vote_id)
+                    tweak(&mut x);
+                    x
                 })
                 .collect();
             let meta = ShardMeta {
@@ -326,9 +402,7 @@ mod tests {
         }
     }
 
-    fn vid(r: &BallotRecord) -> u64 {
-        1 << 63 | u64::from(r.voter) << 8 | u64::from(r.round) << 4 | u64::from(r.tag == "B")
-    }
+    fn same(_: &mut BallotRecord) {}
 
     #[test]
     fn merge_reports_missing_and_duplicates() {
@@ -336,7 +410,7 @@ mod tests {
         let p = plan(&seed);
         // Round 2 of A is shard index 1 (A r1, A r2, B r1).
         let d = tempfile::tempdir().unwrap();
-        write_all(d.path(), &p, &seed, Some(1), vid);
+        write_all(d.path(), &p, &seed, Some(1), same);
         let err = format!(
             "{:#}",
             merge_wave(d.path(), &p, 1, &seed, Verify::Skip).unwrap_err()
@@ -348,7 +422,9 @@ mod tests {
 
         let d = tempfile::tempdir().unwrap();
         write_all(d.path(), &p, &seed, None, |r| {
-            if r.tag == "B" { 1 << 63 | 1 } else { vid(r) }
+            if r.tag == "B" {
+                r.req.vote_id = 1 << 63 | 1;
+            }
         });
         // B's three ballots now share one vote id.
         let err = format!(
@@ -359,7 +435,7 @@ mod tests {
 
         // A foreign pid in one record.
         let d = tempfile::tempdir().unwrap();
-        write_all(d.path(), &p, &seed, None, vid);
+        write_all(d.path(), &p, &seed, None, same);
         let s = ballots::shards(p.wave(1).unwrap(), &seed, SHARD).remove(0);
         let path = shard_path(d.path(), 1, &s);
         let (m, mut recs) = read_shard(&path).unwrap();
@@ -373,11 +449,48 @@ mod tests {
     }
 
     #[test]
+    fn check_record_rejects_another_voters_signature_and_binding() {
+        let seed = Seed::from_bytes([9; 32]);
+        let p = plan(&seed);
+        let e = &p.wave(1).unwrap().elections[0];
+        let good = rec(e, &seed, 1, 0, 0);
+        check_record(e, &seed, &good, None).unwrap();
+        let mut bad = good.clone();
+        bad.req.signature = rec(e, &seed, 1, 1, 0).req.signature;
+        assert!(check_record(e, &seed, &bad, None).is_err());
+        let mut bad = good.clone();
+        bad.req.ballot = Ballot::identity();
+        let err = check_record(e, &seed, &bad, None).unwrap_err().to_string();
+        assert!(err.contains("ballot"), "{err}");
+        let mut bad = good;
+        bad.req.ballot_inputs_hash += Fr::from(1u64);
+        let err = check_record(e, &seed, &bad, None).unwrap_err().to_string();
+        assert!(err.contains("inputs hash"), "{err}");
+    }
+
+    #[test]
+    fn snapshot_matches_compares_key_mode_and_root() {
+        let seed = Seed::from_bytes([9; 32]);
+        let p = plan(&seed);
+        let e = &p.wave(1).unwrap().elections[0];
+        let mut live = e.snap.onchain().unwrap();
+        snapshot_matches(e, &live).unwrap();
+        live.census_root += Fr::from(1u64);
+        assert!(snapshot_matches(e, &live).is_err());
+        let mut e3 = e.clone();
+        e3.snap.census_origin = 3;
+        live.census_origin = 3;
+        snapshot_matches(&e3, &live).unwrap();
+        live.ballot_mode.max_value += 1;
+        assert!(snapshot_matches(&e3, &live).is_err());
+    }
+
+    #[test]
     fn merge_writes_round_voter_order() {
         let seed = Seed::from_bytes([9; 32]);
         let p = plan(&seed);
         let d = tempfile::tempdir().unwrap();
-        write_all(d.path(), &p, &seed, None, vid);
+        write_all(d.path(), &p, &seed, None, same);
         let idx = merge_wave(d.path(), &p, 1, &seed, Verify::Skip).unwrap();
         assert_eq!(idx["A"].rounds, BTreeMap::from([(1, 4), (2, 4)]));
         assert_eq!((idx["A"].ballots, idx["B"].ballots), (8, 3));
