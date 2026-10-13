@@ -698,3 +698,99 @@ async fn l1_restart_with_one_chunk_pending_replaces_it() {
     assert!(node2.db.l1_posts().unwrap().is_empty());
     shutdown2.cancel();
 }
+
+// Ethereum's pace whatever the poll: a block every 12 s.
+fn mine_every_12s(l1: &FakeL1) -> tokio::task::JoinHandle<()> {
+    l1.set_auto_mine(false);
+    let l1 = l1.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            l1.mine(1);
+        }
+    })
+}
+
+async fn all_pending(h: &ActorHandle, vids: &[u64]) {
+    for vid in vids {
+        assert_eq!(vote_status(h, *vid).await, Some(VoteStatus::Pending));
+    }
+}
+
+/// A proof no post fixes, every time: after three proved batches whose
+/// settlement ends without landing the node seals nothing more for the
+/// process and the votes stay pending. A restart clears the stop.
+#[tokio::test(start_paused = true)]
+async fn l1_repeated_settle_failures_stop_sealing_until_a_restart() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    l1.fault_proofs(Some(ProofFault::Data));
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
+    let vids = submit(&h, &s, 0..3, 1500).await;
+    wait_long("three attempts", async || prover.calls() == 3).await;
+    // Past the longest cooldown (300 s): a fourth attempt would have started.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(prover.calls(), 3, "no seal after the third failure");
+    assert_eq!(l1.sends().len(), 3, "one post per attempt, no re-post");
+    all_pending(&h, &vids).await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!((snap.pending, snap.in_flight), (3, false));
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    l1.fault_proofs(None);
+    let db = reopen_db(dir.path()).await;
+    let shutdown2 = CancellationToken::new();
+    let node2 = start_l1_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        3,
+        shutdown2.clone(),
+    )
+    .await;
+    let h2 = handle(&node2).await;
+    wait_long("settled after the restart", async || {
+        all_settled(&h2, &vids).await
+    })
+    .await;
+    assert_eq!(prover.calls(), 4);
+    assert_eq!(s.chain.voters(), 3);
+    shutdown2.cancel();
+    miner.abort();
+}
+
+/// A landing resets the count: two failures, a landing, then three more
+/// failures before the stop.
+#[tokio::test(start_paused = true)]
+async fn l1_a_landing_resets_the_settle_failure_count() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    l1.fault_proofs(Some(ProofFault::Data));
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
+    let vids = submit(&h, &s, 0..3, 1600).await;
+    // The third attempt is proved; its blobs are not mined yet.
+    wait_long("third attempt", async || prover.calls() == 3).await;
+    l1.fault_proofs(None);
+    wait_long("settled", async || all_settled(&h, &vids).await).await;
+    l1.fault_proofs(Some(ProofFault::Data));
+    let more = submit(&h, &s, 3..6, 1700).await;
+    wait_long("three more attempts", async || prover.calls() == 6).await;
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(prover.calls(), 6, "three failures after the landing");
+    all_pending(&h, &more).await;
+    shutdown.cancel();
+    miner.abort();
+}

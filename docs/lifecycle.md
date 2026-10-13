@@ -148,6 +148,12 @@ Each batch:
    needless re-prove); once the root is gone the settlement is rolled back and its votes
    requeued, like a lost race.
 
+Every proved batch posted blobs, so the node bounds the spend of settlements that keep failing:
+after three proved batches in a row whose settlement ended without landing (any of the give-ups
+above, an OP send failure, the deadline), it seals nothing more for that process and logs an
+error with the last failure. The votes stay pending (the grace end errors them as usual). A
+landing, its own or another sequencer's, resets the count; only a restart lifts the stop.
+
 The registry emits `ProcessStateTransitionedL1(processId, l1BlockNumbers, versionedHashes)` right
 after `ProcessStateTransitioned`; the node merges the two and fetches the blobs from Ethereum:
 beacon APIs by slot (`--blob-source beacon:`, Ethereum beacons in this mode), or the L1 anvil.

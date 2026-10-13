@@ -743,6 +743,11 @@ const STALE_WARN_TICKS: u32 = 30;
 /// sealing back.
 const PAUSE_HOLD: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// L1-blob mode: consecutive proved batches whose settlement ends
+/// `Transient` before the process stops sealing. Each one posted blobs on
+/// Ethereum; nothing bounds the spend across requeues otherwise.
+const MAX_SETTLE_FAILURES: u32 = 3;
+
 struct Flight {
     generation: u64,
     prepared: davinci_state::PreparedBatch,
@@ -752,6 +757,9 @@ struct Flight {
     /// Set when the settlement tx landed but the receipt read failed: if the
     /// confirmed chain never shows our root by this instant, roll back.
     landed_deadline: Option<tokio::time::Instant>,
+    /// The proof passed its checks (`Msg::JobProved`): what fails after
+    /// this is the settlement.
+    proved: bool,
     /// Cancels the job when the flight is dropped (rollback, requeue,
     /// shutdown), so an L1-blob job stops waiting on Ethereum.
     _abort: tokio_util::sync::DropGuard,
@@ -836,6 +844,12 @@ struct Actor {
     /// Set when a settlement met a pause the events have not shown yet: no
     /// seal before this instant or the next status event.
     pause_hold: Option<tokio::time::Instant>,
+    /// L1-blob mode: consecutive proved batches whose settlement ended
+    /// `Transient`; any landing (ours or synced) resets it.
+    settle_failures: u32,
+    /// Latched at [`MAX_SETTLE_FAILURES`]: no seal until a restart. In
+    /// memory only, so a restart (after fixing the endpoint) clears it.
+    settle_stopped: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -977,6 +991,8 @@ pub(crate) fn spawn_actor(
         census_recheck: false,
         census_reverts: ([0u8; 32], 0),
         pause_hold: None,
+        settle_failures: 0,
+        settle_stopped: false,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1112,12 +1128,11 @@ impl Actor {
                 self.last_head_block = block;
             }
             Msg::JobProved { generation } => {
-                if self
-                    .in_flight
-                    .as_ref()
-                    .is_some_and(|f| f.generation == generation)
+                if let Some(f) = self.in_flight.as_mut()
+                    && f.generation == generation
                 {
-                    let vids = self.in_flight.as_ref().unwrap().prepared.vote_ids.clone();
+                    f.proved = true;
+                    let vids = f.prepared.vote_ids.clone();
                     self.set_status(&vids, VoteStatus::Processed, None);
                 }
             }
@@ -1612,6 +1627,7 @@ impl Actor {
         if self.in_flight.is_some()
             || self.finalizing
             || self.await_sync
+            || self.settle_stopped
             || self.pending.is_empty()
             || self.record.local != LocalStatus::Active
             || self.deps.contracts.signer().is_none()
@@ -1900,6 +1916,7 @@ impl Actor {
             votes: selected,
             votes_at,
             landed_deadline: None,
+            proved: false,
             _abort: cancel.drop_guard(),
         });
         tokio::spawn(run_job(job));
@@ -2332,6 +2349,18 @@ impl Actor {
                     return;
                 }
                 self.rollback_flight(&f);
+                if self.deps.l1.is_some() && f.proved {
+                    self.settle_failures = self.settle_failures.saturating_add(1);
+                    if self.settle_failures >= MAX_SETTLE_FAILURES && !self.settle_stopped {
+                        self.settle_stopped = true;
+                        error!(
+                            pid = %hex::encode(self.pid31),
+                            failures = self.settle_failures,
+                            error = ?e,
+                            "L1 settlement keeps failing; this process seals nothing more until a restart (its votes stay pending)"
+                        );
+                    }
+                }
                 // Hold the votes pending under a saturating cooldown (~4 min
                 // cap) rather than re-sealing hot against a down prover or
                 // RPC; the window close errors them out if it never returns.
@@ -2449,6 +2478,7 @@ impl Actor {
         self.vote_at_stale = true;
         self.put_record();
         self.await_sync = false;
+        self.settle_failures = 0;
         self.metrics.settled_by_self.fetch_add(1, Ordering::SeqCst);
         info!(
             pid = %hex::encode(self.pid31),
@@ -2727,6 +2757,7 @@ impl Actor {
             .synced_from_others
             .fetch_add(1, Ordering::SeqCst);
         self.await_sync = false;
+        self.settle_failures = 0;
         // Pending votes another sequencer settled for us are done. Votes
         // whose slot got overwritten stay pending: their id is not in the tree.
         self.settle_pending_in_tree();
