@@ -719,7 +719,7 @@ pub(crate) enum JobOutcome {
     /// The guest published `ok = 0` with this fail mask.
     Guest(u32),
     /// The prover failed the job for good (a `failed` job, a refused
-    /// input, undecodable publics); not retried.
+    /// input, undecodable publics): requeued and bisected.
     Failed(String),
     /// The node's own checks refused the proof or the L1 settlement (a
     /// publics or pin mismatch): every batch fails alike, so the votes are
@@ -756,6 +756,23 @@ const FAILED_CYCLES_BEFORE_PAUSE: u32 = 3;
 /// The first pause; each further failed cycle doubles it, up to [`MAX_PAUSE`].
 const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Longest cooldown between bisection cycles, seconds.
+const BISECT_BACKOFF_MAX: u64 = 30;
+/// Single-vote batches errored in a row before the actor stops erroring
+/// and holds every vote pending (the prover fails every input).
+const ISOLATED_BEFORE_HOLD: u32 = 3;
+
+/// Set after a prover-side `Failed`: the votes of the last failed batch, the
+/// cap of the next seal, the prover's reason, and how many single-vote
+/// batches failed in a row. In memory only (a restart retries at full size).
+struct Bisect {
+    suspect: BTreeSet<u64>,
+    cap: usize,
+    reason: String,
+    isolated: u32,
+    hold: bool,
+}
 
 struct Flight {
     generation: u64,
@@ -864,6 +881,8 @@ struct Actor {
     /// `StatusChanged`, at a time no head shows yet: no seal until a head
     /// does, so the budget never sees the new end with a stale clock.
     end_moved: bool,
+    /// Bisection of a batch the prover failed for good; `None` otherwise.
+    bisect: Option<Bisect>,
     /// The last node-side check failure that held votes pending, named in
     /// their close reason. Our landing clears it.
     held_reason: Option<String>,
@@ -1011,6 +1030,7 @@ pub(crate) fn spawn_actor(
         failed_cycles: 0,
         failed_pause: None,
         end_moved: false,
+        bisect: None,
         held_reason: None,
         tx: tx.clone(),
     };
@@ -1289,7 +1309,7 @@ impl Actor {
             .map(|v| v.slot)
             .collect::<std::collections::HashSet<_>>()
             .len();
-        let due = if self.pending.len() >= self.batch_max {
+        let due = if self.pending.len() >= self.seal_max() {
             now
         } else if distinct < self.min_mix {
             oldest + (self.solo_wait as f64 * 0.9).ceil() as u64
@@ -1303,6 +1323,15 @@ impl Actor {
             now.saturating_add(left.as_secs())
         });
         Some(due.min(flush_at).max(paused))
+    }
+
+    /// Most votes the next seal takes: `--batch-max`, or less while a
+    /// bisection halves a failing batch.
+    fn seal_max(&self) -> usize {
+        match &self.bisect {
+            Some(b) if !b.hold => self.batch_max.min(b.cap),
+            _ => self.batch_max,
+        }
     }
 
     fn accepting(&self) -> bool {
@@ -1590,6 +1619,7 @@ impl Actor {
 
     /// Errors out every pending vote; they can never settle now.
     fn close_out(&mut self, reason: &str) {
+        self.bisect = None;
         if self.pending.is_empty() {
             return;
         }
@@ -1705,7 +1735,7 @@ impl Actor {
             as f64;
         let timer_due = age >= self.batch_time as f64 * j;
         let solo_due = age >= self.solo_wait as f64 * j;
-        let at_max = self.pending.len() >= self.batch_max;
+        let at_max = self.pending.len() >= self.seal_max();
         if !(at_max || timer_due || flush || self.pending.len() >= self.capacity_estimate()) {
             return;
         }
@@ -1785,28 +1815,56 @@ impl Actor {
         // L1-blob mode: the Ethereum leg runs during the proof, so a landing
         // takes max(proof, leg) + margin; the leg must fit as well. Each
         // chunk after the first adds a post to it, so a short window takes
-        // a batch of fewer chunks.
-        let max_blobs = match &self.deps.l1 {
+        // a batch of fewer chunks. While bisecting the job is proof-first:
+        // the leg follows the proof, so it gets what a proof of the intended
+        // size leaves (one chunk at least), and the proof what the leg leaves:
+        // base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
+        let spv = self.metrics.prove.spv(nf);
+        let proof_first = self.deps.l1.is_some() && self.bisect.is_some();
+        let (max_blobs, leg) = match &self.deps.l1 {
             Some(l1) => {
                 let window = deadline.saturating_sub(now);
-                let Some(chunks) =
-                    crate::l1da::chunks_fit(window, self.l1_settle_lag, self.settle_margin)
-                else {
-                    debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
-                    return;
+                let after = if proof_first {
+                    let want = k.min(self.seal_max()) as f64;
+                    window.saturating_sub((self.prove_base + want * spv).ceil() as u64)
+                } else {
+                    window
                 };
-                chunks.saturating_mul(l1.chunk).min(self.state.blob_cap())
+                let chunks = match crate::l1da::chunks_fit(
+                    after,
+                    self.l1_settle_lag,
+                    self.settle_margin,
+                ) {
+                    Some(c) => c,
+                    None if proof_first => 1,
+                    None => {
+                        debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
+                        return;
+                    }
+                };
+                let leg = if proof_first {
+                    self.l1_settle_lag.saturating_add(
+                        crate::l1da::POST_TIME.saturating_mul((chunks as u64).saturating_sub(1)),
+                    )
+                } else {
+                    0
+                };
+                (
+                    chunks.saturating_mul(l1.chunk).min(self.state.blob_cap()),
+                    leg,
+                )
             }
-            None => self.state.blob_cap(),
+            None => (self.state.blob_cap(), 0),
         };
-        let left = deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
-        let n_max = (left / self.metrics.prove.spv(nf)).floor();
+        let left =
+            deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64 - leg as f64;
+        let n_max = (left / spv).floor();
         if n_max < 1.0 {
             debug!(pid = %hex::encode(self.pid31), left, "no batch fits before the window closes");
             return; // nothing fits; the window closes on these votes
         }
         let cap = k
-            .min(self.batch_max)
+            .min(self.seal_max())
             .min(n_max.min(MAX_BATCH_SIZE as f64) as usize);
         // Selection and seal-time re-proof. prepare must only ever see a
         // set select_batch sized: shedding a vote after sizing can put an
@@ -1944,6 +2002,7 @@ impl Actor {
             n: vids.len(),
             prove_base: self.prove_base,
             l1: self.deps.l1.clone(),
+            proof_first,
             deadline: tokio::time::Instant::now() + left.min(L1_JOB_CAP),
             cancel: cancel.clone(),
         };
@@ -2222,8 +2281,13 @@ impl Actor {
 
     /// Extends the transient-failure streak; returns the cooldown in seconds.
     fn prove_backoff(&mut self) -> u64 {
+        self.prove_backoff_upto(300)
+    }
+
+    /// [`Self::prove_backoff`] with a ceiling of `max` seconds.
+    fn prove_backoff_upto(&mut self, max: u64) -> u64 {
         self.prove_attempts += 1;
-        let secs = (1u64 << self.prove_attempts.min(8)).min(300);
+        let secs = (1u64 << self.prove_attempts.min(8)).min(max);
         self.prove_after = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
         secs
     }
@@ -2257,6 +2321,79 @@ impl Actor {
         self.pending.splice(0..0, f.votes);
         self.pending_at.splice(0..0, f.votes_at);
         self.sort_pending();
+    }
+
+    /// A batch the prover failed for good: requeue it and bisect. The first
+    /// failure retries at full size; each later one halves the next seal,
+    /// until a single vote fails and is errored alone. After
+    /// [`ISOLATED_BEFORE_HOLD`] of those the prover fails everything: hold,
+    /// erroring nothing more.
+    fn prover_failed(&mut self, f: Flight, reason: String) {
+        let n = f.votes.len();
+        let vids: BTreeSet<u64> = f.prepared.vote_ids.iter().copied().collect();
+        self.metrics.bisections.fetch_add(1, Ordering::SeqCst);
+        let secs = self.prove_backoff_upto(BISECT_BACKOFF_MAX);
+        let mut isolate = false;
+        let mut b = match self.bisect.take() {
+            None => Bisect {
+                suspect: vids,
+                cap: n,
+                reason,
+                isolated: 0,
+                hold: false,
+            },
+            Some(mut b) => {
+                if !b.hold {
+                    b.suspect = vids;
+                    b.cap = n.div_ceil(2).max(1);
+                    isolate = n == 1;
+                }
+                b.reason = reason;
+                b
+            }
+        };
+        if isolate {
+            let msg = format!("{} (isolated by bisection)", b.reason);
+            error!(pid = %hex::encode(self.pid31), vids = ?f.prepared.vote_ids, %msg, "vote isolated by bisection; errored");
+            self.set_status(&f.prepared.vote_ids, VoteStatus::Error, Some(&msg));
+            for vid in &f.prepared.vote_ids {
+                b.suspect.remove(vid);
+            }
+            b.isolated += 1;
+            self.metrics.isolated_votes.fetch_add(1, Ordering::SeqCst);
+            if b.isolated >= ISOLATED_BEFORE_HOLD {
+                b.hold = true;
+                error!(pid = %hex::encode(self.pid31), "prover fails every batch; holding votes pending");
+            }
+        } else {
+            error!(
+                pid = %hex::encode(self.pid31),
+                votes = n,
+                cap = b.cap,
+                hold = b.hold,
+                retry_in = secs,
+                reason = %b.reason,
+                "batch proof failed; requeued for bisection"
+            );
+            self.requeue_flight(f);
+        }
+        self.bisect = Some(b);
+    }
+
+    /// A landing, ours or synced: suspects no longer pending are settled
+    /// (or closed). None left ends the bisection; else the rest seals whole.
+    fn bisect_landed(&mut self) {
+        let Some(b) = self.bisect.as_mut() else {
+            return;
+        };
+        let pending: std::collections::HashSet<u64> =
+            self.pending.iter().map(|v| v.pkg.vote_id).collect();
+        b.suspect.retain(|v| pending.contains(v));
+        if b.suspect.is_empty() {
+            self.bisect = None;
+        } else {
+            b.cap = b.suspect.len();
+        }
     }
 
     /// maxVoters reached: queued new-slot votes can never settle, so they
@@ -2337,10 +2474,10 @@ impl Actor {
                 self.metrics.guest_rejections.fetch_add(1, Ordering::SeqCst);
                 self.set_status(&vids, VoteStatus::Error, Some(&msg));
             }
-            JobOutcome::Failed(msg) => {
+            JobOutcome::Failed(reason) => {
                 self.rollback_flight(&f);
-                error!(pid = %hex::encode(self.pid31), ?msg, "batch proof failed");
-                self.set_status(&vids, VoteStatus::Error, Some(&msg));
+                self.prover_failed(f, reason);
+                return; // the backoff streak continues
             }
             JobOutcome::Held(msg) => {
                 // Every batch fails this way until the node or the prover is
@@ -2456,7 +2593,7 @@ impl Actor {
                 return; // the failure streak continues
             }
         }
-        // Only a conclusive outcome (settled, permanent failure, closed
+        // Only a conclusive outcome (settled, guest rejection, closed
         // window) ends the transient-failure streak; the Transient arm
         // above returns early so its backoff keeps growing.
         self.prove_attempts = 0;
@@ -2561,6 +2698,7 @@ impl Actor {
         self.failed_cycles = 0;
         self.failed_pause = None;
         self.held_reason = None;
+        self.bisect_landed();
         self.metrics.settled_by_self.fetch_add(1, Ordering::SeqCst);
         info!(
             pid = %hex::encode(self.pid31),
@@ -2850,6 +2988,7 @@ impl Actor {
         // Pending votes another sequencer settled for us are done. Votes
         // whose slot got overwritten stay pending: their id is not in the tree.
         self.settle_pending_in_tree();
+        self.bisect_landed();
         self.error_new_slots_if_full();
         info!(
             pid = %hex::encode(self.pid31),
@@ -3072,6 +3211,9 @@ struct JobInput {
     prove_base: f64,
     /// L1-blob mode: the Ethereum side; `None` in blob mode.
     l1: Option<Arc<crate::l1da::L1Da>>,
+    /// L1-blob mode, bisecting: no blob post before the proof passed its
+    /// checks, so a failing retry spends nothing on Ethereum.
+    proof_first: bool,
     /// L1-blob mode: no settlement after this.
     deadline: tokio::time::Instant,
     /// Fired when the actor drops the flight.
@@ -3101,8 +3243,9 @@ async fn job_inner(job: JobInput) -> (JobOutcome, bool) {
         };
         return (settle_blobs(&job, &snark).await, false);
     };
-    // L1-blob mode: the blobs go to Ethereum while the batch is proved; the
-    // flight's end (rollback, shutdown) cancels the job.
+    // L1-blob mode: the blobs go to Ethereum while the batch is proved (after
+    // it, while bisecting); the flight's end (rollback, shutdown) cancels
+    // the job.
     let lj = crate::l1da::L1Job {
         pid: job.pid31,
         root_before: job.expected.root_before,
@@ -3112,7 +3255,11 @@ async fn job_inner(job: JobInput) -> (JobOutcome, bool) {
         posted: Default::default(),
     };
     let work = async {
-        let (proved, posting) = crate::l1da::with_post(&l1, &*job.chain, &lj, proved(&job)).await;
+        let (proved, posting) = if job.proof_first {
+            (proved(&job).await, crate::l1da::Posting::default())
+        } else {
+            crate::l1da::with_post(&l1, &*job.chain, &lj, proved(&job)).await
+        };
         let snark = match proved {
             Ok(s) => s,
             Err(o) => return o,
@@ -3141,7 +3288,7 @@ async fn proved(job: &JobInput) -> Result<PlonkSnark, JobOutcome> {
                 .observe(job.nf, job.n, secs, job.prove_base);
             (got, snark)
         }
-        // Transport/queue trouble is retried; a failed job never is.
+        // Transport/queue trouble is retried as is; a failed job is bisected.
         Err(e) if !e.permanent => return Err(JobOutcome::Transient(e.to_string())),
         Err(e) => return Err(JobOutcome::Failed(e.to_string())),
     };

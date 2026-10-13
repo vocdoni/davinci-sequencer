@@ -1700,14 +1700,15 @@ async fn transient_prover_failure_backs_off_and_recovers() {
     shutdown.cancel();
 }
 
-/// A prover 4xx (refused input) errors the votes once — no retry.
+/// A prover 4xx (refused input) on a lone vote: one full-size retry, then
+/// the vote is isolated and errored with the prover's reason.
 #[tokio::test]
-async fn permanent_prover_refusal_errors_votes_once() {
+async fn permanent_prover_refusal_isolates_a_lone_vote() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
     let prover = FakeProver::open();
-    *prover.fail_batches_permanent.lock().unwrap() = 1;
+    *prover.fail_batches_permanent.lock().unwrap() = 2;
     let node = start_node(
         Db::open_in(dir.path()).unwrap(),
         dir.path(),
@@ -1727,11 +1728,14 @@ async fn permanent_prover_refusal_errors_votes_once() {
         vote_status(&h, vid).await == Some(VoteStatus::Error)
     })
     .await;
-    let sv = h.status(vid).await.unwrap().unwrap();
-    assert!(sv.error.unwrap().contains("400"), "reason recorded");
+    let e = h.status(vid).await.unwrap().unwrap().error.unwrap();
+    assert!(e.contains("400"), "reason recorded: {e}");
+    assert!(e.contains("isolated by bisection"), "{e}");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(prover.calls(), 1, "a refused input must not be resubmitted");
+    assert_eq!(prover.calls(), 2, "one retry, then isolated");
     assert_eq!(s.chain.submit_count(), 0);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 2);
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 1);
     shutdown.cancel();
 }
 
@@ -4871,6 +4875,145 @@ async fn vote_error(h: &ActorHandle, vid: u64) -> String {
         .unwrap_or_default()
 }
 
+/// A prover that fails every batch holding vote X: one full-size retry,
+/// then halvings down to X alone, which is errored with the prover's
+/// reason; every other vote settles. 8 votes: 1 + 1 + log2(8) = 5 failed
+/// batches (8, 8, 4, 2, 1).
+#[tokio::test(start_paused = true)]
+async fn bisection_isolates_the_failing_vote() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        8,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let x = fake_vote(&s.env, 5, &[1, 2], 305).pkg.vote_id;
+    *prover.fail_vid.lock().unwrap() = Some(x);
+    let vids = submit_n(&h, &s, 8, 300).await;
+    assert_eq!(vids[5], x);
+    // The batch timer releases the leftovers once the bisection is over.
+    s.chain.advance_time(400);
+    let others: Vec<u64> = vids.iter().copied().filter(|v| *v != x).collect();
+    wait_long("X errored, the rest settled", async || {
+        vote_status(&h, x).await == Some(VoteStatus::Error) && all_settled(&h, &others).await
+    })
+    .await;
+    let e = vote_error(&h, x).await;
+    assert!(
+        e.contains("guest panicked") && e.contains("isolated by bisection"),
+        "{e}"
+    );
+    assert_eq!(prover.sizes(), vec![8, 8, 4, 4, 2, 1, 1, 1, 1]);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 5);
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 1);
+    assert_eq!(s.chain.voters(), 7);
+    // The landings ended the bisection: later votes seal whole again.
+    let mut more = Vec::new();
+    for i in 0..3 {
+        let v = fake_vote(&s.env, i, &[2, 1], 350 + i as u64);
+        more.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    s.chain.advance_time(400);
+    wait_long("revotes settled", async || all_settled(&h, &more).await).await;
+    assert_eq!(*prover.sizes().last().unwrap(), 3);
+    shutdown.cancel();
+}
+
+/// A prover that fails every batch: three votes are isolated and errored,
+/// then the actor holds; no further vote errors, and the held votes settle
+/// once the prover recovers.
+#[tokio::test(start_paused = true)]
+async fn prover_failing_every_batch_holds_after_three_isolations() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        5,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, &s, 5, 400).await;
+    s.chain.advance_time(400);
+    wait_long("three isolated", async || {
+        node.metrics.isolated_votes.load(Ordering::SeqCst) == 3
+    })
+    .await;
+    // Holding: retries go on at full size, nothing more errors.
+    let calls = prover.calls();
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert!(prover.calls() > calls, "still retrying");
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 3);
+    for vid in &vids[..3] {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Error));
+    }
+    for vid in &vids[3..] {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    assert_eq!(
+        *prover.sizes().last().unwrap(),
+        2,
+        "held batches are full size"
+    );
+    *prover.fail_batches_permanent.lock().unwrap() = 0;
+    wait_long("held votes settled", async || {
+        all_settled(&h, &vids[3..]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+/// A close during a bisection errors the pending suspects with the plain
+/// close reason.
+#[tokio::test(start_paused = true)]
+async fn close_during_bisection_reads_process_closed() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 4, 500).await;
+    // Two failures (full size, then the retry): requeued, cap now 2.
+    wait_long("bisecting, nothing in flight", async || {
+        prover.calls() == 2 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    s.chain.set_status(ProcessStatus::Canceled);
+    for vid in &vids {
+        wait_long("errored", async || {
+            vote_status(&h, *vid).await == Some(VoteStatus::Error)
+        })
+        .await;
+        assert_eq!(vote_error(&h, *vid).await, "process closed");
+    }
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
 /// A node-side check failure (the program vk pin) on every proof holds the
 /// votes: requeued with the usual backoff, never bisected, never errored,
 /// and settled once the proofs pass.
@@ -4927,4 +5070,42 @@ async fn held_votes_close_with_the_held_reason() {
         assert!(e.contains("program vk"), "{e}");
     }
     shutdown.cancel();
+}
+
+/// Bisection state is in memory: after a restart the next seal is full size.
+#[tokio::test(start_paused = true)]
+async fn restart_mid_bisection_seals_full_size() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 4, 800).await;
+    wait_long("bisecting, nothing in flight", async || {
+        prover.calls() == 2 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    let db = reopen_db(dir.path()).await;
+    let shutdown2 = CancellationToken::new();
+    let prover2 = FakeProver::open();
+    let (_node2, h2) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover2.clone(),
+        4,
+        &[],
+        shutdown2.clone(),
+    )
+    .await;
+    wait_long("settled", async || all_settled(&h2, &vids).await).await;
+    assert_eq!(prover2.sizes(), vec![4]);
+    shutdown2.cancel();
 }

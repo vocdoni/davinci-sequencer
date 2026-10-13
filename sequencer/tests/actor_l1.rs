@@ -1022,3 +1022,52 @@ async fn l1_reverted_posted_cycles_count() {
     shutdown.cancel();
     miner.abort();
 }
+
+/// A prover that fails every batch holding vote X, in L1-blob mode: the
+/// first failure posted its blobs (one failed cycle); the bisection cycles
+/// are proof-first, so the failing ones post nothing and the streak never
+/// reaches the pause. X alone is errored, the rest land, and so does the
+/// next vote.
+#[tokio::test(start_paused = true)]
+async fn l1_bisection_cycles_post_only_after_the_proof() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let x = fake_vote(&s.env, 3, &[1, 2], 2203).pkg.vote_id;
+    *prover.fail_vid.lock().unwrap() = Some(x);
+    let node = start_l1_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        4,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let vids = submit(&h, &s, 0..4, 2200).await;
+    assert_eq!(vids[3], x);
+    // Well inside the 10 min pause three posted failures would trigger.
+    wait_secs("X errored, the rest settled", 400, async || {
+        vote_status(&h, x).await == Some(VoteStatus::Error) && all_settled(&h, &vids[..3]).await
+    })
+    .await;
+    assert_eq!(prover.sizes(), vec![4, 4, 2, 2, 1, 1]);
+    // The first failure and the two landings ([0, 1], [2]).
+    assert_eq!(l1.sends().len(), 3, "failed bisection cycles posted");
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 4);
+    let next = submit(&h, &s, 4..5, 2300).await;
+    wait_secs("the next vote landed", 200, async || {
+        all_settled(&h, &next).await
+    })
+    .await;
+    assert_eq!(l1.sends().len(), 4);
+    assert_eq!(s.chain.voters(), 4);
+    shutdown.cancel();
+    miner.abort();
+}
