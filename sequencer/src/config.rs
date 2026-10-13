@@ -365,9 +365,32 @@ pub struct Config {
     pub flush_horizon: Duration,
     /// Landing margin reserved after proving (submit, inclusion,
     /// confirmations): a batch is sized so its estimated proving time plus
-    /// this margin ends before the window closes.
-    #[arg(long, env = "DAVINCI_SETTLE_MARGIN", default_value = "60s", value_parser = parse_duration)]
+    /// this margin ends before the window closes. Default: 60s, 30s in
+    /// L1-blob mode (where `--l1-settle-lag` covers the Ethereum leg).
+    #[arg(
+        long = "settle-margin",
+        env = "DAVINCI_SETTLE_MARGIN",
+        value_name = "DURATION",
+        value_parser = parse_duration
+    )]
+    settle_margin_arg: Option<Duration>,
+    /// Resolved settle margin.
+    #[arg(skip)]
     pub settle_margin: Duration,
+    /// L1-blob mode: seal to provable blobs on OP (blob inclusion, OP's L1
+    /// origin lag, the reorg margin). It overlaps the proof; it and the
+    /// settle margin must fit before the window closes. Lower it only for a
+    /// faster L1 such as a local anvil.
+    #[arg(
+        long = "l1-settle-lag",
+        env = "DAVINCI_L1_SETTLE_LAG",
+        value_name = "DURATION",
+        value_parser = parse_duration
+    )]
+    l1_settle_lag_arg: Option<Duration>,
+    /// Resolved L1 settle lag.
+    #[arg(skip)]
+    pub l1_settle_lag: Duration,
     /// Queued votes one ballot slot may hold at once (settled in order).
     #[arg(long, env = "DAVINCI_SLOT_DEPTH", default_value = "3", value_parser = clap::value_parser!(u32).range(1..))]
     pub slot_depth: u32,
@@ -462,6 +485,7 @@ impl fmt::Debug for Config {
             .field("solo_wait", &self.solo_wait)
             .field("flush_horizon", &self.flush_horizon)
             .field("settle_margin", &self.settle_margin)
+            .field("l1_settle_lag", &self.l1_settle_lag)
             .field("slot_depth", &self.slot_depth)
             .field("prove_base", &self.prove_base)
             .field("eager_results", &self.eager_results)
@@ -517,7 +541,17 @@ impl Config {
     }
 
     // Solo wait defaults to three batch times and never undercuts the timer.
+    // Runs after `resolve_network`: the margin's default depends on the mode,
+    // as in L1-blob mode the Ethereum leg is reserved apart (overlapping the
+    // proof) and the margin only covers the OP leg.
     fn resolve_batching(&mut self) -> Result<(), ConfigError> {
+        let margin = if self.l1_mode() { 30 } else { 60 };
+        self.settle_margin = self
+            .settle_margin_arg
+            .unwrap_or(Duration::from_secs(margin));
+        self.l1_settle_lag = self
+            .l1_settle_lag_arg
+            .unwrap_or(Duration::from_secs(crate::l1da::L1_SETTLE_LAG));
         self.solo_wait = match self.solo_wait_arg {
             Some(d) => d,
             None => self.batch_time.saturating_mul(3),
@@ -781,6 +815,7 @@ mod tests {
         assert_eq!(c.solo_wait, Duration::from_secs(2700));
         assert_eq!(c.flush_horizon, Duration::from_secs(180));
         assert_eq!(c.settle_margin, Duration::from_secs(60));
+        assert_eq!(c.l1_settle_lag, Duration::from_secs(110));
         assert_eq!(c.slot_depth, 3);
         assert_eq!(c.prove_base, Duration::from_secs(30));
         assert!(c.eager_results);
@@ -1045,6 +1080,22 @@ mod tests {
             assert!(!d.contains(secret), "{secret} in {d}");
         }
         assert!(d.contains("l1a:8545") && d.contains("send.example"), "{d}");
+        // L1-blob mode: the margin covers only the OP leg, the Ethereum leg
+        // is reserved apart.
+        assert_eq!(c.settle_margin, Duration::from_secs(30));
+        assert_eq!(c.l1_settle_lag, Duration::from_secs(110));
+        let mut args = with_rpc();
+        args.extend([
+            "--l1-rpc-url",
+            "http://l1a:8545",
+            "--settle-margin",
+            "45s",
+            "--l1-settle-lag",
+            "20s",
+        ]);
+        let c = Config::parse_args(args).unwrap();
+        assert_eq!(c.settle_margin, Duration::from_secs(45));
+        assert_eq!(c.l1_settle_lag, Duration::from_secs(20));
         // A send endpoint or an L1 key without the L1 RPCs is a mistake.
         for extra in [
             ["--l1-send-rpc-url", "http://s:8545"],

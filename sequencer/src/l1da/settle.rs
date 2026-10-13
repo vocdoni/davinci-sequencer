@@ -40,6 +40,10 @@ pub const PROOF_FAIL_FOR: Duration = Duration::from_secs(60);
 /// Re-posts of the blobs in one settlement before the batch goes back to the
 /// queue (each is an L1 blob transaction).
 pub const MAX_REPOSTS: u32 = 3;
+/// Seal to landing in L1-blob mode cannot beat the Ethereum leg: blob
+/// inclusion plus OP's L1 origin lag (~7 blocks) plus the reorg margin,
+/// overlapping the proof. Seconds; the default of `--l1-settle-lag`.
+pub const L1_SETTLE_LAG: u64 = 110;
 
 /// Where a proof is anchored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

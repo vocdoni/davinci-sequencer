@@ -79,6 +79,88 @@ async fn l1_happy_path_posts_proves_and_settles() {
     shutdown.cancel();
 }
 
+// ~10 s per vote at nf 2 (prove_base 30 s).
+fn slow(node: &Node) {
+    for _ in 0..60 {
+        node.metrics.prove.observe(2, 1, 40.0, 30.0);
+    }
+}
+
+/// The live OP setup: a 150 s floor, the default 30 s prove base and the
+/// L1-blob default margin (30 s). The 110 s Ethereum leg overlaps the proof,
+/// so the batch is sized by 150 − 30 − 30 = 90 s: 9 votes at 10 s each.
+#[tokio::test]
+async fn l1_floor_budget_seals_with_the_default_margin() {
+    let s = setup(2, 16, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        20,
+        "30s",
+        &["--batch-time", "100s", "--solo-wait", "300s"],
+    );
+    let node = start_l1_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let vids = submit(&h, &s, 0..15, 1200).await;
+    slow(&node);
+    s.chain.advance_time(115);
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![9, 6]);
+    assert_eq!(s.chain.voters(), 15);
+    assert_eq!(l1.mined_posts(), 2);
+    shutdown.cancel();
+}
+
+/// 110 s of Ethereum leg plus a 60 s margin exceed the 150 s floor: nothing
+/// seals while the window is open. Past the end a raised grace fits them.
+#[tokio::test]
+async fn l1_lag_over_the_floor_waits_for_the_end() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let cfg = test_config(dir.path(), &s.census_dir, 3, "60s");
+    let node = start_l1_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    s.chain.set_grace(600);
+    let vids = submit(&h, &s, 0..3, 1300).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prover.calls(), 0);
+    assert!(l1.sends().is_empty());
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    s.chain.advance_time(DURATION + 1);
+    wait_until("settled in the grace", async || {
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(prover.sizes(), vec![3]);
+    assert_eq!(s.chain.voters(), 3);
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn l1_origin_lag_records_once_and_anchors_at_the_record() {
     let s = setup(2, 8, None);

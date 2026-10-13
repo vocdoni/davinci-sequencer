@@ -74,7 +74,8 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--min-mix` | `DAVINCI_MIN_MIX` | `2` | Distinct slots a timer batch needs; fewer wait for `--solo-wait`. |
 | `--solo-wait` | `DAVINCI_SOLO_WAIT` | 3 × batch time | Age at which a batch below `--min-mix` seals anyway (±10% jitter). Never below `--batch-time`. |
 | `--flush-horizon` | `DAVINCI_FLUSH_HORIZON` | `3m` | From this long before the election end, and through the grace window, every pending vote seals at once. |
-| `--settle-margin` | `DAVINCI_SETTLE_MARGIN` | `60s` | Time reserved to land a transaction: a batch is sized so its estimated proof plus this margin ends before the window closes. |
+| `--settle-margin` | `DAVINCI_SETTLE_MARGIN` | `60s` (`30s` in L1-blob mode) | Time reserved to land a transaction: a batch is sized so its estimated proof plus this margin ends before the window closes. |
+| `--l1-settle-lag` | `DAVINCI_L1_SETTLE_LAG` | `110s` | L1-blob mode: the Ethereum leg of a landing (blob inclusion, OP's L1 origin lag, the reorg margin). It runs during the proof, so a batch seals only if this plus `--settle-margin` fits before the window closes too. Lower it only for a faster L1, such as a local anvil. |
 | `--prove-base` | `DAVINCI_PROVE_BASE` | `30s` | Fixed part of the proving-time estimate. Raise it on a slow prover. |
 | `--slot-depth` | `DAVINCI_SLOT_DEPTH` | `3` | Queued votes one ballot slot may hold, in flight included. |
 | `--max-blobs-per-tx` | `DAVINCI_MAX_BLOBS_PER_TX` | from the chain | Most blobs one settlement carries (1 to 6). See [Chain limits](#chain-limits). |
@@ -123,6 +124,13 @@ Ethereum. Such a node needs, besides the OP settings:
 At boot the node checks the Ethereum chain id and the verifier's `L1Block` address against the
 network (the `optimism` preset expects chain 1 and `0x4200000000000000000000000000000000000015`),
 and sizes batches with Ethereum's blob limit. Observers need no Ethereum key.
+
+The blobs are posted when proving starts, so the Ethereum leg of a landing (about 110 s on
+mainnet, `--l1-settle-lag`) overlaps the proof, and `--settle-margin` (default `30s` here) only
+covers the OP leg. A batch seals only while both the estimated proof and the Ethereum leg, each
+plus the margin, end before the window can close. While the election is open that is
+`now + graceFloor`, so `--l1-settle-lag` plus `--settle-margin` must stay under the registry's
+grace floor (150 s on OP); otherwise nothing seals before the end and the node warns at boot.
 
 ## Data directory
 

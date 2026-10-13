@@ -771,6 +771,8 @@ struct Actor {
     flush_horizon: u64,
     /// Landing margin reserved after proving.
     settle_margin: u64,
+    /// L1-blob mode: the Ethereum leg, which runs during the proof.
+    l1_settle_lag: u64,
     slot_depth: usize,
     prove_base: f64,
     /// Seal jitter of the current window, drawn once per window.
@@ -935,6 +937,7 @@ pub(crate) fn spawn_actor(
         solo_wait: cfg.solo_wait.as_secs(),
         flush_horizon: cfg.flush_horizon.as_secs(),
         settle_margin: cfg.settle_margin.as_secs(),
+        l1_settle_lag: cfg.l1_settle_lag.as_secs(),
         slot_depth: cfg.slot_depth as usize,
         prove_base: cfg.prove_base.as_secs_f64(),
         jitter: None,
@@ -1723,9 +1726,18 @@ impl Actor {
         if self.chain_time < self.end_time() {
             deadline = deadline.min(now.saturating_add(self.deps.grace.grace_floor));
         }
+        // L1-blob mode: the Ethereum leg runs during the proof, so a landing
+        // takes max(proof, lag) + margin; the lag must fit as well.
+        if self.deps.l1.is_some()
+            && deadline.saturating_sub(now) < self.l1_settle_lag.saturating_add(self.settle_margin)
+        {
+            debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
+            return;
+        }
         let left = deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
         let n_max = (left / self.metrics.prove.spv(nf)).floor();
         if n_max < 1.0 {
+            debug!(pid = %hex::encode(self.pid31), left, "no batch fits before the window closes");
             return; // nothing fits; the window closes on these votes
         }
         let cap = k
