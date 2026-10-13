@@ -114,6 +114,7 @@ prover. On failure the node logs, anvil log and datadirs are kept and their path
 | `DAVINCI_E2E_SETUP=1` | Runs only the part before the nodes: chain, contracts, processes and ballots. Needs neither the prover nor the node binary. |
 | `DAVINCI_E2E_DA=l1-blobs` | L1-blob mode, see above. With `DAVINCI_E2E_SETUP=1` it also checks that the relayer moves `MockL1Block` and that blob mode's entry point reverts `WrongDAMode`. |
 | `DAVINCI_E2E_L1_BLOCK_TIME`, `DAVINCI_E2E_L1_LAG` | L1-blob mode on anvil: the Ethereum anvil's block time (default 2 s) and the relayer's lag (default 6 blocks, at most 48). |
+| `DAVINCI_E2E_GRACE` | The anvil registry's grace window, `default,floor,ceil,max_total,notice` in seconds (default `davinci_e2e::chain::GRACE_ARGS`). |
 | `DAVINCI_E2E_GRACE_ONLY=1` | Runs only the grace window phase. |
 | `DAVINCI_E2E_DKG=1` | Adds a DKG automatic process ended with a batch in flight, a locked one decrypted after the reveal, and a zero-vote one. On anvil the harness deploys the DKG contracts and runs three `davinci-dkg-node` operators, built from `DAVINCI_DKG_DIR` unless `DAVINCI_E2E_DKG_NODE_BIN` is set; their circuit artifacts (about 1.1 GB) go to `DAVINCI_E2E_DKG_ARTIFACTS`. |
 | `DAVINCI_E2E_NEGATIVE=1` | Replays settled transactions, tampered, through `eth_call` and requires each to revert with the expected error. |
@@ -151,6 +152,35 @@ organizer's account) and reads `DAVINCI_E2E_L1_RPC` (Ethereum RPCs, default the 
 (default `0.00015eth`), `DAVINCI_E2E_L1_MIN_BALANCE` (default 0.0002 ETH) and
 `DAVINCI_E2E_MIN_BALANCE` (OP; default 0.00005 ETH on an L1-blob preset). `DAVINCI_E2E_BEACON`
 then names Ethereum beacon APIs that keep full blobs. A run posts about six blob transactions.
+
+### One 512 x 16 transition in L1-blob mode
+
+`e2e/tests/l1_big.rs`, gated by `DAVINCI_E2E_L1_BIG=1`, settles one transition of 512 votes at 16
+fields with the real prover, on two anvils whose registry has the OP Mainnet grace window
+(`DAVINCI_E2E_GRACE=300,240,600,1800,60`), or live with the `op_live` environment. One node runs
+the L1-blob defaults (`--l1-settle-lag 110s`, `--settle-margin 30s`, `--prove-base 30s`) with
+`--batch-max 512`. 512 first votes settle as the seal budget allows; then 512 new voters vote while
+the process is paused, the organizer ends it, and the flush seals all of them with 512 silent
+refreshes: nine blobs, posted as two Ethereum transactions and settled in one proof. The process
+takes the registry's 600 s ceiling grace, so a fresh node's proving estimate fits the batch after
+the end; the node then publishes the results. `DAVINCI_E2E_RECORD_DIR` writes the first batch
+job's snark and register dump in davinci-zkvm's `rust-sdk/testdata` format. A run takes about 30
+minutes, half of it the grace window, and wants the shared prover's queue empty:
+
+```bash
+DAVINCI_E2E_L1_BIG=1 DAVINCI_E2E_DA=l1-blobs DAVINCI_E2E_GRACE=300,240,600,1800,60 \
+  systemd-run --user --scope -p MemoryMax=16G -- \
+  cargo test -p davinci-e2e --test l1_big -- --nocapture
+```
+
+### A small election through a running node
+
+`e2e/tests/node_smoke.rs`, gated by `DAVINCI_E2E_NODE_URL`, drives a node that already runs (a
+production node after an upgrade) on the live deployment of the preset: a CSP process with three
+voters and the node's election key, created with the organizer key file
+`DAVINCI_E2E_ORGANIZER_KEY`. The organizer ends it once the votes are queued; the node seals them
+in its flush, settles them and publishes the tally, which must match. It spawns nothing and takes
+about 10 minutes, most of it the grace window.
 
 ## Docker runner
 

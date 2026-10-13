@@ -209,8 +209,26 @@ pub struct Deployment {
 /// through one GPU: the losers' proofs still queue ahead, up to five jobs.
 pub const GRACE_ARGS: (u32, u32, u32, u32, u32) = (120, 40, 180, 240, 5);
 
+/// The anvil registry's grace args: `DAVINCI_E2E_GRACE`
+/// (`default,floor,ceil,max_total,notice`, seconds; `300,240,600,1800,60` is
+/// the OP Mainnet registry's), else [`GRACE_ARGS`].
+pub fn grace_args() -> Result<(u32, u32, u32, u32, u32)> {
+    let Ok(v) = std::env::var("DAVINCI_E2E_GRACE") else {
+        return Ok(GRACE_ARGS);
+    };
+    let n: Vec<u32> = v
+        .split(',')
+        .map(|x| x.trim().parse())
+        .collect::<std::result::Result<_, _>>()
+        .context("DAVINCI_E2E_GRACE")?;
+    let [default, floor, ceil, max_total, notice] = n[..] else {
+        bail!("DAVINCI_E2E_GRACE: default,floor,ceil,max_total,notice");
+    };
+    Ok((default, floor, ceil, max_total, notice))
+}
+
 /// Deploys `ZiskVerifier` (a `PlonkVerifier`) and `ProcessRegistry` pinned to
-/// the release vks, the ballot VK hash and [`GRACE_ARGS`], with `dkg_manager`
+/// the release vks, the ballot VK hash and [`grace_args`], with `dkg_manager`
 /// (zero disables the DKG key modes), then reads the pins back.
 pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deployment> {
     deploy_with(url, dir, dkg_manager, false).await
@@ -264,6 +282,7 @@ async fn deploy_with(url: &str, dir: &Path, dkg_manager: Address, l1: bool) -> R
     };
 
     let vk_hash = B256::from(ballot_vk_hash()?);
+    let grace = grace_args()?;
     let args = (
         u32::try_from(chain_id)?,
         verifier,
@@ -277,7 +296,7 @@ async fn deploy_with(url: &str, dir: &Path, dkg_manager: Address, l1: bool) -> R
         .abi_encode_params();
     let mut code = bytecode(dir, "ProcessRegistry.sol/ProcessRegistry.json")?;
     code.extend_from_slice(&args);
-    code.extend_from_slice(&GRACE_ARGS.abi_encode_params());
+    code.extend_from_slice(&grace.abi_encode_params());
     code.extend_from_slice(&l1_blob_verifier.abi_encode()); // zero: blob mode
     let registry = deploy_code(&provider, code)
         .await
@@ -296,7 +315,7 @@ async fn deploy_with(url: &str, dir: &Path, dkg_manager: Address, l1: bool) -> R
             r.graceCeil().call().await?,
             r.graceMaxTotal().call().await?,
             r.noticeMin().call().await?,
-        ) == GRACE_ARGS
+        ) == grace
     );
     ensure!(r.l1BlobVerifier().call().await? == l1_blob_verifier);
     let dkg_adapter = r.dkgAdapter().call().await?;
