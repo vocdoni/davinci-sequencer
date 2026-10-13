@@ -97,8 +97,8 @@ refreshes the circuit will demand.
 **Release pins.** `rust-sdk/src/release.rs` in davinci-zkvm pins `BATCH_PROGRAM_VK`,
 `RESULTS_PROGRAM_VK` and `ROOT_C_VADCOP_FINAL`. They must equal the programs the prover runs, the
 registry's immutables and davinci-zkvm's go-sdk `CircuitRelease`, and the node refuses any proof
-that differs (the votes end in `error`
-mentioning the pin). Rebuilding a zkVM program or changing the ZisK setup means refreezing the
+that differs (the votes stay pending, and those left at the close end in `process closed (held:
+…)` naming the pin). Rebuilding a zkVM program or changing the ZisK setup means refreezing the
 pins and redeploying the registry. The ballot VK is the SDK's embedded
 `assets/ballot_proof_vkey.json`; its hash is state leaf `0x07` and the registry's `ballotVKHash`.
 

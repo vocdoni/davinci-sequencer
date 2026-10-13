@@ -86,8 +86,27 @@ blobs go to Ethereum instead, see [L1-blob mode](#l1-blob-mode-op-stack). A node
 one batch in flight per process; processes run in parallel.
 
 Transient prover errors back off (up to about 5 minutes) with the votes still pending, and end
-in `error` only if the election closes first. A prover refusal, or a circuit failure, errors the
-votes at once.
+in `error` only if the election closes first. Other failures:
+
+- A job the prover fails for good (a `failed` job, a refused input, outputs it cannot decode)
+  puts the votes back in the queue and retries the batch once at full size. Each further failure
+  halves the next batch, until a single vote fails: that vote alone ends in `error`, with the
+  prover's reason and `(isolated by bisection)`. Retries back off up to 30 s. After three such
+  votes in a row the node takes the prover to fail every input: it stops erroring and keeps
+  retrying full batches. A landing (the node's own or a synced one) ends the bisection once its
+  votes are settled, and so do the close and a restart (the state is in memory).
+- A proof the node's own checks refuse (public outputs, program key or `rootCVadcopFinal` other
+  than the pins), and in L1-blob mode an Ethereum proof that carries other blobs, would fail the
+  same way for every batch: the votes stay pending under the usual backoff, never bisected or
+  errored. Votes still held at the close end in `process closed (held: <reason>)`.
+- A circuit failure (the guest's fail mask) errors the votes at once. Admission repeats every
+  per-vote check, so it means a node bug.
+
+In L1-blob mode the retries of a bisection are proof-first: the blobs go out only once the proof
+passed its checks, so a failing retry posts nothing and is not a failed cycle (only the first
+failure, which posted, is). Such a batch is sized for the proof and the Ethereum leg one after
+the other. Each case logs an error and counts in `GET /info` (`bisections`, `isolatedVotes`,
+`heldBatches`, `guestRejections`).
 
 ## Races and sync
 
@@ -218,6 +237,10 @@ With `--eager-results` (the default) steps 1 to 3 run during the grace window, o
 queued or in flight. The node submits the proof on the first heartbeat after the grace end if the
 root has not moved, and proves again otherwise.
 
+An attempt that fails for good (a failed proving job, a proof that fails the checks, a revert the
+node does not expect) is retried, never abandoned: after 2 s, then 4 s, and from the third failure
+in a row every 5 minutes, each logged as an error.
+
 For a DKG-key process, see below.
 
 ## Key modes
@@ -322,7 +345,8 @@ state, transitions and blobs, the census data, the per-process exposed slot set 
 The per-batch seed and refresh selection exist only in memory for one batch, by design. On
 restart, votes that were in a batch (`aggregated` or `processed`) go back to `pending` and the
 node syncs from the chain. If its own transaction landed before the crash, those votes settle
-through that sync without being proved again.
+through that sync without being proved again. A bisection in progress is forgotten: the next
+batch is full size.
 
 In L1-blob mode the node records each Ethereum blob transaction, with the sending account, before
 sending it and drops the record once it is mined. After a restart the batch is proved again (its

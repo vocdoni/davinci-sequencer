@@ -21,7 +21,7 @@ requests time out after 60 s.
 | Method | Path | Purpose | Error codes |
 |---|---|---|---|
 | GET | `/ping` | Liveness (`pong`). | |
-| GET | `/info` | Sequencer address (`null` for an observer), chain id, registry, ballot VK hash, both program verification keys, `observer`, and the counters `settledBySelf`, `syncedFromOthers` and `lostRaces`. | |
+| GET | `/info` | Sequencer address (`null` for an observer), chain id, registry, ballot VK hash, both program verification keys, `observer`, and the counters `settledBySelf`, `syncedFromOthers`, `lostRaces`, `bisections` (batches the prover failed for good, requeued for bisection), `isolatedVotes` (votes a bisection errored alone), `heldBatches` (batches held pending after a node-side check failed) and `guestRejections` (batches the circuit rejected, their votes errored). | |
 | GET | `/processes` | Process ids this node knows. | |
 | GET | `/processes/{pid}` | On-chain parameters plus the node's view, described below. | 40001, 40402 |
 | POST | `/processes/keys` | Body `{"processId"}`: this node's election key for that future process, as `{x, y}`. | 40001, 41203, 42901 |
@@ -82,11 +82,12 @@ the one that settles last stands. Clients should send all of one voter's ballots
 | `aggregated` | In a batch being proved. |
 | `processed` | Proof checked, settlement pending. |
 | `settled` | On-chain. |
-| `error` | Failed; an `error` field says why (a circuit failure, `process closed`, a settlement revert, a prover refusal, or `census changed, recast`). |
+| `error` | Failed; an `error` field says why (a circuit failure, `process closed`, a settlement revert, a vote the prover fails `(isolated by bisection)`, or `census changed, recast`). |
 
 A batch that loses a race goes back to `pending`, and so does one the settlement refuses because
 the organizer paused the process. Votes still queued when the grace window closes, or when the
-process is canceled, end in `process closed`. A node that never stored a vote still answers
+process is canceled, end in `process closed`, or `process closed (held: <reason>)` when a check of
+the node's own (such as a program key pin) held them. A node that never stored a vote still answers
 `settled` when its id is in the tree, and 404 otherwise.
 
 Once a vote is settled, `GET /votes/{pid}/voteId/{voteId}/proof` returns a tracker proof, and
