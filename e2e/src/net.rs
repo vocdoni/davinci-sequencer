@@ -7,22 +7,26 @@
 //! handed to the node as is; seq1, seq2, seq3, observer), `DAVINCI_E2E_BEACON`
 //! (a `,` list), `DAVINCI_E2E_REGISTRY`, `DAVINCI_E2E_FROM_BLOCK`,
 //! `DAVINCI_E2E_CONFIRMATIONS`, `DAVINCI_E2E_POLL`, `DAVINCI_E2E_TIMEOUT_SCALE`.
-//! Unset, they default to the Gnosis deployment of `davinci_client::networks`.
+//! Unset, they default to the deployment of `davinci_client::networks` named
+//! by `DAVINCI_E2E_NETWORK` (default `gnosis`). `DAVINCI_E2E_MIN_BALANCE`
+//! (native token, decimal) overrides the least balance of each funded account.
 //! With `DAVINCI_E2E_DKG=1`, `DAVINCI_E2E_DKG_MANAGER` names the external
 //! committee's DKGManager. Unset, it is the manager of the registry's adapter.
 //!
-//! `DAVINCI_E2E_DA=l1-blobs` runs the registry in L1-blob mode, see
-//! [`crate::l1`]: on anvil a second, Ethereum-like anvil and an origin relayer.
+//! `DAVINCI_E2E_DA=l1-blobs` (implied live by an L1-blob preset such as
+//! `optimism`) runs the registry in L1-blob mode, see [`crate::l1`]: on anvil
+//! a second, Ethereum-like anvil and an origin relayer; live, Ethereum from
+//! `DAVINCI_E2E_L1_*`. Live, `DAVINCI_E2E_BEACON` then names Ethereum beacons.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, U256, utils::format_ether};
+use alloy::primitives::{Address, U256, utils::format_ether, utils::parse_ether};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail, ensure};
-use davinci_client::networks::{GNOSIS, OP_L1_BLOCK};
+use davinci_client::networks::{self, GNOSIS, Network, NetworkDa, OP_L1_BLOCK};
 use davinci_client::organizer::{Organizer, RegistryDa, verify_registry};
 
 use crate::chain::{self, Anvil, DEV_KEYS};
@@ -33,18 +37,40 @@ use crate::node::NodeConfig;
 /// Least balance each funded account needs for a live run (0.05 xDAI).
 pub const MIN_BALANCE: u128 = 50_000_000_000_000_000;
 
-/// Organizer and harness RPC: the network's last (publicnode, its first,
-/// rate-limits organizer bursts).
+/// The same on an L1-blob preset, where OP gas is cheap: 0.00005 ETH.
+pub const MIN_BALANCE_L1: u128 = 50_000_000_000_000;
+
+/// Organizer and harness RPC on Gnosis: the network's last (publicnode, its
+/// first, rate-limits organizer bursts).
+#[cfg(test)]
 const GNOSIS_RPC: &str = GNOSIS.rpc_urls[GNOSIS.rpc_urls.len() - 1];
 
 /// Live node RPC lists (seq1, seq2, seq3, observer): the network's RPCs
 /// rotated, so each node starts on another endpoint and fails over to the next.
-fn gnosis_node_rpcs() -> String {
-    let u = GNOSIS.rpc_urls;
+fn node_rpcs_of(n: &Network) -> String {
+    let u = n.rpc_urls;
     (0..4)
         .map(|i| format!("{},{}", u[i % u.len()], u[(i + 1) % u.len()]))
         .collect::<Vec<_>>()
         .join(";")
+}
+
+#[cfg(test)]
+fn gnosis_node_rpcs() -> String {
+    node_rpcs_of(&GNOSIS)
+}
+
+/// The live deployment's preset: `DAVINCI_E2E_NETWORK` (default `gnosis`).
+pub fn preset() -> Result<&'static Network> {
+    let name = env_or("DAVINCI_E2E_NETWORK", GNOSIS.name);
+    networks::by_name(&name).with_context(|| format!("DAVINCI_E2E_NETWORK={name}: no such preset"))
+}
+
+/// Whether the run is in L1-blob mode: `DAVINCI_E2E_DA=l1-blobs`, or live on
+/// an L1-blob preset.
+pub fn l1_mode() -> Result<bool> {
+    let preset_l1 = is_live() && matches!(preset()?.da, NetworkDa::L1Blobs { .. });
+    Ok(l1::enabled()? || preset_l1)
 }
 
 pub fn is_live() -> bool {
@@ -111,13 +137,22 @@ pub fn read_key(path: &Path) -> Result<PrivateKeySigner> {
 
 /// RPC, registry and first log block of the live chain, from the env.
 pub fn live_target() -> Result<(String, Address, u64)> {
-    let registry = env_or("DAVINCI_E2E_REGISTRY", &GNOSIS.registry.to_string())
+    let n = preset()?;
+    let registry: Address = env_or("DAVINCI_E2E_REGISTRY", &n.registry.to_string())
         .parse()
         .context("DAVINCI_E2E_REGISTRY")?;
-    let from_block = env_or("DAVINCI_E2E_FROM_BLOCK", &GNOSIS.start_block.to_string())
+    ensure!(
+        registry != Address::ZERO,
+        "network {} has no registry yet: set DAVINCI_E2E_REGISTRY",
+        n.name
+    );
+    let from_block = env_or("DAVINCI_E2E_FROM_BLOCK", &n.start_block.to_string())
         .parse()
         .context("DAVINCI_E2E_FROM_BLOCK")?;
-    Ok((env_or("DAVINCI_E2E_RPC", GNOSIS_RPC), registry, from_block))
+    // The organizer's RPC: the network's last (publicnode, its first,
+    // rate-limits organizer bursts).
+    let rpc = n.rpc_urls[n.rpc_urls.len() - 1];
+    Ok((env_or("DAVINCI_E2E_RPC", rpc), registry, from_block))
 }
 
 pub struct Net {
@@ -228,8 +263,9 @@ impl Net {
     }
 
     async fn live() -> Result<Net> {
+        let n = preset()?;
         let (rpc, registry, from_block) = live_target()?;
-        let node_rpcs = node_lists(&env_or("DAVINCI_E2E_NODE_RPCS", &gnosis_node_rpcs()));
+        let node_rpcs = node_lists(&env_or("DAVINCI_E2E_NODE_RPCS", &node_rpcs_of(n)));
         let org_path = std::env::var_os("DAVINCI_E2E_ORGANIZER_KEY")
             .context("DAVINCI_E2E_ORGANIZER_KEY (a key file) is required live")?;
         let organizer = read_key(Path::new(&org_path))?;
@@ -243,21 +279,37 @@ impl Net {
         }
         let p = ProviderBuilder::new().connect_client(chain::rpc(&rpc)?);
         let chain_id = p.get_chain_id().await.context("RPC chain id")?;
+        ensure!(
+            chain_id == n.chain_id || std::env::var("DAVINCI_E2E_REGISTRY").is_ok(),
+            "the RPC is on chain {chain_id}, network {} is {}",
+            n.name,
+            n.chain_id
+        );
         let head = p.get_block_number().await?;
         ensure!(
             from_block <= head,
             "DAVINCI_E2E_FROM_BLOCK {from_block} is past the head {head}"
         );
+        let l1 = if l1_mode()? {
+            Some(l1::live_net(n, organizer.address())?)
+        } else {
+            None
+        };
+        let default_min = if l1.is_some() {
+            MIN_BALANCE_L1
+        } else {
+            MIN_BALANCE
+        };
+        let min_balance = match std::env::var("DAVINCI_E2E_MIN_BALANCE") {
+            Ok(v) if !v.is_empty() => parse_ether(&v).context("DAVINCI_E2E_MIN_BALANCE")?,
+            _ => U256::from(default_min),
+        };
         Ok(Net {
             live: true,
             rpc,
             node_rpcs,
             beacon: Some(
-                node_lists(&env_or(
-                    "DAVINCI_E2E_BEACON",
-                    &GNOSIS.beacon_urls().join(","),
-                ))
-                .join(","),
+                node_lists(&env_or("DAVINCI_E2E_BEACON", &n.beacon_urls().join(","))).join(","),
             ),
             registry,
             chain_id,
@@ -266,14 +318,14 @@ impl Net {
             organizer,
             census_owner: None,
             sequencers,
-            confirmations: env_or("DAVINCI_E2E_CONFIRMATIONS", "3")
+            confirmations: env_or("DAVINCI_E2E_CONFIRMATIONS", &n.confirmations.to_string())
                 .parse()
                 .context("DAVINCI_E2E_CONFIRMATIONS")?,
             poll: env_or("DAVINCI_E2E_POLL", "5s"),
             dkg: None,
             dkg_stack: None,
-            l1: None,
-            min_balance: U256::from(MIN_BALANCE),
+            l1,
+            min_balance,
             anvil: None,
         })
     }

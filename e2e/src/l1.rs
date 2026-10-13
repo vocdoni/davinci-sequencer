@@ -20,6 +20,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result, bail, ensure};
+use davinci_client::networks::{Network, NetworkDa};
 use davinci_client::organizer::ProcessRegistry;
 
 use crate::chain::{self, Anvil};
@@ -50,6 +51,15 @@ pub const L1_CHAIN_ID: u64 = 1;
 /// Ethereum anvil accounts of sequencers A, B and C. Not their OP keys
 /// (1..=3): a node that signed a blob post with its OP key would show.
 pub const L1_KEYS: [usize; 3] = [5, 6, 7];
+/// Least balance of a live sequencer's Ethereum key, unless
+/// `DAVINCI_E2E_L1_MIN_BALANCE` says otherwise: about ten 6-blob posts at
+/// 0.35 gwei.
+pub const MIN_L1_BALANCE: &str = "0.0002";
+/// The nodes' `DAVINCI_L1_MAX_POST_FEE` live, unless
+/// `DAVINCI_E2E_L1_MAX_POST_FEE` says otherwise: a 6-blob post at twice
+/// 0.35 gwei and twice 0.015 gwei per blob gas is about 0.00004 ETH, so this
+/// leaves room for two doubled replacements.
+pub const LIVE_MAX_POST_FEE: &str = "0.00015eth";
 
 /// `DAVINCI_E2E_DA`: `blobs` (the default) or `l1-blobs`.
 pub fn enabled() -> Result<bool> {
@@ -353,6 +363,67 @@ pub async fn anvil_net(dir: &Path, op_url: &str, dep: &chain::Deployment) -> Res
     })
 }
 
+fn env_or(k: &str, default: &str) -> String {
+    std::env::var(k)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Live: Ethereum from the env, defaults from `preset`.
+/// `DAVINCI_E2E_L1_RPC` (a `,` list), `DAVINCI_E2E_L1_SEND_RPC`,
+/// `DAVINCI_E2E_L1_KEYS` (key files, one per sequencer, in the order of
+/// `DAVINCI_E2E_SEQUENCER_KEYS`), `DAVINCI_E2E_L1_MAX_POST_FEE`,
+/// `DAVINCI_E2E_L1_MIN_BALANCE` (ETH).
+pub fn live_net(preset: &Network, organizer: Address) -> Result<L1Net> {
+    let default_rpcs = match preset.da {
+        NetworkDa::L1Blobs { l1_rpc_urls, .. } => l1_rpc_urls.join(","),
+        NetworkDa::Blobs => String::new(),
+    };
+    let rpc = env_or("DAVINCI_E2E_L1_RPC", &default_rpcs);
+    ensure!(
+        !rpc.is_empty(),
+        "DAVINCI_E2E_L1_RPC (Ethereum RPCs) is required live in L1-blob mode"
+    );
+    let send_rpc = std::env::var("DAVINCI_E2E_L1_SEND_RPC")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let list = std::env::var("DAVINCI_E2E_L1_KEYS")
+        .context("DAVINCI_E2E_L1_KEYS (Ethereum key files) is required live in L1-blob mode")?;
+    let min_balance = parse_ether(&env_or("DAVINCI_E2E_L1_MIN_BALANCE", MIN_L1_BALANCE))
+        .context("DAVINCI_E2E_L1_MIN_BALANCE")?;
+    Ok(L1Net {
+        rpc,
+        send_rpc,
+        keys: live_keys(&list, organizer)?,
+        verifier: Address::ZERO,
+        l1_block: Address::ZERO,
+        max_post_fee: Some(env_or("DAVINCI_E2E_L1_MAX_POST_FEE", LIVE_MAX_POST_FEE)),
+        min_balance,
+        anvil: None,
+    })
+}
+
+/// The Ethereum key files of a `,` list and their addresses. None may be
+/// the organizer's account, whose Ethereum nonces belong to its owner, and
+/// none may repeat: the blob pool wants one sender per node.
+pub fn live_keys(list: &str, organizer: Address) -> Result<Vec<(PathBuf, Address)>> {
+    let mut keys: Vec<(PathBuf, Address)> = Vec::new();
+    for p in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(p);
+        let a = crate::net::read_key(&p)?.address();
+        ensure!(a != organizer, "{}: the organizer's account", p.display());
+        ensure!(
+            keys.iter().all(|(_, b)| *b != a),
+            "{}: an Ethereum key given twice",
+            p.display()
+        );
+        keys.push((p, a));
+    }
+    ensure!(!keys.is_empty(), "DAVINCI_E2E_L1_KEYS lists no key file");
+    Ok(keys)
+}
+
 /// One L1-mode settlement and the Ethereum blob transactions behind it.
 #[derive(Clone, Debug)]
 pub struct L1Post {
@@ -502,5 +573,30 @@ mod tests {
         }
         assert!(parse_da(Some(" l1-blobs ")).unwrap());
         assert!(parse_da(Some("l1")).is_err());
+        assert!(parse_ether(MIN_L1_BALANCE).unwrap() > U256::ZERO);
+    }
+
+    #[test]
+    fn live_keys_are_dedicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, i: usize| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, chain::DEV_KEYS[i]).unwrap();
+            p.display().to_string()
+        };
+        let (a, b, org) = (file("a", 5), file("b", 6), file("org", 0));
+        let organizer = chain::signer(0).unwrap().address();
+        let keys = live_keys(&format!("{a}, {b}"), organizer).unwrap();
+        let want = [
+            chain::signer(5).unwrap().address(),
+            chain::signer(6).unwrap().address(),
+        ];
+        assert_eq!(keys.iter().map(|(_, x)| *x).collect::<Vec<_>>(), want);
+        let e = live_keys(&format!("{a},{org}"), organizer).unwrap_err();
+        assert!(e.to_string().contains("organizer"), "{e}");
+        assert!(live_keys(&format!("{a},{a}"), organizer).is_err());
+        assert!(live_keys(" , ", organizer).is_err());
+        // Errors name the file, never its content.
+        assert!(!e.to_string().contains(chain::DEV_KEYS[0]));
     }
 }
