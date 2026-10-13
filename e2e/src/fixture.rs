@@ -155,7 +155,13 @@ pub fn choices(v: usize, round: usize) -> Vec<u64> {
 
 /// Sum of the last ballot of every voter.
 pub fn expected_tally(last: &[Vec<u64>]) -> Vec<u64> {
-    let mut t = vec![0u64; NUM_FIELDS as usize];
+    // As wide as the ballots: an nf-16 election must not be cut to NUM_FIELDS.
+    let width = last
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(NUM_FIELDS as usize);
+    let mut t = vec![0u64; width];
     for b in last {
         for (o, x) in t.iter_mut().zip(b) {
             *o += x;
@@ -494,6 +500,15 @@ pub fn build_ballots(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expected_tally_is_as_wide_as_the_ballots() {
+        let ballots: Vec<Vec<u64>> = (0..8).map(|v| super::choices_nf(v, 16)).collect();
+        let t = super::expected_tally(&ballots);
+        assert_eq!(t.len(), 16);
+        assert_eq!(t.iter().sum::<u64>(), 8 * 6);
+        assert_eq!(super::expected_tally(&[]).len(), super::NUM_FIELDS as usize);
+    }
+
     #[test]
     fn bench_choices_are_valid() {
         for nf in 2..=16 {
