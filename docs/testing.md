@@ -193,6 +193,18 @@ DAVINCI_E2E_BENCH=sizes cargo test -p davinci-e2e --test bench -- --nocapture
 Sizes come from `DAVINCI_E2E_BENCH_SIZES` (default `4,16,64,128,256`) and the field count from
 `DAVINCI_E2E_BENCH_NF` (default 4).
 
+**L1 blobs** (`e2e/tests/bench_l1.rs`, `DAVINCI_E2E_BENCH=l1`): the batch-size benchmark of the
+L1-blob mode, live on OP Mainnet or, as a dry run, on anvil with `DAVINCI_E2E_DA=l1-blobs`. Per
+case and run a fresh node proves a first and a steady batch; per settlement it records the proof
+time, the latencies from seal and from proof-ready to settled, the Ethereum post (execution plus
+blob gas), the OP settlement (L2 execution plus L1 data fee, plus any `record()`), the L1 proof's
+header count and the gas of `L1BlobVerifier.verify` alone. Sizes come from
+`DAVINCI_E2E_BENCH_SIZES` (default `64,128,256`, at most 256), fields from `DAVINCI_E2E_BENCH_NFS`
+(`2,16`), runs from `DAVINCI_E2E_BENCH_RUNS` (3); runs are `DAVINCI_E2E_BENCH_PAUSE` (60) s apart
+and each waits for an empty prover queue; no new run starts once the node's Ethereum key spent
+`DAVINCI_E2E_BENCH_L1_BUDGET` (0.0009 ETH). It writes the Markdown table to
+`DAVINCI_E2E_BENCH_OUT` and the rows as JSON next to it.
+
 **Throughput** (`e2e/tests/throughput.rs`): sustained votes per second across several provers.
 One node per URL in `DAVINCI_E2E_BENCH_PROVERS` sequences its own processes, so the provers never
 race on one state root. Every ballot is proved before the clock starts, and the clock runs from
