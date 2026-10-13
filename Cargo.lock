@@ -2566,6 +2566,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "arbo",
+ "clap",
  "davinci-client",
  "davinci-state",
  "davinci-zkvm-sdk",
@@ -2575,6 +2576,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]
