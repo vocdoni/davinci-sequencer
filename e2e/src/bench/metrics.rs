@@ -206,6 +206,10 @@ pub enum Kind {
         pid: String,
         error: String,
     },
+    /// The prover failed every batch: votes are held pending.
+    ProverHold {
+        pid: String,
+    },
     GuestRejected {
         pid: String,
         mask: String,
@@ -287,9 +291,17 @@ pub fn kind(e: &LogEvent) -> Option<Kind> {
                 .unwrap_or_default();
             Kind::GuestRejected { pid, mask }
         }
-        "results_request failed" | "dkg_results_inputs failed" => {
-            Kind::FinalizeFailed { pid, error: f("e") }
+        "results failed; retrying" | "finalize attempt failed, will retry" => {
+            Kind::FinalizeFailed {
+                pid,
+                error: if e.fields.contains_key("msg") {
+                    f("msg")
+                } else {
+                    f("e")
+                },
+            }
         }
+        "prover fails every batch; holding votes pending" => Kind::ProverHold { pid },
         _ => return None,
     })
 }
@@ -509,18 +521,30 @@ mod tests {
                 mask: "0x3".into()
             }
         );
-        for m in ["results_request failed", "dkg_results_inputs failed"] {
-            let (_, k) = ev(&format!(
-                "2026-10-13T18:00:00.000000Z ERROR {m} pid={pid} e=no secret key"
-            ));
-            assert_eq!(
-                k,
-                Kind::FinalizeFailed {
-                    pid: pid.into(),
-                    error: "no secret key".into()
-                }
-            );
-        }
+        let (_, k) = ev(&format!(
+            "2026-10-13T18:00:00.000000Z ERROR results failed; retrying pid={pid} msg=no secret key failures=2 retry_in=30"
+        ));
+        assert_eq!(
+            k,
+            Kind::FinalizeFailed {
+                pid: pid.into(),
+                error: "no secret key".into()
+            }
+        );
+        let (_, k) = ev(&format!(
+            "2026-10-13T18:00:00.000000Z ERROR finalize attempt failed, will retry pid={pid} e=\"proof busy\" attempts=1 retry_in=30"
+        ));
+        assert_eq!(
+            k,
+            Kind::FinalizeFailed {
+                pid: pid.into(),
+                error: "proof busy".into()
+            }
+        );
+        let (_, k) = ev(&format!(
+            "2026-10-13T18:00:00.000000Z ERROR prover fails every batch; holding votes pending pid={pid}"
+        ));
+        assert_eq!(k, Kind::ProverHold { pid: pid.into() });
         assert!(parse_line("not a log line").is_none());
     }
 

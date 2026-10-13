@@ -100,14 +100,52 @@ pub struct Balances {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
     pub start: Balances,
+    /// Transfers `fund` made since the start.
+    #[serde(default)]
+    pub inflows: Balances,
     pub caps: Caps,
 }
 
 impl Budget {
-    /// Balances fell since the start (a gain counts as no spend).
+    /// A budget needs funded sequencer accounts: below its cap, an account
+    /// could never reach the cap by spending.
+    pub fn new(start: Balances, caps: Caps) -> Result<Budget, String> {
+        let mut low = Vec::new();
+        for (n, b, cap) in [
+            ("seq-a.l1", start.l1[0], caps.l1_per_key),
+            ("seq-b.l1", start.l1[1], caps.l1_per_key),
+            ("seq-a.op", start.op[0], caps.op_per_key),
+            ("seq-b.op", start.op[1], caps.op_per_key),
+        ] {
+            if b < cap {
+                low.push(format!("{n} holds {b} wei, below its cap {cap}"));
+            }
+        }
+        if low.is_empty() {
+            Ok(Budget {
+                start,
+                inflows: Balances::default(),
+                caps,
+            })
+        } else {
+            Err(format!("fund first: {}", low.join("; ")))
+        }
+    }
+
+    /// Balances fell since the start plus the inflows.
     pub fn spent(&self, now: &Balances) -> Balances {
         let d = |s: U256, n: U256| s.saturating_sub(n);
-        let s = &self.start;
+        let s = &Balances {
+            l1: [
+                self.start.l1[0] + self.inflows.l1[0],
+                self.start.l1[1] + self.inflows.l1[1],
+            ],
+            op: [
+                self.start.op[0] + self.inflows.op[0],
+                self.start.op[1] + self.inflows.op[1],
+            ],
+            organizer_op: self.start.organizer_op + self.inflows.organizer_op,
+        };
         Balances {
             l1: [d(s.l1[0], now.l1[0]), d(s.l1[1], now.l1[1])],
             op: [d(s.op[0], now.op[0]), d(s.op[1], now.op[1])],
@@ -257,7 +295,7 @@ pub fn foreign_sequencers(pgrep: &str, docker: &str, own: &[u32]) -> Vec<String>
         if pid.parse::<u32>().is_ok_and(|p| own.contains(&p)) || base == "pgrep" {
             continue;
         }
-        if l.contains("davinci-sequencer") {
+        if base == "davinci-sequencer" {
             out.push(l.to_string());
         }
     }
@@ -311,15 +349,16 @@ fn sha256_file(p: &Path) -> Result<String> {
     Ok(hex::encode(Sha256::digest(b)))
 }
 
-fn run(cmd: &str, args: &[&str]) -> Result<String> {
+/// `ok1`: exit code 1 is an answer (pgrep: no match), not a failure.
+fn run(cmd: &str, args: &[&str], ok1: bool) -> Result<String> {
     let o = std::process::Command::new(cmd)
         .args(args)
         .output()
         .map_err(|e| anyhow!("{cmd}: {}", e.kind()))?;
-    // pgrep exits 1 for no match.
     ensure!(
-        o.status.success() || o.status.code() == Some(1),
-        "{cmd} failed"
+        o.status.success() || (ok1 && o.status.code() == Some(1)),
+        "{cmd} failed ({})",
+        o.status
     );
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
@@ -354,6 +393,32 @@ fn two_keys(var: &str) -> Result<[Address; 2]> {
         crate::net::read_key(Path::new(&v[0]))?.address(),
         crate::net::read_key(Path::new(&v[1]))?.address(),
     ])
+}
+
+/// Adds a transfer to `<campaign>/budget.json`'s inflows (a no-op while the
+/// file does not exist: the first go then starts from the funded balances).
+/// Call before sending, so a failed send only makes the budget stricter.
+pub fn record_inflow(campaign: &Path, to: Address, l1: bool, amount: U256) -> Result<()> {
+    let path = campaign.join("budget.json");
+    let raw = match std::fs::read(&path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => bail!("{}: {}", path.display(), e.kind()),
+    };
+    let mut b: Budget =
+        serde_json::from_slice(&raw).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    let (keys, slots) = if l1 {
+        (two_keys("DAVINCI_E2E_L1_KEYS")?, &mut b.inflows.l1)
+    } else {
+        (two_keys("DAVINCI_E2E_SEQUENCER_KEYS")?, &mut b.inflows.op)
+    };
+    let i = keys
+        .iter()
+        .position(|a| *a == to)
+        .with_context(|| format!("{to} is not seq-a or seq-b; cannot record the inflow"))?;
+    slots[i] += amount;
+    std::fs::write(&path, serde_json::to_vec_pretty(&b)?)
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// The go/no-go gate: fees, balances, spend against the caps (when a
@@ -405,15 +470,23 @@ pub async fn gate_check(campaign: Option<&Path>, own: &[u32]) -> Result<GateRepo
             Ok(b) => serde_json::from_slice::<Budget>(&b)
                 .map_err(|e| anyhow!("{}: {e}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let b = Budget {
-                    start: now.clone(),
-                    caps,
-                };
-                if r.problems.is_empty() {
-                    std::fs::write(&path, serde_json::to_vec_pretty(&b)?)
-                        .with_context(|| format!("write {}", path.display()))?;
+                match Budget::new(now.clone(), caps.clone()) {
+                    Ok(b) => {
+                        if r.problems.is_empty() {
+                            std::fs::write(&path, serde_json::to_vec_pretty(&b)?)
+                                .with_context(|| format!("write {}", path.display()))?;
+                        }
+                        b
+                    }
+                    Err(why) => {
+                        r.problems.push(format!("budget: {why}"));
+                        Budget {
+                            start: now.clone(),
+                            inflows: Balances::default(),
+                            caps,
+                        }
+                    }
                 }
-                b
             }
             Err(e) => bail!("{}: {}", path.display(), e.kind()),
         };
@@ -474,8 +547,12 @@ pub async fn gate_check(campaign: Option<&Path>, own: &[u32]) -> Result<GateRepo
     let mut mine = own.to_vec();
     mine.push(std::process::id());
     match (
-        run("pgrep", &["-af", "davinci-sequencer"]),
-        run("docker", &["ps", "--format", "{{.Names}} {{.Image}}"]),
+        run("pgrep", &["-af", "davinci-sequencer"], true),
+        run(
+            "docker",
+            &["ps", "--format", "{{.Names}} {{.Image}}"],
+            false,
+        ),
     ) {
         (Ok(p), Ok(d)) => {
             for l in foreign_sequencers(&p, &d, &mine) {
@@ -561,6 +638,7 @@ mod tests {
     fn budget_stops_at_a_cap() {
         let e = |x: u64| U256::from(x);
         let b = Budget {
+            inflows: Balances::default(),
             start: Balances {
                 l1: [e(1000), e(1000)],
                 op: [e(100), e(100)],
@@ -583,6 +661,23 @@ mod tests {
         // A balance above the start is no spend.
         now.l1[1] = e(5000);
         assert!(b.check(&now).is_ok());
+        // An inflow raises the baseline, not the cap.
+        let mut f = b.clone();
+        f.inflows.l1[1] = e(200);
+        now.l1[1] = e(900);
+        assert!(f.check(&now).is_err());
+        // A budget cannot start below a cap (nothing would ever trip it).
+        let low = Balances {
+            l1: [e(1000), e(0)],
+            op: [e(100), e(100)],
+            organizer_op: e(500),
+        };
+        let err = Budget::new(low, b.caps.clone()).unwrap_err();
+        assert!(
+            err.contains("fund first") && err.contains("seq-b.l1"),
+            "{err}"
+        );
+        assert!(Budget::new(b.start.clone(), b.caps.clone()).is_ok());
     }
 
     #[test]
@@ -613,6 +708,13 @@ mod tests {
     }
 
     #[test]
+    fn docker_failure_is_not_an_answer() {
+        // `false` exits 1 with no output, like docker without its socket.
+        assert!(run("false", &[], false).is_err());
+        assert_eq!(run("false", &[], true).unwrap(), "");
+    }
+
+    #[test]
     fn fund_checks() {
         let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
         let max = parse_ether(FUND_MAX_OP).unwrap();
@@ -631,6 +733,13 @@ mod tests {
                       prover ghcr.io/vocdoni/davinci-zkvm:1.3.2\n";
         let f = foreign_sequencers(pgrep, docker, &[101]);
         assert_eq!(f.len(), 2, "{f:?}");
+        let bench = "404 /home/p4u/davinci-sequencer-bench/target/debug/deps/davinci_e2e-x bench\n\
+                     405 /usr/local/bin/davinci-sequencer --datadir d\n";
+        let f2 = foreign_sequencers(bench, "", &[]);
+        assert_eq!(
+            f2,
+            vec!["405 /usr/local/bin/davinci-sequencer --datadir d".to_string()]
+        );
         assert!(f[0].starts_with("202 ") && f[1].starts_with("davinci-sequencer ghcr"));
         let none = foreign_sequencers("", "prover ghcr.io/vocdoni/davinci-zkvm:x\n", &[]);
         assert!(none.is_empty());
