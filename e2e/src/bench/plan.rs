@@ -4,13 +4,19 @@ use std::fmt;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::Duration;
 
 use alloy::primitives::Address;
-use anyhow::{Context, Result, anyhow, ensure};
+use alloy::sol_types::SolEvent;
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use davinci_client::api::{Fr, ProcessId, ProcessStatus};
-use davinci_client::organizer::OnchainProcess;
+use davinci_client::organizer::{
+    KeyMode, NewProcess, OnchainProcess, Organizer, ProcessRegistry, RegistryReader, census_file,
+    merkle_census,
+};
 use davinci_client::voter::random_k;
 use davinci_zkvm_sdk::ballot::BallotMode;
+use davinci_zkvm_sdk::census::eth_address;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal;
 use davinci_zkvm_sdk::crypto::field::{fr_from_dec, fr_to_dec};
@@ -20,7 +26,11 @@ use rand::{RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::fixture::ballot_mode_nf;
+use crate::bench::r#gen::{WEIGHT, census_root};
+use crate::bench::rig::{Rig, Role};
+use crate::census::{Census, census_dir};
+use crate::fixture::{self as fx, ballot_mode_nf};
+use crate::net::{self, Net};
 
 /// The two sequencer nodes of a campaign.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -28,6 +38,22 @@ use crate::fixture::ballot_mode_nf;
 pub enum NodeId {
     A,
     B,
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            NodeId::A => "a",
+            NodeId::B => "b",
+        })
+    }
+}
+
+fn role_of(n: NodeId) -> Role {
+    match n {
+        NodeId::A => Role::A,
+        NodeId::B => Role::B,
+    }
 }
 
 /// The campaign secret: anyone holding it can vote in the benchmark's
@@ -269,10 +295,7 @@ impl Plan {
             let mut seen = std::collections::HashSet::new();
             for e in &w.elections {
                 let t = e.spec.tag.as_str();
-                ensure!(
-                    !t.is_empty() && !t.contains(['/', '\\', '\0']) && !t.contains(".."),
-                    "bad election tag {t:?}"
-                );
+                check_tag(t)?;
                 ensure!(seen.insert(t), "duplicate tag {t:?} in wave {}", w.n);
             }
         }
@@ -291,6 +314,13 @@ impl Plan {
     pub fn wave(&self, n: u32) -> Result<&Wave> {
         self.waves
             .iter()
+            .find(|w| w.n == n)
+            .ok_or_else(|| anyhow!("plan has no wave {n}"))
+    }
+
+    fn wave_mut(&mut self, n: u32) -> Result<&mut Wave> {
+        self.waves
+            .iter_mut()
             .find(|w| w.n == n)
             .ok_or_else(|| anyhow!("plan has no wave {n}"))
     }
@@ -340,12 +370,377 @@ impl Plan {
     }
 }
 
+/// Tags become path components and shard keys: no empty tag, `/`, `\`,
+/// NUL or `..`.
+fn check_tag(t: &str) -> Result<()> {
+    ensure!(
+        !t.is_empty() && !t.contains(['/', '\\', '\0']) && !t.contains(".."),
+        "bad election tag {t:?}"
+    );
+    Ok(())
+}
+
+/// Writes `pins.json`, the release pins the TS script checks the registry
+/// against (`0x` hex).
+pub fn write_pins(campaign: &Path) -> Result<()> {
+    use davinci_zkvm_sdk::release as r;
+    let h = |b: &[u8]| format!("0x{}", hex::encode(b));
+    let pins = serde_json::json!({
+        "batchProgramVK": h(&r::BATCH_PROGRAM_VK),
+        "resultsProgramVK": h(&r::RESULTS_PROGRAM_VK),
+        "rootCVadcopFinal": h(&r::ROOT_C_VADCOP_FINAL),
+        "ziskVerifierCodeHash": h(&r::ZISK_VERIFIER_CODEHASH),
+        "ballotVKHash": h(&crate::chain::ballot_vk_hash()?),
+    });
+    let p = campaign.join("pins.json");
+    std::fs::write(&p, serde_json::to_vec_pretty(&pins)?)
+        .with_context(|| format!("write {}", p.display()))
+}
+
+/// Registry duration of every campaign election: its ballots are proved
+/// before the run, so it must outlive gen, merge and the run.
+pub const DURATION: u64 = 72 * 3600;
+
+/// Census contract members per `addMembers` transaction.
+const MEMBER_CHUNK: usize = 64;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Creates the elections of wave `n` the plan does not hold yet and appends
+/// each to `plan.json` as soon as it exists (a rerun skips it). Origin-3
+/// specs are skipped unless `onchain_census`. Every election gets
+/// `spec.max_voters()`, the key of its key node, and waits until A and B
+/// serve it.
+pub async fn create_wave(
+    net: &Net,
+    rig: &Rig,
+    campaign: &Path,
+    seed: &Seed,
+    n: u32,
+    specs: &[ElectionSpec],
+    onchain_census: bool,
+) -> Result<()> {
+    let mut plan = Plan::load(campaign)?;
+    ensure!(
+        (plan.chain_id, plan.registry) == (net.chain_id, net.registry),
+        "plan.json is for chain {} registry {}, not chain {} registry {}",
+        plan.chain_id,
+        plan.registry,
+        net.chain_id,
+        net.registry
+    );
+    let org = net.organizer()?;
+    let grace = org.grace_params().await.context("registry grace")?;
+    // Fail before creating anything.
+    for s in specs {
+        check_tag(&s.tag)?;
+        ensure!(s.voters > 0, "{}: no voters", s.tag);
+        ensure!(
+            s.grace == grace.default_grace
+                || (grace.grace_floor..=grace.grace_ceil).contains(&s.grace),
+            "{}: grace {} s is outside the registry's {}..={}",
+            s.tag,
+            s.grace,
+            grace.grace_floor,
+            grace.grace_ceil
+        );
+    }
+    let census = campaign.join("census");
+    std::fs::create_dir_all(&census)?;
+    let reader = RegistryReader::connect(&net.rpc, net.registry)?;
+    if plan.wave(n).is_err() {
+        plan.waves.push(Wave {
+            n,
+            created: unix_now(),
+            elections: Vec::new(),
+        });
+        plan.waves.sort_by_key(|w| w.n);
+        plan.save(campaign)?;
+    }
+    for s in specs {
+        if plan.wave(n)?.elections.iter().any(|e| e.spec.tag == s.tag) {
+            println!("election {} already planned", s.tag);
+            continue;
+        }
+        if s.origin == 3 && !onchain_census {
+            println!(
+                "election {} skipped: no on-chain census (plan --onchain-census)",
+                s.tag
+            );
+            continue;
+        }
+        let ctx = Creator {
+            net,
+            rig,
+            org: &org,
+            reader: &reader,
+            census: &census,
+            default_grace: grace.default_grace,
+        };
+        let e = create_election(&ctx, seed, n, s)
+            .await
+            .with_context(|| format!("election {}", s.tag))?;
+        println!(
+            "election {} {} nf {} origin {} key {}",
+            s.tag, e.snap.pid, s.nf, s.origin, s.key_node
+        );
+        // Recorded before the wait: the process exists, and `run` waits for
+        // the nodes again.
+        plan.wave_mut(n)?.elections.push(e.clone());
+        plan.check_tags()?;
+        plan.save(campaign)?;
+        wait_served(rig, &e, seed).await?;
+    }
+    Ok(())
+}
+
+/// What creating one election needs.
+struct Creator<'a> {
+    net: &'a Net,
+    rig: &'a Rig,
+    org: &'a Organizer,
+    reader: &'a RegistryReader,
+    /// The nodes' `--census-dir`.
+    census: &'a Path,
+    default_grace: u32,
+}
+
+/// One election: its census, metadata, the key node's key, `newProcess`
+/// and, when it differs from the registry's default, its grace. The
+/// snapshot is the registry's, checked against what was asked for.
+async fn create_election(
+    c: &Creator<'_>,
+    seed: &Seed,
+    n: u32,
+    s: &ElectionSpec,
+) -> Result<Election> {
+    let Creator {
+        net,
+        rig,
+        org,
+        reader,
+        census,
+        default_grace,
+    } = *c;
+    let mut e = Election {
+        spec: s.clone(),
+        census_uri: String::new(),
+        census_contract: None,
+        snap: ProcSnap {
+            pid: ProcessId([0; 31]),
+            encryption_key: String::new(),
+            ballot_mode: ballot_mode_nf(s.nf),
+            census_origin: s.origin,
+            census_root: String::new(),
+        },
+    };
+    // The root `gen` proves against; for a CSP, the wave's CSP key.
+    let root = census_root(&e, seed, n)?;
+    let parts: Vec<([u8; 20], u128)> = (0..s.voters)
+        .map(|v| {
+            (
+                eth_address(seed.voter_key(&s.tag, v).verifying_key()),
+                WEIGHT,
+            )
+        })
+        .collect();
+    match s.origin {
+        1 => {
+            let file = census_file(&parts);
+            ensure!(merkle_census(&file)?.root() == root, "census file root");
+            e.census_uri = fx::write_census(census, &format!("w{n}-{}.json", s.tag), &file)?;
+        }
+        3 => {
+            let c = Census::deploy(net.census_provider(org)?, &census_dir()).await?;
+            for chunk in parts.chunks(MEMBER_CHUNK) {
+                c.add_members(chunk).await?;
+            }
+            ensure!(
+                c.root().await? == root && c.size().await? == u64::from(s.voters),
+                "census contract {} does not hold the planned voters",
+                c.address
+            );
+            e.census_uri = format!("onchain://{}", c.address);
+            e.census_contract = Some(c.address);
+        }
+        4 => e.census_uri = "csp://davinci-bench".into(),
+        o => bail!("census origin {o} is not supported"),
+    }
+    let (metadata, metadata_hash) = fx::write_metadata(
+        census,
+        &format!("w{n}-{}-metadata.json", s.tag),
+        &format!("davinci-bench wave {n} {}", s.tag),
+    )?;
+    let next = org.next_process_id().await?;
+    let pk = election_key(rig, s.key_node, &next).await?;
+    let pid = org
+        .create_process(&NewProcess {
+            process_id: next,
+            start_time: 0,
+            duration: DURATION,
+            max_voters: u64::from(s.max_voters()),
+            ballot_mode: e.snap.ballot_mode,
+            census_origin: s.origin,
+            census_root: root,
+            census_contract: e.census_contract.map_or([0; 20], |a| a.into_array()),
+            census_uri: e.census_uri.clone(),
+            metadata,
+            metadata_hash,
+            key_mode: KeyMode::Sequencer(pk),
+        })
+        .await?
+        .pid;
+    if s.grace != default_grace {
+        org.set_process_grace(&pid, s.grace).await?;
+    }
+    let p = reader.process(&pid).await?;
+    fx::check_metadata(&p)?;
+    let want = ProcSnap {
+        pid: ProcessId(next),
+        encryption_key: hex::encode(pk.compress()),
+        census_root: fr_to_dec(&root),
+        ..e.snap
+    };
+    e.snap = ProcSnap::of(&p);
+    ensure!(
+        e.snap == want
+            && p.max_voters == u64::from(s.max_voters())
+            && p.grace == u64::from(s.grace),
+        "the registry's process {} differs from the one asked for",
+        e.snap.pid
+    );
+    Ok(e)
+}
+
+/// The key node's election key for `pid`. A node gives at most
+/// `--keys-per-minute` (10) keys a minute; a 42901 waits a minute.
+async fn election_key(rig: &Rig, n: NodeId, pid: &[u8; 31]) -> Result<Point> {
+    let node = rig.node(role_of(n))?;
+    for _ in 0..5 {
+        match node.api.new_key(pid).await {
+            Err(davinci_client::Error::Api {
+                code: Some(42901), ..
+            }) => {
+                println!("node {n}: key rate limit, waiting 60 s");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            r => return r.with_context(|| format!("election key from node {n}")),
+        }
+    }
+    bail!("node {n} kept refusing keys (42901)")
+}
+
+/// Waits until A and B list `e`, accept votes and serve its census: the
+/// last voter's Merkle proof (a CSP census has none to serve).
+async fn wait_served(rig: &Rig, e: &Election, seed: &Seed) -> Result<()> {
+    let (pid, tag) = (e.snap.pid, e.spec.tag.as_str());
+    let last = seed.voter_key(tag, e.spec.voters.saturating_sub(1));
+    let last = eth_address(last.verifying_key());
+    for id in [NodeId::A, NodeId::B] {
+        let node = rig.node(role_of(id))?;
+        crate::wait::until(
+            &format!("node {id} to serve {tag}"),
+            net::scaled(Duration::from_secs(180)),
+            Duration::from_secs(1),
+            || async {
+                node.check_alive()?;
+                if !node.api.processes().await?.contains(&pid) {
+                    return Ok(None);
+                }
+                let v = node.api.process(&pid.0).await?;
+                ensure!(!v.ignored, "node {id} refuses to serve {tag}");
+                if !v.is_accepting_votes {
+                    return Ok(None);
+                }
+                if e.spec.origin == 4 {
+                    return Ok(Some(()));
+                }
+                Ok(node.api.participant(&pid.0, &last).await.ok().map(|_| ()))
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The processes `cancel` looks at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelScope {
+    /// A wave's elections, from `plan.json`.
+    Wave(u32),
+    /// Every process the organizer created since the plan's start block,
+    /// from the registry logs: the TS runs' processes too.
+    All,
+}
+
+pub async fn cancel_candidates(
+    plan: &Plan,
+    rpc: &str,
+    organizer: Address,
+    scope: CancelScope,
+) -> Result<Vec<ProcessId>> {
+    use ProcessRegistry::ProcessCreated as Ev;
+    match scope {
+        CancelScope::Wave(n) => Ok(plan.wave(n)?.elections.iter().map(|e| e.snap.pid).collect()),
+        CancelScope::All => {
+            let logs = crate::chain::registry_logs(
+                rpc,
+                plan.registry,
+                Ev::SIGNATURE_HASH,
+                plan.start_block,
+            )
+            .await?;
+            let mut out = Vec::new();
+            for l in &logs {
+                let d = l.log_decode::<Ev>()?.inner.data;
+                if d.creator == organizer {
+                    out.push(ProcessId(d.processId.0));
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Cancels each READY or PAUSED process of `pids`, printing one line per
+/// process. Tries them all, then fails with the errors; returns how many it
+/// canceled.
+pub async fn cancel_open(org: &Organizer, pids: &[ProcessId]) -> Result<usize> {
+    let (mut done, mut errs) = (0, Vec::new());
+    for pid in pids {
+        let r = async {
+            let st = org.process(&pid.0).await?.status;
+            if matches!(st, ProcessStatus::Ready | ProcessStatus::Paused) {
+                org.cancel_process(&pid.0).await?;
+                println!("{pid}: {st:?}, canceled");
+                Ok::<_, anyhow::Error>(true)
+            } else {
+                println!("{pid}: {st:?}, left alone");
+                Ok(false)
+            }
+        }
+        .await;
+        match r {
+            Ok(c) => done += usize::from(c),
+            Err(e) => {
+                let e = crate::redact_urls(&format!("{e:#}"));
+                println!("{pid}: {e}");
+                errs.push(format!("{pid}: {e}"));
+            }
+        }
+    }
+    ensure!(errs.is_empty(), "cancel failed: {}", errs.join("; "));
+    Ok(done)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
-
-    use davinci_zkvm_sdk::census::eth_address;
 
     use super::*;
 
@@ -508,5 +903,27 @@ mod tests {
         assert!(!dir.path().join("plan.json.tmp").exists());
         assert_eq!(Plan::load(dir.path()).unwrap(), plan);
         assert!(plan.wave(2).is_err());
+    }
+
+    #[test]
+    fn pins_json_matches_release() {
+        use davinci_zkvm_sdk::release;
+        let dir = tempfile::tempdir().unwrap();
+        write_pins(dir.path()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("pins.json")).unwrap()).unwrap();
+        let hex = |b: &[u8]| serde_json::Value::from(format!("0x{}", hex::encode(b)));
+        assert_eq!(v["batchProgramVK"], hex(&release::BATCH_PROGRAM_VK));
+        assert_eq!(v["resultsProgramVK"], hex(&release::RESULTS_PROGRAM_VK));
+        assert_eq!(v["rootCVadcopFinal"], hex(&release::ROOT_C_VADCOP_FINAL));
+        assert_eq!(
+            v["ziskVerifierCodeHash"],
+            hex(&release::ZISK_VERIFIER_CODEHASH)
+        );
+        assert_eq!(
+            v["ballotVKHash"],
+            hex(&crate::chain::ballot_vk_hash().unwrap())
+        );
+        assert_eq!(v.as_object().unwrap().len(), 5);
     }
 }
