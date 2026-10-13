@@ -4,6 +4,7 @@ pub mod audit;
 pub mod ballots;
 pub mod chain_view;
 pub mod chaos;
+pub mod r#gen;
 pub mod ledger;
 pub mod metrics;
 pub mod money;

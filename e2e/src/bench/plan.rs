@@ -13,7 +13,7 @@ use davinci_client::voter::random_k;
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal;
-use davinci_zkvm_sdk::crypto::field::{fr_from_be_mod_order, fr_from_dec, fr_to_dec};
+use davinci_zkvm_sdk::crypto::field::{fr_from_dec, fr_to_dec};
 use k256::ecdsa::SigningKey;
 use rand::rngs::{OsRng, StdRng};
 use rand::{RngCore, SeedableRng};
@@ -306,8 +306,7 @@ impl Plan {
                 pid.copy_from_slice(&seed.hash("pid", &spec.tag, n, 0)[..31]);
                 let mut rng = StdRng::from_seed(seed.hash("ekey", &spec.tag, n, 0));
                 let (_, pk) = elgamal::keygen(&mut rng);
-                let root = fr_from_be_mod_order(&seed.hash("root", &spec.tag, n, 0));
-                Election {
+                let mut e = Election {
                     spec: spec.clone(),
                     census_uri: String::new(),
                     census_contract: None,
@@ -316,11 +315,15 @@ impl Plan {
                         encryption_key: hex::encode(pk.compress()),
                         ballot_mode: ballot_mode_nf(spec.nf),
                         census_origin: spec.origin,
-                        census_root: fr_to_dec(&root),
+                        census_root: String::new(),
                     },
-                }
+                };
+                // The root the ballots will prove against, so they verify.
+                let root = crate::bench::r#gen::census_root(&e, seed, n)?;
+                e.snap.census_root = fr_to_dec(&root);
+                Ok(e)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let plan = Plan {
             campaign: "stand-in".into(),
             chain_id: 0,

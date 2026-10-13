@@ -370,6 +370,11 @@ pub fn load_prover() -> Result<BallotProver> {
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../davinci-circom/artifacts")
         });
+    load_prover_from(&dir)
+}
+
+/// The prover of the artifacts in `dir`.
+pub fn load_prover_from(dir: &Path) -> Result<BallotProver> {
     Ok(BallotProver::load(
         &dir.join("ballot_proof.wasm"),
         &dir.join("ballot_proof_pkey.zkey"),

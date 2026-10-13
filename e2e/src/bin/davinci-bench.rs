@@ -9,7 +9,10 @@ use alloy::primitives::utils::parse_ether;
 use alloy::primitives::{Address, U256};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use davinci_e2e::bench::r#gen::{GenOpts, gen_wave};
 use davinci_e2e::bench::money;
+use davinci_e2e::bench::plan::{ElectionSpec, NodeId, Plan, Seed};
+use davinci_e2e::fixture;
 use davinci_e2e::net;
 
 #[derive(Parser)]
@@ -46,6 +49,53 @@ enum Cmd {
         #[arg(long)]
         campaign: Option<PathBuf>,
     },
+    /// Write a campaign seed and a stand-in plan (no chain) for dry runs.
+    StandIn {
+        #[arg(long, env = "DAVINCI_BENCH_DIR")]
+        campaign: PathBuf,
+        #[arg(long)]
+        wave: u32,
+        /// `tag:nf:origin:voters:rounds:permille,...`
+        #[arg(long)]
+        elections: String,
+    },
+    /// Prove this host's ballot shards of a wave.
+    Gen {
+        #[arg(long, env = "DAVINCI_BENCH_DIR")]
+        campaign: PathBuf,
+        #[arg(long)]
+        wave: u32,
+        #[arg(long)]
+        host: usize,
+        #[arg(long)]
+        hosts: usize,
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+        #[arg(long, env = "CIRCOM_ARTIFACTS")]
+        artifacts: PathBuf,
+    },
+}
+
+fn parse_specs(s: &str) -> Result<Vec<ElectionSpec>> {
+    s.split(',')
+        .map(|e| {
+            let f: Vec<&str> = e.split(':').collect();
+            let [tag, nf, origin, voters, rounds, pm] = f[..] else {
+                bail!("election {e:?}: want tag:nf:origin:voters:rounds:permille");
+            };
+            Ok(ElectionSpec {
+                tag: tag.into(),
+                scenario: "stand-in".into(),
+                nf: nf.parse().context("nf")?,
+                origin: origin.parse().context("origin")?,
+                voters: voters.parse().context("voters")?,
+                rounds: rounds.parse().context("rounds")?,
+                revote_permille: pm.parse().context("permille")?,
+                key_node: NodeId::A,
+                grace: 60,
+            })
+        })
+        .collect()
 }
 
 fn pair(
@@ -99,6 +149,51 @@ async fn real_main() -> Result<ExitCode> {
                 bail!("DAVINCI_E2E_L1_RPC");
             }
             money::fund(&owner, &op_rpc, &l1_rpc, op, l1).await?;
+        }
+        Cmd::StandIn {
+            campaign,
+            wave,
+            elections,
+        } => {
+            use std::os::unix::fs::DirBuilderExt;
+            let specs = parse_specs(&elections)?;
+            let sdir = campaign.join("secret");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&sdir)
+                .context("create secret dir")?;
+            let seed = Seed::create(&sdir.join("seed"))?;
+            let plan = Plan::stand_in(&seed, wave, &specs)?;
+            plan.save(&campaign)?;
+            println!("stand-in plan for wave {wave}: {} elections", specs.len());
+        }
+        Cmd::Gen {
+            campaign,
+            wave,
+            host,
+            hosts,
+            threads,
+            artifacts,
+        } => {
+            let plan = Plan::load(&campaign)?;
+            let seed = Seed::load(&campaign.join("secret").join("seed"))?;
+            let prover = fixture::load_prover_from(&artifacts)?;
+            let host_name = std::env::var("HOSTNAME").unwrap_or_else(|_| format!("host{host}"));
+            let o = GenOpts {
+                host,
+                hosts,
+                threads,
+                host_name,
+                artifacts,
+            };
+            let st = tokio::task::block_in_place(|| {
+                gen_wave(&campaign, &plan, wave, &seed, &prover, &o)
+            })?;
+            println!(
+                "gen host {host}/{hosts}: {} shards ({} skipped), {} ballots in {:.0}s",
+                st.shards, st.skipped, st.ballots, st.secs
+            );
         }
         Cmd::Gate { campaign } => {
             let r = money::gate_check(campaign.as_deref(), &[]).await?;
