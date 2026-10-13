@@ -577,7 +577,7 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
     drop(node);
 
     // Phase 2: an exposed record over 126 of those slots, as a lost race
-    // leaves it, then one new vote that is not in it yet.
+    // leaves it, then one new vote whose slot is not in it.
     let db = reopen_db(dir.path()).await;
     let late = fake_vote(&s.env, 140, &[1, 2], 3700);
     let late_vid = late.pkg.vote_id;
@@ -594,7 +594,12 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
     // The fake registry's 150 s floor and no margin: one chunk of one blob
     // while voting is open.
     let shutdown2 = CancellationToken::new();
-    let cfg = chunked_cfg(&dir, &s, 140, &["--l1-settle-lag", "140s"]);
+    let cfg = chunked_cfg(
+        &dir,
+        &s,
+        140,
+        &["--l1-settle-lag", "140s", "--batch-time", "0s"],
+    );
     let node2 = start_l1_node_cfg(
         db,
         s.chain.clone(),
@@ -605,8 +610,9 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
     )
     .await;
     let h2 = handle(&node2).await;
-    h2.submit(late).await.unwrap();
+    // Read before the submit: a seal tick follows it.
     let before = node2.db.exposed(&pid_fr()).unwrap().unwrap();
+    h2.submit(late).await.unwrap();
     // A few seal ticks in the short window: nothing errors, nothing clears.
     for _ in 0..5 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -615,6 +621,8 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
             Some(VoteStatus::Pending),
             "a window-limited overflow touched the vote"
         );
+        // Still queued, so the loop's ticks do reach the selection.
+        assert_eq!(h2.snapshot().await.unwrap().pending, 1);
         assert_eq!(node2.db.exposed(&pid_fr()).unwrap().as_ref(), Some(&before));
     }
     // The end opens a grace of 180 s: window 180 - 140 fits two chunks.

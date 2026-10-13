@@ -1781,6 +1781,9 @@ impl Actor {
                 }
             };
             if sized.is_empty() {
+                if max_blobs < self.state.blob_cap() {
+                    debug!(pid = %hex::encode(self.pid31), max_blobs, cap = self.state.blob_cap(), "the exposed set needs more blob transactions than the window fits");
+                }
                 return;
             }
             // Seal-time re-proof at the batch root (origins 2/3): changed
