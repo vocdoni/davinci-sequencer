@@ -64,6 +64,15 @@ async fn l1_big_batch() -> Result<()> {
         eprintln!("DAVINCI_E2E_L1_BIG not set, skipping");
         return Ok(());
     }
+    // Every error chain may embed an RPC URL: only the redacted copy is printed.
+    if let Err(e) = l1_big().await {
+        eprintln!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}")));
+        bail!("l1_big failed; see the FAILED line");
+    }
+    Ok(())
+}
+
+async fn l1_big() -> Result<()> {
     let prover_url =
         std::env::var("DAVINCI_ZKVM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let health = ProverClient::new(&prover_url).health().await?;
@@ -92,14 +101,12 @@ async fn l1_big_batch() -> Result<()> {
         "the registry's grace is {g:?}: on anvil set DAVINCI_E2E_GRACE=300,240,600,1800,60"
     );
     let r = run(&net, &org, &prover_url, dir.path(), ballot_prover).await;
-    match &r {
-        Ok(()) => eprintln!("PASSED"),
-        Err(e) => eprintln!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}"))),
+    if r.is_ok() {
+        eprintln!("PASSED");
     }
     let c = org.cancel_open().await;
     dir.ok = r.is_ok();
-    // The chain may embed an RPC URL: only the redacted copy above is printed.
-    ensure!(r.is_ok(), "l1_big failed; see the FAILED line");
+    r?;
     c.context("cancel the open processes")?;
     Ok(())
 }
@@ -201,12 +208,6 @@ async fn run(
     // Phase 1: the first 512 voters, in the batches the seal budget allows.
     let phase1 = Instant::now();
     submit(&node, &reqs[..N]).await?;
-    // The root of the first settled transition, for the fixture check.
-    settled(&node, &pid, &reqs[..1]).await?;
-    let root1 = RegistryReader::connect(&net.rpc, net.registry)?
-        .process(&pid)
-        .await?
-        .state_root;
     settled(&node, &pid, &reqs[..N]).await?;
     let first = ours().await?;
     eprintln!("first 512 votes settled in {} transitions", first.len());
@@ -286,7 +287,7 @@ async fn run(
     if let Some(out) = std::env::var_os("DAVINCI_E2E_RECORD_DIR") {
         let id = jobs.lock().ok().and_then(|j| j.first().cloned());
         let r = match id {
-            Some(id) => record(prover_url, &id, Path::new(&out), &root1).await,
+            Some(id) => record(prover_url, &id, Path::new(&out), &p.state_root).await,
             None => Err(anyhow::anyhow!("no /prove call seen")),
         };
         if let Err(e) = r {
@@ -386,18 +387,17 @@ async fn wait_status(node: &Node, pid: &[u8; 31], status: ProcessStatus) -> Resu
 
 /// Writes job `id`'s snark (the key order of davinci-zkvm's testdata) and
 /// its 256-byte register dump into `out`.
-async fn record(prover_url: &str, id: &str, out: &Path, root1: &[u8; 32]) -> Result<()> {
+async fn record(prover_url: &str, id: &str, out: &Path, genesis: &[u8; 32]) -> Result<()> {
     let pc = ProverClient::new(prover_url);
     let id = JobId::parse(id)?;
     let s = pc.snark(&id).await?;
     let regs = pc.publics(&id).await?;
     ensure!(regs.len() == 256, "{} register bytes", regs.len());
     let p = BatchPublics::parse(&regs)?;
-    let mut rev = p.root_after;
-    rev.reverse();
+    // The first transition starts from the genesis root read before any vote.
     ensure!(
-        p.ok && (p.root_after == *root1 || rev == *root1),
-        "job {id} is not the first settled transition of this run"
+        p.ok && p.root_before == *genesis,
+        "job {id} is not the first transition of this run"
     );
     std::fs::create_dir_all(out)?;
     let json = format!(

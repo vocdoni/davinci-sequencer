@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use davinci_client::SequencerClient;
 use davinci_client::api::{ProcessId, VoteStatus};
 use davinci_client::organizer::{KeyMode, NewProcess, Organizer, RegistryReader, verify_registry};
@@ -26,6 +26,15 @@ async fn node_smoke() -> Result<()> {
         eprintln!("DAVINCI_E2E_NODE_URL not set, skipping");
         return Ok(());
     };
+    // Every error chain may embed an RPC URL: only the redacted copy is printed.
+    if let Err(e) = smoke(&url).await {
+        eprintln!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}")));
+        bail!("node smoke failed; see the FAILED line");
+    }
+    Ok(())
+}
+
+async fn smoke(url: &str) -> Result<()> {
     let (rpc, registry, _) = net::live_target()?;
     let pins = verify_registry(&rpc, registry)
         .await
@@ -33,7 +42,7 @@ async fn node_smoke() -> Result<()> {
     let key_file = std::env::var("DAVINCI_E2E_ORGANIZER_KEY")
         .context("DAVINCI_E2E_ORGANIZER_KEY (a key file) is required")?;
     let org = Organizer::connect(&rpc, net::read_key(Path::new(&key_file))?, registry)?;
-    let node = SequencerClient::new(&url);
+    let node = SequencerClient::new(url);
     let info = node.info().await.context("node /info")?;
     ensure!(
         info.chain_id == pins.chain_id && info.process_registry == registry.0.0 && !info.observer,
@@ -75,12 +84,7 @@ async fn node_smoke() -> Result<()> {
         let _ = org.cancel_process(&pid).await;
     }
     dir.ok = r.is_ok();
-    if let Err(e) = &r {
-        eprintln!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}")));
-    }
-    // The chain may embed an RPC URL: only the redacted copy above is printed.
-    ensure!(r.is_ok(), "node smoke failed; see the FAILED line");
-    Ok(())
+    r
 }
 
 async fn vote(

@@ -159,7 +159,7 @@ impl RetryPolicy for CappedRateLimit {
 pub fn rpc_client(url: &str, user_agent: &str) -> Result<RpcClient> {
     let url: reqwest::Url = url
         .parse()
-        .map_err(|_| Error::Invalid(format!("bad RPC URL {url:.60}")))?;
+        .map_err(|e| Error::Invalid(format!("bad RPC URL ({e})")))?;
     let http = reqwest::Client::builder()
         .user_agent(user_agent)
         .build()
