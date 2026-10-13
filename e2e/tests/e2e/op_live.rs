@@ -144,6 +144,10 @@ pub(super) async fn run(dir: &Path) -> Result<()> {
                 "the orphan was mined before the restart's first post"
             }
         );
+        ensure!(
+            picked_up,
+            "the restart did not pick up the earlier L1 post record"
+        );
 
         // Round 2: the revotes of voters 0..8.
         let mut round2 = Vec::new();

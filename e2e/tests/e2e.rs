@@ -164,7 +164,7 @@ async fn e2e() -> Result<()> {
     let r = scenario(&dir).await;
     match &r {
         Ok(()) => say!("PASSED in {:.1} min", t0().elapsed().as_secs_f64() / 60.0),
-        Err(e) => say!("FAILED: {e:#}"),
+        Err(e) => say!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}"))),
     }
     art.ok = r.is_ok();
     r
@@ -186,7 +186,7 @@ async fn op_live() -> Result<()> {
     let r = op_live::run(&dir).await;
     match &r {
         Ok(()) => say!("PASSED in {:.1} min", t0().elapsed().as_secs_f64() / 60.0),
-        Err(e) => say!("FAILED: {e:#}"),
+        Err(e) => say!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}"))),
     }
     art.ok = r.is_ok();
     r
