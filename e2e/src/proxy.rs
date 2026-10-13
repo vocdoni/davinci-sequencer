@@ -40,6 +40,10 @@ pub fn target(base: &str, path: &str) -> String {
 /// Called with every exchange after its response went back to the client.
 pub type Tap = Arc<dyn Fn(&Exchange<'_>) + Send + Sync>;
 
+/// Called with the method and path of a request as it arrives, before it is
+/// forwarded: sees calls the client abandons on a timeout.
+pub type Arrival = Arc<dyn Fn(Instant, &str, &str) + Send + Sync>;
+
 /// A running proxy; the listener stops when this drops.
 pub struct Proxy {
     /// `http://127.0.0.1:<port>`: give this to the client instead of `upstream`.
@@ -58,15 +62,20 @@ impl Drop for Proxy {
 
 impl Proxy {
     pub async fn start(upstream: &str) -> Result<Proxy> {
-        Proxy::spawn(upstream, None).await
+        Proxy::spawn(upstream, None, None).await
     }
 
     /// [`Proxy::start`], handing every exchange to `tap`.
     pub async fn tapped(upstream: &str, tap: Tap) -> Result<Proxy> {
-        Proxy::spawn(upstream, Some(tap)).await
+        Proxy::spawn(upstream, Some(tap), None).await
     }
 
-    async fn spawn(upstream: &str, tap: Option<Tap>) -> Result<Proxy> {
+    /// [`Proxy::tapped`], also telling `arrival` of each request when it comes in.
+    pub async fn watched(upstream: &str, arrival: Arrival, tap: Tap) -> Result<Proxy> {
+        Proxy::spawn(upstream, Some(tap), Some(arrival)).await
+    }
+
+    async fn spawn(upstream: &str, tap: Option<Tap>, arrival: Option<Arrival>) -> Result<Proxy> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}", listener.local_addr()?);
         let base = upstream.trim_end_matches('/').to_string();
@@ -84,9 +93,10 @@ impl Proxy {
                     drop(sock); // the client sees a reset connection
                     continue;
                 }
-                let (client, base, tap) = (client.clone(), base.clone(), tap.clone());
+                let (client, base, tap, arrival) =
+                    (client.clone(), base.clone(), tap.clone(), arrival.clone());
                 tokio::spawn(async move {
-                    let _ = serve(sock, &client, &base, tap.as_ref()).await;
+                    let _ = serve(sock, &client, &base, tap.as_ref(), arrival.as_ref()).await;
                 });
             }
         });
@@ -124,6 +134,7 @@ async fn serve(
     client: &reqwest::Client,
     base: &str,
     tap: Option<&Tap>,
+    arrival: Option<&Arrival>,
 ) -> Result<()> {
     let at = Instant::now();
     let mut buf = Vec::new();
@@ -148,6 +159,9 @@ async fn serve(
         first.next().unwrap_or_default(),
         first.next().unwrap_or("/"),
     );
+    if let Some(a) = arrival {
+        a(at, method, path);
+    }
     let mut len = 0usize;
     let mut headers = Vec::new();
     for l in lines.filter(|l| !l.is_empty()) {

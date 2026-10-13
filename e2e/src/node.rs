@@ -297,6 +297,19 @@ impl Node {
                 // Something answers; it must be our child, not a stranger
                 // that won the port (the caller also checks /info).
                 node.check_alive()?;
+                if let Some(want) = cfg.address {
+                    let got = node
+                        .api
+                        .info()
+                        .await
+                        .context("GET /info")?
+                        .sequencer_address;
+                    ensure!(
+                        got == Some(want.into_array()),
+                        "node {} on port {port} reports sequencer {got:?}, want {want}",
+                        cfg.name
+                    );
+                }
                 return Ok(node);
             }
             node.check_alive()?;
@@ -332,6 +345,12 @@ impl Node {
     /// of [`START_PAUSES`] when it dies before answering (a fixed port is
     /// what a proxy-wired restart needs).
     pub async fn start_on(bin: &Path, cfg: &NodeConfig, port: u16) -> Result<Node> {
+        // A taken port means a leftover node (maybe with the real key) or a
+        // stranger; waiting does not free it, and its /ping must not pass
+        // for ours.
+        if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            bail!("port {port} taken ({e}); node {} not started", cfg.name);
+        }
         let mut last: Option<anyhow::Error> = None;
         for pause in START_PAUSES {
             if let Some(e) = &last {
@@ -446,6 +465,29 @@ fn strip_ansi(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn start_on_refuses_a_taken_port() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let cfg = super::NodeConfig::new(
+            "n",
+            None,
+            None,
+            "http://r",
+            Default::default(),
+            "http://p",
+            std::path::Path::new("/c"),
+            std::path::Path::new("/d"),
+        );
+        let t = std::time::Instant::now();
+        let e = super::Node::start_on(std::path::Path::new("/nonexistent"), &cfg, port)
+            .await
+            .err()
+            .expect("taken port");
+        assert!(format!("{e:#}").contains("taken"), "{e:#}");
+        assert!(t.elapsed().as_secs() < 2);
+    }
+
     #[test]
     fn strips_colour() {
         let l = "INFO \x1b[3mcap\x1b[0m\x1b[2m=\x1b[0m2 blob cap per transaction";
