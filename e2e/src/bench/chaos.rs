@@ -143,7 +143,7 @@ pub fn references_exist(a: &Action, urls: &[[usize; 4]; 3]) -> bool {
 }
 
 /// What to put back.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Restore {
     Start(Role),
     ProxyUp { role: Role, rpc: Rpc, index: usize },
@@ -155,7 +155,7 @@ pub enum Restore {
 }
 
 /// What to restore and when; `at` is `None` for a change that stays.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Undo {
     pub at: Option<Instant>,
     pub what: Restore,
@@ -258,8 +258,8 @@ pub async fn apply(rig: &mut Rig, _net: &Net, a: &Action) -> Result<Undo> {
 }
 
 impl Undo {
-    pub async fn run(self, rig: &mut Rig) -> Result<()> {
-        match self.what {
+    pub async fn run(&self, rig: &mut Rig) -> Result<()> {
+        match self.what.clone() {
             Restore::Start(r) => rig.start(r).await?,
             Restore::ProxyUp { role, rpc, index } => proxy(rig, role, rpc, index)?.set_down(false),
             Restore::ProxyOk { role, rpc, index } => proxy(rig, role, rpc, index)?.set_fail(None),
@@ -339,8 +339,31 @@ struct Active {
     kinds: Vec<Kind>,
 }
 
+/// Whether anvil mining should be held now: an injection waits on an
+/// `L1Pending` node that has sealed, so its post must stay in the pool.
+fn should_pause(waiting: &[Chaos], o: &Observed) -> bool {
+    waiting
+        .iter()
+        .any(|c| matches!(c.trigger, Trigger::L1Pending(n) if o.new_seals[idx(n)] > 0))
+}
+
+/// Indices of the active injections whose undo is due at `now`; an undo
+/// without a deadline stays until [`Controller::finish`].
+fn due_undos(active: &[Active], now: Instant) -> Vec<usize> {
+    active
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.undo.at.is_some_and(|at| now >= at))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Runs a scenario's injections: fires each when due, undoes it at its
 /// deadline, and times the node's recovery from the log events.
+///
+/// The scenario driver must call [`Controller::finish`] on every exit path
+/// (normal end, error, the SIGTERM handler): nothing else undoes an active
+/// kill, proxy mode, prover delay or knob change, or resumes anvil mining.
 pub struct Controller {
     waiting: Vec<Chaos>,
     active: Vec<Active>,
@@ -362,7 +385,8 @@ impl Controller {
     }
 
     /// One poll. `events` are the nodes' new log lines as (node, seconds
-    /// since the scenario start, kind).
+    /// since the scenario start, kind). An error leaves what is applied
+    /// recorded, for [`Controller::finish`].
     pub async fn step(
         &mut self,
         rig: &mut Rig,
@@ -376,10 +400,7 @@ impl Controller {
         // from the node's first seal until the L1Pending injection fires.
         if let Some(l1) = anvil
             && !self.paused
-            && self
-                .waiting
-                .iter()
-                .any(|c| matches!(c.trigger, Trigger::L1Pending(n) if o.new_seals[idx(n)] > 0))
+            && should_pause(&self.waiting, o)
         {
             l1.pause_mining().await?;
             self.paused = true;
@@ -400,16 +421,11 @@ impl Controller {
             let c = self.waiting.remove(i);
             let unpause = self.paused && matches!(c.trigger, Trigger::L1Pending(_));
             let undo = apply(rig, net, &c.action).await?;
-            if unpause && let Some(l1) = anvil {
-                l1.resume_mining().await?;
-                self.paused = false;
-            }
-            let applied_s = o.elapsed.as_secs_f64();
             self.active.push(Active {
                 row: ChaosRow {
                     name: c.name,
                     due_s: now,
-                    applied_s,
+                    applied_s: o.elapsed.as_secs_f64(),
                     undone_s: None,
                     effects: Vec::new(),
                     recovery_s: None,
@@ -418,19 +434,15 @@ impl Controller {
                 undo,
                 kinds: Vec::new(),
             });
-        }
-        let t = Instant::now();
-        let mut i = 0;
-        while i < self.active.len() {
-            if self.active[i].undo.at.is_none_or(|at| t < at) {
-                i += 1;
-                continue;
+            if unpause && let Some(l1) = anvil {
+                l1.resume_mining().await?;
+                self.paused = false;
             }
-            let mut a = self.active.remove(i);
-            a.undo.run(rig).await?;
-            a.row.undone_s = Some(now);
-            a.row.effects = effects(&a.kinds);
-            self.recovering.push((a.row, a.role));
+        }
+        for i in due_undos(&self.active, Instant::now()).into_iter().rev() {
+            // Run first: a failed undo stays active for `finish` to retry.
+            self.active[i].undo.run(rig).await?;
+            self.undone(i, now);
         }
         let mut i = 0;
         while i < self.recovering.len() {
@@ -450,14 +462,65 @@ impl Controller {
         Ok(())
     }
 
+    /// Moves active injection `i` to recovering, undone at `now` seconds.
+    fn undone(&mut self, i: usize, now: f64) {
+        let mut a = self.active.remove(i);
+        a.row.undone_s = Some(now);
+        a.row.effects = effects(&a.kinds);
+        self.recovering.push((a.row, a.role));
+    }
+
+    /// Undoes every active injection and resumes anvil mining, continuing
+    /// past errors; fails with all of them.
+    pub async fn finish(&mut self, rig: &mut Rig, net: &Net, now: Duration) -> Result<()> {
+        let anvil = net.l1.as_ref().and_then(|l| l.anvil.as_ref());
+        self.finish_with(
+            now.as_secs_f64(),
+            async |u: &Undo| u.run(rig).await,
+            async || match anvil {
+                Some(l1) => l1.resume_mining().await,
+                None => Ok(()),
+            },
+        )
+        .await
+    }
+
+    async fn finish_with(
+        &mut self,
+        now: f64,
+        mut undo: impl AsyncFnMut(&Undo) -> Result<()>,
+        resume: impl AsyncFn() -> Result<()>,
+    ) -> Result<()> {
+        let mut errs = Vec::new();
+        while !self.active.is_empty() {
+            if let Err(e) = undo(&self.active[0].undo).await {
+                errs.push(format!("{}: {e:#}", self.active[0].row.name));
+            }
+            // Failed or not, the injection leaves the active list.
+            self.undone(0, now);
+        }
+        if self.paused {
+            match resume().await {
+                Ok(()) => self.paused = false,
+                Err(e) => errs.push(format!("resume mining: {e:#}")),
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            bail!("chaos teardown: {}", errs.join("; "))
+        }
+    }
+
     /// Every row so far; an injection still active or unrecovered has no
     /// recovery time, one that never fired is absent.
-    pub fn rows(self) -> Vec<ChaosRow> {
-        let mut v = self.done;
-        v.extend(self.recovering.into_iter().map(|(r, _)| r));
-        v.extend(self.active.into_iter().map(|mut a| {
-            a.row.effects = effects(&a.kinds);
-            a.row
+    pub fn rows(&self) -> Vec<ChaosRow> {
+        let mut v = self.done.clone();
+        v.extend(self.recovering.iter().map(|(r, _)| r.clone()));
+        v.extend(self.active.iter().map(|a| {
+            let mut r = a.row.clone();
+            r.effects = effects(&a.kinds);
+            r
         }));
         v
     }
@@ -570,5 +633,101 @@ mod tests {
             for_: Duration::from_secs(600),
         };
         assert!(references_exist(&p, &[[0; 4]; 3]));
+    }
+
+    fn active(name: &str, role: Role, at: Option<Instant>, what: Restore) -> Active {
+        Active {
+            row: ChaosRow {
+                name: name.into(),
+                due_s: 0.0,
+                applied_s: 0.0,
+                undone_s: None,
+                effects: vec![],
+                recovery_s: None,
+            },
+            role,
+            undo: Undo { at, what },
+            kinds: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_undoes_everything_and_resumes_mining() {
+        let mut c = Controller::new(vec![]);
+        c.paused = true;
+        c.active
+            .push(active("kill", Role::A, None, Restore::Start(Role::A)));
+        c.active
+            .push(active("bad", Role::B, None, Restore::ProverUp(Role::B)));
+        let ran = std::cell::RefCell::new(Vec::new());
+        let resumed = std::cell::Cell::new(false);
+        let r = c
+            .finish_with(
+                5.0,
+                async |u: &Undo| {
+                    ran.borrow_mut().push(format!("{:?}", u.what));
+                    if matches!(u.what, Restore::Start(_)) {
+                        anyhow::bail!("start failed");
+                    }
+                    Ok(())
+                },
+                async || {
+                    resumed.set(true);
+                    Ok(())
+                },
+            )
+            .await;
+        // The first failure did not stop the second undo or the resume.
+        assert_eq!(ran.borrow().len(), 2);
+        assert!(r.unwrap_err().to_string().contains("start failed"));
+        assert!(c.active.is_empty() && !c.paused && resumed.get());
+        assert!(c.rows().iter().all(|r| r.undone_s == Some(5.0)));
+    }
+
+    #[test]
+    fn pause_only_for_a_sealed_pending_trigger() {
+        let w = |t| {
+            vec![Chaos {
+                name: "c".into(),
+                trigger: t,
+                action: Action::Kill {
+                    node: Role::A,
+                    down: Duration::ZERO,
+                },
+            }]
+        };
+        let sealed = Observed {
+            new_seals: [1, 0],
+            ..obs()
+        };
+        assert!(should_pause(&w(Trigger::L1Pending(NodeId::A)), &sealed));
+        assert!(!should_pause(&w(Trigger::L1Pending(NodeId::B)), &sealed));
+        assert!(!should_pause(&w(Trigger::Sealed(NodeId::A)), &sealed));
+        assert!(!should_pause(&w(Trigger::L1Pending(NodeId::A)), &obs()));
+    }
+
+    #[test]
+    fn only_deadlined_undos_are_swept() {
+        let now = Instant::now();
+        let a = vec![
+            active("kill", Role::A, Some(now), Restore::Start(Role::A)),
+            active("stays", Role::B, None, Restore::Nothing),
+            active(
+                "later",
+                Role::B,
+                Some(now + Duration::from_secs(9)),
+                Restore::Nothing,
+            ),
+        ];
+        assert_eq!(due_undos(&a, now), [0]);
+        assert_eq!(due_undos(&a, now + Duration::from_secs(10)), [0, 2]);
+        let k = Action::Kill {
+            node: Role::A,
+            down: Duration::from_secs(30),
+        };
+        assert!(matches!(
+            undo_for(&k, None, now).what,
+            Restore::Start(Role::A)
+        ));
     }
 }

@@ -89,7 +89,9 @@ pub struct NodeProxies {
     pub beacon: Vec<Proxy>,
 }
 
-/// A `POST /prove` a node made.
+/// A `POST /prove` a node made. A call the client dropped during a proxy
+/// delay has `job: None` and never reached the prover: only `job.is_some()`
+/// counts as a wasted job.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProveCall {
     /// Seconds since the rig came up.
