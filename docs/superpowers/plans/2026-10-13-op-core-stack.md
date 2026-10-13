@@ -15,7 +15,7 @@
 - **Grace of the new OP registry**, immutable: `GRACE_DEFAULT=300 GRACE_FLOOR=240 GRACE_CEIL=600 GRACE_MAX_TOTAL=1800 NOTICE_MIN=60`; the deployed `defaultGrace/graceFloor/graceCeil/graceMaxTotal/noticeMin` must read `300/240/600/1800/60` (`DeployAll.s.sol` silently keeps 180/150/600/1800/60 for an unset or misspelled variable).
 - **Pins of the new OP registry** (davinci-zkvm v0.2.0): `batchProgramVK` `0xa0ad5c4c7e39d4a7007933158181418a752e6c1563a211af84c579640db435fa`, `resultsProgramVK` `0xe693589453ecaee63eba697c48d4c5321a714bb18c2d84a97437b3f368578f68`; `rootCVadcopFinal` `0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80` and `ballotVKHash` `0xbf1e6590bb1ba883d601c4d7d1c6fa2722a78590716874019db6d68fc776bb0e` unchanged.
 - **Reused verifiers on OP**: `ZISK_VERIFIER=0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c`, `L1_BLOB_VERIFIER=0x3B95BC14F43ed8Addb83F84D10A949De74eE7529` (on `L1Block` `0x4200000000000000000000000000000000000015`). The 2026-10-12 registry `0x8b63fAE96948D69CF92Eb40e4EE0fCE40962267d` is retired (v0.1 vks).
-- **Two caps.** Per transaction: what `resolve_blob_cap` gives (the L1's `eth_config` blob schedule, `--max-blobs-per-tx`, else 6); it is the chunk size. Per batch: the guest's `MAX_BLOBS` (32) in L1-blob mode, the per-transaction cap in blob mode. `select_batch`, `capacity_estimate` and the prepare-time refresh check use the per-batch cap. The node logs both (`blob cap per transaction`, `blob cap per batch`); `op_live` keeps asserting the per-transaction one (6).
+- **Two caps.** Per transaction: what `resolve_blob_cap` gives (the L1's `eth_config` blob schedule, `--max-blobs-per-tx`, else 6); it is the chunk size. Per batch: the guest's `MAX_BLOBS` (32) in L1-blob mode, the per-transaction cap in blob mode. `select_batch`, `capacity_estimate` and the prepare-time refresh check use the per-batch cap. The node logs both (`blob cap per transaction`, `blob cap per batch`); the live L1-blob run asserts the per-transaction one (6) in `e2e.rs` (Task 5).
 - **Chunks.** Chunk `i` holds blobs `cap*i ..` in order (the last may be shorter); the chunks' versioned hashes concatenated in chunk order are the transition's.
 - **POST_TIME = 24 s**: the seal guard requires `l1_settle_lag + (chunks - 1) * POST_TIME + settle_margin <= window`; a window that fits fewer chunks sizes the batch down, never holds it.
 - **MAX_REPOSTS = 3 per transition**: re-posting one chunk counts one, re-posting every chunk counts one. Worst case per transition: `chunks + MAX_REPOSTS * chunks` posts, each under `--l1-max-post-fee` (13 blobs in 3 chunks: 12 posts, 0.012 ETH at the default cap).
@@ -24,9 +24,9 @@
 - **Commits.** Titles `type(scope): lowercase title`. No AI attribution and no `Co-Authored-By` (or any other) trailer in commits, PR bodies or release notes. Stage files by name.
 - **Never push, merge, tag or release without the owner's explicit confirmation**, step by step (see "Owner checkpoints"). Pushes and PRs go through `gh` and HTTPS remotes (SSH pushes fail on this host).
 - **Build output never in `/tmp`.** Cargo targets stay in each repository's `target/`; every shell exports `TMPDIR=$HOME/.cache/op-core/tmp`; e2e logs under `~/.cache/davinci-e2e`; `make e2e` always gets `E2E_LOG=$HOME/.cache/davinci-e2e/<name>.log`.
-- **Secrets never printed, logged or committed**: `~/optimism-privkey.txt`, `~/optimism-rpcs.txt`, `~/.config/davinci-l1blob/*.key`. Private keys never sit in an exported environment variable or a container's environment: nodes and the harness get key *files*, and `forge` gets `PRIVATE_KEY` only inside the deployment's subshell. The private OP RPC URL is exported only by `~/.config/davinci-l1blob/env.sh` (as `OP_RPC`, for the deployment and the live harness) and never reaches a container. Commands read secrets through `env.sh` (`owner_key`, `key_of`) and pipe anything that may echo the OP RPC through `redact`. Deployments set variables in a subshell, never in a `.env`.
+- **Secrets never printed, logged or committed**: `~/optimism-privkey.txt`, `~/optimism-rpcs.txt`, `~/.config/davinci-l1blob/*.key`. Private keys never sit in an exported environment variable or a container's environment: nodes and the harness get key *files*, and `forge` gets `PRIVATE_KEY` only inside the deployment's subshell. The private OP RPC URL is exported only by `~/.config/davinci-l1blob/env.sh` (as `OP_RPC`, for the deployment and the live harness) and never reaches a container, with one exception chosen by the owner: the production node's `DAVINCI_RPC_URL` (Task 14 Step 3) lists the owner-provided endpoint `$OP_PRIVATE_RPC` first, then the preset's two public ones. Commands read secrets through `env.sh` (`owner_key`, `key_of`) and pipe anything that may echo the OP RPC through `redact`. Deployments set variables in a subshell, never in a `.env`.
 - **Shared GPU prover** at `DAVINCI_ZKVM_URL` (default `http://127.0.0.1:8080`, the production prover): before every GPU run `curl -s "$DAVINCI_ZKVM_URL/health"` must show `"queue_len":0`; one GPU workload at a time; never start a run while production jobs are queued.
-- **Spending caps** for the whole plan: the owner's OP account at most 0.0002 ETH (the deployment, organizer transactions), the owner's Ethereum account at most 0.0005 ETH (a top-up of `seq-a.l1` only if its balance is below the run's minimum); `seq-a.l1` at most 0.0003 ETH of blob posts before the production switch. Every spending step has a go/no-go check.
+- **Spending caps** for the whole plan (resolved by the owner as written; `seq-a` keeps what is left for production, no production top-up): the owner's OP account at most 0.0002 ETH (the deployment, organizer transactions), the owner's Ethereum account at most 0.0005 ETH (a top-up of `seq-a.l1` only if its balance is below the run's minimum); `seq-a.l1` at most 0.0003 ETH of blob posts before the production switch. Every spending step has a go/no-go check.
 - In `/home/p4u/davinci-zkvm` never read, stage or touch `SILENT-REVOTING.md`, `paper.tex`, `token.overleaf`.
 - Strict Fable 5.1 audits: one per task (the reviewer of subagent-driven development), and a final whole-release audit (Task 13 Step 1) before any push or merge.
 
@@ -40,16 +40,16 @@
 - **The davinci-zkvm fixture is recorded by that test** (`DAVINCI_E2E_RECORD_DIR`): the node does not log job ids and the prover lists none, so the test taps the node's `/prove` calls and fetches the first job's `/snark` and `/publics`. The wire test's tuple of publics follows the recording.
 - **Bindings are generated with abigen v1.17.8**, the version the contracts' `bindings-sync` and `release-tag` workflows install today (`go install …/abigen@latest`): v1.16.5 output differs (imports, `ErrEventSignatureMismatch`), so its bindings would make the bot push a regeneration commit and could fail the release's drift check.
 - **`deployments/10.json` is renamed `deployments/10-0x8b63.json`** before the deployment writes the new record, so the retired registry keeps its verified record.
-- **Compose mounts a second secret** (`sequencer_l1_key`, `SEQUENCER_L1_KEY_FILE`, default `./sequencer-l1.key`) and `.env.example` sets `DAVINCI_L1_PRIVKEY_FILE`: with `optimism` as the default a signing compose node needs its Ethereum key.
+- **Compose mounts a second secret** (`sequencer_l1_key`, `SEQUENCER_L1_KEY_FILE`, default `./sequencer-l1.key`) and sets `DAVINCI_L1_PRIVKEY_FILE` itself in `x-sequencer-env` (like `DAVINCI_PRIVKEY_FILE`; `.env.example` keeps only the commented `SEQUENCER_L1_KEY_FILE` line): with `optimism` as the default a signing compose node needs its Ethereum key, and compose refuses to start until `./sequencer-l1.key` exists, so the v0.6.0 notes and the README say to create it before the image moves.
 - **`davinci-sequencer-1` is removed, not only stopped**: the host's watchtower runs `--include-stopped --revive-stopped`, so a stopped container that carries the watchtower label is updated to `v0.6.0` and restarted on its Gnosis environment. Its `docker inspect` is saved first; its keys and datadir are bind mounts and stay.
-- **The production OP node uses the preset's public OP RPCs**, so no secret URL lands in a container's environment (the owner may add a private one later).
+- **The production OP node's OP RPCs** are set in its environment: `DAVINCI_RPC_URL=$OP_PRIVATE_RPC,https://optimism-rpc.publicnode.com,https://mainnet.optimism.io` (the owner's endpoint first, then the `optimism` preset's two public ones). The committed `optimism` preset is not changed. The URL therefore lands in `docker inspect`; the saved inspect file is mode 600 and treated as private. Resolved (owner).
 - **`e2e/tests/node_smoke.rs`** drives an already running node through a three-voter CSP election; it is the "small live election" of the production switch.
 - **Task 9 also reruns the blob-mode e2e**: the selection and seal code it changes runs in both modes.
 - **Task 11 boots the built node as an observer on the filled preset**, and checks that it refuses the retired registry, before anything is committed.
 - **Live spend bounds**: go only at Ethereum base plus priority fee at most 0.5 gwei and a blob base fee at most 0.02 gwei (`op_live`) or 0.01 gwei (the live 512 x 16 run), with a stop rule on `seq-a`'s balance during each run.
-- **Merges**: `gh pr merge --rebase`; davinci-contracts' `main` requires a code-owner review, so either another code owner approves or the owner merges with `--admin`. Both `feat/op-core` branches stay on GitHub: the rebase merge rewrites commit ids, and `deployments/10.json` names the `feat/op-core` commit the registry was built from.
+- **Merges**: `gh pr merge --rebase`; davinci-contracts' `main` requires a code-owner review, the owner decided to merge with `gh pr merge --rebase --admin` after CI is green and the final Fable audit passes, and the PR body says the merge relied on the final Fable audit as its review. Both `feat/op-core` branches stay on GitHub: the rebase merge rewrites commit ids, and `deployments/10.json` names the `feat/op-core` commit the registry was built from.
 - **davinci-contracts' CHANGELOG entry sits under the release date** (the file's convention); `package.json` moves to 0.0.51 by the release bot, and `main` is fast-forwarded to the bot's bump commit, as for v0.0.50.
-- **The production OP node is a `docker run` container like the Gnosis one** (`--user 1001:1001`, the same ports and prover URL), named `davinci-sequencer-op`, with `seq-a`'s key files mounted read-only from `~/.config/davinci-l1blob/` (not copied) and the datadir `~/.davinci-op/data`. The owner picks the image policy; pinned `v0.6.0` without the watchtower label is the recommendation.
+- **The production OP node is a `docker run` container like the Gnosis one** (`--user 1001:1001`, the same ports and prover URL), named `davinci-sequencer-op`, with `seq-a`'s key files mounted read-only from `~/.config/davinci-l1blob/` (not copied) and the datadir `~/.davinci-op/data`. The image is `ghcr.io/vocdoni/davinci-sequencer:latest` **with** the watchtower enable label (owner's choice, resolved): the node follows releases automatically, so a release that changes required configuration must ship with upgrade notes before its tag (a `:latest` move restarts the node mid-flight; a restart re-proves and replaces a pending chunk).
 
 ## Review Focus
 
@@ -321,7 +321,7 @@ batch below the cap when the landing window fits fewer transactions."
 
 - [ ] **Step 1: Write the failing unit tests**
 
-In `sequencer/src/l1da/settle.rs`'s `mod tests`, every existing `choose_anchor(n, ` call becomes `choose_anchor(n, n, ` (12 calls; `cargo fmt` rewraps one). Append to that module:
+In `sequencer/src/l1da/settle.rs`'s `mod tests`, every existing `choose_anchor(n, ` call becomes `choose_anchor(n, n, ` (10 calls; `cargo fmt` rewraps one). Append to that module:
 
 ```rust
 
@@ -846,6 +846,35 @@ async fn a_fee_spike_between_chunks_waits_for_the_second() {
     assert_eq!(r.l1.mined_posts(), 2);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_fee_spike_that_never_calms_stops_at_the_deadline() {
+    // Chunk 0 mined, then fees stay above the cap: the retry loop must not
+    // outlive the job's deadline (the flight would hold the process's single
+    // slot until fees fall, however long after the grace end).
+    let mut r = rig_chunked(Duration::from_millis(5), 3, 2);
+    let spiky = Arc::new(Spiky {
+        inner: r.l1.clone(),
+        calm: AtomicBool::new(false), // never set
+    });
+    let cap = L1Fees::offer(&r.l1.market()).cost(2) * 3;
+    let (dir, db) = fresh_db();
+    r.da = L1Da::new(spiky.clone(), db.clone(), cap, Duration::from_millis(5), 2).unwrap();
+    (r.db, r._dir) = (db, dir);
+    let job = L1Job {
+        deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+        ..r.job()
+    };
+    let (_, posting) = with_post(&r.da, &r.s.chain, &job, std::future::ready(())).await;
+    assert_eq!(posting.posts.len(), 1, "{posting:?}");
+    assert!(matches!(posting.error, Some(PostError::Deadline)), "{posting:?}");
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("deadline")),
+        "{out:?}"
+    );
+    assert_eq!(r.l1.sends().len(), 1);
+}
+
 #[tokio::test]
 async fn two_transitions_interleave_their_chunks() {
     // Two processes' transitions through one Ethereum account at once: the
@@ -963,9 +992,23 @@ impl L1Da {
 /// last may be shorter), each with its commitments, openings and versioned
 /// hashes. Chunk `i` holds blobs `per_tx * i ..`, so the chunks' versioned
 /// hashes in chunk order are the transition's: the order the registry opens
-/// its commitments in.
+/// its commitments in. The per-blob vectors must have the length of `blobs`
+/// (`build_blobs` output always does); unequal ones would panic on a slice.
 pub fn chunks(blobs: &TransitionBlobs, per_tx: usize) -> Vec<TransitionBlobs> {
     let per_tx = per_tx.max(1);
+    let n = blobs.blobs.len();
+    debug_assert!(
+        [
+            blobs.commitments.len(),
+            blobs.zs.len(),
+            blobs.ys.len(),
+            blobs.proofs.len(),
+            blobs.versioned_hashes.len()
+        ]
+        .iter()
+        .all(|&l| l == n),
+        "per-blob vectors of unequal length"
+    );
     (0..blobs.blobs.len())
         .step_by(per_tx)
         .map(|a| {
@@ -1026,6 +1069,12 @@ async fn post_chunks(
                 // Fee cap, L1 trouble: wait and post again while the proof runs.
                 Err(e @ (PostError::FeeCap { .. } | PostError::L1(_))) => {
                     warn!(pid = %hex::encode(job.pid), error = %e, "L1 post failed; retrying");
+                    // A fee spike between chunks must not hold the flight past
+                    // the job's deadline; `settle` then posts the missing chunk
+                    // and gets `Deadline` from its own `timeout_at`.
+                    if tokio::time::Instant::now() >= job.deadline {
+                        return (posts, Some(PostError::Deadline));
+                    }
                     if !da.pause(&job.cancel).await {
                         return (posts, Some(e));
                     }
@@ -1611,6 +1660,53 @@ async fn l1_the_seal_budget_sizes_a_batch_down_to_fewer_transactions() {
     shutdown.cancel();
 }
 
+/// A lost race exposes the batch's slots; the requeue lands in a short
+/// window that fits one blob only. A window-limited `RefreshOverflow` is
+/// transient: no vote errors and the exposed set stays until a window that
+/// fits the refreshes opens (the grace after the end: two blobs).
+#[tokio::test]
+async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
+    let s = setup(16, 140, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    // The fake registry's 150 s floor and no margin: one chunk of one blob
+    // while voting is open, two blobs in the 180 s default grace.
+    let cfg = chunked_cfg(
+        &dir,
+        &s,
+        140,
+        &["--l1-settle-lag", "140s", "--batch-time", "100s"],
+    );
+    let (node, h) = chunked_node(&s, &l1, prover.clone(), &dir, cfg, &shutdown).await;
+    s.chain.revert_simulates("InvalidStateRoot", 1);
+    let vids = submit(&h, &s, 0..126, 3500).await;
+    wait_until("exposed set recorded", async || {
+        node.db.exposed(&pid_fr()).unwrap().is_some()
+    })
+    .await;
+    let slots = node.db.exposed(&pid_fr()).unwrap().unwrap();
+    // A few seal ticks in the short window: nothing errors, nothing clears.
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for vid in &vids {
+            assert_ne!(
+                vote_status(&h, *vid).await,
+                Some(VoteStatus::Error),
+                "a window-limited overflow errored a vote"
+            );
+        }
+        assert_eq!(node.db.exposed(&pid_fr()).unwrap().as_ref(), Some(&slots));
+    }
+    s.chain.end_process();
+    s.chain.advance_time(5);
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    // The settlement after the end carries two blobs in two transactions.
+    assert_eq!(s.chain.l1_last().unwrap().blocks.len(), 2);
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn l1_restart_with_one_chunk_pending_replaces_it() {
     let s = setup(16, 140, None);
@@ -1676,6 +1772,8 @@ async fn l1_restart_with_one_chunk_pending_replaces_it() {
     shutdown2.cancel();
 }
 ```
+
+Hardening note (optional): the fake L1 mines a block per `head()` call and the harness polls every 20 ms, so the restarted poster replaces the pending chunk after about three polls, and the `[0, 1, 1, 2]` assertion needs the first shutdown to land inside that 60 ms window. It passed in every run so far. If it ever flakes, call `l1.set_auto_mine(false)` once the second send is seen (`wait_until("second chunk pending"` above) instead of racing the shutdown, and `set_auto_mine(true)` before the restart.
 
 - [ ] **Step 2: Run to see them fail**
 
@@ -1757,6 +1855,14 @@ the sized selection inside `let selected: Vec<VerifiedVote> = loop {` (lines 175
                 max_blobs,
             ) {
                 Ok((refs, _)) => refs.into_iter().cloned().collect(),
+                // The exposed set needs more blob transactions than this
+                // window fits; the full-cap selection above passed, so wait
+                // for a window that does (the votes and the set stay). Only
+                // an overflow at the full cap is permanent.
+                Err(StateError::RefreshOverflow { .. }) if max_blobs < self.state.blob_cap() => {
+                    debug!(pid = %hex::encode(self.pid31), max_blobs, "the exposed set does not fit the blob transactions the window allows");
+                    return;
+                }
                 Err(StateError::RefreshOverflow { .. }) => {
                     self.refresh_overflow();
                     return;
@@ -1794,13 +1900,15 @@ and the belt (lines 1797-1806):
 - [ ] **Step 4: Run the tests, and check that the guard test bites**
 
 ```bash
-rtk proxy bash -c 'cargo test -p davinci-sequencer --lib "l1da|budget_decision" 2>&1 | grep -E "test result|panicked"'
+rtk proxy bash -c 'cargo test -p davinci-sequencer --lib -- l1da budget_decision 2>&1 | grep -E "test result|panicked"'
 rtk proxy bash -c 'cargo test -p davinci-sequencer --test actor_l1 2>&1 | grep -E "^test l1_(a_two|the_seal|restart_with)|test result"'
 ```
 
-Expected: unit `5 passed` and `budget_decision` ok; `actor_l1`: the three new tests ok, `test result: ok. 16 passed` (about 2 s).
+Expected: unit `6 passed` (the filter matches by substring, so the quoted form `"l1da|budget_decision"` runs nothing); `actor_l1`: the four new tests ok, `test result: ok. 17 passed` (about 3 s).
 
 Mutation check: in `maybe_seal` replace `chunks.saturating_mul(l1.chunk).min(self.state.blob_cap())` with `{ let _ = (chunks, l1); self.state.blob_cap() }`, run `cargo test -p davinci-sequencer --test actor_l1 l1_the_seal_budget`; expected `FAILED` with `timeout waiting for one batch settled` (one batch of 140 went out). Revert the line and re-run: ok.
+
+Second mutation check: drop the new `if max_blobs < self.state.blob_cap()` arm of the sized selection and run `cargo test -p davinci-sequencer --test actor_l1 l1_a_short_window`; expected `FAILED` on `a window-limited overflow errored a vote` (the old handler sets the exposed votes to `Error("exposed refresh set too large, recast")` and clears the set). Restore it and re-run: ok.
 
 - [ ] **Step 5: Docs**
 
@@ -1916,8 +2024,9 @@ git add sequencer/src/l1da/mod.rs sequencer/src/actor.rs sequencer/src/api/mod.r
 git commit -m "feat(actor): a per-batch blob cap of max_blobs and a per-chunk seal budget in l1-blob mode" -m "In L1-blob mode a batch may take the guest's 32 blobs; the per-transaction cap
 from eth_config is the chunk size, and the node logs both. The seal budget
 reserves 24 s per chunk after the first and sizes a batch down to the chunks
-the window fits instead of holding it. Blob mode keeps one transaction per
-batch."
+the window fits instead of holding it. A refresh set that needs more blobs than
+a short window allows waits for a larger window; it no longer errors the
+exposed votes and clears the set. Blob mode keeps one transaction per batch."
 ```
 
 Expected: no failure line, about 40 suites ok, `exit 0`.
@@ -2132,7 +2241,7 @@ git commit -m "test(state): dry run of a nine-blob 512 x 16 steady batch"
 
 **Files:**
 - Modify: `client/src/networks.rs` (`GNOSIS` gone, `NETWORKS`, `DEFAULT`, tests), `sequencer/src/config.rs` (tests)
-- Modify: `e2e/src/net.rs`, `e2e/tests/e2e.rs`, `e2e/tests/demo.rs`
+- Modify: `e2e/src/net.rs`, `e2e/tests/e2e.rs`, `e2e/tests/demo.rs`; comments only: `client/src/organizer.rs`, `e2e/src/demo.rs`, `e2e/src/dkg.rs`, `docs/agm.md` (`docs/benchmarks.md` keeps its dated Gnosis figures)
 - Modify: `README.md`, `docs/configuration.md`, `docs/deployments.md`, `docs/lifecycle.md`, `docs/testing.md`, `docs/demo.md`, `docker-compose.yml`, `.env.example`
 
 **Interfaces:**
@@ -2382,6 +2491,10 @@ edit("e2e/tests/e2e.rs", [
 """    // The nodes size transitions from eth_config.
     for n in &nodes {
         match n.logged_blob_cap() {
+            // The OP preset's Ethereum schedule gives 6 blobs per transaction.
+            Some(c) if net.live && net.l1.is_some() => {
+                ensure!(c == 6, "{}: blob cap {c}, want 6", n.name)
+            }
             Some(c) => say!("{}: blob cap {c}", n.name),
             None => say!("{}: no blob cap in its log", n.name),
         }
@@ -2402,6 +2515,28 @@ edit("e2e/tests/demo.rs", [
                     format!("https://optimistic.etherscan.io/address/{a}")
                 } else {"""),
 ])
+edit("client/src/organizer.rs", [
+("""/// Retries of a rate-limited request, a second apart: the public Gnosis RPCs""",
+"""/// Retries of a rate-limited request, a second apart: public RPCs"""),
+])
+
+edit("e2e/src/demo.rs", [
+("""            // Past the move, the last votes go in well inside Gnosis'
+            // 60 s noticeMin, and one comes after the new end.""",
+"""            // Past the move, the last votes go in well inside the registry's
+            // 60 s noticeMin, and one comes after the new end."""),
+])
+
+edit("e2e/src/dkg.rs", [
+("""/// nodes open one on their own, Live about two minutes later on Gnosis.""",
+"""/// nodes open one on their own, Live about two minutes later on a public chain."""),
+])
+
+edit("docs/agm.md", [
+("""The figures below are for one RTX 5090 prover and a Gnosis-style chain with 2 blobs per""",
+"""The figures below are for one RTX 5090 prover and a chain with 2 blobs per"""),
+])
+
 print("gnosis code: done")
 ```
 
@@ -2471,7 +2606,12 @@ checks every election and needs neither xDAI nor a prover.""",
 (`sudo install -o 10001 -m 0400 /dev/null sequencer.key`, the same for `sequencer-l1.key`) run an
 observer, which follows and checks every election and needs neither ETH nor a prover. Nothing
 but the node may send from the Ethereum account (see
-[configuration.md](docs/configuration.md#l1-blob-mode))."""),
+[configuration.md](docs/configuration.md#l1-blob-mode)).
+
+Upgrading a compose node from v0.5.0: create `sequencer-l1.key` before the image moves
+(`sudo install -o 10001 -m 0400 /dev/null sequencer-l1.key` for an observer, or the funded
+Ethereum key for a signing node), or compose will not start the service: the file is a secret's
+source. A signing node without a key in it refuses to boot."""),
 ("""DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \\
 DAVINCI_PROVER_URL=http://127.0.0.1:8080 \\
 ./target/release/davinci-sequencer
@@ -2582,7 +2722,8 @@ edit("docker-compose.yml", [
   DAVINCI_PRIVKEY_FILE: /run/secrets/sequencer_key""",
 """  DAVINCI_NETWORK: ${DAVINCI_NETWORK:-optimism}
   DAVINCI_DATADIR: /data
-  DAVINCI_PRIVKEY_FILE: /run/secrets/sequencer_key"""),
+  DAVINCI_PRIVKEY_FILE: /run/secrets/sequencer_key
+  DAVINCI_L1_PRIVKEY_FILE: /run/secrets/sequencer_l1_key"""),
 ("""secrets:
   sequencer_key:
     file: ${SEQUENCER_KEY_FILE:-./sequencer.key}""",
@@ -2641,10 +2782,9 @@ edit(".env.example", [
 
 # L1-blob mode: host path of the file holding the dedicated Ethereum key that
 # posts the blobs (nothing else may send from that account). Compose mounts it
-# as a secret, like the key above. A signing node needs it; an empty file is
-# no key.
-SEQUENCER_L1_KEY_FILE=./sequencer-l1.key
-DAVINCI_L1_PRIVKEY_FILE=/run/secrets/sequencer_l1_key
+# as a secret and sets DAVINCI_L1_PRIVKEY_FILE for the container, like the key
+# above. A signing node needs it; an empty file is no key.
+# SEQUENCER_L1_KEY_FILE=./sequencer-l1.key
 
 # Most one blob post may cost at the fees it offers (wei, or a gwei/eth amount).
 # DAVINCI_L1_MAX_POST_FEE=0.001eth"""),
@@ -2715,9 +2855,10 @@ print("deployments.md: done")
 python3 -I ~/.cache/op-core/gnosis_docs.py && python3 -I ~/.cache/op-core/gnosis_deployments.py
 grep -n -i "gnosis" README.md docker-compose.yml .env.example docs/configuration.md docs/testing.md docs/demo.md docs/lifecycle.md
 docker compose -f docker-compose.yml --env-file .env.example config 2>&1 | grep -E "sequencer_l1_key|DAVINCI_NETWORK|error" | head -5
+docker compose -f docker-compose.yml --env-file .env.example config 2>&1 | grep -c DAVINCI_L1_PRIVKEY_FILE
 ```
 
-Expected: `gnosis docs: done`, `deployments.md: done`; the remaining Gnosis mentions are only: README "Gnosis is retired…" (2 lines), `docs/configuration.md` "The `gnosis` preset is gone…" and the chain-limits text ("2 on Gnosis and Chiado…", chain data that stays). The compose render (read-only, starts nothing) lists `- sequencer_l1_key` and `DAVINCI_NETWORK: optimism` and no `error`.
+Expected: `gnosis docs: done`, `deployments.md: done`; the remaining Gnosis mentions are only: README "Gnosis is retired…" (2 lines), `docs/configuration.md` "The `gnosis` preset is gone…" and the chain-limits text ("2 on Gnosis and Chiado…", chain data that stays). The compose render (read-only, starts nothing) lists `- sequencer_l1_key` and `DAVINCI_NETWORK: optimism` and no `error`; the `grep -c DAVINCI_L1_PRIVKEY_FILE` prints `1` per service rendered (compose sets it in `x-sequencer-env`, not in `.env`, so a `.env` that predates this release still gets it).
 
 - [ ] **Step 4: Commit**
 
@@ -2982,10 +3123,18 @@ async fn run(
     };
 
     // Phase 1: the first 512 voters, in the batches the seal budget allows.
+    let phase1 = Instant::now();
     submit(&node, &reqs[..N]).await?;
     settled(&node, &pid, &reqs[..N]).await?;
     let first = ours().await?;
     eprintln!("first 512 votes settled in {} transitions", first.len());
+    // What the node measured: the benchmarks sub-project decides from this
+    // whether a warmed node fits 512 x 16 inside the 300 s default grace.
+    eprintln!(
+        "phase 1: {:.2} s per vote from submit to settled ({:.0} s for {N}, including the Ethereum legs)",
+        phase1.elapsed().as_secs_f64() / N as f64,
+        phase1.elapsed().as_secs_f64()
+    );
     if let Some(out) = std::env::var_os("DAVINCI_E2E_RECORD_DIR") {
         let id = jobs.lock().ok().and_then(|j| j.first().cloned());
         record(
@@ -4116,7 +4265,7 @@ curl -s "${DAVINCI_ZKVM_URL:-http://127.0.0.1:8080}/health"; echo
 docker ps -a --filter name=davinci-sequencer --format '{{.Names}} {{.Image}} {{.Status}}'
 ```
 
-Go: `"status":"ok"` and `"queue_len":0`, and `davinci-sequencer-1 ghcr.io/vocdoni/davinci-sequencer:latest Exited (0) ...` (the Gnosis node has been stopped since 2026-10-13 13:27 UTC; its v0.1 pins cannot settle v0.2.0 proofs). No-go if the queue is not empty or a production node runs: wait, and ask the owner; never stop or start a container from this plan before Task 13.
+Go: `"status":"ok"` and `"queue_len":0`, and `davinci-sequencer-1 ghcr.io/vocdoni/davinci-sequencer:latest Exited (0) ...` (the Gnosis node has been stopped since 2026-10-13 13:27 UTC; its v0.1 pins cannot settle v0.2.0 proofs). No-go if the queue is not empty or a production node runs: wait, and ask the owner. Before each of Steps 3, 4 and 5 (each runs for up to an hour on the production GPU) the controller tells the owner that the run is starting and for how long; no confirmation is needed while the queue is empty; never stop or start a container from this plan before Task 13.
 
 - [ ] **Step 3: The L1-blob scenario (about 60 minutes)**
 
@@ -4170,7 +4319,7 @@ DAVINCI_E2E_L1_BIG=1 DAVINCI_E2E_DA=l1-blobs DAVINCI_E2E_GRACE=300,240,600,1800,
   DAVINCI_E2E_RECORD_DIR=$HOME/.cache/op-core/fixture TMPDIR=$HOME/.cache/davinci-e2e \
   systemd-run --user --scope -p MemoryMax=16G -- \
   cargo test -p davinci-e2e --test l1_big -- --nocapture > ~/.cache/davinci-e2e/l1-big.log 2>&1
-grep -E "pins ok|L1-blob mode|node at|s grace|ballots proved|transitions|recorded job|after the end|nine blobs|results on-chain|PASSED|FAILED|test result" ~/.cache/davinci-e2e/l1-big.log
+grep -E "pins ok|L1-blob mode|node at|s grace|ballots proved|transitions|phase 1|recorded job|after the end|nine blobs|results on-chain|PASSED|FAILED|test result" ~/.cache/davinci-e2e/l1-big.log
 ```
 
 Expected:
@@ -4182,6 +4331,7 @@ node at http://127.0.0.1:<port> log <work dir>/node-big.log
 process 0x... with a 600 s grace
 1024 ballots proved in <n> s
 first 512 votes settled in <k> transitions
+phase 1: <p> s per vote from submit to settled (<t> s for 512, including the Ethereum legs)
 recorded job <id> in /home/p4u/.cache/op-core/fixture: voters <v> overwrites <w> n_blobs <b> occupied_before <o> nproofs <p> n_public <q> log_n <l>
 512 x 16 settled <s> s after the end
 nine blobs in Ethereum blocks [<a>, <b>] (2 transactions), OP tx 0x...
@@ -4193,7 +4343,7 @@ with `<s>` under 600 (the process's grace) and `<k>` at least 2 (a fresh node's 
 
 - [ ] **Step 6: Record the results**
 
-No commit (nothing changed unless a fix was needed). Note for the final report: the three run times, `<k>`, `<s>` and the `recorded job` line.
+No commit (nothing changed unless a fix was needed). Note for the final report: the three run times, `<k>`, `<p>` (the measured seconds per vote: a figure under 0.5 s a vote at 16 fields says a warmed node fits 512 x 16 in the 300 s default grace; the benchmarks sub-project decides whether the default needs raising), `<s>` and the `recorded job` line.
 
 ---
 
@@ -4792,15 +4942,43 @@ Expected: `0`; the build; the balances (write them down as the starting point `S
 
 - [ ] **Step 2: Zero-cost dry check: balances are checked before anything is spent**
 
+Save as `~/.cache/op-core/scan_secrets.py` (it reads the files itself: no secret ever appears in a process argument, shell history or a command audit):
+
+```python
+"""Secret scan by file. python3 -I scan_secrets.py <key files, comma separated> <rpcs file> <path>...
+Directories are walked. Prints the files that hold a key or an RPC URL and a total; exit 1 if any."""
+import os
+import sys
+
+keys = [open(p).read().strip().lower().removeprefix("0x") for p in sys.argv[1].split(",")]
+rpcs = [l.strip() for l in open(sys.argv[2]) if l.strip()]
+files = []
+for a in sys.argv[3:]:
+    if os.path.isdir(a):
+        files += [os.path.join(d, f) for d, _, fs in os.walk(a) for f in fs]
+    else:
+        files.append(a)
+bad = 0
+for f in sorted(files):
+    t = open(f, errors="replace").read()
+    k = any(x and x in t.lower() for x in keys)
+    r = any(x in t for x in rpcs)
+    if k or r:
+        bad += 1
+        print(f, "key" if k else "no key", "rpc" if r else "no rpc")
+print(f"{len(files)} files, {bad} with a secret")
+sys.exit(1 if bad else 0)
+```
+
 ```bash
 "$CAST" nonce "$OWNER" --rpc-url "$OP_PUB"
 DAVINCI_E2E_OP_LIVE=1 DAVINCI_E2E_L1_MIN_BALANCE=1000 cargo test -p davinci-e2e --test e2e op_live -- --nocapture 2>&1 | redact > ~/.cache/davinci-e2e/op-live-dry.log
 grep -E "pins ok|L1-blob mode|balance|below|FAILED|test result" ~/.cache/davinci-e2e/op-live-dry.log
-grep -cF "$(key_of $KEYS/seq-a.l1.key | sed 's/^0x//')" ~/.cache/davinci-e2e/op-live-dry.log; grep -cF "$OP_RPC" ~/.cache/davinci-e2e/op-live-dry.log
+python3 -I ~/.cache/op-core/scan_secrets.py "$KEYS/seq-a.l1.key,$KEYS/seq-a.op.key,$HOME/optimism-privkey.txt" "$HOME/optimism-rpcs.txt" ~/.cache/davinci-e2e/op-live-dry.log
 "$CAST" nonce "$OWNER" --rpc-url "$OP_PUB"
 ```
 
-Expected: `chain 10 registry 0x<B> verifier 0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c (pins ok)`, `L1-blob mode: L1BlobVerifier 0x3B95BC14F43ed8Addb83F84D10A949De74eE7529 on L1Block 0x4200000000000000000000000000000000000015`, the balance lines, then `FAILED: below 1000 ETH on Ethereum: sequencer 1 0x<SEQ_A_L1>` and `test result: FAILED`; both counts `0`; the owner's OP nonce unchanged.
+Expected: `chain 10 registry 0x<B> verifier 0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c (pins ok)`, `L1-blob mode: L1BlobVerifier 0x3B95BC14F43ed8Addb83F84D10A949De74eE7529 on L1Block 0x4200000000000000000000000000000000000015`, the balance lines, then `FAILED: below 1000 ETH on Ethereum: sequencer 1 0x<SEQ_A_L1>` and `test result: FAILED`; the scanner prints `1 files, 0 with a secret`; the owner's OP nonce unchanged.
 
 - [ ] **Step 3: Go/no-go for `op_live` (owner checkpoints 2 and 3)**
 
@@ -4809,7 +4987,7 @@ curl -s "${DAVINCI_ZKVM_URL:-http://127.0.0.1:8080}/health"; echo
 balances; fees
 ```
 
-Go: `"queue_len":0`; Ethereum base fee plus priority fee at most 0.5 gwei (500000000 wei; the node pays the RPC's suggested tip, at least 0.001 gwei) and blob base fee at most 0.02 gwei (20000000 wei), which bounds this run at about 0.0001 ETH (up to 8 posts of 21,000 gas and 8 blobs of 131,072 blob gas); `seq-a` at least 0.0002 ETH on Ethereum and 0.00005 ETH on OP. If `seq-a` Ethereum is below 0.0002 ETH, propose a top-up to the owner (checkpoint 2: `"$CAST" send --rpc-url "$L1_READ" --private-key "$(owner_key)" --value 0.0005ether "$SEQ_A_L1" --json`, at most 0.0005 ETH, gas at the base fee above) and run it only on their explicit "top up". Then show the owner the expected spend (about 0.00004 to 0.0001 ETH of blob posts, a few OP settlements) and wait for an explicit "run op_live" (checkpoint 3).
+Go: `"queue_len":0`; Ethereum base fee plus priority fee at most 0.5 gwei (500000000 wei; the node pays the RPC's suggested tip, at least 0.001 gwei) and blob base fee at most 0.02 gwei (20000000 wei), which bounds this run at about 0.0001 ETH (up to 8 posts of 21,000 gas and 8 blobs of 131,072 blob gas); `seq-a` at least 0.0002 ETH on Ethereum and 0.00005 ETH on OP. If `seq-a` Ethereum is below 0.0002 ETH, propose a top-up to the owner (checkpoint 2: `"$CAST" send --rpc-url "$L1_READ" --private-key "$(owner_key)" --value 0.0005ether "$SEQ_A_L1" --json`, at most 0.0005 ETH, gas at the base fee above) and run it only on their explicit "top up". (That `cast send --private-key "$(owner_key)"` puts the owner's key in a process argument for the length of one transaction: the same one-off as the 2026-10-12 precedent, under the owner's eyes, accepted; nothing else in this plan passes a key or the private RPC URL as an argument.) Then show the owner the expected spend (about 0.00004 to 0.0001 ETH of blob posts, a few OP settlements) and that the run occupies the production prover for 30 to 45 minutes, and wait for an explicit "run op_live" (checkpoint 3).
 
 - [ ] **Step 4: The live run (about 30 to 45 minutes)**
 
@@ -4845,32 +5023,31 @@ The run's batches are small, so each transition is one Ethereum transaction; wha
 - [ ] **Step 5: Secrets and spend after `op_live`**
 
 ```bash
-grep -rlF -- "$OP_RPC" ~/.cache/davinci-e2e 2>/dev/null | wc -l
-grep -rlF -- "$(key_of $KEYS/seq-a.l1.key | sed 's/^0x//')" ~/.cache/davinci-e2e 2>/dev/null | wc -l
+python3 -I ~/.cache/op-core/scan_secrets.py "$KEYS/seq-a.l1.key,$KEYS/seq-a.op.key,$HOME/optimism-privkey.txt" "$HOME/optimism-rpcs.txt" ~/.cache/davinci-e2e
 balances; fees
 ```
 
-Expected: `0`, `0`; `seq-a` Ethereum spend (against `S`) consistent with the gas bill, about 0.00004 to 0.0001 ETH.
+Expected: `<n> files, 0 with a secret` (the scanner walks `~/.cache/davinci-e2e`; a hit names the file, which is then redacted or deleted and the cause fixed); `seq-a` Ethereum spend (against `S`) consistent with the gas bill, about 0.00004 to 0.0001 ETH.
 
 - [ ] **Step 6: Go/no-go for the live 512 x 16 transition (owner checkpoint 4)**
 
 The run settles 512 first votes in several transitions (about 5 to 8 blobs in all), then one transition of nine blobs in two Ethereum transactions: about 8 to 12 blob posts and 15 to 17 blobs in total. At 0.5 gwei of base plus priority fee and a blob base fee of 0.01 gwei that is at most about 0.00015 ETH (12 x 21,000 gas and 17 x 131,072 blob gas); each post is also capped at the harness's live `--l1-max-post-fee` (0.00015 ETH).
 
-Go: Step 3's prover check; Ethereum base fee plus priority fee at most 500000000 wei (0.5 gwei) and blob base fee at most 10000000 wei (0.01 gwei); `seq-a` Ethereum spend so far plus 0.00015 ETH at most 0.0003 ETH, and its balance at least 0.0002 ETH (a top-up as in Step 3 only within the 0.0005 ETH cap, and only if the spend bound still holds). Otherwise skip the live 512 x 16 run, say so in the report (Task 9 Step 5 covers it on anvil), and go to Step 9. With a go, show the owner the numbers and wait for an explicit "run l1_big live".
+Go: Step 3's prover check; Ethereum base fee plus priority fee at most 500000000 wei (0.5 gwei) and blob base fee at most 10000000 wei (0.01 gwei); `seq-a` Ethereum spend so far plus 0.00015 ETH at most 0.0003 ETH, and its balance at least 0.0002 ETH (a top-up as in Step 3 only within the 0.0005 ETH cap, and only if the spend bound still holds). Otherwise skip the live 512 x 16 run, say so in the report (Task 9 Step 5 covers it on anvil), and go to Step 9. With a go, show the owner the numbers and that the run occupies the production prover for about an hour, and wait for an explicit "run l1_big live". (Owner decision: run it whenever the fee gates pass; skip only on fees, and say so in the report.)
 
 - [ ] **Step 7: The live run (about 60 minutes, 10 of them the 600 s grace)**
 
 ```bash
 DAVINCI_E2E_L1_BIG=1 systemd-run --user --scope -p MemoryMax=16G -- \
   cargo test -p davinci-e2e --test l1_big -- --nocapture 2>&1 | redact > ~/.cache/davinci-e2e/l1-big-live.log
-grep -E "pins ok|L1-blob mode|node at|s grace|ballots proved|transitions|after the end|nine blobs|results on-chain|PASSED|FAILED|test result" ~/.cache/davinci-e2e/l1-big-live.log
+grep -E "pins ok|L1-blob mode|node at|s grace|ballots proved|transitions|phase 1|after the end|nine blobs|results on-chain|PASSED|FAILED|test result" ~/.cache/davinci-e2e/l1-big-live.log
 ```
 
-Expected: `chain 10 registry 0x<B> ... (pins ok)`, the L1-blob line of Step 4, then the lines of Task 9 Step 5 without `recorded job` (`DAVINCI_E2E_RECORD_DIR` is unset): `first 512 votes settled in <k> transitions`, `512 x 16 settled <s> s after the end` (under 600), `nine blobs in Ethereum blocks [<a>, <b>] (2 transactions), OP tx 0x...`, `results on-chain = tally`, `PASSED`, `test l1_big ... ok`. The same stop rule as Step 4 applies (0.00015 ETH below the balance at Step 6). On failure the test cancels its open process; keep the work directory and debug as in Task 9 Step 3.
+Expected: `chain 10 registry 0x<B> ... (pins ok)`, the L1-blob line of Step 4, then the lines of Task 9 Step 5 without `recorded job` (`DAVINCI_E2E_RECORD_DIR` is unset): `first 512 votes settled in <k> transitions`, `phase 1: <p> s per vote ...`, `512 x 16 settled <s> s after the end` (under 600), `nine blobs in Ethereum blocks [<a>, <b>] (2 transactions), OP tx 0x...`, `results on-chain = tally`, `PASSED`, `test l1_big ... ok`. The same stop rule as Step 4 applies (0.00015 ETH below the balance at Step 6). On failure the test cancels its open process; keep the work directory and debug as in Task 9 Step 3.
 
 - [ ] **Step 8: Secrets and spend after the live 512 x 16 run**
 
-Step 5's commands again. Expected: `0`, `0`; `seq-a` Ethereum spend for both runs together at most 0.0003 ETH.
+Step 5's commands again (the scanner over `~/.cache/davinci-e2e`). Expected: `<n> files, 0 with a secret`; `seq-a` Ethereum spend for both runs together at most 0.0003 ETH.
 
 - [ ] **Step 9: Report figures**
 
@@ -4973,6 +5150,8 @@ git push -u origin feat/op-core
 cat > ~/.cache/op-core/pr-contracts.md <<'EOF'
 L1-blob mode for OP Stack chains and the OP Mainnet registry of the davinci-zkvm v0.2.0 release.
 
+Review: this repository's `main` requires a code-owner review; the merge (by rebase, with `--admin`) relied on the final Fable 5.1 audit of the whole release as its review.
+
 - `submitStateTransitionL1` and `L1BlobVerifier`: a transition's blobs live in one or several Ethereum blob transactions, proven against OP's L1 origin (`L1Block`) or a recorded one.
 - The OP Mainnet registry on the v0.2.0 program vks with grace 300/240/600/1800/60 s (`deployments/10.json`); the first OP registry is retired (`deployments/10-0x8b63.json`).
 - Deployment: `L1_BLOB_VERIFIER` / `L1_BLOCK`; `verify_deployment.py --grace` (`EXPECT_GRACE`); compose and docs on the v0.2.0 vks; bindings regenerated with abigen v1.17.8.
@@ -4996,10 +5175,9 @@ Expected: every check passes; the bindings run `success` (or none: no `.sol` cha
 
 - [ ] **Step 4: Merge davinci-contracts (owner checkpoint 6)**
 
-`main` requires one approving code-owner review. Either another code owner approves and the owner runs the first command, or the owner, as admin, bypasses the review with the second:
+`main` requires one approving code-owner review. The owner decided to bypass it as admin, once CI is green and Step 1's final Fable audit has approved; the PR body (Step 3) says so:
 
 ```bash
-gh pr merge feat/op-core -R vocdoni/davinci-contracts --rebase
 gh pr merge feat/op-core -R vocdoni/davinci-contracts --rebase --admin
 ```
 
@@ -5087,7 +5265,7 @@ SEQUENCER = f"""OP Mainnet, and Gnosis retired. The node settles on OP Mainnet w
 
 - **Nodes that follow `latest` move to OP Mainnet.** A signing node also needs `DAVINCI_L1_PRIVKEY_FILE` (and Ether on Ethereum for its blob posts), or it refuses to boot. A node that must stay on Gnosis pins `ghcr.io/vocdoni/davinci-sequencer:v0.5.0` and a v0.1 prover.
 - The new registry opens `<datadir>/10-{reg.lower()}`; other databases are left alone.
-- `docker-compose.yml` mounts the Ethereum key as a second secret (`SEQUENCER_L1_KEY_FILE`, default `./sequencer-l1.key`).
+- `docker-compose.yml` mounts the Ethereum key as a second secret (`SEQUENCER_L1_KEY_FILE`, default `./sequencer-l1.key`) and sets `DAVINCI_L1_PRIVKEY_FILE` itself. **Compose nodes must create `sequencer-l1.key` before the image moves** (`sudo install -o 10001 -m 0400 /dev/null sequencer-l1.key` for an observer; the funded Ethereum key for a signing node), or compose will not start the service. An empty file is no key: an observer runs, a signing node refuses to boot.
 
 **Full Changelog**: https://github.com/vocdoni/davinci-sequencer/compare/v0.5.0...v0.6.0
 """
@@ -5125,7 +5303,7 @@ git commit -m "chore(release): workspace version 0.6.0" -m "OP Mainnet in L1-blo
 transition, davinci-zkvm v0.2.0, and Gnosis retired."
 ```
 
-Expected: no warnings; no failed suite and `exit 0`; `test result: ok. 4 passed`; two commits.
+Expected: no warnings; no failed suite and `exit 0`; `test result: ok. 14 passed` (the file runs every test without a filter: 13 today plus Task 4's); two commits.
 
 - [ ] **Step 7: Push davinci-sequencer `feat/op-core` and open the pull request (owner checkpoint 8)**
 
@@ -5223,18 +5401,17 @@ echo "seq-a OP $SEQ_A_OP $("$CAST" balance "$SEQ_A_OP" --ether --rpc-url "$OP_PU
 stat -c '%a %u %n' "$KEYS/seq-a.op.key" "$KEYS/seq-a.l1.key"
 ```
 
-Expected: a digest; no `davinci-sequencer*` container; `"status":"ok"`; the two nonces equal (no blob post of the test runs still pending); `600 1001` for both keys (the container runs as `1001:1001`). The Ethereum balance funds production posts (about 0.00002 ETH a post at 0.5 gwei): below 0.0005 ETH, tell the owner before Step 3 (a top-up for production is the owner's call, outside this plan's caps).
+Expected: a digest; no `davinci-sequencer*` container; `"status":"ok"`; the two nonces equal (no blob post of the test runs still pending); `600 1001` for both keys (the container runs as `1001:1001`). The Ethereum balance funds production posts (about 0.00002 ETH a post at 0.5 gwei): below 0.0005 ETH, tell the owner before Step 3; the owner decided there is no production top-up (`seq-a` keeps what is left), so a low balance is reported, not fixed.
 
 - [ ] **Step 2: The owner's decisions (owner checkpoint 13)**
 
-Ask for and record: (a) the image and update policy, either `ghcr.io/vocdoni/davinci-sequencer:v0.6.0` without the watchtower label (upgrades by hand; recommended for the first OP release) or `:latest` with `--label com.centurylinklabs.watchtower.enable=true` (follows releases, as the Gnosis node did); (b) the go for the switch, accepting the outage of `sequencer2.davinci.vote`'s Gnosis beta. Wait for an explicit "switch".
+Decided by the owner: the image is `ghcr.io/vocdoni/davinci-sequencer:latest` **with** `--label com.centurylinklabs.watchtower.enable=true`, so the node follows releases automatically, as the Gnosis node did; every later release reaches production within the watchtower interval. Operator caution: a release that changes required configuration (a new mandatory key or variable, as v0.6.0's `DAVINCI_L1_PRIVKEY_FILE` was) must ship with upgrade notes before its tag, because the tag is what moves the node. Still to ask: the go for the switch, accepting the outage of `sequencer2.davinci.vote`'s Gnosis beta. Wait for an explicit "switch".
 
 - [ ] **Step 3: Start the OP node**
 
 ```bash
 mkdir -p ~/.davinci-op/data && chmod 700 ~/.davinci-op ~/.davinci-op/data
-IMAGE=ghcr.io/vocdoni/davinci-sequencer:v0.6.0       # or :latest, as decided in Step 2
-WT_LABEL=()                                           # or WT_LABEL=(--label com.centurylinklabs.watchtower.enable=true)
+IMAGE=ghcr.io/vocdoni/davinci-sequencer:latest       # the owner's choice (Step 2): follows releases
 docker pull "$IMAGE"
 docker run -d --name davinci-sequencer-op --restart unless-stopped --user 1001:1001 \
   -p 127.0.0.1:9090:9090 -p 10.200.0.26:9090:9090 \
@@ -5245,10 +5422,11 @@ docker run -d --name davinci-sequencer-op --restart unless-stopped --user 1001:1
   -e DAVINCI_PRIVKEY_FILE=/run/secrets/sequencer_key \
   -e DAVINCI_L1_PRIVKEY_FILE=/run/secrets/sequencer_l1_key \
   -e DAVINCI_PROVER_URL=http://10.200.0.26:8080 \
-  "${WT_LABEL[@]}" "$IMAGE"
+  -e DAVINCI_RPC_URL=$OP_PRIVATE_RPC,https://optimism-rpc.publicnode.com,https://mainnet.optimism.io \
+  --label com.centurylinklabs.watchtower.enable=true "$IMAGE"
 ```
 
-The node uses the preset's public OP and Ethereum endpoints, so no secret URL enters the container's environment (a private OP RPC can be added later as `DAVINCI_RPC_URL`, by the owner).
+`DAVINCI_RPC_URL` lists the owner-provided endpoint first, then the `optimism` preset's two public ones (the committed preset is not changed); the Ethereum endpoints are the preset's. The URL is in `docker inspect`, so the saved inspect file stays mode 600.
 
 - [ ] **Step 4: Boot checks**
 
@@ -5270,15 +5448,17 @@ docker inspect davinci-sequencer-op > $TMPDIR/op-inspect.json; docker logs davin
 python3 -I - "$KEYS/seq-a.op.key" "$KEYS/seq-a.l1.key" "$HOME/optimism-privkey.txt" "$HOME/optimism-rpcs.txt" $TMPDIR/op-inspect.json $TMPDIR/op-logs.txt <<'EOF'
 import sys
 keys = [open(p).read().strip().lower().removeprefix("0x") for p in sys.argv[1:4]]
-rpc = open(sys.argv[4]).readline().strip()
+# The three endpoints of the container's DAVINCI_RPC_URL are expected in the inspect; any other listed one is a leak.
+ok = ("$OP_PRIVATE_RPC", "https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io")
+rpcs = [l.strip() for l in open(sys.argv[4]) if l.strip() and l.strip() not in ok]
 for f in sys.argv[5:]:
     t = open(f, errors="replace").read()
-    print(f.rsplit("/", 1)[1], "key" if any(k in t.lower() for k in keys) else "no key", "rpc" if rpc and rpc in t else "no rpc")
+    print(f.rsplit("/", 1)[1], "key" if any(k in t.lower() for k in keys) else "no key", "rpc" if any(r in t for r in rpcs) else "no rpc")
 EOF
 install -m 600 $TMPDIR/op-inspect.json ~/.davinci-op/container-inspect-v0.6.0.json && rm $TMPDIR/op-inspect.json $TMPDIR/op-logs.txt
 ```
 
-Expected: `op-inspect.json no key no rpc`, `op-logs.txt no key no rpc`.
+Expected: `op-inspect.json no key no rpc`, `op-logs.txt no key no rpc` (the three `DAVINCI_RPC_URL` endpoints are in the inspect by design and are not counted).
 
 - [ ] **Step 6: A small live election through the production node**
 
@@ -5302,15 +5482,17 @@ Expected (about 10 to 15 minutes, most of it the 300 s default grace): `process 
 curl -s https://sequencer2.davinci.vote/info; echo
 ```
 
-Expected: the same `/info` as Step 4 if `sequencer2.davinci.vote` routes to this host's `10.200.0.26:9090`; anything else is reported to the owner as is (the route is theirs).
+Expected: the same `/info` as Step 4: the owner confirmed `sequencer2.davinci.vote` routes to this host (`10.200.0.26:9090`), so the public endpoint is checked after the switch. Anything else is reported to the owner as is.
 
 - [ ] **Step 8: Report**
 
-Container name, image and update policy, datadir, the boot lines, the smoke election's process id and times, the spend of Steps 1-6, and the reminder that `seq-a`'s keys now belong to production.
+Container name, image and update policy (`:latest` with the watchtower label: it follows releases), datadir, the boot lines, the smoke election's process id and times, the spend of Steps 1-6, and the reminder that `seq-a`'s keys now belong to production.
 
 ---
 
 ## Owner checkpoints
+
+**Decisions already taken by the owner (resolved, no open questions remain):** production OP node on `ghcr.io/vocdoni/davinci-sequencer:latest` with the watchtower label (it follows releases; a release that changes required configuration must ship with upgrade notes before its tag); production `DAVINCI_RPC_URL=$OP_PRIVATE_RPC,https://optimism-rpc.publicnode.com,https://mainnet.optimism.io` (the committed preset unchanged); the contracts PR merged with `gh pr merge --rebase --admin` after green CI and the final Fable audit (the PR body says the merge relied on it); spending caps as stated, `seq-a` keeps what is left for production (no production top-up); the blob-mode GPU e2e is rerun (Task 9 Step 4); `sequencer2.davinci.vote` routes to this host and Task 14 checks it; the live 512 x 16 runs whenever the fee gates pass (skipped only on fees, said so in the report); `l1_big` keeps the 600 s ceiling grace and prints its measured seconds per vote after phase 1; the controller tells the owner before each hour-long GPU run (Tasks 9 and 12).
 
 In order; each needs the owner's explicit yes on the command shown, and nothing proceeds past one without it.
 
@@ -5319,16 +5501,16 @@ In order; each needs the owner's explicit yes on the command shown, and nothing 
 3. **Run `op_live`** (Task 12 Step 3): about 0.00004 to 0.0001 ETH of blob posts, organizer transactions on OP; fee and balance go/no-go first.
 4. **Run the live 512 x 16 transition** (Task 12 Step 6): at most about 0.00015 ETH of blob posts; skipped if fees or the 0.0003 ETH total for `seq-a.l1` do not allow it.
 5. **Push davinci-contracts `feat/op-core` and open its PR** (Task 13 Step 3), after the final audit.
-6. **Merge the davinci-contracts PR by rebase** (Task 13 Step 4), with a code owner's approval or the owner's admin bypass.
+6. **Merge the davinci-contracts PR by rebase with `--admin`** (Task 13 Step 4), after CI is green and the final Fable audit passes (resolved: the owner chose the admin bypass; the PR body says the merge relied on that audit).
 7. **Release davinci-contracts v0.0.51** (Task 13 Step 5): push `main` to `release` (the bot bumps and tags), fast-forward `main` to the bump commit, replace the generated release notes.
 8. **Push davinci-sequencer `feat/op-core` with `CONTRACTS_REF: v0.0.51` and version 0.6.0, and open its PR** (Task 13 Steps 6-7).
 9. **Merge the davinci-sequencer PR by rebase** (Task 13 Step 8).
 10. **Push davinci-zkvm `main`** with the fixture commit (Task 13 Step 9; `:main` image only).
 11. **Remove `davinci-sequencer-1`** (Task 13 Step 10), before the tag: its inspect saved, keys and data kept.
 12. **Tag and push davinci-sequencer v0.6.0, publish its release** (Task 13 Step 11): moves `ghcr.io/vocdoni/davinci-sequencer:latest`.
-13. **Switch production** (Task 14 Step 2): the image and watchtower policy, the go for the outage; then the start and the small live election (organizer and `seq-a` spend, well under 0.0001 ETH each).
+13. **Switch production** (Task 14 Step 2): the go for the outage (the image is decided: `:latest` with the watchtower label); then the start and the small live election (organizer and `seq-a` spend, well under 0.0001 ETH each).
 
-The GPU runs of Tasks 9 and 12 use the shared production prover; they need no confirmation while the Gnosis node is stopped and the queue is empty, and stop for the owner otherwise.
+The GPU runs of Tasks 9 and 12 use the shared production prover; they need no confirmation while the Gnosis node is stopped and the queue is empty, but the controller tells the owner before each hour-long run (Task 9 Steps 3-5, Task 12 Steps 4 and 7) and stops for the owner otherwise.
 
 ## Self-review
 
@@ -5351,4 +5533,4 @@ The GPU runs of Tasks 9 and 12 use the shared production prover; they need no co
 **Consistency.** `select_batch_within(pending, max_voters, must_include, max_votes, max_blobs)` (Task 1) is what Task 3's actor calls; `L1Da::new(l1, db, fee_cap, poll, chunk)`, `chunks`, `Posting { posts, error, recorded }`, `post_chunks` (Task 2) are what `settle`, the boot (Task 3) and the tests use; `choose_anchor(oldest, newest, head, origin, recorded)` has five arguments in `settle.rs`, `l1da.rs` and `web3_anvil.rs`; `POST_TIME`, `batch_blob_cap`, `chunks_fit` (Task 3) are the names the actor, the boot log and the docs use; `grace_args` and the `DAVINCI_E2E_GRACE`, `DAVINCI_E2E_L1_BIG`, `DAVINCI_E2E_RECORD_DIR`, `DAVINCI_E2E_NODE_URL` variables (Task 6) are what Tasks 9, 12 and 14 set; the `recorded job` line format (Task 6) is what `wire_fixture.py` parses.
 
 
-**Checked while writing (scratch clones under `~/.cache`, real trees untouched).** Tasks 1-8 applied in order to clones of both branches: `davinci-state` 22 transition tests, `l1da` 32 and `actor_l1` 16 sequencer tests, the workspace suites, `ANVIL=1 web3_anvil` (4 passed, including the two-transaction settlement), the nine-blob `ZISKEMU=1` dry run (275 s cold), forge 370 tests (worst-case proof 47,168 bytes, 3,491,169 gas), the Go vector generator's checksums, `verify_deployment.py --grace` on a local deployment, `build_all.sh` with abigen v1.17.8, the Gnosis retirement and docs scripts reproducing the scratch commits, `fill_op_core.py` on a made-up record, `wire_fixture.py` on a clone of davinci-zkvm (it fails only at the restored assertion with the v0.1 fixture), `changelog_v0051.py` and `notes.py` on the retired record, the CI pin `sed`, the workspace version bump (`cargo update --workspace --offline`: five crates), the `davinci-client` `networks` and `davinci-sequencer` `config` unit tests, and a read-only `verify_deployment.py` of the retired OP registry against this branch's build (19 OK, 0 FAIL). Not checked: anything that needs the GPU prover, a transaction on OP or Ethereum, a push, or a container change (Tasks 9-14).
+**Checked while writing (scratch clones under `~/.cache`, real trees untouched).** Tasks 1-8 applied in order to clones of both branches: `davinci-state` 22 transition tests, `l1da` 32 and `actor_l1` 16 sequencer tests, the workspace suites, `ANVIL=1 web3_anvil` (filtered to `l1_blob_mode`: 4 passed, including the two-transaction settlement), the nine-blob `ZISKEMU=1` dry run (275 s cold), forge 370 tests (worst-case proof 47,168 bytes, 3,491,169 gas), the Go vector generator's checksums, `verify_deployment.py --grace` on a local deployment, `build_all.sh` with abigen v1.17.8, the Gnosis retirement and docs scripts reproducing the scratch commits, `fill_op_core.py` on a made-up record, `wire_fixture.py` on a clone of davinci-zkvm (it fails only at the restored assertion with the v0.1 fixture), `changelog_v0051.py` and `notes.py` on the retired record, the CI pin `sed`, the workspace version bump (`cargo update --workspace --offline`: five crates), the `davinci-client` `networks` and `davinci-sequencer` `config` unit tests, and a read-only `verify_deployment.py` of the retired OP registry against this branch's build (19 OK, 0 FAIL). Not checked: anything that needs the GPU prover, a transaction on OP or Ethereum, a push, or a container change (Tasks 9-14).
