@@ -262,14 +262,22 @@ impl Election {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Wave {
     pub n: u32,
     pub created: u64,
+    /// The scale the wave was planned at (1 live): `run` sizes the ceiling
+    /// bursts from it. Plans from before the field read as 1.
+    #[serde(default = "one")]
+    pub scale: f64,
     pub elections: Vec<Election>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+fn one() -> f64 {
+    1.0
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     pub campaign: String,
     pub chain_id: u64,
@@ -289,14 +297,34 @@ impl Plan {
     }
 
     /// Tags become path components and shard keys: reject empty, `/`, `..`
-    /// and repeats within a wave.
+    /// and repeats in any wave (the seed derivations ignore the wave, so a
+    /// repeated tag repeats the voter keys, `k` and the census).
     pub fn check_tags(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
         for w in &self.waves {
-            let mut seen = std::collections::HashSet::new();
             for e in &w.elections {
                 let t = e.spec.tag.as_str();
                 check_tag(t)?;
-                ensure!(seen.insert(t), "duplicate tag {t:?} in wave {}", w.n);
+                ensure!(seen.insert(t), "duplicate tag {t:?} (wave {})", w.n);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `specs` may go into wave `n`: valid tags, none twice, none in
+    /// another wave. A tag already in wave `n` is a rerun.
+    pub fn check_new_tags(&self, n: u32, specs: &[ElectionSpec]) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for s in specs {
+            let t = s.tag.as_str();
+            check_tag(t)?;
+            ensure!(seen.insert(t), "tag {t:?} twice in wave {n}");
+            let other = self
+                .waves
+                .iter()
+                .find(|w| w.n != n && w.elections.iter().any(|e| e.spec.tag == t));
+            if let Some(w) = other {
+                bail!("tag {t:?} is already in wave {}", w.n);
             }
         }
         Ok(())
@@ -323,6 +351,32 @@ impl Plan {
             .iter_mut()
             .find(|w| w.n == n)
             .ok_or_else(|| anyhow!("plan has no wave {n}"))
+    }
+
+    /// The scale wave `n` was planned at.
+    pub fn scale(&self, n: u32) -> Result<f64> {
+        Ok(self.wave(n)?.scale)
+    }
+
+    /// Wave `n`, added at `scale` (created at unix time `created`) when
+    /// absent. An existing wave must have been planned at `scale`.
+    pub fn open_wave(&mut self, n: u32, scale: f64, created: u64) -> Result<&mut Wave> {
+        if let Some(w) = self.waves.iter().find(|w| w.n == n) {
+            ensure!(
+                w.scale == scale,
+                "wave {n} was planned at scale {}, not {scale}",
+                w.scale
+            );
+        } else {
+            self.waves.push(Wave {
+                n,
+                created,
+                scale,
+                elections: Vec::new(),
+            });
+            self.waves.sort_by_key(|w| w.n);
+        }
+        self.wave_mut(n)
     }
 
     /// A plan with locally generated election keys and no chain, for tests
@@ -362,6 +416,7 @@ impl Plan {
             waves: vec![Wave {
                 n,
                 created: 0,
+                scale: 1.0,
                 elections,
             }],
         };
@@ -410,17 +465,20 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Creates the elections of wave `n` the plan does not hold yet and appends
-/// each to `plan.json` as soon as it exists (a rerun skips it). Origin-3
-/// specs are skipped unless `onchain_census`. Every election gets
-/// `spec.max_voters()`, the key of its key node, and waits until A and B
-/// serve it.
+/// Creates the elections of wave `n` the plan does not hold yet and
+/// records each in `plan.json` as soon as it exists. A process an earlier,
+/// crashed or interrupted call created but never recorded is adopted rather
+/// than created again. Origin-3 specs are skipped unless `onchain_census`.
+/// Every election gets `spec.max_voters()`, its grace, the key of its key
+/// node, and waits until A and B serve it.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_wave(
     net: &Net,
     rig: &Rig,
     campaign: &Path,
     seed: &Seed,
     n: u32,
+    scale: f64,
     specs: &[ElectionSpec],
     onchain_census: bool,
 ) -> Result<()> {
@@ -436,8 +494,8 @@ pub async fn create_wave(
     let org = net.organizer()?;
     let grace = org.grace_params().await.context("registry grace")?;
     // Fail before creating anything.
+    plan.check_new_tags(n, specs)?;
     for s in specs {
-        check_tag(&s.tag)?;
         ensure!(s.voters > 0, "{}: no voters", s.tag);
         ensure!(
             s.grace == grace.default_grace
@@ -449,20 +507,23 @@ pub async fn create_wave(
             grace.grace_ceil
         );
     }
+    plan.open_wave(n, scale, unix_now())?;
+    plan.save(campaign)?;
     let census = campaign.join("census");
     std::fs::create_dir_all(&census)?;
     let reader = RegistryReader::connect(&net.rpc, net.registry)?;
-    if plan.wave(n).is_err() {
-        plan.waves.push(Wave {
-            n,
-            created: unix_now(),
-            elections: Vec::new(),
-        });
-        plan.waves.sort_by_key(|w| w.n);
-        plan.save(campaign)?;
-    }
+    let c = Creator {
+        net,
+        rig,
+        org: &org,
+        reader: &reader,
+    };
+    let mut orphans = orphans(&plan, &c).await?;
     for s in specs {
-        if plan.wave(n)?.elections.iter().any(|e| e.spec.tag == s.tag) {
+        let planned = plan.wave(n)?.elections.iter().find(|e| e.spec.tag == s.tag);
+        if let Some(e) = planned.cloned() {
+            ensure!(e.spec == *s, "{}: plan.json holds another spec", s.tag);
+            ensure_grace(&c, &e).await?;
             println!("election {} already planned", s.tag);
             continue;
         }
@@ -473,26 +534,29 @@ pub async fn create_wave(
             );
             continue;
         }
-        let ctx = Creator {
-            net,
-            rig,
-            org: &org,
-            reader: &reader,
-            census: &census,
-            default_grace: grace.default_grace,
-        };
-        let e = create_election(&ctx, seed, n, s)
+        let d = draft(&census, seed, n, s).with_context(|| format!("election {}", s.tag))?;
+        let adopted = adopt(&c, &d, &mut orphans)
             .await
             .with_context(|| format!("election {}", s.tag))?;
+        let (e, how) = match adopted {
+            Some(e) => (e, " (adopted)"),
+            None => (
+                create(&c, d)
+                    .await
+                    .with_context(|| format!("election {}", s.tag))?,
+                "",
+            ),
+        };
         println!(
-            "election {} {} nf {} origin {} key {}",
+            "election {} {} nf {} origin {} key {}{how}",
             s.tag, e.snap.pid, s.nf, s.origin, s.key_node
         );
-        // Recorded before the wait: the process exists, and `run` waits for
-        // the nodes again.
+        // Recorded first: the process exists. A rerun repairs the grace, and
+        // `run` waits for the nodes again.
         plan.wave_mut(n)?.elections.push(e.clone());
         plan.check_tags()?;
         plan.save(campaign)?;
+        ensure_grace(&c, &e).await?;
         wait_served(rig, &e, seed).await?;
     }
     Ok(())
@@ -504,28 +568,30 @@ struct Creator<'a> {
     rig: &'a Rig,
     org: &'a Organizer,
     reader: &'a RegistryReader,
-    /// The nodes' `--census-dir`.
-    census: &'a Path,
-    default_grace: u32,
 }
 
-/// One election: its census, metadata, the key node's key, `newProcess`
-/// and, when it differs from the registry's default, its grace. The
-/// snapshot is the registry's, checked against what was asked for.
-async fn create_election(
-    c: &Creator<'_>,
-    seed: &Seed,
-    n: u32,
-    s: &ElectionSpec,
-) -> Result<Election> {
-    let Creator {
-        net,
-        rig,
-        org,
-        reader,
-        census,
-        default_grace,
-    } = *c;
+/// What an election's process must carry, worked out before it exists.
+struct Draft {
+    /// The snapshot lacks the pid and the key; the census URI of origin 3
+    /// comes with its contract.
+    e: Election,
+    root: Fr,
+    /// `(address, weight)` of every voter, in voter order.
+    parts: Vec<([u8; 20], u128)>,
+    metadata: String,
+    metadata_hash: [u8; 32],
+}
+
+/// The metadata title of an election: its hash finds the election's process
+/// again if `plan.json` never recorded it.
+fn metadata_title(n: u32, tag: &str) -> String {
+    format!("davinci-bench wave {n} {tag}")
+}
+
+/// The census root `gen` proves against (for a CSP, the wave's CSP key),
+/// the census file of origin 1 and the metadata, written to `census` (the
+/// nodes' `--census-dir`).
+fn draft(census: &Path, seed: &Seed, n: u32, s: &ElectionSpec) -> Result<Draft> {
     let mut e = Election {
         spec: s.clone(),
         census_uri: String::new(),
@@ -538,7 +604,6 @@ async fn create_election(
             census_root: String::new(),
         },
     };
-    // The root `gen` proves against; for a CSP, the wave's CSP key.
     let root = census_root(&e, seed, n)?;
     let parts: Vec<([u8; 20], u128)> = (0..s.voters)
         .map(|v| {
@@ -554,66 +619,196 @@ async fn create_election(
             ensure!(merkle_census(&file)?.root() == root, "census file root");
             e.census_uri = fx::write_census(census, &format!("w{n}-{}.json", s.tag), &file)?;
         }
-        3 => {
-            let c = Census::deploy(net.census_provider(org)?, &census_dir()).await?;
-            for chunk in parts.chunks(MEMBER_CHUNK) {
-                c.add_members(chunk).await?;
-            }
-            ensure!(
-                c.root().await? == root && c.size().await? == u64::from(s.voters),
-                "census contract {} does not hold the planned voters",
-                c.address
-            );
-            e.census_uri = format!("onchain://{}", c.address);
-            e.census_contract = Some(c.address);
-        }
+        3 => {}
         4 => e.census_uri = "csp://davinci-bench".into(),
         o => bail!("census origin {o} is not supported"),
     }
     let (metadata, metadata_hash) = fx::write_metadata(
         census,
         &format!("w{n}-{}-metadata.json", s.tag),
-        &format!("davinci-bench wave {n} {}", s.tag),
+        &metadata_title(n, &s.tag),
     )?;
-    let next = org.next_process_id().await?;
-    let pk = election_key(rig, s.key_node, &next).await?;
-    let pid = org
+    Ok(Draft {
+        e,
+        root,
+        parts,
+        metadata,
+        metadata_hash,
+    })
+}
+
+impl Draft {
+    /// Whether `p` is this election with key `pk`: the snapshot, max
+    /// voters, metadata and census URI asked for. The registry's snapshot.
+    fn check(&self, p: &OnchainProcess, pk: &Point) -> Result<ProcSnap> {
+        let want = ProcSnap {
+            pid: ProcessId(p.id),
+            encryption_key: hex::encode(pk.compress()),
+            census_root: fr_to_dec(&self.root),
+            ..self.e.snap.clone()
+        };
+        let got = ProcSnap::of(p);
+        ensure!(got == want, "snapshot (key, mode, origin or root) differs");
+        let max = u64::from(self.e.spec.max_voters());
+        ensure!(p.max_voters == max, "maxVoters {}, not {max}", p.max_voters);
+        ensure!(
+            p.metadata_hash == self.metadata_hash,
+            "metadata hash differs"
+        );
+        ensure!(
+            self.e.spec.origin == 3 || p.census_uri == self.e.census_uri,
+            "census URI differs"
+        );
+        Ok(got)
+    }
+}
+
+/// The organizer's processes since the plan's start block that `plan.json`
+/// does not hold, as the registry has them.
+async fn orphans(plan: &Plan, c: &Creator<'_>) -> Result<Vec<OnchainProcess>> {
+    let planned: std::collections::HashSet<ProcessId> = plan
+        .waves
+        .iter()
+        .flat_map(|w| w.elections.iter().map(|e| e.snap.pid))
+        .collect();
+    let mut out = Vec::new();
+    let all = cancel_candidates(plan, &c.net.rpc, c.org.address(), CancelScope::All).await?;
+    for pid in all.into_iter().filter(|p| !planned.contains(p)) {
+        out.push(c.reader.process(&pid.0).await?);
+    }
+    Ok(out)
+}
+
+/// Orphans that may be an election's unrecorded process: READY, with the
+/// election's metadata hash (its wave and tag). Never a canceled one.
+pub fn orphans_matching<'a>(
+    cands: &'a [OnchainProcess],
+    metadata_hash: &[u8; 32],
+) -> Vec<&'a OnchainProcess> {
+    cands
+        .iter()
+        .filter(|p| p.status == ProcessStatus::Ready && p.metadata_hash == *metadata_hash)
+        .collect()
+}
+
+/// The first orphan that passes `d`'s full check, with the key node's key
+/// for its id (a key is a function of the id), taken out of `orphans`.
+async fn adopt(
+    c: &Creator<'_>,
+    d: &Draft,
+    orphans: &mut Vec<OnchainProcess>,
+) -> Result<Option<Election>> {
+    let s = &d.e.spec;
+    let ids: Vec<[u8; 31]> = orphans_matching(orphans, &d.metadata_hash)
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    for id in ids {
+        let Some(i) = orphans.iter().position(|p| p.id == id) else {
+            continue;
+        };
+        let pk = election_key(c.rig, s.key_node, &id).await?;
+        match d.check(&orphans[i], &pk) {
+            Ok(snap) => {
+                let p = orphans.remove(i);
+                fx::check_metadata(&p)?;
+                let mut e = d.e.clone();
+                e.snap = snap;
+                e.census_uri = p.census_uri;
+                e.census_contract =
+                    (p.census_origin == 3).then(|| Address::from(p.census_contract));
+                return Ok(Some(e));
+            }
+            Err(why) => println!(
+                "process {} has the metadata of {} but is not it ({why:#}); left alone",
+                ProcessId(id),
+                s.tag
+            ),
+        }
+    }
+    Ok(None)
+}
+
+/// Creates `d`'s process: the census contract of origin 3, the key node's
+/// key for the next id, `newProcess`, then the check of what the registry
+/// holds.
+async fn create(c: &Creator<'_>, mut d: Draft) -> Result<Election> {
+    let s = d.e.spec.clone();
+    if s.origin == 3 {
+        let census = Census::deploy(c.net.census_provider(c.org)?, &census_dir()).await?;
+        for chunk in d.parts.chunks(MEMBER_CHUNK) {
+            census.add_members(chunk).await?;
+        }
+        ensure!(
+            census.root().await? == d.root && census.size().await? == u64::from(s.voters),
+            "census contract {} does not hold the planned voters",
+            census.address
+        );
+        d.e.census_uri = format!("onchain://{}", census.address);
+        d.e.census_contract = Some(census.address);
+    }
+    let next = c.org.next_process_id().await?;
+    let pk = election_key(c.rig, s.key_node, &next).await?;
+    let pid = c
+        .org
         .create_process(&NewProcess {
             process_id: next,
             start_time: 0,
             duration: DURATION,
             max_voters: u64::from(s.max_voters()),
-            ballot_mode: e.snap.ballot_mode,
+            ballot_mode: d.e.snap.ballot_mode,
             census_origin: s.origin,
-            census_root: root,
-            census_contract: e.census_contract.map_or([0; 20], |a| a.into_array()),
-            census_uri: e.census_uri.clone(),
-            metadata,
-            metadata_hash,
+            census_root: d.root,
+            census_contract: d.e.census_contract.map_or([0; 20], |a| a.into_array()),
+            census_uri: d.e.census_uri.clone(),
+            metadata: d.metadata.clone(),
+            metadata_hash: d.metadata_hash,
             key_mode: KeyMode::Sequencer(pk),
         })
         .await?
         .pid;
-    if s.grace != default_grace {
-        org.set_process_grace(&pid, s.grace).await?;
-    }
-    let p = reader.process(&pid).await?;
+    let p = c.reader.process(&pid).await?;
     fx::check_metadata(&p)?;
-    let want = ProcSnap {
-        pid: ProcessId(next),
-        encryption_key: hex::encode(pk.compress()),
-        census_root: fr_to_dec(&root),
-        ..e.snap
-    };
-    e.snap = ProcSnap::of(&p);
     ensure!(
-        e.snap == want
-            && p.max_voters == u64::from(s.max_voters())
-            && p.grace == u64::from(s.grace),
-        "the registry's process {} differs from the one asked for",
-        e.snap.pid
+        pid == next,
+        "created {}, not {}",
+        ProcessId(pid),
+        ProcessId(next)
     );
-    Ok(e)
+    let snap = d.check(&p, &pk).with_context(|| {
+        format!(
+            "the registry's process {} differs from the one asked for",
+            ProcessId(pid)
+        )
+    })?;
+    d.e.snap = snap;
+    Ok(d.e)
+}
+
+/// Sets the spec's grace on `e`'s process when the registry holds another
+/// and the process is still READY: a crash may have come between
+/// `newProcess` and `setProcessGrace`.
+async fn ensure_grace(c: &Creator<'_>, e: &Election) -> Result<()> {
+    let (pid, want) = (&e.snap.pid.0, u64::from(e.spec.grace));
+    let p = c.reader.process(pid).await?;
+    if p.grace == want {
+        return Ok(());
+    }
+    if p.status != ProcessStatus::Ready {
+        println!(
+            "election {}: grace {} s, not {want}, and the process is {:?}",
+            e.spec.tag, p.grace, p.status
+        );
+        return Ok(());
+    }
+    c.org.set_process_grace(pid, e.spec.grace).await?;
+    let got = c.reader.process(pid).await?.grace;
+    ensure!(
+        got == want,
+        "{}: grace {got} s after setProcessGrace",
+        e.spec.tag
+    );
+    Ok(())
 }
 
 /// The key node's election key for `pid`. A node gives at most
@@ -741,6 +936,8 @@ pub async fn cancel_open(org: &Organizer, pids: &[ProcessId]) -> Result<usize> {
 mod tests {
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
+
+    use davinci_client::organizer::metadata_hash;
 
     use super::*;
 
@@ -925,5 +1122,82 @@ mod tests {
             hex(&crate::chain::ballot_vk_hash().unwrap())
         );
         assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn plan_save_roundtrips_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = Plan::stand_in(&seed(8), 1, &[spec("A", 2, 1, 10, 1, 0)]).unwrap();
+        plan.waves[0].scale = 0.05;
+        plan.save(dir.path()).unwrap();
+        let back = Plan::load(dir.path()).unwrap();
+        assert_eq!(back, plan);
+        assert_eq!(back.scale(1).unwrap(), 0.05);
+        assert!(back.scale(2).is_err());
+        // A plan.json from before the field reads as scale 1.
+        let mut v = serde_json::to_value(&plan).unwrap();
+        v["waves"][0].as_object_mut().unwrap().remove("scale");
+        std::fs::write(dir.path().join("plan.json"), v.to_string()).unwrap();
+        assert_eq!(Plan::load(dir.path()).unwrap().scale(1).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn a_wave_keeps_its_scale() {
+        let mut plan = Plan::stand_in(&seed(8), 1, &[spec("A", 2, 1, 10, 1, 0)]).unwrap();
+        assert!(plan.open_wave(1, 1.0, 5).is_ok());
+        let e = format!("{:#}", plan.open_wave(1, 0.05, 5).unwrap_err());
+        assert!(e.contains("scale"), "{e}");
+        let w = plan.open_wave(2, 0.05, 7).unwrap();
+        assert_eq!((w.n, w.scale, w.created), (2, 0.05, 7));
+        assert_eq!(plan.waves.iter().map(|w| w.n).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn tags_are_unique_across_waves() {
+        let s = seed(9);
+        let mut plan = Plan::stand_in(&s, 1, &[spec("A", 2, 1, 3, 1, 0)]).unwrap();
+        let other = Plan::stand_in(&s, 2, &[spec("A", 2, 1, 3, 1, 0)]).unwrap();
+        // A rerun of wave 1 may name its own tags again; wave 2 may not.
+        plan.check_new_tags(1, &[spec("A", 2, 1, 3, 1, 0)]).unwrap();
+        let e = format!(
+            "{:#}",
+            plan.check_new_tags(2, &[spec("A", 2, 1, 3, 1, 0)])
+                .unwrap_err()
+        );
+        assert!(e.contains("\"A\"") && e.contains("wave 1"), "{e}");
+        let twice = [spec("B", 2, 1, 3, 1, 0), spec("B", 2, 1, 3, 1, 0)];
+        assert!(plan.check_new_tags(2, &twice).is_err());
+        plan.waves.extend(other.waves);
+        let e = format!("{:#}", plan.check_tags().unwrap_err());
+        assert!(e.contains("duplicate tag \"A\" (wave 2)"), "{e}");
+    }
+
+    #[test]
+    fn orphan_matcher_takes_the_metadata_hash() {
+        let mut rng = StdRng::seed_from_u64(10);
+        let (_, pk) = elgamal::keygen(&mut rng);
+        let snap = |b: u8| ProcSnap {
+            pid: ProcessId([b; 31]),
+            encryption_key: hex::encode(pk.compress()),
+            ballot_mode: ballot_mode_nf(2),
+            census_origin: 1,
+            census_root: "1".into(),
+        };
+        let want = metadata_hash(b"wave 1 R1");
+        let mut a = snap(1).onchain().unwrap();
+        a.metadata_hash = metadata_hash(b"wave 1 R2");
+        let mut b = snap(2).onchain().unwrap();
+        b.metadata_hash = want;
+        // Canceled by `cancel --all`: never adopted.
+        let mut c = snap(3).onchain().unwrap();
+        c.metadata_hash = want;
+        c.status = ProcessStatus::Canceled;
+        let cands = [a, b, c];
+        let got: Vec<_> = orphans_matching(&cands, &want)
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(got, [[2; 31]]);
+        assert!(orphans_matching(&cands, &[0; 32]).is_empty());
     }
 }

@@ -171,6 +171,13 @@ mod tests {
                 assert_ne!(p[0].key_node, p[1].key_node, "{} {}", p[0].tag, p[1].tag);
             }
         }
+        // The seed derivations ignore the wave: a tag must not repeat in any
+        // wave.
+        for scale in [1.0, 0.02] {
+            let all: Vec<_> = (1..=3).flat_map(|n| wave_specs(n, scale)).collect();
+            let tags: HashSet<_> = all.iter().map(|s| s.tag.as_str()).collect();
+            assert_eq!(tags.len(), all.len(), "tags repeat across waves at {scale}");
+        }
         let total: usize = wave_specs(1, 1.0).iter().map(|s| ballots(s, &seed())).sum();
         assert!(
             (42_000..=46_000).contains(&total),
