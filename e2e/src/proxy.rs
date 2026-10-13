@@ -26,6 +26,17 @@ pub struct Exchange<'a> {
     pub response: &'a [u8],
 }
 
+/// The URL a request for `path` (with its query) is forwarded to: `base` may
+/// carry a path of its own (`https://h/optimism`), which a root request keeps.
+pub fn target(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if path == "/" {
+        base.to_string()
+    } else {
+        format!("{base}{path}")
+    }
+}
+
 /// Called with every exchange after its response went back to the client.
 pub type Tap = Arc<dyn Fn(&Exchange<'_>) + Send + Sync>;
 
@@ -166,7 +177,7 @@ async fn serve(
     }
     body.truncate(len);
 
-    let mut req = client.request(method.parse()?, format!("{base}{path}"));
+    let mut req = client.request(method.parse()?, target(base, path));
     for (k, v) in headers {
         req = req.header(k, v);
     }
@@ -278,6 +289,28 @@ mod tests {
         back.await?;
         let r = c.get(format!("{}/x", p.url)).send().await?;
         assert_eq!(r.text().await?, "GET /x HTTP/1.1|");
+        Ok(())
+    }
+
+    #[test]
+    fn target_keeps_a_path_upstream() {
+        assert_eq!(target("https://h/optimism", "/"), "https://h/optimism");
+        assert_eq!(
+            target("https://h", "/eth/v1/beacon/blobs/1?x=y"),
+            "https://h/eth/v1/beacon/blobs/1?x=y"
+        );
+        assert_eq!(target("http://h:8080/", "/prove"), "http://h:8080/prove");
+    }
+
+    #[tokio::test]
+    async fn forwards_root_to_a_path_upstream() -> Result<()> {
+        let p = Proxy::start(&format!("{}/optimism", echo().await?)).await?;
+        let r = reqwest::Client::new()
+            .post(format!("{}/", p.url))
+            .body("{}")
+            .send()
+            .await?;
+        assert_eq!(r.text().await?, "POST /optimism HTTP/1.1|{}");
         Ok(())
     }
 

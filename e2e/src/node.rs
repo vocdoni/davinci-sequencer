@@ -133,6 +133,8 @@ pub struct NodeConfig {
     /// `DAVINCI_L1_SETTLE_LAG`: the Ethereum leg the node reserves; `None`
     /// keeps the node's default (Ethereum mainnet timing).
     pub l1_settle_lag: Option<String>,
+    /// `DAVINCI_MIN_MIX`: votes that seal a batch; `None` keeps the default.
+    pub min_mix: Option<u32>,
 }
 
 impl NodeConfig {
@@ -176,6 +178,7 @@ impl NodeConfig {
             l1_privkey_file: None,
             l1_max_post_fee: None,
             l1_settle_lag: None,
+            min_mix: None,
         }
     }
 }
@@ -248,6 +251,7 @@ impl Node {
             ("DAVINCI_L1_SEND_RPC_URL", cfg.l1_send_rpc_url.clone()),
             ("DAVINCI_L1_MAX_POST_FEE", cfg.l1_max_post_fee.clone()),
             ("DAVINCI_L1_SETTLE_LAG", cfg.l1_settle_lag.clone()),
+            ("DAVINCI_MIN_MIX", cfg.min_mix.map(|n| n.to_string())),
         ];
         for (k, v) in knobs {
             if let Some(v) = v {
@@ -317,6 +321,24 @@ impl Node {
             }
             tokio::time::sleep(Duration::from_secs(pause)).await;
             match Node::spawn(bin, cfg, crate::chain::free_port()?).await {
+                Ok(n) => return Ok(n),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("node {} did not start", cfg.name)))
+    }
+
+    /// Starts the node on `port`, and again on the same port after the next
+    /// of [`START_PAUSES`] when it dies before answering (a fixed port is
+    /// what a proxy-wired restart needs).
+    pub async fn start_on(bin: &Path, cfg: &NodeConfig, port: u16) -> Result<Node> {
+        let mut last: Option<anyhow::Error> = None;
+        for pause in START_PAUSES {
+            if let Some(e) = &last {
+                eprintln!("{e:#}; starting it again in {pause} s");
+            }
+            tokio::time::sleep(Duration::from_secs(pause)).await;
+            match Node::spawn(bin, cfg, port).await {
                 Ok(n) => return Ok(n),
                 Err(e) => last = Some(e),
             }
