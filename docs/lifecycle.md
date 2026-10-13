@@ -118,7 +118,8 @@ Each batch:
    so on, at Ethereum's per-transaction limit (six). A 512-vote batch at 16 fields takes 9 blobs
    in two transactions, 13 in three when every vote is a revote. The account sends one
    transaction at a time; the next waits until the one before is mined. The tip is at least
-   0.001 gwei, the max fee twice the base fee plus the tip, the blob fee twice the blob base fee.
+   0.001 gwei (0.05 gwei when the endpoint fails `eth_maxPriorityFeePerGas`), the max fee twice
+   the base fee plus the tip, the blob fee twice the blob base fee.
    A transaction not mined after 3 Ethereum blocks is replaced at its nonce with every fee
    doubled. A post whose worst-case cost would pass `--l1-max-post-fee` (or that L1 refuses) is
    retried while the proof runs, waiting for cheaper fees, up to the grace end.

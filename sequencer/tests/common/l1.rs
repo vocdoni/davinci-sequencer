@@ -542,13 +542,16 @@ impl L1Chain for FakeL1 {
                     .map(|t| t.envelope.clone())
                     .collect();
                 let (_, proof) = tx_trie_proof(&envs, *idx);
-                L1TxProof {
-                    header_index: (top - n) as usize,
+                let above = top
+                    .checked_sub(*n)
+                    .ok_or_else(|| Web3Error::Rpc(format!("block {n} is above top {top}")))?;
+                Ok(L1TxProof {
+                    header_index: above as usize,
                     key: tx_key(*idx),
                     proof,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, Web3Error>>()?;
         if i.proof_fault == Some(ProofFault::BrokenChain)
             && let Some(last) = headers.last().cloned()
         {

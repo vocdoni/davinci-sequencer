@@ -38,6 +38,9 @@ pub const BLOB_TX_GAS: u64 = 21_000;
 pub const GAS_PER_BLOB: u128 = 131_072;
 /// Floor of the priority fee: 0.001 gwei.
 pub const MIN_TIP: u128 = 1_000_000;
+/// The tip offered when `eth_maxPriorityFeePerGas` fails: 0.05 gwei, so the
+/// first post is includable without a ladder of doubled replacements.
+pub const FALLBACK_TIP: u128 = 50_000_000;
 
 /// What the L1 market asks now, in wei.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,6 +218,8 @@ pub struct L1Rpc {
     blob_cap: Option<usize>,
     /// The last sidecar built (one post at a time): its replacements reuse it.
     sidecar: tokio::sync::Mutex<Option<(B256, bool, Arc<BlobTransactionSidecarVariant>)>>,
+    /// The last tip read failed: warn only when reads start failing.
+    tip_failing: AtomicBool,
 }
 
 impl std::fmt::Debug for L1Rpc {
@@ -274,6 +279,7 @@ impl L1Rpc {
             cell_proofs: AtomicBool::new(cell_proofs),
             blob_cap,
             sidecar: Default::default(),
+            tip_failing: AtomicBool::new(false),
         })
     }
 
@@ -346,12 +352,20 @@ impl L1Chain for L1Rpc {
             .await
             .map_err(rpc_err)?
             .ok_or_else(|| Web3Error::Data("no latest L1 block".into()))?;
-        // Not every endpoint serves it; the floor covers that.
-        let tip = self
-            .provider
-            .get_max_priority_fee_per_gas()
-            .await
-            .unwrap_or(0);
+        // Not every endpoint serves it.
+        let tip = match self.provider.get_max_priority_fee_per_gas().await {
+            Ok(t) => {
+                self.tip_failing.store(false, Ordering::Relaxed);
+                t
+            }
+            Err(e) => {
+                if !self.tip_failing.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error = %rpc_err(e), fallback_wei = FALLBACK_TIP,
+                        "L1 tip read failed; offering the fallback tip");
+                }
+                FALLBACK_TIP
+            }
+        };
         Ok(L1Market {
             base_fee: u128::from(b.header.base_fee_per_gas.unwrap_or(0)),
             tip,
@@ -455,7 +469,7 @@ impl L1Chain for L1Rpc {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::transports::HttpError;
@@ -566,14 +580,15 @@ mod tests {
     }
 
     // An Ethereum RPC stub on `chain`: Osaka `eth_config`, six blobs per
-    // transaction; counts `eth_sendRawTransaction`.
-    async fn stub(chain: u64) -> (Url, Arc<AtomicUsize>) {
+    // transaction, a 1 gwei base fee, `tip` wei of tip (0: the method is
+    // missing); counts `eth_sendRawTransaction`.
+    async fn stub(chain: u64, tip: Arc<AtomicU64>) -> (Url, Arc<AtomicUsize>) {
         let sends = Arc::new(AtomicUsize::new(0));
         let n = sends.clone();
         let app = axum::Router::new().route(
             "/",
             axum::routing::post(move |axum::Json(req): axum::Json<Value>| {
-                let n = n.clone();
+                let (n, tip) = (n.clone(), tip.clone());
                 async move {
                     let id = req["id"].clone();
                     let result = match req["method"].as_str().unwrap_or_default() {
@@ -584,6 +599,31 @@ mod tests {
                             n.fetch_add(1, Ordering::SeqCst);
                             json!(B256::repeat_byte(5))
                         }
+                        "eth_getBlockByNumber" => {
+                            let inner = alloy::consensus::Header {
+                                base_fee_per_gas: Some(1_000_000_000),
+                                ..Default::default()
+                            };
+                            json!(alloy::rpc::types::Block::<alloy::rpc::types::Transaction> {
+                                header: alloy::rpc::types::Header {
+                                    hash: inner.hash_slow(),
+                                    inner,
+                                    total_difficulty: None,
+                                    size: None,
+                                },
+                                uncles: vec![],
+                                transactions: Default::default(),
+                                withdrawals: None,
+                            })
+                        }
+                        "eth_blobBaseFee" => json!("0x1"),
+                        "eth_maxPriorityFeePerGas" => match tip.load(Ordering::SeqCst) {
+                            0 => {
+                                return axum::Json(json!({"jsonrpc": "2.0", "id": id,
+                                    "error": {"code": -32601, "message": "method not found"}}));
+                            }
+                            t => json!(format!("{t:#x}")),
+                        },
                         m => panic!("unexpected {m}"),
                     };
                     axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
@@ -607,8 +647,8 @@ mod tests {
 
     #[tokio::test]
     async fn blob_sends_go_to_the_send_endpoints() {
-        let (reads, read_sends) = stub(1).await;
-        let (send, sends) = stub(1).await;
+        let (reads, read_sends) = stub(1, Default::default()).await;
+        let (send, sends) = stub(1, Default::default()).await;
         let key = SecretString::new(hex::encode([0x11u8; 32]));
         let l1 = L1Rpc::connect(std::slice::from_ref(&reads), &[send], Some(&key))
             .await
@@ -644,11 +684,31 @@ mod tests {
             .unwrap();
         assert_ne!(again.hash, tx.hash);
         // Send endpoints on another chain are refused.
-        let (other, _) = stub(5).await;
+        let (other, _) = stub(5, Default::default()).await;
         assert!(
             L1Rpc::connect(&[reads], &[other], Some(&key))
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_tip_read_offers_the_fallback_tip() {
+        let tip = Arc::new(AtomicU64::new(0));
+        let (url, _) = stub(1, tip.clone()).await;
+        let l1 = L1Rpc::connect(&[url], &[], None).await.unwrap();
+        let m = l1.fees().await.unwrap();
+        assert_eq!(
+            (m.base_fee, m.tip, m.blob_base_fee),
+            (1_000_000_000, FALLBACK_TIP, 1)
+        );
+        assert!(l1.tip_failing.load(Ordering::SeqCst));
+        assert_eq!(L1Fees::offer(&m).tip, FALLBACK_TIP);
+        // A read that answers keeps its value: only MIN_TIP floors it.
+        tip.store(2, Ordering::SeqCst);
+        let m = l1.fees().await.unwrap();
+        assert_eq!(m.tip, 2);
+        assert!(!l1.tip_failing.load(Ordering::SeqCst));
+        assert_eq!(L1Fees::offer(&m).tip, MIN_TIP);
     }
 }

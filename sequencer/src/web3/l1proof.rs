@@ -281,8 +281,12 @@ pub async fn build<P: Provider>(
         if root != blk.header.transactions_root {
             return Err(L1ProofError::TxRoot(n));
         }
+        // The receipt may have moved above `top` since the caller read it.
+        let above = top
+            .checked_sub(n)
+            .ok_or_else(|| L1ProofError::Rpc(format!("block {n} is above top {top}")))?;
         txs.push(L1TxProof {
-            header_index: (top - n) as usize,
+            header_index: above as usize,
             key: tx_key(i),
             proof,
         });
@@ -353,6 +357,61 @@ mod tests {
         assert_eq!(blob_hashes(&envelope(3, 2)), None);
         assert_eq!(blob_hashes(&envelope(2, 1)), None);
         assert_eq!(blob_hashes(&[]), None);
+    }
+
+    // A transaction whose receipt reads above `top` (it moved since the
+    // caller looked) is an RPC-class error, not an underflow.
+    #[tokio::test]
+    async fn a_transaction_above_top_is_an_rpc_error() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::rpc::types::{Block, BlockTransactions};
+        use alloy::transports::mock::Asserter;
+        use serde_json::json;
+
+        let block = |n: u64| {
+            let inner = Header {
+                number: n,
+                transactions_root: alloy::trie::EMPTY_ROOT_HASH,
+                ..Default::default()
+            };
+            Block {
+                header: alloy::rpc::types::Header {
+                    hash: inner.hash_slow(),
+                    inner,
+                    total_difficulty: None,
+                    size: None,
+                },
+                uncles: vec![],
+                transactions: BlockTransactions::<alloy::rpc::types::Transaction>::Hashes(vec![]),
+                withdrawals: None,
+            }
+        };
+        let receipt = |tx: B256, n: u64| {
+            json!({
+                "transactionHash": tx, "transactionIndex": "0x0",
+                "blockHash": B256::repeat_byte(n as u8), "blockNumber": format!("{n:#x}"),
+                "from": alloy::primitives::Address::ZERO, "to": alloy::primitives::Address::ZERO,
+                "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208", "effectiveGasPrice": "0x1",
+                "logs": [], "logsBloom": format!("0x{}", "0".repeat(512)), "status": "0x1",
+                "type": "0x2", "contractAddress": null,
+            })
+        };
+        let (a, b) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        let mock = Asserter::new();
+        // Receipts in blocks 3 and 10, top 5: headers 5..3, then each block.
+        mock.push_success(&receipt(a, 3));
+        mock.push_success(&receipt(b, 10));
+        for n in [5, 4, 3, 3, 10] {
+            mock.push_success(&block(n));
+        }
+        let p = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(mock);
+        let err = build(&p, &[a, b], 5).await.unwrap_err();
+        assert!(
+            matches!(&err, L1ProofError::Rpc(m) if m.contains("above top 5")),
+            "{err:?}"
+        );
     }
 
     #[test]
