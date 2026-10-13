@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 
 use davinci_zkvm_sdk::census::{CensusWitness, csp_sign, slot_key_address, slot_key_csp};
 use davinci_zkvm_sdk::crypto::field::fr_from_be;
-use davinci_zkvm_sdk::limits::required_refresh;
+use davinci_zkvm_sdk::limits::{MAX_BLOBS, required_refresh};
 use davinci_zkvm_sdk::publics::BatchPublics;
 use davinci_zkvm_sdk::types::ProveRequest;
 use rand::SeedableRng;
@@ -440,6 +440,41 @@ fn two_blob_cap_batch_accepted() {
     assert_eq!(b.blobs.blobs.len(), 2);
     assert_eq!(b.expected.n_blobs, 2);
     assert_accepted(&b);
+}
+
+#[test]
+fn a_512_vote_steady_batch_at_sixteen_fields_in_nine_blobs_accepted() {
+    if !gated() {
+        return;
+    }
+    // Above one transaction's six blobs: an L1-blob node posts these nine
+    // in two transactions. 512 committed voters (fake proofs) make it
+    // steady: 512 new votes (cached proofs) and 512 refreshes,
+    // T = 1 + 384 + 32 * 1024 = 33,153 cells.
+    let env = env(16, 1024);
+    let mut st = new_state(&env);
+    let mut rng = StdRng::seed_from_u64(30);
+    let fields: Vec<u64> = (0..16).map(|i| i % 6).collect();
+    let first: Vec<_> = (512..1024)
+        .map(|i| fake_vote(&env, i, &fields, 900 + i as u64))
+        .collect();
+    let b = st.prepare(&first, &mut rng, &none()).unwrap();
+    st.commit(&b).unwrap();
+
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    let pending: Vec<_> = (0..512)
+        .map(|i| real_vote(&env, i, &fields, 60 + i as u64))
+        .collect();
+    let (sel, blocked) = st.select_batch(&pending, u64::MAX, &none(), 512).unwrap();
+    assert_eq!((sel.len(), blocked), (512, false));
+    let sel: Vec<VerifiedVote> = sel.into_iter().cloned().collect();
+    let b = st.prepare(&sel, &mut rng, &none()).unwrap();
+    assert_eq!(b.refresh_slots().len(), 512);
+    assert_eq!(b.blobs.blobs.len(), 9);
+    assert_eq!(b.expected.n_blobs, 9);
+    assert_eq!(b.request.kzg.as_ref().unwrap().commitments.len(), 9);
+    assert_accepted(&b);
+    assert_blob_count_bound(&b);
 }
 
 #[test]
