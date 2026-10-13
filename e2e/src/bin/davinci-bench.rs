@@ -260,6 +260,11 @@ async fn rig_up(net: &Net, campaign: &Path, a: &RigArgs) -> Result<Rig> {
         .clone()
         .try_into()
         .map_err(|_| anyhow!("--ports takes three ports"))?;
+    // Else `Rig::up` builds one, which need not be the binary `gate` hashed.
+    ensure!(
+        std::env::var_os("DAVINCI_SEQUENCER_BIN").is_some(),
+        "set DAVINCI_SEQUENCER_BIN to the gated node binary"
+    );
     ports_free(&ports)?;
     std::fs::create_dir_all(campaign.join("census"))?;
     let rig = Rig::up(
@@ -344,11 +349,13 @@ async fn open_campaign(net: &Net, dir: &Path) -> Result<Seed> {
 
 /// `plan`'s body: seed and plan, pins, the rig for the keys, then each
 /// wave's elections.
+#[allow(clippy::too_many_arguments)]
 async fn plan_waves(
     net: &Net,
     rig_slot: &mut Option<Rig>,
     campaign: &Path,
     waves: &[(u32, Vec<ElectionSpec>)],
+    scale: f64,
     onchain_census: bool,
     rig: &RigArgs,
 ) -> Result<()> {
@@ -356,7 +363,7 @@ async fn plan_waves(
     plan::write_pins(campaign)?;
     let rig = rig_slot.insert(rig_up(net, campaign, rig).await?);
     for (n, specs) in waves {
-        plan::create_wave(net, rig, campaign, &seed, *n, specs, onchain_census).await?;
+        plan::create_wave(net, rig, campaign, &seed, *n, scale, specs, onchain_census).await?;
         let p = Plan::load(campaign)?;
         println!(
             "plan.json: wave {n}, {} elections",
@@ -561,7 +568,16 @@ async fn real_main() -> Result<ExitCode> {
             let campaign = campaign_dir(&campaign)?;
             held_step(false, async |h: &mut Held| {
                 let net = h.net.insert(Net::open(&campaign).await?);
-                plan_waves(net, &mut h.rig, &campaign, &waves, onchain_census, &rig).await
+                plan_waves(
+                    net,
+                    &mut h.rig,
+                    &campaign,
+                    &waves,
+                    scale,
+                    onchain_census,
+                    &rig,
+                )
+                .await
             })
             .await?;
         }
@@ -637,13 +653,19 @@ async fn real_main() -> Result<ExitCode> {
                             .as_secs()
                     )),
             };
+            // Its anvil is new, with the same registry address: an old
+            // plan would name processes that do not exist.
+            ensure!(
+                !campaign.join("plan.json").exists(),
+                "dry needs a fresh campaign dir"
+            );
             let campaign = campaign_dir(&campaign)?;
             println!("dry campaign {}", campaign.display());
             let chain_dir = campaign.join("chain");
             std::fs::create_dir_all(&chain_dir)?;
             held_step(false, async |h: &mut Held| {
                 let net = h.net.insert(Net::open(&chain_dir).await?);
-                plan_waves(net, &mut h.rig, &campaign, &waves, true, &rig).await?;
+                plan_waves(net, &mut h.rig, &campaign, &waves, scale, true, &rig).await?;
                 // Exercises `cancel --all` on what the plan created.
                 let plan = Plan::load(&campaign)?;
                 let org = net.organizer()?;

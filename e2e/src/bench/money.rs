@@ -601,11 +601,15 @@ pub async fn gate_check(campaign: Option<&Path>, own: &[u32]) -> Result<GateRepo
             .push(format!("{n} has a pending nonce above its latest"));
     }
 
-    r.lines
-        .push(match std::env::var_os("DAVINCI_SEQUENCER_BIN") {
-            Some(b) => format!("sequencer sha256 {}", sha256_file(Path::new(&b))?),
-            None => "sequencer sha256 unset (DAVINCI_SEQUENCER_BIN)".into(),
-        });
+    // The rig refuses to start without it, so the hash is of what runs.
+    match std::env::var_os("DAVINCI_SEQUENCER_BIN") {
+        Some(b) => r
+            .lines
+            .push(format!("sequencer sha256 {}", sha256_file(Path::new(&b))?)),
+        None => r
+            .problems
+            .push("DAVINCI_SEQUENCER_BIN is unset: no gated node binary".into()),
+    }
     r.lines.push(format!(
         "davinci-bench sha256 {}",
         sha256_file(&std::env::current_exe()?)?
