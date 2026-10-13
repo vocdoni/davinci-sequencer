@@ -45,7 +45,7 @@
 
 1. **Integer slots at their maxima** (a vote id of `u64::MAX`, a key of `BALLOT_MAX`): a packed slot must never bleed into its neighbour or push the cell to `2^252`. Tests: Task 1 `integer_cells_pack_four_per_cell` and `TestPack4MatchesBigInt`, Task 2 `pack4_layout`.
 2. **Transitions of exactly 4096 and 4097 cells**: guest and both SDKs must agree on one versus two blobs, and the guest must reject a commitment count one off. Tests: Task 1 `layout_boundaries_round_trip` and `TestBuildTransitionBlobsMultipleBlobs`, Task 5 `blob_boundary_batches_accepted`.
-3. **A follower whose stored ballot is wrong or missing** (a corrupted database, or a revote of a slot refreshed one batch earlier): it must stop at the root check or with an error, never apply the transition or treat the slot as empty. Tests: Task 4 `corrupted_stored_ballot_fails_the_root_check`, `occupied_slot_without_a_ballot_is_an_error`, `results_after_matches_the_guest_leaf`.
+3. **A follower whose stored ballot is wrong or missing** (a corrupted database): it must stop at the root check or with an error, never apply the transition or treat the slot as empty; and a revote of a slot refreshed one batch earlier must apply. Tests: Task 4 `corrupted_stored_ballot_fails_the_root_check`, `occupied_slot_without_a_ballot_is_an_error`, `results_after_matches_the_guest_leaf`.
 4. **Hostile blob content from another sequencer** (version bits, more ids than updates, counts above the limits, bits in unused slots, an integer cell at `2^252`, an extra blob): `decode_blobs` returns an error and never panics. Test: Task 1 `decode_rejects_malformed_blobs`.
 5. **The 512 default on a one-transaction chain at 16 fields**: the node must seal what six blobs hold (379 steady votes) and keep the rest queued, never build an unsettleable transition. Test: Task 6 `a_512_vote_queue_at_sixteen_fields_seals_what_six_blobs_hold`.
 
@@ -59,7 +59,7 @@ export TMPDIR=$HOME/.cache/compact-da/tmp
 export PATH=$HOME/.zisk/bin:$HOME/.foundry/bin:$PATH
 ```
 
-Agents whose shell does not keep state prefix every command with these exports.
+Agents whose shell does not keep state prefix every command with these exports. Run every verification pipeline through `rtk proxy bash -c '…'` or from a script file: the `rtk` hook filters direct `cargo`/`go` output, and the plan's `Expected:` lines are raw output.
 
 ## File Structure
 
@@ -505,7 +505,7 @@ func totalCells(nVids, nUpdates, nf int) int {
 
 - [ ] **Step 5: Update the harness and the vector generator to the new signature**
 
-In `go-sdk/tests/integration/election.go`, the stash comment (lines 119-122), the struct (lines 132-136), its literal (lines 678-682), the `BuildKZGBlock` comment (lines 878-881) and the call (lines 904-910) become:
+In `go-sdk/tests/integration/election.go`, the stash comment (lines 119-122), the struct (lines 132-136), its literal (lines 678-682), the `BuildKZGBlock` comment (lines 878-882) and the call (lines 904-910) become:
 
 ```go
 	// lastDA holds the DA blob inputs produced by BuildStateBlock for this
@@ -1169,7 +1169,7 @@ pub fn cells(t: &TransitionData) -> Vec<[u8; 32]> {
 }
 ```
 
-In `impl Cells`, delete the `u64` method (lines 276-284) and the `count` method with its comment (lines 301-309); `total`, `cell`, `take`, `point` and `ciphertexts` stay. Replace `decode_blobs` and its doc (lines 312-376) with:
+In `impl Cells`, delete lines 275-284 (the blank line and the `u64` method) and lines 300-309 (the blank line, the `// A count must fit…` comment and the `count` method); `total`, `cell`, `take`, `point` and `ciphertexts` stay. Replace `decode_blobs` and its doc (lines 312-376) with:
 
 ```rust
 /// Parses a transition's blobs (in order) at the election's `nf`. Rejects a
@@ -1294,7 +1294,7 @@ Expected: only `M rust-sdk/testdata/blob.json` and `M rust-sdk/testdata/wire_pro
 cd /home/p4u/davinci-zkvm
 cargo fmt --all --check
 cargo clippy -p davinci-zkvm-service -p davinci-zkvm-sdk -p davinci-zkvm-input-gen --all-targets -- -D warnings
-cargo test -p davinci-zkvm-service -p davinci-zkvm-sdk -p davinci-zkvm-input-gen 2>&1 | grep -E '^test result' | grep -v ' 0 failed' ; echo "no failing suites above"
+rtk proxy bash -c 'cargo test -p davinci-zkvm-service -p davinci-zkvm-sdk -p davinci-zkvm-input-gen 2>&1 | tee $TMPDIR/rust-tests.log | grep -E "^test result" | grep -v " 0 failed"; echo "suites: $(grep -c "^test result" $TMPDIR/rust-tests.log) (expect >= 20), cargo exit ${PIPESTATUS[0]} (expect 0)"'
 cd go-sdk && go test $(go list ./... | grep -v /tests/integration) 2>&1 | grep -v -E 'no test files|^ok'; echo "no failing go packages above"
 ```
 
@@ -1630,7 +1630,7 @@ Expected: `error[E0425]: cannot find function \`header\`` (and `pack4`, `LOW63`)
 
 - [ ] **Step 5: Implement the guest layout**
 
-Replace everything above `#[cfg(test)]` in `circuit-primitives/src/da_blob.rs` (lines 1-117) with exactly this text (the guest ELF, and so the vk, depends on every line, including comments, because panic locations carry line numbers):
+Replace lines 1-118 of `circuit-primitives/src/da_blob.rs` (everything above `#[cfg(test)]`, including the blank line) with exactly this text; the block's last line is the blank line before `#[cfg(test)]` (the guest ELF, and so the vk, depends on every line, including comments, because panic locations carry line numbers):
 
 ```rust
 //! Data-availability blob cell layout for the vote-batch guest.
@@ -1779,7 +1779,7 @@ pub fn digest_pairs(pairs: &[([u8; 48], [u8; 32])]) -> [u8; 32] {
 
 ```
 
-(`digest_pairs` is unchanged; the blank line before `#[cfg(test)]` stays.)
+(`digest_pairs` is unchanged.)
 
 - [ ] **Step 6: Run the host tests**
 
@@ -2113,7 +2113,7 @@ Check: `grep -n 'NEW net accumulator\|net-Results leaf' circuit/CIRCUIT.md` prin
 cd /home/p4u/davinci-zkvm
 cargo fmt --all --check
 cargo clippy -p davinci-zkvm-service -p davinci-zkvm-sdk -p davinci-zkvm-input-gen --all-targets -- -D warnings
-cargo test -p davinci-zkvm-service -p davinci-zkvm-sdk -p davinci-zkvm-input-gen 2>&1 | grep -E '^test result' | grep -v ' 0 failed'; echo "no failing suites above"
+rtk proxy bash -c 'cargo test -p davinci-zkvm-service -p davinci-zkvm-sdk -p davinci-zkvm-input-gen 2>&1 | tee $TMPDIR/rust-tests.log | grep -E "^test result" | grep -v " 0 failed"; echo "suites: $(grep -c "^test result" $TMPDIR/rust-tests.log) (expect >= 20), cargo exit ${PIPESTATUS[0]} (expect 0)"'
 cd go-sdk && gofmt -l . && go vet ./... && go build ./tests/integration/... && go test $(go list ./... | grep -v /tests/integration) 2>&1 | grep -v -E 'no test files|^ok'; echo "no failing go packages above"
 go run ./cmd/sdk-vectors -out ../rust-sdk/testdata && git status --porcelain -- ../rust-sdk/testdata ../rust-sdk/assets   # expect nothing
 cd tests && GEN_INPUT_BIN=/home/p4u/davinci-zkvm/target/release/gen-input \
@@ -2402,9 +2402,9 @@ silent refreshes, the cached ballots), measured with `TestEmuSteps`
 | 512 | 16 | 9 | 398,325,831 | 397,410,188 | −0.23 % | 89,711,259,340 | 89,582,954,231 | −0.14 % | 16,743,319 | 16,707,965 |
 
 The stream saves blob space, not proving: every change stays within 0.25 %.
-The layout alone (measured with the omega table still built per blob) adds
-0.09 % of cost at 256 × 2 and 0.05 % at 512 × 16; building the table once
-saves about 4.1k `arith256_mod` calls per extra blob, 0.19 % at 512 × 16.
+Derived from the `arith256_mod` column: building the omega table once saves
+about 4.1k calls per extra blob (512 × 16: 8 extra blobs × 4.1k plus 1,185
+fewer cells × 2 ≈ 35.4k; the table shows 35,354).
 Repeated runs differ by about 0.0005 %.
 ```
 
@@ -2442,6 +2442,8 @@ cd /home/p4u/davinci-sequencer
 git checkout feat/l1-blob-da && git checkout -b feat/compact-da-stream
 cargo build --workspace --all-targets --keep-going 2>&1 | grep -E '^error|-->' | head -30
 ```
+
+Pin CI to the SDK this branch builds against: set `ZKVM_REF` in `.github/workflows/main.yml` and the davinci-zkvm `ref:` in `.github/workflows/docker-build.yml` to the davinci-zkvm `feat/compact-da-stream` head SHA (`git -C /home/p4u/davinci-zkvm rev-parse HEAD`), and commit it with this task; the owner moves it to `v0.2.0` after the tag.
 
 Expected: the `davinci-state` library stops on `accumulator` (`state/src/sync.rs:65` and `:82`, `no field \`accumulator\``; `state/src/transition.rs:436`, `has no field named \`accumulator\``), so the crates above it are not compiled yet. Once Step 4 fixes the library, the same command lists the ten fixture lines of Step 7 (Step 2 rewrites the eleventh, `state/tests/sync.rs:98`).
 
@@ -2731,7 +2733,7 @@ Expected: 7 tests `ok` (`follower_reaches_the_same_state_from_blobs`, `tampered_
 Run: `cargo test -p davinci-state --test transition 2>&1 | grep -E 'FAILED|panicked'`
 Expected: `exposed_refreshes_above_a_lower_blob_cap_are_refused` fails at line 415: one vote with 250 exposed refreshes now fits two blobs (8,096 cells).
 
-In `state/tests/transition.rs` (lines 409-415):
+In `state/tests/transition.rs` (lines 410-415, from the `// 250 exposed` comment through the `assert!(blob_count(1, 251, 16) …)` line):
 
 ```rust
     // 260 exposed 16-field slots fit next to one vote in six blobs, not two.
@@ -2760,7 +2762,7 @@ Delete the `accumulator: …,` line from each `TransitionData` literal:
 
 Remove the now-unused `use davinci_zkvm_sdk::ballot::Ballot;` from `sequencer/tests/l1da.rs:17` and `sequencer/src/web3/l1.rs:462` (their fixtures have no updates). The `l1da.rs`/`l1.rs` fixtures (one vote id, no update) build fine; they are never decoded.
 
-`web3_anvil.rs`'s second transition must stay two blobs: 460 votes at nf 4 are now 3,911 cells (one blob). At line 414:
+`web3_anvil.rs`'s second transition must stay two blobs: 460 votes at nf 4 are now 3,911 cells (one blob). At the `let n = 460u64;` line (414 before the deletions above, 413 after):
 
 ```rust
     // Second transition: two blobs, occupied_before = the first batch's voters.
@@ -2786,7 +2788,7 @@ committed root, and requires the result to equal the event's `newRoot`. Queued v
 cd /home/p4u/davinci-sequencer
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace 2>&1 | grep -c -E 'FAILED|panicked'     # expect 0
+rtk proxy bash -c 'cargo test --workspace 2>&1 | tee $TMPDIR/ws-tests.log | grep -E "^test result: FAILED|panicked"; echo "suites: $(grep -c "^test result: ok" $TMPDIR/ws-tests.log) (expect > 25), cargo exit ${PIPESTATUS[0]} (expect 0)"'
 (cd ../davinci-contracts && git checkout feat/l1-blob-da && forge build)
 ANVIL=1 cargo test -p davinci-sequencer --test web3_anvil 2>&1 | grep -E '^test result'
 ```
@@ -2894,7 +2896,7 @@ fn blob_boundary_batches_accepted() {
 
 A single-blob request cannot be cut to zero commitments here (`ig::write_kzg_block` refuses an empty list); Task 2's `TestCheatKZGBlobCount` covers zero on the raw block.
 
-In `two_blob_cap_batch_accepted`, the comment and the sizes (lines 372-387) become:
+In `two_blob_cap_batch_accepted`, the comment and the sizes (lines 372-388, from the `// Gnosis takes two blobs` comment through the `.collect();` that ends `pending`) become:
 
 ```rust
     // Gnosis takes two blobs per block. 200 committed voters (fake proofs)
@@ -3039,7 +3041,7 @@ Expected: `ok` in about 9 s (379 votes and 379 refreshes are 24,542 cells, six b
 ```bash
 cd /home/p4u/davinci-sequencer
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace 2>&1 | grep -c -E 'FAILED|panicked'     # expect 0
+rtk proxy bash -c 'cargo test --workspace 2>&1 | tee $TMPDIR/ws-tests.log | grep -E "^test result: FAILED|panicked"; echo "suites: $(grep -c "^test result: ok" $TMPDIR/ws-tests.log) (expect > 25), cargo exit ${PIPESTATUS[0]} (expect 0)"'
 git add sequencer/src/config.rs .env.example docs/configuration.md state/tests/transition.rs
 git commit -m "feat(config): 512-vote batches by default" -m "--batch-max now defaults to 512; the guest still takes 1024. On a chain that
 holds one transaction's six blobs the node still seals only what fits (379
@@ -3065,6 +3067,8 @@ cd /home/p4u/davinci-contracts
 git checkout feat/l1-blob-da && git checkout -b feat/compact-da-stream
 cd test/vectors && go vet . 2>&1 | head -3
 ```
+
+Pin CI to the SDK this branch builds against: set the davinci-zkvm `ref:` in `.github/workflows/test.yml` to the davinci-zkvm `feat/compact-da-stream` head SHA (`git -C /home/p4u/davinci-zkvm rev-parse HEAD`), and commit it with this task; the owner moves it to `v0.2.0` after the tag.
 
 Expected: `too many arguments in call to davinci.BuildTransitionBlobs`.
 
@@ -3161,7 +3165,7 @@ git add service/Cargo.toml Cargo.lock
 git commit -m "chore(service): v0.2.0"
 ```
 
-**Gated on the owner's explicit confirmation**: pushing `main` publishes `vocdoni/davinci-zkvm:main`, and the tag publishes `vocdoni/davinci-zkvm:v0.2.0` and `:latest`, which the watchtower on the prover host follows. From then on that prover proves only under the new batch vk, and the production Gnosis node on the same host, which pins `0x6cfc89d5…7a10`, will refuse its proofs (Gnosis is being retired). Before the push, the owner may want `ZKVM_REF` pinned to `v0.1.1` in davinci-sequencer's `.github/workflows/main.yml` and `docker-build.yml` and the davinci-zkvm `ref` in davinci-contracts' `.github/workflows/test.yml` on their `main` branches: both check out davinci-zkvm `main`, whose SDK their `main` no longer compiles against until the core sub-project merges.
+**Gated on the owner's explicit confirmation**: pushing `main` publishes `vocdoni/davinci-zkvm:main`, and the tag publishes `vocdoni/davinci-zkvm:v0.2.0` and `:latest`, which the watchtower on the prover host follows. From then on that prover proves only under the new batch vk, and the production Gnosis node on the same host, which pins `0x6cfc89d5…7a10`, will refuse its proofs (Gnosis is being retired). Before pushing davinci-zkvm `main`, pin `ZKVM_REF` (davinci-sequencer `.github/workflows/main.yml`, `docker-build.yml`) and the davinci-zkvm `ref:` (davinci-contracts `.github/workflows/test.yml`) to `v0.1.1` on their `main` and `feat/l1-blob-da` branches (one commit each, owner's call): both check out davinci-zkvm `main`, whose SDK those branches do not compile against until the core sub-project merges. Keep tag pins from then on and bump them with the SDK. A `v0.2.0-rc1` prerelease would publish an image for the OP deployment without moving `latest`, so the watchtower-managed prover keeps the Gnosis vk until `v0.2.0` is cut.
 
 ```bash
 # only after the owner confirms
