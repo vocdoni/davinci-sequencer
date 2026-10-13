@@ -30,17 +30,17 @@ of nodes.
 | 16 | ~122 | ~64 s | ~115 |
 
 Before the end, the time budget can cap batches below the transaction capacity: it leaves
-`graceFloor − prove_base − settle_margin` for the per-vote cost, which is 75 votes at nf = 16 on
-the cold estimate with a 150 s floor and the default margins. The estimate follows the prover's
+`graceFloor − prove_base − settle_margin` for the per-vote cost, which is 225 votes at nf = 16 on
+the cold estimate with a 240 s floor and the default margins. The estimate follows the prover's
 real cost after a few batches, and past the end the whole grace window counts.
 
-Time from pressing END to results on-chain, with a 150 s grace and a sequencer key:
+Time from pressing END to results on-chain, with a 240 s grace and a sequencer key:
 
 | Backlog at the end | Last landing | Grace end | Results |
 |---|---|---|---|
-| none | before the end | end + 150 s | ~2.8–3.0 min |
-| one round | end + ~75 s | end + ~225 s | ~4.0 min |
-| k rounds (nf = 16) | end + k·~70 s | last landing + 150 s | ~(1.2·k + 2.8) min |
+| none | before the end | end + 240 s | ~4.3–4.5 min |
+| one round | end + ~75 s | end + ~315 s | ~5.5 min |
+| k rounds (nf = 16) | end + k·~70 s | last landing + 240 s | ~(1.2·k + 4.3) min |
 
 A DKG key adds the committee's decryption round, 1 to 5 minutes, after the request at the grace
 end. A shortened end drains during the notice and lands in the first row, about 4.4 minutes from

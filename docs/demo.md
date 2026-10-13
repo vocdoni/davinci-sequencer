@@ -46,7 +46,7 @@ Wave 2 also exercises the edge cases: a reweighted member whose pending vote err
 `census changed, recast` and who votes again, a 400-voter approval split over several
 transitions, two elections without votes, a metadata hash that does not match its document, and
 refused votes checked by status and code. Against nodes on the default batching policy and a
-180 s grace, it takes two to three and a half hours. Wave 3 takes 30 to 45 minutes.
+300 s grace, it takes two to three and a half hours. Wave 3 takes 30 to 45 minutes.
 
 ## Running again on a new registry
 

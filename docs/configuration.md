@@ -162,7 +162,8 @@ On OP Mainnet:
   cost about 2 µETH at 0.08 gwei and 0.004 gwei; the 0.001 ETH default leaves room for spikes and
   replacements. A batch of three transactions, re-posted at most three times, sends at most 12.
 - Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the
-  node logs why at debug level ("no time to land an L1-blob batch", "no batch fits").
+  node logs why at debug level ("no time to land an L1-blob batch", "no batch fits", "the exposed set needs more blob
+  transactions than the window fits").
 
 ## Data directory
 

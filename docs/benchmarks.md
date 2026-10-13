@@ -37,7 +37,7 @@ proofs took about 0.16 s each.
 ## L1-blob batch sizes on OP Mainnet
 
 Measured on 2026-10-13 (01:53-03:49 UTC) on OP Mainnet in L1-blob mode (registry
-`0x8b63fAE96948D69CF92Eb40e4EE0fCE40962267d`, see [deployments.md](deployments.md#op-mainnet))
+`0x8b63fAE96948D69CF92Eb40e4EE0fCE40962267d`, see [deployments.md](deployments.md#op-mainnet-first-registry))
 with one RTX 5090 prover shared with a production node, `e2e/tests/bench_l1.rs`, 3 runs per case,
 one node, `--batch-max N`, `--batch-time 2m`. Blobs go to Ethereum at proving start; the
 settlement waits for OP's L1 origin to reach the blob block. "Prove" is the prover's GPU time;
