@@ -60,13 +60,16 @@ open, the batch holds at most the votes whose estimated proof plus `--settle-mar
 `min(graceEnd, now + graceFloor)`; once it has ended, before `graceEnd`. The second term covers
 the worst legal close: the organizer ends the election right after the seal and lowers the grace
 to the registry's floor. In L1-blob mode the Ethereum leg (`--l1-settle-lag`) runs during the
-proof, so it plus `--settle-margin` must fit before that deadline as well. When not even one vote
-fits, nothing seals and the votes wait.
+proof, so it plus `--settle-margin` must fit before that deadline as well, plus 24 s for each blob
+transaction after the first (they go out one after another): a short window takes a batch of
+fewer transactions. When not even one vote fits, nothing seals and the votes wait.
 
 To build a batch, the actor:
 
 1. takes votes in arrival order, the oldest per slot, within `maxVoters`, the size above and the
-   per-transaction blob limit (counting the refreshes the circuit will require);
+   blob limit, counting the refreshes the circuit will require: the chain's per-transaction limit
+   in blob mode, the circuit's 32 blobs in L1-blob mode (at most the transactions the time left
+   allows);
 2. draws a fresh seed and a refresh selection from the OS random number generator;
 3. re-encrypts every ballot along the seed's scalar chain and re-randomizes a sample of other
    occupied slots, so an observer cannot tell a revote from a routine refresh;
@@ -110,28 +113,32 @@ L1-mode one. A signing node also needs its dedicated Ethereum key.
 Each batch:
 
 1. Seals and builds its blobs as in blob mode.
-2. Posts the blobs on Ethereum while it is proved: one type-3 transaction from the node's
-   Ethereum account to itself, EIP-7594 sidecar, at most six blobs. The account sends one
-   transaction at a time; a later post waits until the earlier one is mined. The tip is at least
+2. Posts the blobs on Ethereum while it is proved, in type-3 transactions from the node's
+   Ethereum account to itself (EIP-7594 sidecar): blobs 0-5 in the first, 6-11 in the second and
+   so on, at Ethereum's per-transaction limit (six). A 512-vote batch at 16 fields takes 9 blobs
+   in two transactions, 13 in three when every vote is a revote. The account sends one
+   transaction at a time; the next waits until the one before is mined. The tip is at least
    0.001 gwei, the max fee twice the base fee plus the tip, the blob fee twice the blob base fee.
    A transaction not mined after 3 Ethereum blocks is replaced at its nonce with every fee
    doubled. A post whose worst-case cost would pass `--l1-max-post-fee` (or that L1 refuses) is
    retried while the proof runs, waiting for cheaper fees, up to the grace end.
-3. If OP's L1 origin (`L1Block.number()`) reaches the blob block before the proof is ready, the
-   node calls `record()` on the verifier once, which stores that origin on OP.
-4. With the proof ready, waits until the blob transaction has one Ethereum block on top and OP's
-   origin reached it, then builds the L1 proof: Ethereum headers from at most two blocks above the
-   origin down to the blob block while that is at most 16 headers; else from the recorded origin
+3. If OP's L1 origin (`L1Block.number()`) reaches the block of the last transaction before the
+   proof is ready, the node calls `record()` on the verifier once, which stores that origin on OP.
+4. With the proof ready, waits until every blob transaction has one Ethereum block on top and
+   OP's origin reached the newest, then builds one L1 proof of all of them, in blob order:
+   Ethereum headers from at most two blocks above the origin down to the oldest blob block while
+   that is at most 16 headers; else from a recorded origin at or above the newest blob block
    down; else up to 64 headers from the current origin. Deeper than that, or 7,200 blocks behind
-   the origin, it posts the blobs again.
+   the origin, it posts every transaction again.
 5. Checks the proof locally, simulates `submitStateTransitionL1` on OP and sends it (gas estimate
    plus 20 %). `L1OriginMismatch` (the origin moved past the proof, or the node's Ethereum RPC is
    behind OP's origin) rebuilds the proof from fresh reads, at most 5 times, then the votes go back
    to the queue.
-6. A blob transaction that disappears (dropped, or reorged out of Ethereum) is posted again. A
+6. A blob transaction that disappears (dropped, or reorged out of Ethereum) is posted again
+   alone, at the account's next nonce, so it may land after the transactions that follow it. A
    missing receipt counts as gone only after 36 s, since a lagging endpoint reads the same. A
-   proof that cannot be built or anchored for 60 s also posts the blobs again. Re-posts are
-   capped at 3 per batch; then the votes go back to the queue.
+   proof that cannot be built or anchored for 60 s also posts every transaction again. Re-posts
+   (one transaction or all) are capped at 3 per batch; then the votes go back to the queue.
 7. Commits when its `ProcessStateTransitioned` event reaches `--confirmations`, not at the receipt:
    OP's unsafe blocks reorg with Ethereum. If the event is still missing after 90 s, the node
    looks at the registry: while it still shows the settlement's root the node keeps waiting (no
@@ -306,8 +313,9 @@ through that sync without being proved again.
 In L1-blob mode the node records each Ethereum blob transaction, with the sending account, before
 sending it and drops the record once it is mined. After a restart the batch is proved again (its
 secrets died with the process) and its first post replaces a still-pending transaction at its
-nonce with doubled fees instead of queueing behind it. Records of another account (a rotated L1
-key) are dropped at start. A transaction mined before the crash is wasted.
+nonce with doubled fees instead of queueing behind it, whichever of the batch's transactions that
+was. Records of another account (a rotated L1 key) are dropped at start. Transactions mined
+before the crash are wasted.
 
 A datadir written by the previous release (storage schema 8) is upgraded in place on first start:
 schema 9 only adds the `l1_posts` table.

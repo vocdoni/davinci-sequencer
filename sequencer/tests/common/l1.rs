@@ -53,6 +53,9 @@ struct L1Inner {
     pinned: Option<u64>,
     /// Pool sends without mining them.
     hold: bool,
+    /// Blocks take pooled transactions only while fewer than this many are
+    /// mined (any sender); the rest stay pending.
+    mine_limit: Option<usize>,
     /// `head()` mines a block per call.
     auto_mine: bool,
     /// The next N accepted sends are lost.
@@ -105,10 +108,14 @@ fn envelope(from: Address, nonce: u64, fees: &L1Fees, vhs: &[B256]) -> (B256, By
 fn mine(i: &mut L1Inner) {
     let number = i.blocks.len() as u64;
     let parent_hash = i.blocks.last().map_or(B256::ZERO, |b| b.hash);
+    let room = i.mine_limit.map_or(usize::MAX, |m| {
+        m.saturating_sub(i.blocks.iter().map(|b| b.txs.len()).sum())
+    });
     let txs: Vec<FakeTx> = if i.hold {
         Vec::new()
     } else {
-        std::mem::take(&mut i.pool).into_values().collect()
+        let keys: Vec<(Address, u64)> = i.pool.keys().take(room).copied().collect();
+        keys.iter().filter_map(|k| i.pool.remove(k)).collect()
     };
     let envs: Vec<Bytes> = txs.iter().map(|t| t.envelope.clone()).collect();
     let header = Header {
@@ -172,6 +179,7 @@ impl FakeL1 {
             lag: 0,
             pinned: None,
             hold: false,
+            mine_limit: None,
             auto_mine: true,
             drop_next: 0,
             refuse_next: 0,
@@ -238,6 +246,11 @@ impl FakeL1 {
 
     pub fn set_auto_mine(&self, on: bool) {
         self.lock().auto_mine = on;
+    }
+
+    /// Mines pooled transactions only up to `n` mined in all; `None` lifts it.
+    pub fn limit_mined(&self, n: Option<usize>) {
+        self.lock().mine_limit = n;
     }
 
     pub fn drop_next(&self, n: u32) {

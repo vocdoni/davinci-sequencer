@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use davinci_zkvm_sdk::blob::TransitionBlobs;
+use davinci_zkvm_sdk::limits::{MAX_BLOBS, TX_BLOB_CAP};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -23,6 +24,29 @@ pub use settle::{
     MAX_PROOF_RETRIES, MAX_REPOSTS, PROOF_FAIL_FOR, REORG_MARGIN, TOP_ABOVE_ORIGIN, choose_anchor,
     settle,
 };
+
+/// Seconds each chunk after the first adds to the Ethereum leg: its post
+/// waits until the one before is mined (about two L1 blocks).
+pub const POST_TIME: u64 = 24;
+
+/// Most blobs one transition may use: in L1-blob mode the guest's
+/// `MAX_BLOBS`, posted in chunks of the per-transaction cap; otherwise the
+/// per-transaction cap (`TX_BLOB_CAP` when unknown).
+pub fn batch_blob_cap(l1_mode: bool, per_tx: Option<usize>) -> usize {
+    if l1_mode {
+        MAX_BLOBS
+    } else {
+        per_tx.unwrap_or(TX_BLOB_CAP)
+    }
+}
+
+/// Most chunks whose Ethereum leg lands within `window` seconds:
+/// `lag + (chunks - 1) * POST_TIME + margin <= window`. `None` when not
+/// even one does.
+pub fn chunks_fit(window: u64, lag: u64, margin: u64) -> Option<usize> {
+    let spare = window.checked_sub(lag.saturating_add(margin))?;
+    usize::try_from(1 + spare / POST_TIME).ok()
+}
 
 /// The Ethereum side of a node in L1-blob mode.
 pub struct L1Da {
@@ -160,8 +184,9 @@ async fn post_chunks(
                 Err(e @ (PostError::FeeCap { .. } | PostError::L1(_))) => {
                     warn!(pid = %hex::encode(job.pid), error = %e, "L1 post failed; retrying");
                     // A fee spike between chunks must not hold the flight past
-                    // the job's deadline; `settle` then posts the missing chunk
-                    // and gets `Deadline` from its own `timeout_at`.
+                    // the job's deadline; `settle` then posts the missing chunk,
+                    // but its top-of-loop deadline check fires first and
+                    // reports `Deadline`.
                     if tokio::time::Instant::now() >= job.deadline {
                         return (posts, Some(PostError::Deadline));
                     }
@@ -277,6 +302,22 @@ mod tests {
             versioned_hashes: (0..n).map(|i| [i as u8 ^ 0x40; 32]).collect(),
             digest: [7; 32],
         }
+    }
+
+    #[test]
+    fn each_chunk_after_the_first_needs_post_time() {
+        // OP defaults: a 110 s leg and a 30 s margin.
+        assert_eq!(chunks_fit(139, 110, 30), None);
+        assert_eq!(chunks_fit(140, 110, 30), Some(1));
+        assert_eq!(chunks_fit(163, 110, 30), Some(1));
+        assert_eq!(chunks_fit(164, 110, 30), Some(2));
+        assert_eq!(chunks_fit(188, 110, 30), Some(3));
+        // The 240 s floor while voting is open: five chunks, 30 blobs.
+        assert_eq!(chunks_fit(240, 110, 30), Some(5));
+        assert_eq!(chunks_fit(600, u64::MAX, 30), None);
+        assert_eq!(batch_blob_cap(true, Some(6)), MAX_BLOBS);
+        assert_eq!(batch_blob_cap(false, Some(2)), 2);
+        assert_eq!(batch_blob_cap(false, None), TX_BLOB_CAP);
     }
 
     #[test]

@@ -467,3 +467,226 @@ async fn l1_event_before_the_receipt_commits_once() {
     assert_eq!((prover.calls(), l1.mined_posts()), (2, 2));
     shutdown.cancel();
 }
+
+// ------------------------------------------------- several transactions
+
+/// A 16-field node whose Ethereum takes one blob per transaction: a batch
+/// of 127 or more fresh votes needs two blobs, so two transactions.
+fn chunked_cfg(dir: &TempDir, s: &TestSetup, batch_max: usize, extra: &[&str]) -> Config {
+    let mut args = vec!["--max-blobs-per-tx", "1"];
+    args.extend_from_slice(extra);
+    test_config_with(dir.path(), &s.census_dir, batch_max, "0s", &args)
+}
+
+async fn chunked_node(
+    s: &TestSetup,
+    l1: &FakeL1,
+    prover: Arc<FakeProver>,
+    dir: &TempDir,
+    cfg: Config,
+    shutdown: &CancellationToken,
+) -> (Node, ActorHandle) {
+    let node = start_l1_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        l1.clone(),
+        prover,
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    (node, h)
+}
+
+#[tokio::test]
+async fn l1_a_two_blob_batch_goes_out_in_two_transactions() {
+    let s = setup(16, 140, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let cfg = chunked_cfg(&dir, &s, 140, &[]);
+    let (node, h) = chunked_node(&s, &l1, prover.clone(), &dir, cfg, &shutdown).await;
+    let vids = submit(&h, &s, 0..140, 2000).await;
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    // One batch (the per-batch cap is MAX_BLOBS), two blobs, two posts.
+    assert_eq!(prover.sizes(), vec![140]);
+    let sends = l1.sends();
+    assert_eq!(sends.iter().map(|x| x.nonce).collect::<Vec<_>>(), [0, 1]);
+    let blocks: Vec<u64> = sends
+        .iter()
+        .map(|x| l1.block_of(&x.hash).unwrap())
+        .collect();
+    assert!(blocks[1] > blocks[0]);
+    assert_eq!(s.chain.l1_last().unwrap().blocks, blocks);
+    assert_eq!(s.chain.voters(), 140);
+    assert!(node.db.l1_posts().unwrap().is_empty());
+    shutdown.cancel();
+}
+
+/// The fake registry's 150 s floor, a 140 s Ethereum leg and no margin:
+/// the leg of a second transaction (24 s more) does not fit while voting is
+/// open, so the batch is sized down to one blob, not held.
+#[tokio::test]
+async fn l1_the_seal_budget_sizes_a_batch_down_to_fewer_transactions() {
+    let s = setup(16, 140, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let cfg = chunked_cfg(
+        &dir,
+        &s,
+        140,
+        &["--l1-settle-lag", "140s", "--batch-time", "100s"],
+    );
+    let (_node, h) = chunked_node(&s, &l1, prover.clone(), &dir, cfg, &shutdown).await;
+    let vids = submit(&h, &s, 0..140, 3000).await;
+    // One blob holds 126 fresh 16-field votes.
+    wait_until("one batch settled", async || s.chain.voters() == 126).await;
+    assert_eq!(prover.sizes(), vec![126]);
+    assert_eq!(l1.mined_posts(), 1);
+    s.chain.advance_time(115);
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![126, 14]);
+    assert_eq!(l1.mined_posts(), 2);
+    shutdown.cancel();
+}
+
+/// An exposed set of 126 live slots plus one new vote needs 127 entries: two
+/// blobs. In a window that fits one blob this is a window-limited shortfall,
+/// not a `RefreshOverflow`: no vote errors and the set stays until the grace
+/// after the end opens a window for two (grace raised to 180 s).
+#[tokio::test]
+async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
+    let s = setup(16, 150, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    // Phase 1: 140 votes settle, so their slots are live.
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(&dir, &s, 140, &[]);
+    let (node, h) = chunked_node(&s, &l1, FakeProver::open(), &dir, cfg, &shutdown).await;
+    let first = submit(&h, &s, 0..140, 3500).await;
+    wait_until("first votes settled", async || {
+        all_settled(&h, &first).await
+    })
+    .await;
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    // Phase 2: an exposed record over 126 of those slots, as a lost race
+    // leaves it, then one new vote that is not in it yet.
+    let db = reopen_db(dir.path()).await;
+    let late = fake_vote(&s.env, 140, &[1, 2], 3700);
+    let late_vid = late.pkg.vote_id;
+    db.put_exposed(
+        &pid_fr(),
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: (0..126)
+                .map(|i| fake_vote(&s.env, i, &[1, 2], 3500 + i as u64).slot)
+                .collect(),
+            vote_ids: vec![late_vid],
+        },
+    )
+    .unwrap();
+    // The fake registry's 150 s floor and no margin: one chunk of one blob
+    // while voting is open.
+    let shutdown2 = CancellationToken::new();
+    let cfg = chunked_cfg(&dir, &s, 140, &["--l1-settle-lag", "140s"]);
+    let node2 = start_l1_node_cfg(
+        db,
+        s.chain.clone(),
+        l1.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown2.clone(),
+    )
+    .await;
+    let h2 = handle(&node2).await;
+    h2.submit(late).await.unwrap();
+    let before = node2.db.exposed(&pid_fr()).unwrap().unwrap();
+    // A few seal ticks in the short window: nothing errors, nothing clears.
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            vote_status(&h2, late_vid).await,
+            Some(VoteStatus::Pending),
+            "a window-limited overflow touched the vote"
+        );
+        assert_eq!(node2.db.exposed(&pid_fr()).unwrap().as_ref(), Some(&before));
+    }
+    // The end opens a grace of 180 s: window 180 - 140 fits two chunks.
+    s.chain.set_grace(180);
+    s.chain.advance_time(DURATION + 1);
+    wait_until("settled", async || all_settled(&h2, &[late_vid]).await).await;
+    // The settlement after the end carries two blobs in two transactions.
+    assert_eq!(s.chain.l1_last().unwrap().blocks.len(), 2);
+    shutdown2.cancel();
+}
+
+#[tokio::test]
+async fn l1_restart_with_one_chunk_pending_replaces_it() {
+    let s = setup(16, 140, None);
+    let l1 = FakeL1::new();
+    // The first chunk is mined, the second stays in the pool.
+    l1.limit_mined(Some(1));
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(&dir, &s, 140, &[]);
+    let (node, h) = chunked_node(&s, &l1, FakeProver::open(), &dir, cfg, &shutdown).await;
+    let vids = submit(&h, &s, 0..140, 4000).await;
+    wait_until("second chunk pending", async || {
+        l1.sends().len() == 2 && node.db.l1_posts().unwrap().len() == 1
+    })
+    .await;
+    let rec = node.db.l1_posts().unwrap().remove(0);
+    assert_eq!((rec.nonce, l1.mined_posts()), (1, 1));
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    let db = reopen_db(dir.path()).await;
+    l1.limit_mined(None);
+    let shutdown2 = CancellationToken::new();
+    let cfg = chunked_cfg(&dir, &s, 140, &[]);
+    let node2 = start_l1_node_cfg(
+        db,
+        s.chain.clone(),
+        l1.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown2.clone(),
+    )
+    .await;
+    let h2 = handle(&node2).await;
+    // Proved again; its first chunk replaces the pending one at nonce 1
+    // with every fee doubled, its second follows at nonce 2.
+    wait_until("recovered votes settled", async || {
+        all_settled(&h2, &vids).await
+    })
+    .await;
+    let sends = l1.sends();
+    assert_eq!(
+        sends.iter().map(|x| x.nonce).collect::<Vec<_>>(),
+        [0, 1, 1, 2]
+    );
+    assert!(sends[2].fees.max_fee >= 2 * rec.fees.max_fee);
+    assert!(sends[2].fees.tip >= 2 * rec.fees.tip);
+    assert!(sends[2].fees.blob_fee >= 2 * rec.fees.blob_fee);
+    assert_eq!(
+        l1.block_of(&rec.tx_hash),
+        None,
+        "the pending chunk was replaced"
+    );
+    // The first run's mined chunk is wasted; the settlement carries the new pair.
+    assert_eq!(l1.mined_posts(), 3);
+    let (b2, b3) = (
+        l1.block_of(&sends[2].hash).unwrap(),
+        l1.block_of(&sends[3].hash).unwrap(),
+    );
+    assert_eq!(s.chain.l1_last().unwrap().blocks, vec![b2, b3]);
+    assert!(node2.db.l1_posts().unwrap().is_empty());
+    shutdown2.cancel();
+}

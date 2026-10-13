@@ -261,6 +261,10 @@ async fn start(
     let cap = crate::web3::resolve_blob_cap(cfg.max_blobs_per_tx, advertised, blob_chain);
     cfg.max_blobs_per_tx = Some(cap);
     tracing::info!(cap, "blob cap per transaction");
+    tracing::info!(
+        cap = crate::l1da::batch_blob_cap(l1.is_some(), Some(cap)),
+        "blob cap per batch"
+    );
     // L1-blob mode posts a transition in chunks of the per-transaction cap.
     let l1 = match l1 {
         Some(rpc) => Some(Arc::new(L1Da::new(
@@ -328,6 +332,11 @@ mod tests {
         let (fatal, e) = budget_error(d(110), d(60), 150, true).unwrap();
         assert!(fatal && e.contains("--settle-margin") && e.contains("150"));
         assert!(!budget_error(d(110), d(60), 150, false).unwrap().0);
+        // The OP registry's 240 s floor: the L1-blob defaults fit, and so does a
+        // blob-mode 60 s margin carried over; a leg and margin above it do not.
+        assert!(budget_error(d(110), d(30), 240, true).is_none());
+        assert!(budget_error(d(110), d(60), 240, true).is_none());
+        assert!(budget_error(d(110), d(131), 240, true).unwrap().0);
     }
 
     // The registry's mode and `--l1-rpc-url` must agree, both ways.

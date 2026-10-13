@@ -917,9 +917,12 @@ pub(crate) fn spawn_actor(
 ) -> Result<ActorHandle, ActorError> {
     let pid = pcfg.process_id;
     let mut state = open_state(&deps.db, &pid, &pcfg)?;
-    if let Some(cap) = cfg.max_blobs_per_tx {
-        state.set_blob_cap(cap).map_err(ierr)?;
-    }
+    state
+        .set_blob_cap(crate::l1da::batch_blob_cap(
+            deps.l1.is_some(),
+            cfg.max_blobs_per_tx,
+        ))
+        .map_err(ierr)?;
     let transitions = deps.db.transitions(&pid).map_err(ierr)?;
     let next_index = transitions.last().map(|t| t.index + 1).unwrap_or(0);
     let last_tx_block = transitions.last().map(|t| t.block).unwrap_or(0);
@@ -1727,13 +1730,22 @@ impl Actor {
             deadline = deadline.min(now.saturating_add(self.deps.grace.grace_floor));
         }
         // L1-blob mode: the Ethereum leg runs during the proof, so a landing
-        // takes max(proof, lag) + margin; the lag must fit as well.
-        if self.deps.l1.is_some()
-            && deadline.saturating_sub(now) < self.l1_settle_lag.saturating_add(self.settle_margin)
-        {
-            debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
-            return;
-        }
+        // takes max(proof, leg) + margin; the leg must fit as well. Each
+        // chunk after the first adds a post to it, so a short window takes
+        // a batch of fewer chunks.
+        let max_blobs = match &self.deps.l1 {
+            Some(l1) => {
+                let window = deadline.saturating_sub(now);
+                let Some(chunks) =
+                    crate::l1da::chunks_fit(window, self.l1_settle_lag, self.settle_margin)
+                else {
+                    debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
+                    return;
+                };
+                chunks.saturating_mul(l1.chunk).min(self.state.blob_cap())
+            }
+            None => self.state.blob_cap(),
+        };
         let left = deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
         let n_max = (left / self.metrics.prove.spv(nf)).floor();
         if n_max < 1.0 {
@@ -1749,21 +1761,25 @@ impl Actor {
         // unaccounted. So the batch_max and budget caps go into the
         // selection, and a re-proof drop re-runs it over what is left.
         let selected: Vec<VerifiedVote> = loop {
-            let sized: Vec<VerifiedVote> =
-                match self
-                    .state
-                    .select_batch(&self.pending, max_voters, &self.exposed, cap)
-                {
-                    Ok((refs, _)) => refs.into_iter().cloned().collect(),
-                    Err(StateError::RefreshOverflow { .. }) => {
-                        self.refresh_overflow();
-                        return;
-                    }
-                    Err(e) => {
-                        error!(pid = %hex::encode(self.pid31), %e, "select_batch");
-                        return;
-                    }
-                };
+            let sized: Vec<VerifiedVote> = match self.state.select_batch_within(
+                &self.pending,
+                max_voters,
+                &self.exposed,
+                cap,
+                max_blobs,
+            ) {
+                // A window too small for the exposed set yields an empty
+                // selection and waits; an overflow is permanent.
+                Ok((refs, _)) => refs.into_iter().cloned().collect(),
+                Err(StateError::RefreshOverflow { .. }) => {
+                    self.refresh_overflow();
+                    return;
+                }
+                Err(e) => {
+                    error!(pid = %hex::encode(self.pid31), %e, "select_batch");
+                    return;
+                }
+            };
             if sized.is_empty() {
                 return;
             }
@@ -1796,11 +1812,11 @@ impl Actor {
         };
         // Belt: select_batch sized the batch for the cap, so this never
         // fires; a batch above it could never land.
-        if prepared.blobs.blobs.len() > self.state.blob_cap() {
+        if prepared.blobs.blobs.len() > max_blobs {
             error!(
                 pid = %hex::encode(self.pid31),
                 blobs = prepared.blobs.blobs.len(),
-                cap = self.state.blob_cap(),
+                cap = max_blobs,
                 "prepared batch exceeds the blob cap; not sealing"
             );
             if let Err(e) = self.state.rollback(&prepared) {

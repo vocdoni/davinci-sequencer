@@ -77,10 +77,10 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--solo-wait` | `DAVINCI_SOLO_WAIT` | 3 × batch time | Age at which a batch below `--min-mix` seals anyway (±10% jitter). Never below `--batch-time`. |
 | `--flush-horizon` | `DAVINCI_FLUSH_HORIZON` | `3m` | From this long before the election end, and through the grace window, every pending vote seals at once. |
 | `--settle-margin` | `DAVINCI_SETTLE_MARGIN` | `60s` (`30s` in L1-blob mode) | Time reserved to land a transaction: a batch is sized so its estimated proof plus this margin ends before the window closes. |
-| `--l1-settle-lag` | `DAVINCI_L1_SETTLE_LAG` | `110s` | L1-blob mode: the Ethereum leg of a landing (blob inclusion, OP's L1 origin lag, the reorg margin). It runs during the proof, so a batch seals only if this plus `--settle-margin` fits before the window closes too. Lower it only for a faster L1, such as a local anvil. |
+| `--l1-settle-lag` | `DAVINCI_L1_SETTLE_LAG` | `110s` | L1-blob mode: the Ethereum leg of a landing (blob inclusion, OP's L1 origin lag, the reorg margin). It runs during the proof, so a batch seals only if this plus `--settle-margin`, plus 24 s for each blob transaction after the first, fits before the window closes too. Lower it only for a faster L1, such as a local anvil. |
 | `--prove-base` | `DAVINCI_PROVE_BASE` | `30s` | Fixed part of the proving-time estimate. Raise it on a slow prover. |
 | `--slot-depth` | `DAVINCI_SLOT_DEPTH` | `3` | Queued votes one ballot slot may hold, in flight included. |
-| `--max-blobs-per-tx` | `DAVINCI_MAX_BLOBS_PER_TX` | from the chain | Most blobs one settlement carries (1 to 6). See [Chain limits](#chain-limits). |
+| `--max-blobs-per-tx` | `DAVINCI_MAX_BLOBS_PER_TX` | from the chain | Most blobs one blob transaction carries (1 to 6): the most per batch in blob mode; in L1-blob mode a batch takes up to 32, posted in transactions of this many. See [Chain limits](#chain-limits). |
 | `--eager-results` | `DAVINCI_EAGER_RESULTS` | `true` | Prove a sequencer-key election's results during its grace window and submit them when it closes. |
 | `--poll-interval` | `DAVINCI_POLL_INTERVAL` | `5s` | Chain polling interval. |
 | `--heartbeat` | `DAVINCI_HEARTBEAT` | poll interval | Drives batch timing, the close-out at the grace end and finalization. |
@@ -125,12 +125,16 @@ Ethereum. Such a node needs, besides the OP settings:
 
 At boot the node checks the Ethereum chain id and the verifier's `L1Block` address against the
 network (the `optimism` preset expects chain 1 and `0x4200000000000000000000000000000000000015`),
-and sizes batches with Ethereum's blob limit. Observers need no Ethereum key.
+and reads Ethereum's per-transaction blob limit. A batch may take up to the circuit's 32 blobs:
+the node posts them in transactions of that limit, one after another, and proves all of them in
+one settlement. It logs both caps (`blob cap per transaction`, `blob cap per batch`). Observers
+need no Ethereum key.
 
 The blobs are posted when proving starts, so the Ethereum leg of a landing (about 110 s on
 mainnet, `--l1-settle-lag`) overlaps the proof, and `--settle-margin` (default `30s` here) only
 covers the OP leg. A batch seals only while both the estimated proof and the Ethereum leg, each
-plus the margin, end before the window can close. While the election is open that is
+plus the margin, end before the window can close; each blob transaction after the first adds 24 s
+to the leg, so a short window takes a batch of fewer transactions. While the election is open that is
 `now + graceFloor`, so `--l1-settle-lag` plus `--settle-margin` must stay under the registry's
 grace floor (150 s on OP); otherwise nothing could seal while a window is open, so a signing
 node refuses to boot (an observer only warns).
@@ -150,9 +154,10 @@ On OP Mainnet:
   archives do. publicnode's served recent and day-old slots when the preset was filled in;
   lodestar's public endpoint refused blob requests (403). Production followers should add a beacon
   node of their own.
-- `--l1-max-post-fee` bounds what one post may cost at the fees it offers (twice the base fee and
-  twice the blob base fee); a replacement doubles them. A one-blob post cost about 2 µETH at
-  0.08 gwei and 0.004 gwei; the 0.001 ETH default leaves room for spikes and replacements.
+- `--l1-max-post-fee` bounds what one post (one blob transaction) may cost at the fees it offers
+  (twice the base fee and twice the blob base fee); a replacement doubles them. A one-blob post
+  cost about 2 µETH at 0.08 gwei and 0.004 gwei; the 0.001 ETH default leaves room for spikes and
+  replacements. A batch of three transactions, re-posted at most three times, sends at most 12.
 - Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the
   node logs why at debug level ("no time to land an L1-blob batch", "no batch fits").
 
