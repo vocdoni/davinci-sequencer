@@ -77,6 +77,9 @@ enum Cmd {
         threads: usize,
         #[arg(long, env = "CIRCOM_ARTIFACTS")]
         artifacts: PathBuf,
+        /// Recorded in each shard's meta; defaults to /etc/hostname.
+        #[arg(long)]
+        host_name: Option<String>,
     },
     /// Verify and join both hosts' shards into `ballots/w<N>/`.
     Merge {
@@ -200,11 +203,17 @@ async fn real_main() -> Result<ExitCode> {
             hosts,
             threads,
             artifacts,
+            host_name,
         } => {
             let plan = Plan::load(&campaign)?;
             let seed = Seed::load(&campaign.join("secret").join("seed"))?;
             let prover = fixture::load_prover_from(&artifacts)?;
-            let host_name = std::env::var("HOSTNAME").unwrap_or_else(|_| format!("host{host}"));
+            let host_name = match host_name {
+                Some(n) => n,
+                None => std::fs::read_to_string("/etc/hostname")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| format!("host{host}")),
+            };
             let o = GenOpts {
                 host,
                 hosts,
