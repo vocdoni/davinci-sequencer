@@ -7,6 +7,7 @@ mod post;
 mod settle;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use davinci_zkvm_sdk::blob::TransitionBlobs;
@@ -135,6 +136,8 @@ pub struct L1Job<'a> {
     pub deadline: tokio::time::Instant,
     /// Fired when the actor drops the flight (rollback, shutdown).
     pub cancel: CancellationToken,
+    /// Set once any chunk of this job is mined: the job spent on Ethereum.
+    pub posted: AtomicBool,
 }
 
 /// What [`with_post`] leaves for [`settle`].
@@ -178,6 +181,7 @@ async fn post_chunks(
             {
                 Ok(p) => {
                     posts.push(p);
+                    job.posted.store(true, Ordering::Relaxed);
                     break;
                 }
                 // Fee cap, L1 trouble: wait and post again while the proof runs.

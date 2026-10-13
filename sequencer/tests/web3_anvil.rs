@@ -2617,6 +2617,7 @@ mod l1_blob_mode {
             blobs: &blobs,
             deadline: tokio::time::Instant::now() + Duration::from_secs(120),
             cancel: CancellationToken::new(),
+            posted: Default::default(),
         };
         let (_, posting) = with_post(&da, &t.c, &job, std::future::ready(())).await;
         let posts = posting.posts.clone();
@@ -2695,6 +2696,7 @@ mod l1_blob_mode {
             blobs: &blobs,
             deadline,
             cancel: CancellationToken::new(),
+            posted: Default::default(),
         };
         let posting = Posting {
             posts: vec![posted],

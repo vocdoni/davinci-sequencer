@@ -149,11 +149,14 @@ Each batch:
    needless re-prove); once the root is gone the settlement is rolled back and its votes
    requeued, like a lost race.
 
-Every proved batch posted blobs, so the node bounds the spend of settlements that keep failing:
-after three proved batches in a row whose settlement ended without landing (any of the give-ups
-above, an OP send failure, the deadline), it seals nothing more for that process and logs an
-error with the last failure. The votes stay pending (the grace end errors them as usual). A
-landing, its own or another sequencer's, resets the count; only a restart lifts the stop.
+The node bounds the spend of cycles that keep failing. A failed cycle posted at least one blob
+transaction but did not land: the settlement gave up (any of the give-ups above, an OP send
+failure, the deadline), or the proof failed after a post. After three in a row the node pauses
+sealing for that process for 10 minutes, and each further failed cycle doubles the pause, up to
+an hour. Each pause logs an error with its length, the count and the last failure; the votes stay
+pending (the grace end errors them as usual) and `nextSealNotBefore` shows the pause end. A
+landing, the node's own or another sequencer's, resets the count and ends the pause; so does a
+restart.
 
 The registry emits `ProcessStateTransitionedL1(processId, l1BlockNumbers, versionedHashes)` right
 after `ProcessStateTransitioned`; the node merges the two and fetches the blobs from Ethereum:

@@ -455,6 +455,7 @@ impl Rig {
             blobs: &self.blobs,
             deadline: soon(),
             cancel: CancellationToken::new(),
+            posted: Default::default(),
         }
     }
 

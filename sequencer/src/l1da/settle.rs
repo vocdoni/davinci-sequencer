@@ -4,6 +4,7 @@
 //! send. A chunk whose transaction is gone is posted again alone; a proof
 //! that would be too deep posts every chunk again.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use alloy::primitives::B256;
@@ -189,6 +190,7 @@ pub async fn settle(
             {
                 Ok(p) => {
                     posts[i] = Some(p);
+                    job.posted.store(true, Ordering::Relaxed);
                     // A recorded origin below the new post anchors nothing.
                     recorded = None;
                     proof_failing = None;

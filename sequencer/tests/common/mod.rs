@@ -629,6 +629,11 @@ impl FakeChain {
         i.block += 1;
     }
 
+    /// The head time.
+    pub fn time(&self) -> u64 {
+        self.inner.lock().unwrap().time
+    }
+
     /// Sets the head time, backwards too (a lagging endpoint's head).
     pub fn set_time(&self, t: u64) {
         self.inner.lock().unwrap().time = t;

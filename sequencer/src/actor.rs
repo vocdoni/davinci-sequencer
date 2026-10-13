@@ -488,6 +488,8 @@ pub(crate) enum Msg {
     JobDone {
         generation: u64,
         outcome: JobOutcome,
+        /// L1-blob mode: the job mined at least one blob post.
+        posted: bool,
     },
     FinalizeDone {
         generation: u64,
@@ -743,10 +745,12 @@ const STALE_WARN_TICKS: u32 = 30;
 /// sealing back.
 const PAUSE_HOLD: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// L1-blob mode: consecutive proved batches whose settlement ends
-/// `Transient` before the process stops sealing. Each one posted blobs on
-/// Ethereum; nothing bounds the spend across requeues otherwise.
-const MAX_SETTLE_FAILURES: u32 = 3;
+/// L1-blob mode: consecutive failed cycles (blobs posted on Ethereum, no
+/// landing) before sealing pauses; nothing bounds the spend otherwise.
+const FAILED_CYCLES_BEFORE_PAUSE: u32 = 3;
+/// The first pause; each further failed cycle doubles it, up to [`MAX_PAUSE`].
+const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 struct Flight {
     generation: u64,
@@ -844,12 +848,13 @@ struct Actor {
     /// Set when a settlement met a pause the events have not shown yet: no
     /// seal before this instant or the next status event.
     pause_hold: Option<tokio::time::Instant>,
-    /// L1-blob mode: consecutive proved batches whose settlement ended
-    /// `Transient`; any landing (ours or synced) resets it.
-    settle_failures: u32,
-    /// Latched at [`MAX_SETTLE_FAILURES`]: no seal until a restart. In
-    /// memory only, so a restart (after fixing the endpoint) clears it.
-    settle_stopped: bool,
+    /// L1-blob mode: consecutive cycles that posted blobs but did not land.
+    /// Any landing (ours or synced) resets it and the pause; in memory only,
+    /// so a restart does too.
+    failed_cycles: u32,
+    /// No seal before this instant after [`FAILED_CYCLES_BEFORE_PAUSE`]
+    /// failed cycles.
+    failed_pause: Option<tokio::time::Instant>,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -991,8 +996,8 @@ pub(crate) fn spawn_actor(
         census_recheck: false,
         census_reverts: ([0u8; 32], 0),
         pause_hold: None,
-        settle_failures: 0,
-        settle_stopped: false,
+        failed_cycles: 0,
+        failed_pause: None,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1139,7 +1144,8 @@ impl Actor {
             Msg::JobDone {
                 generation,
                 outcome,
-            } => self.on_job_done(generation, outcome).await,
+                posted,
+            } => self.on_job_done(generation, outcome, posted).await,
             Msg::ForceRefreshOverflow => self.refresh_overflow(),
             Msg::ResultsHeld {
                 generation,
@@ -1276,7 +1282,12 @@ impl Actor {
             oldest + (self.batch_time as f64 * 0.9).ceil() as u64
         };
         let flush_at = self.end_time().saturating_sub(self.flush_horizon);
-        Some(due.min(flush_at))
+        // Paused after failed L1 cycles: not before the pause ends.
+        let paused = self.failed_pause.map_or(0, |t| {
+            let left = t.saturating_duration_since(tokio::time::Instant::now());
+            now.saturating_add(left.as_secs())
+        });
+        Some(due.min(flush_at).max(paused))
     }
 
     fn accepting(&self) -> bool {
@@ -1627,7 +1638,6 @@ impl Actor {
         if self.in_flight.is_some()
             || self.finalizing
             || self.await_sync
-            || self.settle_stopped
             || self.pending.is_empty()
             || self.record.local != LocalStatus::Active
             || self.deps.contracts.signer().is_none()
@@ -1646,9 +1656,9 @@ impl Actor {
             ProcessStatus::Paused if self.chain_time >= self.end_time() => {}
             _ => return,
         }
-        // Cooling down after transient prover/RPC trouble, or holding for
-        // a pause the events have not shown yet?
-        if let Some(t) = self.prove_after.max(self.pause_hold)
+        // Cooling down after transient prover/RPC trouble, holding for a
+        // pause the events have not shown yet, or after failed L1 cycles?
+        if let Some(t) = self.prove_after.max(self.pause_hold).max(self.failed_pause)
             && tokio::time::Instant::now() < t
         {
             return;
@@ -2191,6 +2201,25 @@ impl Actor {
         secs
     }
 
+    /// Counts a cycle that posted blobs but did not land; from the
+    /// [`FAILED_CYCLES_BEFORE_PAUSE`]th in a row, pauses sealing: 10 min,
+    /// doubling per further failure, at most 1 h. The votes stay pending.
+    fn failed_cycle(&mut self, error: &str) {
+        self.failed_cycles = self.failed_cycles.saturating_add(1);
+        let Some(extra) = self.failed_cycles.checked_sub(FAILED_CYCLES_BEFORE_PAUSE) else {
+            return;
+        };
+        let pause = FIRST_PAUSE.saturating_mul(1 << extra.min(8)).min(MAX_PAUSE);
+        self.failed_pause = Some(tokio::time::Instant::now() + pause);
+        error!(
+            pid = %hex::encode(self.pid31),
+            pause_secs = pause.as_secs(),
+            failed_cycles = self.failed_cycles,
+            %error,
+            "L1 cycles keep posting blobs without landing; pausing this process's sealing (votes stay pending)"
+        );
+    }
+
     /// Puts a flight's votes back in the queue with their original age,
     /// ahead of the later votes of their slots.
     fn requeue_flight(&mut self, f: Flight) {
@@ -2246,11 +2275,19 @@ impl Actor {
         }
     }
 
-    async fn on_job_done(&mut self, generation: u64, outcome: JobOutcome) {
+    async fn on_job_done(&mut self, generation: u64, outcome: JobOutcome, posted: bool) {
         let Some(mut f) = self.in_flight.take_if(|f| f.generation == generation) else {
             return; // a stale job of an aborted flight
         };
         let vids = f.prepared.vote_ids.clone();
+        // Blobs went out and the proof failed: a failed cycle.
+        if posted && !f.proved {
+            match &outcome {
+                JobOutcome::Guest(mask) => self.failed_cycle(&format!("guest mask {mask:#x}")),
+                JobOutcome::Failed(e) | JobOutcome::Transient(e) => self.failed_cycle(e),
+                _ => {}
+            }
+        }
         match outcome {
             JobOutcome::Landed(rc) if self.deps.l1.is_some() => {
                 // L1-blob mode: OP's unsafe blocks reorg with Ethereum, so the
@@ -2349,17 +2386,9 @@ impl Actor {
                     return;
                 }
                 self.rollback_flight(&f);
-                if self.deps.l1.is_some() && f.proved {
-                    self.settle_failures = self.settle_failures.saturating_add(1);
-                    if self.settle_failures >= MAX_SETTLE_FAILURES && !self.settle_stopped {
-                        self.settle_stopped = true;
-                        error!(
-                            pid = %hex::encode(self.pid31),
-                            failures = self.settle_failures,
-                            error = ?e,
-                            "L1 settlement keeps failing; this process seals nothing more until a restart (its votes stay pending)"
-                        );
-                    }
+                // The settlement gave up after posting: a failed cycle.
+                if posted && f.proved {
+                    self.failed_cycle(&e);
                 }
                 // Hold the votes pending under a saturating cooldown (~4 min
                 // cap) rather than re-sealing hot against a down prover or
@@ -2478,7 +2507,8 @@ impl Actor {
         self.vote_at_stale = true;
         self.put_record();
         self.await_sync = false;
-        self.settle_failures = 0;
+        self.failed_cycles = 0;
+        self.failed_pause = None;
         self.metrics.settled_by_self.fetch_add(1, Ordering::SeqCst);
         info!(
             pid = %hex::encode(self.pid31),
@@ -2757,7 +2787,8 @@ impl Actor {
             .synced_from_others
             .fetch_add(1, Ordering::SeqCst);
         self.await_sync = false;
-        self.settle_failures = 0;
+        self.failed_cycles = 0;
+        self.failed_pause = None;
         // Pending votes another sequencer settled for us are done. Votes
         // whose slot got overwritten stay pending: their id is not in the tree.
         self.settle_pending_in_tree();
@@ -2992,22 +3023,25 @@ struct JobInput {
 async fn run_job(job: JobInput) {
     let generation = job.generation;
     let tx = job.tx.clone();
-    let outcome = job_inner(job).await;
+    let (outcome, posted) = job_inner(job).await;
     let _ = tx
         .send(Msg::JobDone {
             generation,
             outcome,
+            posted,
         })
         .await;
 }
 
-async fn job_inner(job: JobInput) -> JobOutcome {
+/// The outcome, and whether the job mined any blob post on Ethereum
+/// (L1-blob mode only).
+async fn job_inner(job: JobInput) -> (JobOutcome, bool) {
     let Some(l1) = job.l1.clone() else {
         let snark = match proved(&job).await {
             Ok(s) => s,
-            Err(o) => return o,
+            Err(o) => return (o, false),
         };
-        return settle_blobs(&job, &snark).await;
+        return (settle_blobs(&job, &snark).await, false);
     };
     // L1-blob mode: the blobs go to Ethereum while the batch is proved; the
     // flight's end (rollback, shutdown) cancels the job.
@@ -3017,6 +3051,7 @@ async fn job_inner(job: JobInput) -> JobOutcome {
         blobs: &job.blobs,
         deadline: job.deadline,
         cancel: job.cancel.clone(),
+        posted: Default::default(),
     };
     let work = async {
         let (proved, posting) = crate::l1da::with_post(&l1, &*job.chain, &lj, proved(&job)).await;
@@ -3028,10 +3063,11 @@ async fn job_inner(job: JobInput) -> JobOutcome {
             .await
             .into()
     };
-    tokio::select! {
+    let outcome = tokio::select! {
         _ = job.cancel.cancelled() => JobOutcome::Transient("flight aborted".into()),
         o = work => o,
-    }
+    };
+    (outcome, lj.posted.load(Ordering::Relaxed))
 }
 
 /// Proves the batch and checks the proof against the prepared batch and the
