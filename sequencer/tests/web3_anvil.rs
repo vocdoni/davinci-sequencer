@@ -2156,7 +2156,9 @@ mod l1_blob_mode {
     use alloy::consensus::Transaction as _;
     use alloy::node_bindings::AnvilInstance;
     use alloy::providers::DynProvider;
-    use davinci_sequencer::l1da::{Anchor, L1Da, L1Job, Posting, Settled, choose_anchor, settle};
+    use davinci_sequencer::l1da::{
+        Anchor, L1Da, L1Job, Posting, Settled, choose_anchor, settle, with_post,
+    };
     use davinci_sequencer::storage::Db;
     use davinci_sequencer::web3::l1proof::verify_local;
     use davinci_sequencer::web3::{L1Blobs, L1Chain, L1Rpc, OnchainProcess, RegistryDa};
@@ -2387,6 +2389,36 @@ mod l1_blob_mode {
         (blobs, snark)
     }
 
+    /// A 500-vote transition from `before`: two blobs at NF 4.
+    fn two_blob_transition(
+        pid: &[u8; 31],
+        before: [u8; 32],
+        after: [u8; 32],
+    ) -> (TransitionBlobs, PlonkSnark) {
+        let n = 500u64;
+        let t = TransitionData {
+            vote_ids: (0..n).map(|i| VOTE_ID_MIN + 5000 + i).collect(),
+            updates: (0..n)
+                .map(|i| (0x400 + i, Ballot([Ciphertext::IDENTITY; 16])))
+                .collect(),
+            num_fields: NF,
+        };
+        let blobs = build_blobs(&t, &pid_fr(pid), &before).unwrap();
+        assert_eq!(blobs.blobs.len(), 2);
+        let snark = batch_snark(
+            &Batch {
+                before,
+                after,
+                voters: n as u32,
+                overwrites: 0,
+                occupied_before: 0,
+            },
+            &CENSUS_ROOT,
+            &blobs,
+        );
+        (blobs, snark)
+    }
+
     /// Ethereum produces a block every 400 ms and OP's origin follows its
     /// head, until `stop`.
     async fn relay_origin(
@@ -2551,6 +2583,73 @@ mod l1_blob_mode {
                 if b.blocks[0] == posted2.block),
             "{evs:?}"
         );
+    }
+
+    // One blob per Ethereum transaction: a two-blob transition goes out in
+    // two transactions, in two blocks, and settles with one L1 proof of both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_settlement_spans_two_transactions() {
+        if !enabled() {
+            eprintln!("skipped: set ANVIL=1");
+            return;
+        }
+        let t = two_chains().await;
+        // Initialises the mode cell: events() pairs L1 events strictly from here on.
+        t.c.da_mode().await.unwrap();
+        let da = t.da(1);
+        let (pid, p, _pk) = t.process().await;
+        let (blobs, snark) = two_blob_transition(&pid, p.state_root, [0x93; 32]);
+        let want: Vec<B256> = blobs
+            .versioned_hashes
+            .iter()
+            .map(|h| B256::from(*h))
+            .collect();
+        let stop = CancellationToken::new();
+        let relay = tokio::spawn(relay_origin(
+            t.l1_read.clone(),
+            t.relay.clone(),
+            t.l1_block,
+            stop.clone(),
+        ));
+        let job = L1Job {
+            pid,
+            root_before: p.state_root,
+            blobs: &blobs,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+            cancel: CancellationToken::new(),
+        };
+        let (_, posting) = with_post(&da, &t.c, &job, std::future::ready(())).await;
+        let posts = posting.posts.clone();
+        assert_eq!(posts.len(), 2, "{posting:?}");
+        assert_eq!(posts[1].nonce, posts[0].nonce + 1);
+        assert!(posts[1].block > posts[0].block);
+        let out = settle(&da, &t.c, &job, &snark, posting).await;
+        stop.cancel();
+        relay.await.unwrap();
+        let Settled::Landed(rc) = out else {
+            panic!("{out:?}");
+        };
+        let evs = t.c.events(rc.block, rc.block).await.unwrap();
+        let EventKind::StateTransitioned {
+            l1: Some(b),
+            n_blobs,
+            new_root,
+            ..
+        } = &evs[0].kind
+        else {
+            panic!("{evs:?}");
+        };
+        assert_eq!((*n_blobs, *new_root), (2, [0x93; 32]));
+        assert_eq!(b.blocks, vec![posts[0].block, posts[1].block]);
+        assert_eq!(b.vhs, want);
+        // A follower reads them back from the two Ethereum blocks.
+        let got = AnvilBlobs::new(std::slice::from_ref(&t.l1_url))
+            .blobs_for_l1(&b.blocks, &b.vhs)
+            .await
+            .unwrap();
+        assert_eq!(got, blobs.blobs);
+        assert_eq!(t.c.process(&pid).await.unwrap().state_root, [0x93; 32]);
+        assert!(t.db.l1_posts().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
