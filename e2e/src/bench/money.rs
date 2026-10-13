@@ -399,6 +399,23 @@ fn two_keys(var: &str) -> Result<[Address; 2]> {
 /// file does not exist: the first go then starts from the funded balances).
 /// Call before sending, so a failed send only makes the budget stricter.
 pub fn record_inflow(campaign: &Path, to: Address, l1: bool, amount: U256) -> Result<()> {
+    record_inflow_with(campaign, to, l1, amount, |l1| {
+        two_keys(if l1 {
+            "DAVINCI_E2E_L1_KEYS"
+        } else {
+            "DAVINCI_E2E_SEQUENCER_KEYS"
+        })
+    })
+}
+
+/// [`record_inflow`] with the sequencer addresses (a side's A and B) from `keys`.
+pub fn record_inflow_with(
+    campaign: &Path,
+    to: Address,
+    l1: bool,
+    amount: U256,
+    keys: impl FnOnce(bool) -> Result<[Address; 2]>,
+) -> Result<()> {
     let path = campaign.join("budget.json");
     let raw = match std::fs::read(&path) {
         Ok(r) => r,
@@ -408,9 +425,9 @@ pub fn record_inflow(campaign: &Path, to: Address, l1: bool, amount: U256) -> Re
     let mut b: Budget =
         serde_json::from_slice(&raw).map_err(|e| anyhow!("{}: {e}", path.display()))?;
     let (keys, slots) = if l1 {
-        (two_keys("DAVINCI_E2E_L1_KEYS")?, &mut b.inflows.l1)
+        (keys(true)?, &mut b.inflows.l1)
     } else {
-        (two_keys("DAVINCI_E2E_SEQUENCER_KEYS")?, &mut b.inflows.op)
+        (keys(false)?, &mut b.inflows.op)
     };
     let i = keys
         .iter()
@@ -749,5 +766,34 @@ mod tests {
             &[s("seq-a.l1", 4), s("seq-b.l1", 3), s("seq-a.op", 2)],
         );
         assert_eq!(gaps, vec!["seq-a.l1".to_string()]);
+    }
+
+    #[test]
+    fn record_inflow_adds_once_to_the_matching_slot() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let one = U256::from(1u8);
+        let bal = Balances {
+            l1: [one; 2],
+            op: [one; 2],
+            organizer_op: one,
+        };
+        let caps = Caps {
+            l1_per_key: one,
+            op_per_key: one,
+            organizer_op: one,
+        };
+        let budget = Budget::new(bal, caps).unwrap();
+        std::fs::write(
+            d.path().join("budget.json"),
+            serde_json::to_vec(&budget).unwrap(),
+        )
+        .unwrap();
+        let amount = U256::from(7u8);
+        record_inflow_with(d.path(), b, true, amount, |_| Ok([a, b])).unwrap();
+        let got: Budget =
+            serde_json::from_slice(&std::fs::read(d.path().join("budget.json")).unwrap()).unwrap();
+        assert_eq!(got.inflows.l1, [U256::ZERO, amount]);
+        assert_eq!(got.inflows.op, [U256::ZERO; 2]);
     }
 }

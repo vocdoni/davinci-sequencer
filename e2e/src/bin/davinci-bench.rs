@@ -173,13 +173,6 @@ async fn real_main() -> Result<ExitCode> {
                     }
                 }
             }
-            if let Some(dir) = &campaign {
-                for (t, l1_side) in [(op, false), (l1, true)] {
-                    if let Some((to, a)) = t {
-                        money::record_inflow(dir, to, l1_side, a)?;
-                    }
-                }
-            }
             money::fund(&owner, &op_rpc, &l1_rpc, op, l1).await?;
         }
         Cmd::StandIn {
