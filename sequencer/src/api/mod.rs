@@ -247,20 +247,19 @@ async fn start(
         }
         RegistryDa::Blobs => None,
     };
-    // Only a signing node seals.
-    let reserved = cfg
-        .l1_settle_lag
-        .saturating_add(cfg.settle_margin)
-        .as_secs();
-    if l1.is_some() && contracts.signer().is_some() && reserved > grace.grace_floor {
-        tracing::warn!(
-            l1_settle_lag = ?cfg.l1_settle_lag,
-            settle_margin = ?cfg.settle_margin,
-            grace_floor = grace.grace_floor,
-            "L1-blob mode: the Ethereum leg plus the settle margin exceed the registry's \
-             grace floor: no batch can seal while a window is open, nor in a grace window \
-             at the floor; lower --settle-margin"
-        );
+    if l1.is_some() {
+        let signing = contracts.signer().is_some();
+        if let Some((fatal, msg)) = budget_error(
+            cfg.l1_settle_lag,
+            cfg.settle_margin,
+            grace.grace_floor,
+            signing,
+        ) {
+            if fatal {
+                return Err(anyhow::anyhow!(msg));
+            }
+            tracing::warn!("{msg}");
+        }
     }
     // Batches are sized for the chain that carries the blobs.
     let (advertised, blob_chain) = match &l1 {
@@ -291,12 +290,42 @@ async fn start(
     Ok((listener, node))
 }
 
+/// L1-blob mode: the Ethereum leg plus the settle margin must fit in the
+/// registry's grace floor, or no batch can seal. Only a signing node seals,
+/// so only it must refuse; an observer just gets the warning.
+fn budget_error(
+    lag: std::time::Duration,
+    margin: std::time::Duration,
+    floor: u64,
+    signing: bool,
+) -> Option<(bool, String)> {
+    (lag.saturating_add(margin).as_secs() > floor).then(|| {
+        let msg = format!(
+            "L1-blob mode: the Ethereum leg (--l1-settle-lag {lag:?}) plus the settle margin \
+             (--settle-margin {margin:?}) exceed the registry's grace floor ({floor}s): no batch \
+             can seal while a window is open, nor in a grace window at the floor; lower \
+             --settle-margin or --l1-settle-lag"
+        );
+        (signing, msg)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[test]
+    fn budget_decision() {
+        let d = std::time::Duration::from_secs;
+        assert!(budget_error(d(110), d(30), 150, true).is_none());
+        assert!(budget_error(d(110), d(40), 150, true).is_none());
+        let (fatal, e) = budget_error(d(110), d(60), 150, true).unwrap();
+        assert!(fatal && e.contains("--settle-margin") && e.contains("150"));
+        assert!(!budget_error(d(110), d(60), 150, false).unwrap().0);
+    }
 
     // The registry's mode and `--l1-rpc-url` must agree, both ways.
     #[test]
