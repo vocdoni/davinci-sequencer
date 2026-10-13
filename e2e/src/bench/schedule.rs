@@ -28,10 +28,11 @@ pub struct Schedule {
     pub phases: Vec<Phase>,
 }
 
-/// Seconds to a duration; a non-finite or negative value is zero.
+/// Seconds to a duration; NaN or negative is zero and a huge value is
+/// capped, so a tiny rate cannot panic `from_secs_f64`.
 fn dur(s: f64) -> Duration {
-    if s.is_finite() && s > 0.0 {
-        Duration::from_secs_f64(s)
+    if s > 0.0 {
+        Duration::from_secs_f64(s.min(1e12))
     } else {
         Duration::ZERO
     }
@@ -64,8 +65,8 @@ impl Arrivals {
         count: Option<usize>,
         rng: &mut StdRng,
     ) {
-        if per_min <= 0.0 {
-            return;
+        if per_min.is_nan() || per_min <= 0.0 {
+            return; // [`Schedule::validate`] reports it
         }
         let step = 60.0 / per_min;
         let mut t = t0;
@@ -85,6 +86,19 @@ impl Arrivals {
 }
 
 impl Schedule {
+    /// Rejects a rate that is not positive and finite. `capacity` and
+    /// `offsets` skip such a rate rather than panic; call this first.
+    pub fn validate(&self) -> Result<(), String> {
+        for (i, p) in self.phases.iter().enumerate() {
+            if let Phase::Rate { per_min, .. } = p
+                && !(per_min.is_finite() && *per_min > 0.0)
+            {
+                return Err(format!("phase {i}: rate {per_min} per minute"));
+            }
+        }
+        Ok(())
+    }
+
     /// Votes the phases hold (a rate holds `per_min * secs / 60`).
     pub fn capacity(&self) -> usize {
         self.phases
@@ -111,6 +125,8 @@ impl Schedule {
             if a.full() {
                 break;
             }
+            // A Poisson overrun shifts the phases after it.
+            t = f64::max(t, a.out.last().map_or(0.0, Duration::as_secs_f64));
             match *p {
                 Phase::Rate {
                     per_min,
@@ -154,7 +170,8 @@ pub enum Gap {
 
 /// Round 1 at `offsets[i]` for `first[i]`; round r >= 2 of voter v at its
 /// round r-1 time plus the gap. A later round whose predecessor is not
-/// scheduled is dropped. Sorted by time.
+/// scheduled is dropped. Sorted by time. Panics if `first` and `offsets`
+/// differ in length.
 pub fn order(
     first: &[u32],
     later: &[(u32, u8)],
@@ -162,6 +179,11 @@ pub fn order(
     gap: &Gap,
     seed: u64,
 ) -> Vec<(Duration, u32, u8)> {
+    assert_eq!(
+        first.len(),
+        offsets.len(),
+        "one offset per first-round vote"
+    );
     let mut out: Vec<(Duration, u32, u8)> = first
         .iter()
         .zip(offsets)
