@@ -3,3 +3,4 @@
 pub mod ballots;
 pub mod plan;
 pub mod rig;
+pub mod schedule;
