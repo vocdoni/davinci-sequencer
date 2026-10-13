@@ -136,17 +136,20 @@ covers the OP leg. A batch seals only while both the estimated proof and the Eth
 plus the margin, end before the window can close; each blob transaction after the first adds 24 s
 to the leg, so a short window takes a batch of fewer transactions. While the election is open that is
 `now + graceFloor`, so `--l1-settle-lag` plus `--settle-margin` must stay under the registry's
-grace floor (150 s on OP); otherwise nothing could seal while a window is open, so a signing
+grace floor (240 s on OP); otherwise nothing could seal while a window is open, so a signing
 node refuses to boot (an observer only warns).
 
 On OP Mainnet:
 
-- Keep the L1-blob defaults: `--settle-margin 30s` and `--l1-settle-lag 110s`. Do not carry a
-  blob-mode `DAVINCI_SETTLE_MARGIN=60s` into an `optimism` node (110 + 60 > 150), and do not lower
-  `--l1-settle-lag` below about 100 s: a post settled about 72 s after it was sent in the live run,
-  and the rest is headroom for a missed slot or a wider origin lag.
-- Organizers should keep the grace at the 180 s default or above, not the 150 s floor: after the
-  end, a follow-up batch can seal only within `grace - 140 s` of the previous landing.
+- Keep the L1-blob defaults: `--settle-margin 30s` and `--l1-settle-lag 110s`. They leave a batch
+  up to 240 - 30 - 30 = 180 s of estimated proof while an election is open, and five blob
+  transactions of Ethereum leg. Do not lower `--l1-settle-lag` below about 100 s: a post settled
+  about 72 s after it was sent in the live run, and the rest is headroom for a missed slot or a
+  wider origin lag.
+- Organizers should keep the grace at the 300 s default or above, not the 240 s floor: after the
+  end, a follow-up batch can seal only within `grace - 140 s` of the previous landing. A 512-vote
+  batch at 16 fields after the end wants the 600 s ceiling on a node that has not proved yet (its
+  estimate starts at 0.8 s a vote).
 - `--l1-rpc-url` must include an endpoint that takes 1.5 MB request bodies (a six-blob send):
   publicnode refuses them, dRPC takes them, and the node sends a blob transaction to every listed
   endpoint, so the preset's pair works. With your own endpoint, set it as `--l1-send-rpc-url`.

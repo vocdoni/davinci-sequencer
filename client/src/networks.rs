@@ -53,14 +53,14 @@ impl Network {
 }
 
 /// OP Mainnet in L1-blob mode: transitions settle on OP, their blobs live on
-/// Ethereum (deployed 2026-10-12, see docs/deployments.md). Blob sends need an
+/// Ethereum (deployed 2026-10-13, see docs/deployments.md). Blob sends need an
 /// Ethereum RPC that takes 1.5 MB bodies: publicnode refuses them, dRPC takes
 /// them, and the node sends to every L1 endpoint at once.
 pub const OPTIMISM: Network = Network {
     name: "optimism",
     chain_id: 10,
-    registry: address!("8b63fAE96948D69CF92Eb40e4EE0fCE40962267d"),
-    start_block: 158_125_136,
+    registry: address!("C5f88160a1Df51A3Ee56b970b12B8308799c05A7"),
+    start_block: 158_155_408,
     rpc_urls: &[
         "https://optimism-rpc.publicnode.com",
         "https://mainnet.optimism.io",
