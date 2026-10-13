@@ -2009,8 +2009,20 @@ pub async fn start_l1_node(
     batch_max: usize,
     shutdown: CancellationToken,
 ) -> Node {
-    chain.attach_l1(&l1);
     let cfg = test_config(datadir, &s.census_dir, batch_max, "0s");
+    start_l1_node_cfg(db, chain, l1, prover, cfg, shutdown).await
+}
+
+/// [`start_l1_node`] with a caller-built [`Config`].
+pub async fn start_l1_node_cfg(
+    db: Db,
+    chain: FakeChain,
+    l1: FakeL1,
+    prover: Arc<FakeProver>,
+    cfg: Config,
+    shutdown: CancellationToken,
+) -> Node {
+    chain.attach_l1(&l1);
     let da =
         davinci_sequencer::l1da::L1Da::new(Arc::new(l1), db.clone(), u128::MAX, cfg.poll_interval)
             .unwrap();

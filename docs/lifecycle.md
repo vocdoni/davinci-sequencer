@@ -59,7 +59,9 @@ cost, a moving average of the prover's measured job time that starts high. While
 open, the batch holds at most the votes whose estimated proof plus `--settle-margin` ends before
 `min(graceEnd, now + graceFloor)`; once it has ended, before `graceEnd`. The second term covers
 the worst legal close: the organizer ends the election right after the seal and lowers the grace
-to the registry's floor. When not even one vote fits, nothing seals and the votes wait.
+to the registry's floor. In L1-blob mode the Ethereum leg (`--l1-settle-lag`) runs during the
+proof, so it plus `--settle-margin` must fit before that deadline as well. When not even one vote
+fits, nothing seals and the votes wait.
 
 To build a batch, the actor:
 

@@ -496,9 +496,14 @@ impl Net {
                 })
                 .transpose()?;
             c.l1_max_post_fee = l1.max_post_fee.clone();
-            // A landing also waits for OP's origin to pass the blob block:
-            // about lag x block time on anvil, 90-100 s on OP Mainnet.
-            c.settle_margin = Some(if self.live { "120s" } else { "15s" }.into());
+            // The node reserves the Ethereum leg (OP's origin passing the blob
+            // block) itself, overlapping the proof; the margin is the OP leg.
+            c.settle_margin = Some(if self.live { "30s" } else { "15s" }.into());
+            // On anvil that leg is the inclusion block plus the relayer's lag,
+            // with a block to spare, not Ethereum's ~110 s.
+            if let Some(a) = &l1.anvil {
+                c.l1_settle_lag = Some(format!("{}s", a.block_time.saturating_mul(a.lag + 2)));
+            }
         }
         c.start_block = self.start_block;
         Ok(c)

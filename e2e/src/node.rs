@@ -130,6 +130,9 @@ pub struct NodeConfig {
     pub l1_send_rpc_url: Option<String>,
     pub l1_privkey_file: Option<PathBuf>,
     pub l1_max_post_fee: Option<String>,
+    /// `DAVINCI_L1_SETTLE_LAG`: the Ethereum leg the node reserves; `None`
+    /// keeps the node's default (Ethereum mainnet timing).
+    pub l1_settle_lag: Option<String>,
 }
 
 impl NodeConfig {
@@ -172,6 +175,7 @@ impl NodeConfig {
             l1_send_rpc_url: None,
             l1_privkey_file: None,
             l1_max_post_fee: None,
+            l1_settle_lag: None,
         }
     }
 }
@@ -243,6 +247,7 @@ impl Node {
             ("DAVINCI_L1_RPC_URL", cfg.l1_rpc_url.clone()),
             ("DAVINCI_L1_SEND_RPC_URL", cfg.l1_send_rpc_url.clone()),
             ("DAVINCI_L1_MAX_POST_FEE", cfg.l1_max_post_fee.clone()),
+            ("DAVINCI_L1_SETTLE_LAG", cfg.l1_settle_lag.clone()),
         ];
         for (k, v) in knobs {
             if let Some(v) = v {

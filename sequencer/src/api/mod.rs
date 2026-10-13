@@ -247,6 +247,21 @@ async fn start(
         }
         RegistryDa::Blobs => None,
     };
+    // Only a signing node seals.
+    let reserved = cfg
+        .l1_settle_lag
+        .saturating_add(cfg.settle_margin)
+        .as_secs();
+    if l1.is_some() && contracts.signer().is_some() && reserved > grace.grace_floor {
+        tracing::warn!(
+            l1_settle_lag = ?cfg.l1_settle_lag,
+            settle_margin = ?cfg.settle_margin,
+            grace_floor = grace.grace_floor,
+            "L1-blob mode: the Ethereum leg plus the settle margin exceed the registry's \
+             grace floor: no batch can seal while a window is open, nor in a grace window \
+             at the floor; lower --settle-margin"
+        );
+    }
     // Batches are sized for the chain that carries the blobs.
     let (advertised, blob_chain) = match &l1 {
         Some((rpc, _)) => (rpc.chain_blob_cap(), rpc.chain_id()),
