@@ -769,3 +769,22 @@ fn dkg_results_inputs_verify_like_the_registry() {
         check(&st);
     }
 }
+
+#[test]
+fn a_512_vote_queue_at_sixteen_fields_seals_what_six_blobs_hold() {
+    // The node's default --batch-max is 512. At 16 fields a steady batch
+    // (one refresh per new vote) fits six blobs only up to 379 votes, so the
+    // selection stops there and reports the transaction full.
+    let env = env(16, 1024);
+    let mut st = committed_state(&env, 512);
+    let pending: Vec<VerifiedVote> = (512..1024)
+        .map(|i| fake_vote(&env, i, &[1], 50_000 + i as u64))
+        .collect();
+    let (sel, blocked) = st.select_batch(&pending, u64::MAX, &none(), 512).unwrap();
+    assert_eq!((sel.len(), blocked), (379, true));
+    let sel: Vec<VerifiedVote> = sel.into_iter().cloned().collect();
+    let b = st
+        .prepare(&sel, &mut StdRng::seed_from_u64(17), &none())
+        .unwrap();
+    assert_eq!(b.blobs.blobs.len(), TX_BLOB_CAP);
+}

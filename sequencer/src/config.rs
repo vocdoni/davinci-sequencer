@@ -340,7 +340,8 @@ pub struct Config {
     #[arg(long, env = "DAVINCI_PROVER_URL", default_value = "http://127.0.0.1:8080", value_parser = parse_http_url)]
     pub prover_url: Url,
     /// Hard cap on a batch; pending votes past it seal one without waiting.
-    #[arg(long, env = "DAVINCI_BATCH_MAX", default_value = "1024", value_parser = parse_batch_max)]
+    /// The guest takes up to 1024 votes; the default is 512.
+    #[arg(long, env = "DAVINCI_BATCH_MAX", default_value = "512", value_parser = parse_batch_max)]
     pub batch_max: usize,
     /// Most blobs one settlement transaction may carry. Unset: the chain's
     /// `eth_config` blob schedule, capped at the protocol's six.
@@ -808,7 +809,7 @@ mod tests {
         let c = Config::parse_args(with_rpc()).unwrap();
         assert_eq!(c.network, NetworkChoice::Custom);
         assert_eq!(c.api_port, 9090);
-        assert_eq!(c.batch_max, 1024);
+        assert_eq!(c.batch_max, 512);
         assert_eq!(c.max_blobs_per_tx, None);
         assert_eq!(c.batch_time, Duration::from_secs(900));
         assert_eq!(c.min_mix, 2);
