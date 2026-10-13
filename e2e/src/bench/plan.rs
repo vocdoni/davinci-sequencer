@@ -121,7 +121,8 @@ impl Seed {
     pub fn choices(&self, tag: &str, v: u32, round: u8, nf: u8) -> Vec<u64> {
         let nf = usize::from(nf.max(1));
         let h = self.hash("choices", tag, v, round);
-        let units = 1 + usize::from(h[0]) % 6;
+        // Capped so an nf of 1 (5 units fit) cannot loop forever below.
+        let units = (1 + usize::from(h[0]) % 6).min(5 * nf);
         let mut c = vec![0u64; nf];
         for &b in &h[1..=units] {
             let mut j = usize::from(b) % nf;
@@ -255,7 +256,27 @@ impl Plan {
     pub fn load(dir: &Path) -> Result<Plan> {
         let p = dir.join("plan.json");
         let b = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
-        serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))
+        let plan: Plan =
+            serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
+        plan.check_tags()?;
+        Ok(plan)
+    }
+
+    /// Tags become path components and shard keys: reject empty, `/`, `..`
+    /// and repeats within a wave.
+    pub fn check_tags(&self) -> Result<()> {
+        for w in &self.waves {
+            let mut seen = std::collections::HashSet::new();
+            for e in &w.elections {
+                let t = e.spec.tag.as_str();
+                ensure!(
+                    !t.is_empty() && !t.contains(['/', '\\', '\0']) && !t.contains(".."),
+                    "bad election tag {t:?}"
+                );
+                ensure!(seen.insert(t), "duplicate tag {t:?} in wave {}", w.n);
+            }
+        }
+        Ok(())
     }
 
     /// Written to `plan.json.tmp` first so a crash never leaves a torn plan.
@@ -300,7 +321,7 @@ impl Plan {
                 }
             })
             .collect();
-        Ok(Plan {
+        let plan = Plan {
             campaign: "stand-in".into(),
             chain_id: 0,
             registry: Address::ZERO,
@@ -310,7 +331,9 @@ impl Plan {
                 created: 0,
                 elections,
             }],
-        })
+        };
+        plan.check_tags()?;
+        Ok(plan)
     }
 }
 
@@ -359,7 +382,8 @@ mod tests {
                     let sum: u64 = c.iter().sum();
                     assert!((1..=6).contains(&sum), "sum {sum}");
                     assert_eq!(mode.num_fields, nf);
-                    assert!(mode.max_value >= 5 && 10 >= sum);
+                    assert!(c.iter().all(|&x| x <= mode.max_value));
+                    assert!(sum <= 10);
                 }
             }
         }
@@ -367,6 +391,29 @@ mod tests {
             .filter(|&v| s.choices("T", v, 1, 2) != s.choices("T", v, 2, 2))
             .count();
         assert!(differ >= 160, "only {differ} of 200 differ");
+    }
+
+    #[test]
+    fn choices_terminate_at_nf_one() {
+        let s = seed(6);
+        for v in 0..100 {
+            let c = s.choices("T", v, 1, 1);
+            assert_eq!(c.len(), 1);
+            assert!((1..=5).contains(&c[0]));
+        }
+    }
+
+    #[test]
+    fn bad_tags_are_rejected() {
+        let s = seed(7);
+        for t in ["", "a/b", "..", "a..b"] {
+            assert!(
+                Plan::stand_in(&s, 1, &[spec(t, 2, 1, 3, 1, 0)]).is_err(),
+                "{t:?}"
+            );
+        }
+        let dup = [spec("A", 2, 1, 3, 1, 0), spec("A", 2, 1, 3, 1, 0)];
+        assert!(Plan::stand_in(&s, 1, &dup).is_err());
     }
 
     #[test]
