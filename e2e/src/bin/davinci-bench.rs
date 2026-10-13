@@ -1,20 +1,35 @@
-//! The live benchmark's controller. Money steps only for now: `keygen`,
-//! `fund` and `gate`. Keys come from files (`DAVINCI_E2E_ORGANIZER_KEY` names
-//! one) and are never printed.
+//! The live benchmark's controller: `keygen`, `fund`, `gate`, `plan`,
+//! `gen`, `merge`, `serve`, `cancel` and `dry`. Keys come from files
+//! (`DAVINCI_E2E_ORGANIZER_KEY` names one) and are never printed.
+//!
+//! A step that brings the rig up (`plan`, `serve`, `dry`) tears it down on
+//! every exit, SIGINT and SIGTERM included: the nodes die only when their
+//! handles drop.
 
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::utils::parse_ether;
 use alloy::primitives::{Address, U256};
-use anyhow::{Context, Result, bail};
+use alloy::providers::{Provider, ProviderBuilder};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
+use davinci_client::organizer::Organizer;
+use davinci_e2e::bench::chaos::Controller;
 use davinci_e2e::bench::r#gen::{GenOpts, gen_wave};
 use davinci_e2e::bench::merge::{Verify, check_snapshots, merge_wave};
 use davinci_e2e::bench::money;
-use davinci_e2e::bench::plan::{ElectionSpec, NodeId, Plan, Seed};
+use davinci_e2e::bench::plan::{
+    self, CancelScope, ElectionSpec, NodeId, Plan, Seed, cancel_candidates, cancel_open,
+};
+use davinci_e2e::bench::rig::{Knobs, Rig, RigSpec, Role};
+use davinci_e2e::bench::scenarios::{scenario_specs, wave_specs};
+use davinci_e2e::chain;
 use davinci_e2e::fixture;
-use davinci_e2e::net;
+use davinci_e2e::net::{self, Net};
+use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Parser)]
 #[command(name = "davinci-bench")]
@@ -63,12 +78,12 @@ enum Cmd {
         #[arg(long)]
         elections: String,
     },
-    /// Prove this host's ballot shards of a wave.
+    /// Prove this host's ballot shards of one or more waves.
     Gen {
         #[arg(long, env = "DAVINCI_BENCH_DIR")]
         campaign: PathBuf,
-        #[arg(long)]
-        wave: u32,
+        #[arg(long, value_delimiter = ',', required = true)]
+        wave: Vec<u32>,
         #[arg(long)]
         host: usize,
         #[arg(long)]
@@ -94,6 +109,274 @@ enum Cmd {
         #[arg(long)]
         rpc: Option<String>,
     },
+    /// Create the elections of one or more waves, live. The first wave
+    /// writes the seed and records the start block; the rig comes up only
+    /// for the election keys.
+    Plan {
+        #[arg(long, env = "DAVINCI_BENCH_DIR")]
+        campaign: PathBuf,
+        #[arg(long, value_delimiter = ',', required = true)]
+        wave: Vec<u32>,
+        /// Every election scaled down (1 live).
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+        /// Create the origin-3 elections (R4): deploy and fill a census
+        /// contract per election.
+        #[arg(long)]
+        onchain_census: bool,
+        #[command(flatten)]
+        rig: RigArgs,
+    },
+    /// Hold the rig up for external drivers until SIGTERM or SIGINT.
+    Serve {
+        #[arg(long, env = "DAVINCI_BENCH_DIR")]
+        campaign: PathBuf,
+        #[command(flatten)]
+        rig: RigArgs,
+    },
+    /// Cancel the READY and PAUSED processes of a wave (`plan.json`), or with
+    /// `--all` every one the organizer created since the start block.
+    Cancel {
+        #[arg(long, env = "DAVINCI_BENCH_DIR")]
+        campaign: PathBuf,
+        #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+        wave: Option<u32>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// A scaled-down run of some scenarios on two anvils.
+    Dry {
+        #[arg(long, value_delimiter = ',', required = true)]
+        scenario: Vec<String>,
+        #[arg(long, default_value_t = 0.05)]
+        scale: f64,
+        /// The last stage to run; only `plan` so far.
+        #[arg(long)]
+        stop_after: Option<String>,
+        /// Default: a new `~/.cache/davinci-bench/dry-<unix time>`.
+        #[arg(long)]
+        campaign: Option<PathBuf>,
+        #[command(flatten)]
+        rig: RigArgs,
+    },
+}
+
+#[derive(clap::Args)]
+struct RigArgs {
+    /// API ports of nodes A, B and O.
+    #[arg(long, value_delimiter = ',', default_value = "9101,9102,9103")]
+    ports: Vec<u16>,
+    #[arg(
+        long,
+        env = "DAVINCI_BENCH_PROVER_A",
+        default_value = "http://127.0.0.1:8080"
+    )]
+    prover_a: String,
+    #[arg(
+        long,
+        env = "DAVINCI_BENCH_PROVER_B",
+        default_value = "http://10.200.0.27:8080"
+    )]
+    prover_b: String,
+}
+
+/// What a step holds that must go on every exit (end, error, SIGINT,
+/// SIGTERM): the rig's nodes and proxies and the net's anvils die only when
+/// they drop, and only `Controller::finish` undoes an active chaos
+/// injection.
+#[derive(Default)]
+struct Held {
+    net: Option<Net>,
+    rig: Option<Rig>,
+    /// The controller and its scenario's start.
+    chaos: Option<(Controller, Instant)>,
+}
+
+impl Held {
+    /// Undoes chaos, then drops the rig, then the chain it runs on.
+    async fn teardown(&mut self) -> Result<()> {
+        let r = match (&mut self.chaos, &mut self.rig, &self.net) {
+            (Some((c, t0)), Some(rig), Some(net)) => c.finish(rig, net, t0.elapsed()).await,
+            _ => Ok(()),
+        };
+        self.chaos = None;
+        self.rig = None;
+        self.net = None;
+        r
+    }
+}
+
+/// Runs `step` until it ends or SIGINT or SIGTERM arrives, then tears down
+/// what it holds. A signal is an error unless `signal_ends` (serve); a
+/// teardown error never hides the step's.
+async fn held_step<T>(
+    signal_ends: bool,
+    step: impl AsyncFnOnce(&mut Held) -> Result<T>,
+) -> Result<Option<T>> {
+    let mut int = signal(SignalKind::interrupt()).context("SIGINT handler")?;
+    let mut term = signal(SignalKind::terminate()).context("SIGTERM handler")?;
+    let mut held = Held::default();
+    // The step's result, or the signal that ended it.
+    let ended: std::result::Result<Result<T>, &str> = tokio::select! {
+        r = step(&mut held) => Ok(r),
+        _ = int.recv() => Err("SIGINT"),
+        _ = term.recv() => Err("SIGTERM"),
+    };
+    let down = held.teardown().await;
+    let r = match ended {
+        Ok(r) => r.map(Some),
+        Err(sig) if signal_ends => {
+            println!("{sig}: rig down");
+            Ok(None)
+        }
+        Err(sig) => Err(anyhow!("stopped by {sig}; rig down")),
+    };
+    match (r, down) {
+        (Err(e), Err(d)) => Err(e.context(format!("teardown also failed: {d:#}"))),
+        (r, Ok(())) => r,
+        (Ok(_), Err(d)) => Err(d.context("teardown")),
+    }
+}
+
+/// Spec §14: the rig's ports are free before it starts. A taken one may be
+/// a leftover node holding a real key.
+fn ports_free(ports: &[u16; 3]) -> Result<()> {
+    let taken: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|&p| std::net::TcpListener::bind(("127.0.0.1", p)).is_err())
+        .collect();
+    ensure!(
+        taken.is_empty(),
+        "ports {taken:?} are taken: stop the leftover nodes first"
+    );
+    Ok(())
+}
+
+/// Nodes A, B and O with production knobs on the campaign's datadirs.
+async fn rig_up(net: &Net, campaign: &Path, a: &RigArgs) -> Result<Rig> {
+    let ports: [u16; 3] = a
+        .ports
+        .clone()
+        .try_into()
+        .map_err(|_| anyhow!("--ports takes three ports"))?;
+    ports_free(&ports)?;
+    std::fs::create_dir_all(campaign.join("census"))?;
+    let rig = Rig::up(
+        net,
+        RigSpec {
+            campaign: campaign.to_path_buf(),
+            prover: [a.prover_a.clone(), a.prover_b.clone()],
+            ports,
+            knobs: [Knobs::production(), Knobs::production()],
+        },
+    )
+    .await?;
+    for (name, r) in [("a", Role::A), ("b", Role::B), ("o", Role::O)] {
+        println!("node {name} at {}", rig.node(r)?.url);
+    }
+    Ok(rig)
+}
+
+/// `p` created with mode 0700, as an absolute path: the nodes confine
+/// `file://` censuses to its `census/`.
+fn campaign_dir(p: &Path) -> Result<PathBuf> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(p)
+        .with_context(|| format!("create {}", p.display()))?;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+    Ok(p.canonicalize()?)
+}
+
+fn check_plan(plan: &Plan, net: &Net) -> Result<()> {
+    ensure!(
+        (plan.chain_id, plan.registry) == (net.chain_id, net.registry),
+        "plan.json is for chain {} registry {}, not chain {} registry {}",
+        plan.chain_id,
+        plan.registry,
+        net.chain_id,
+        net.registry
+    );
+    Ok(())
+}
+
+/// The campaign's seed. Before the first wave it writes the seed and a
+/// plan whose start block is the head, before any creation.
+async fn open_campaign(net: &Net, dir: &Path) -> Result<Seed> {
+    let seed_path = dir.join("secret").join("seed");
+    if dir.join("plan.json").exists() {
+        check_plan(&Plan::load(dir)?, net)?;
+        return Seed::load(&seed_path);
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir.join("secret"))
+        .context("create secret dir")?;
+    // A seed without a plan.json predates any creation, so nothing used it.
+    let seed = if seed_path.exists() {
+        Seed::load(&seed_path)?
+    } else {
+        Seed::create(&seed_path)?
+    };
+    let head = ProviderBuilder::new()
+        .connect_client(chain::rpc(&net.rpc)?)
+        .get_block_number()
+        .await
+        .context("head block")?;
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Plan {
+        campaign: name.clone(),
+        chain_id: net.chain_id,
+        registry: net.registry,
+        start_block: head,
+        waves: Vec::new(),
+    }
+    .save(dir)?;
+    println!("campaign {name}: start block {head}");
+    Ok(seed)
+}
+
+/// `plan`'s body: seed and plan, pins, the rig for the keys, then each
+/// wave's elections.
+async fn plan_waves(
+    net: &Net,
+    rig_slot: &mut Option<Rig>,
+    campaign: &Path,
+    waves: &[(u32, Vec<ElectionSpec>)],
+    onchain_census: bool,
+    rig: &RigArgs,
+) -> Result<()> {
+    let seed = open_campaign(net, campaign).await?;
+    plan::write_pins(campaign)?;
+    let rig = rig_slot.insert(rig_up(net, campaign, rig).await?);
+    for (n, specs) in waves {
+        plan::create_wave(net, rig, campaign, &seed, *n, specs, onchain_census).await?;
+        let p = Plan::load(campaign)?;
+        println!(
+            "plan.json: wave {n}, {} elections",
+            p.wave(*n)?.elections.len()
+        );
+    }
+    Ok(())
+}
+
+fn check_scale(scale: f64) -> Result<()> {
+    ensure!(scale > 0.0 && scale <= 1.0, "--scale must be in (0, 1]");
+    Ok(())
+}
+
+fn require_live(step: &str) -> Result<()> {
+    ensure!(
+        net::is_live(),
+        "{step} runs live (DAVINCI_E2E_LIVE=1); `dry` plans on anvil"
+    );
+    Ok(())
 }
 
 fn parse_specs(s: &str) -> Result<Vec<ElectionSpec>> {
@@ -183,7 +466,6 @@ async fn real_main() -> Result<ExitCode> {
             wave,
             elections,
         } => {
-            use std::os::unix::fs::DirBuilderExt;
             let specs = parse_specs(&elections)?;
             let sdir = campaign.join("secret");
             std::fs::DirBuilder::new()
@@ -207,6 +489,9 @@ async fn real_main() -> Result<ExitCode> {
         } => {
             let plan = Plan::load(&campaign)?;
             let seed = Seed::load(&campaign.join("secret").join("seed"))?;
+            for &n in &wave {
+                plan.wave(n)?;
+            }
             let prover = fixture::load_prover_from(&artifacts)?;
             let host_name = match host_name {
                 Some(n) => n,
@@ -221,13 +506,15 @@ async fn real_main() -> Result<ExitCode> {
                 host_name,
                 artifacts,
             };
-            let st = tokio::task::block_in_place(|| {
-                gen_wave(&campaign, &plan, wave, &seed, &prover, &o)
-            })?;
-            println!(
-                "gen host {host}/{hosts}: {} shards ({} skipped), {} ballots in {:.0}s",
-                st.shards, st.skipped, st.ballots, st.secs
-            );
+            for n in wave {
+                let st = tokio::task::block_in_place(|| {
+                    gen_wave(&campaign, &plan, n, &seed, &prover, &o)
+                })?;
+                println!(
+                    "gen wave {n} host {host}/{hosts}: {} shards ({} skipped), {} ballots in {:.0}s",
+                    st.shards, st.skipped, st.ballots, st.secs
+                );
+            }
         }
         Cmd::Merge {
             campaign,
@@ -253,6 +540,121 @@ async fn real_main() -> Result<ExitCode> {
                     i.ballots, i.rounds, i.sha256
                 );
             }
+        }
+        Cmd::Plan {
+            campaign,
+            wave,
+            scale,
+            onchain_census,
+            rig,
+        } => {
+            require_live("plan")?;
+            check_scale(scale)?;
+            let waves = wave
+                .iter()
+                .map(|&n| {
+                    let specs = wave_specs(n, scale);
+                    ensure!(!specs.is_empty(), "wave {n} has no elections yet");
+                    Ok((n, specs))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let campaign = campaign_dir(&campaign)?;
+            held_step(false, async |h: &mut Held| {
+                let net = h.net.insert(Net::open(&campaign).await?);
+                plan_waves(net, &mut h.rig, &campaign, &waves, onchain_census, &rig).await
+            })
+            .await?;
+        }
+        Cmd::Serve { campaign, rig } => {
+            require_live("serve")?;
+            let campaign = campaign
+                .canonicalize()
+                .with_context(|| format!("campaign {}", campaign.display()))?;
+            let plan = Plan::load(&campaign)?;
+            held_step(true, async |h: &mut Held| -> Result<()> {
+                let net = h.net.insert(Net::open(&campaign).await?);
+                check_plan(&plan, net)?;
+                let rig = h.rig.insert(rig_up(net, &campaign, &rig).await?);
+                println!("serving until SIGTERM");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    for r in [Role::A, Role::B, Role::O] {
+                        rig.node(r)?.check_alive()?;
+                    }
+                }
+            })
+            .await?;
+        }
+        Cmd::Cancel {
+            campaign,
+            wave,
+            all: _,
+        } => {
+            let plan = Plan::load(&campaign)?;
+            let (rpc, ..) = net::live_target()?;
+            let key = std::env::var_os("DAVINCI_E2E_ORGANIZER_KEY")
+                .context("DAVINCI_E2E_ORGANIZER_KEY (a key file)")?;
+            let org = Organizer::connect(&rpc, net::read_key(Path::new(&key))?, plan.registry)?
+                .with_receipt_timeout(net::scaled(Duration::from_secs(180)));
+            let chain_id = org.provider().get_chain_id().await.context("chain id")?;
+            ensure!(
+                chain_id == plan.chain_id,
+                "the RPC is on chain {chain_id}, the plan on {}",
+                plan.chain_id
+            );
+            // clap makes `--wave` and `--all` exclusive and one required.
+            let scope = match wave {
+                Some(n) => CancelScope::Wave(n),
+                None => CancelScope::All,
+            };
+            let pids = cancel_candidates(&plan, &rpc, org.address(), scope).await?;
+            let n = cancel_open(&org, &pids).await?;
+            println!("canceled {n} of {} processes", pids.len());
+        }
+        Cmd::Dry {
+            scenario,
+            scale,
+            stop_after,
+            campaign,
+            rig,
+        } => {
+            ensure!(!net::is_live(), "dry runs on anvil: unset DAVINCI_E2E_LIVE");
+            check_scale(scale)?;
+            match stop_after.as_deref() {
+                Some("plan") => {}
+                Some(s) => bail!("--stop-after {s}: only plan so far"),
+                None => bail!("dry runs only up to --stop-after plan so far"),
+            }
+            let waves = scenario_specs(&scenario, scale)?;
+            let campaign = match campaign {
+                Some(c) => c,
+                None => PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+                    .join(".cache/davinci-bench")
+                    .join(format!(
+                        "dry-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_secs()
+                    )),
+            };
+            let campaign = campaign_dir(&campaign)?;
+            println!("dry campaign {}", campaign.display());
+            let chain_dir = campaign.join("chain");
+            std::fs::create_dir_all(&chain_dir)?;
+            held_step(false, async |h: &mut Held| {
+                let net = h.net.insert(Net::open(&chain_dir).await?);
+                plan_waves(net, &mut h.rig, &campaign, &waves, true, &rig).await?;
+                // Exercises `cancel --all` on what the plan created.
+                let plan = Plan::load(&campaign)?;
+                let org = net.organizer()?;
+                let pids =
+                    cancel_candidates(&plan, &net.rpc, org.address(), CancelScope::All).await?;
+                let n = cancel_open(&org, &pids).await?;
+                println!("cancel --all: canceled {n} of {} processes", pids.len());
+                Ok(())
+            })
+            .await?;
+            println!("dry stopped after plan");
         }
         Cmd::Gate { campaign } => {
             let r = money::gate_check(campaign.as_deref(), &[]).await?;
