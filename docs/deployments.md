@@ -7,25 +7,25 @@ together.
 ## OP Mainnet
 
 Chain id 10, preset `optimism`, L1-blob mode: transitions settle on OP Mainnet and their blobs
-live in Ethereum blob transactions. Deployed on 2026-10-13 from davinci-contracts commit `44fdca1`
-(the contract sources of release v0.0.51); davinci-contracts' `deployments/10.json` holds the
-verified record. Not source-verified on an explorer yet.
+live in Ethereum blob transactions. Deployed on 2026-10-13 from davinci-contracts commit `fd79251`
+on the davinci-zkvm ZisK 1.3.2 pins; davinci-contracts' `deployments/10.json` holds the verified
+record. Not source-verified on an explorer yet.
 
 | Contract | Address | Block |
 |---|---|---|
-| ZiskVerifier | `0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c` (reused; code hash the pinned `0x82385a40…5566`) | |
+| ZiskVerifier | `0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7` (code hash `0xadab570d…cadcc1`) | |
 | L1BlobVerifier | `0x3B95BC14F43ed8Addb83F84D10A949De74eE7529` (reused from the first OP registry) | 158125135 |
-| ProcessRegistry | `0xC5f88160a1Df51A3Ee56b970b12B8308799c05A7` | 158155408 |
+| ProcessRegistry | `0x7bfa68879f118C98B864FB52d2aD3a112eF1558F` | 158164175 |
 
-Pinned values, equal to the SDK release pins (davinci-zkvm v0.2.0):
+Pinned values, equal to the SDK release pins (davinci-zkvm `feat/zisk-1.3.2`, ZisK 1.3.2):
 
 | Value | Where | Hash |
 |---|---|---|
-| batch program vk | registry `batchProgramVK` | `0xa0ad5c4c7e39d4a7007933158181418a752e6c1563a211af84c579640db435fa` |
-| results program vk | registry `resultsProgramVK` | `0xe693589453ecaee63eba697c48d4c5321a714bb18c2d84a97437b3f368578f68` |
-| `rootCVadcopFinal` | registry and verifier | `0x05006517b6ccde5da4d890587ba62845b5af8a307c00e87d4b9d05099b16dc80` |
+| batch program vk | registry `batchProgramVK` | `0xe39e460085ecddecf365649a61183a71c0fe778aa9c06fd2aa1a6c43cddb988b` |
+| results program vk | registry `resultsProgramVK` | `0x394694558f39d0b2da0bbb09322333a0f567ee8d16bea2f354543a086587d167` |
+| `rootCVadcopFinal` | registry and verifier | `0x6b2490fba336fb00f0c8719a961de309a8db6f43a9bfb7575ca5f014d609b265` |
 | ballot VK hash | registry `ballotVKHash`, state leaf `0x07` | `0xbf1e6590bb1ba883d601c4d7d1c6fa2722a78590716874019db6d68fc776bb0e` |
-| verifier code keccak256 | `ZiskVerifier` runtime code | `0x82385a405b7301345d7e246017846ca3228aaea349cb68b116d76e0e77056566` |
+| verifier code keccak256 | `ZiskVerifier` runtime code | `0xadab570d3e3a4c172d0c75e5aef5d06098b94d70a9c8ff76af239a90fdcadcc1` |
 
 The grace window fits the Ethereum leg: 300 s by default, floor 240 s, ceiling 600 s, at most
 1800 s past the end, 60 s shorten notice. No DKG or Council adapter: those key modes are not on
@@ -44,9 +44,18 @@ keeps full blobs.
 
 ## Retired deployments
 
-These registries stay on chain, but no preset follows them. They pin the v0.1 program vks
-(davinci-zkvm v0.1.1), so a node of this release, which proves under v0.2.0, refuses them at boot.
+These registries stay on chain, but no preset follows them. They pin older program vks
+(v0.1 or v0.2.0), so a node of this release, which proves under ZisK 1.3.2, refuses them at boot.
 Their datadir directories stay untouched next to the current one.
+
+### OP Mainnet, ZisK 1.3.0 registry
+
+`ProcessRegistry` `0xC5f88160a1Df51A3Ee56b970b12B8308799c05A7` (block 158155408), deployed on
+2026-10-13 from davinci-contracts `44fdca1` on the reused `ZiskVerifier`
+`0x6781FFF50D615CB3F331CCD3Bdad3416d4ce0d5c` and `L1BlobVerifier`, followed by the `optimism`
+preset until the ZisK 1.3.2 registry replaced it the same day. It pins ZisK 1.3.0 and the v0.2.0
+vks (batch `0xa0ad5c4c…35fa`, results `0xe6935894…8f68`, rootC `0x05006517…dc80`). Its record is
+davinci-contracts' `deployments/10-0xC5f8.json`.
 
 ### OP Mainnet, first registry
 
@@ -89,3 +98,18 @@ Three checks refuse a registry that pins other programs: the node's startup chec
 the commit in the deployment record) and reads back every pin, the grace settings
 (`--grace`) and, in L1-blob mode, the verifier's `L1Block`. Rebuilding a zkVM program changes its
 verification key, which needs a new registry.
+
+For the current OP registry, from davinci-contracts at `fd79251` after `forge build`:
+
+```bash
+python3 script/verify_deployment.py --rpc "$RPC" --chain-id 10 \
+    --registry 0x7bfa68879f118C98B864FB52d2aD3a112eF1558F \
+    --verifier 0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7 \
+    --batch-vk 0xe39e460085ecddecf365649a61183a71c0fe778aa9c06fd2aa1a6c43cddb988b \
+    --results-vk 0x394694558f39d0b2da0bbb09322333a0f567ee8d16bea2f354543a086587d167 \
+    --root-c 0x6b2490fba336fb00f0c8719a961de309a8db6f43a9bfb7575ca5f014d609b265 \
+    --ballot-vk-hash 0xbf1e6590bb1ba883d601c4d7d1c6fa2722a78590716874019db6d68fc776bb0e \
+    --dkg-manager 0x0 --council-manager 0x0 \
+    --l1-block 0x4200000000000000000000000000000000000015 --grace 300,240,600,1800,60 \
+    --l1-blob-verifier 0x3B95BC14F43ed8Addb83F84D10A949De74eE7529
+```
