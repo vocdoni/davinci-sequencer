@@ -855,6 +855,10 @@ struct Actor {
     /// No seal before this instant after [`FAILED_CYCLES_BEFORE_PAUSE`]
     /// failed cycles.
     failed_pause: Option<tokio::time::Instant>,
+    /// A `DurationChanged` since the last head. An END emits it before its
+    /// `StatusChanged`, at a time no head shows yet: no seal until a head
+    /// does, so the budget never sees the new end with a stale clock.
+    end_moved: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -998,6 +1002,7 @@ pub(crate) fn spawn_actor(
         pause_hold: None,
         failed_cycles: 0,
         failed_pause: None,
+        end_moved: false,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1131,6 +1136,7 @@ impl Actor {
             Msg::Head { block, time } => {
                 self.chain_time = time;
                 self.last_head_block = block;
+                self.end_moved = false;
             }
             Msg::JobProved { generation } => {
                 if let Some(f) = self.in_flight.as_mut()
@@ -1638,6 +1644,7 @@ impl Actor {
         if self.in_flight.is_some()
             || self.finalizing
             || self.await_sync
+            || self.end_moved
             || self.pending.is_empty()
             || self.record.local != LocalStatus::Active
             || self.deps.contracts.signer().is_none()
@@ -1749,10 +1756,12 @@ impl Actor {
         // landing margin ends before the window closes. While open, the
         // earliest legal close is an END now under a grace lowered to the
         // floor; past the end neither is possible and the grace end binds.
+        // `Ended` is past the end even before a head shows the END block's
+        // time (a shortened end stays `Ready` until it).
         let nf = self.state.config().ballot_mode.num_fields;
         let now = self.chain_time.max(self.deps.clock.now());
         let mut deadline = self.grace_end();
-        if self.chain_time < self.end_time() {
+        if self.chain_time < self.end_time() && self.record.onchain.status != ProcessStatus::Ended {
             deadline = deadline.min(now.saturating_add(self.deps.grace.grace_floor));
         }
         // L1-blob mode: the Ethereum leg runs during the proof, so a landing
@@ -2539,6 +2548,7 @@ impl Actor {
             // the grace end all read it.
             EventKind::DurationChanged { duration, .. } => {
                 self.record.onchain.duration = duration;
+                self.end_moved = true;
                 self.put_record();
             }
             EventKind::GraceChanged { grace, .. } => {

@@ -3815,6 +3815,44 @@ async fn budget_past_end_uses_grace_end() {
     shutdown.cancel();
 }
 
+/// The END events arrive before a head shows the END block's time: the
+/// registry's `Ended` status already says the end passed, so the first
+/// flush is sized by the 600 s grace (all 15 votes), not by the open
+/// window's now + 150 s floor (12).
+#[tokio::test]
+async fn first_flush_after_an_end_uses_the_grace() {
+    let s = setup(2, 16, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        20,
+        // Only the flush seals.
+        &["--batch-time", "1000000s", "--solo-wait", "3000000s"],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.set_grace(600);
+    beats().await;
+    let votes: Vec<VerifiedVote> = (0..15)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    slow(&node);
+    s.chain.end_ahead_of_head(5);
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![15]);
+    shutdown.cancel();
+}
+
 /// Far from the end a batch is still sized to survive the earliest legal
 /// close, an END now under the floor grace: 150 − 30 s fits 12 votes, and
 /// the END right after sealing still lands them.

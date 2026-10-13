@@ -623,6 +623,29 @@ impl FakeChain {
         i.events.push(ev);
     }
 
+    /// The organizer presses END in a block `dt` seconds after the head
+    /// time, which no head read shows yet: the node gets the new end
+    /// (`DurationChanged`, then `StatusChanged`) before a fresh head.
+    pub fn end_ahead_of_head(&self, dt: u64) {
+        let mut i = self.inner.lock().unwrap();
+        let old = i.proc.status;
+        i.proc.status = ProcessStatus::Ended;
+        i.proc.duration = (i.time + dt).saturating_sub(i.proc.start_time);
+        push_duration(&mut i);
+        i.block += 1;
+        let ev = RegistryEvent {
+            block: i.block,
+            tx_hash: B256::with_last_byte(2),
+            log_index: 0,
+            kind: EventKind::StatusChanged {
+                pid: pid31(),
+                old,
+                new: ProcessStatus::Ended,
+            },
+        };
+        i.events.push(ev);
+    }
+
     pub fn advance_time(&self, dt: u64) {
         let mut i = self.inner.lock().unwrap();
         i.time += dt;

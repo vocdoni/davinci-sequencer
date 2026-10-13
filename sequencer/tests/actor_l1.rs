@@ -881,3 +881,40 @@ async fn l1_a_proof_failure_after_posting_counts() {
     shutdown.cancel();
     miner.abort();
 }
+
+/// The END events arrive before a head shows the END block's time: the
+/// first flush is sized by the 600 s grace (all 15 votes, one blob), not
+/// by the open window's now + 150 s floor (12).
+#[tokio::test]
+async fn l1_first_flush_after_an_end_uses_the_grace() {
+    let s = setup(2, 16, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        20,
+        "0s",
+        &["--batch-time", "1000000s", "--solo-wait", "3000000s"],
+    );
+    let node = start_l1_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    s.chain.set_grace(600);
+    let vids = submit(&h, &s, 0..15, 1900).await;
+    slow(&node);
+    s.chain.end_ahead_of_head(5);
+    wait_until("settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![15]);
+    assert_eq!(l1.mined_posts(), 1);
+    shutdown.cancel();
+}
