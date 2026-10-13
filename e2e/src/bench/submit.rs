@@ -337,6 +337,6 @@ mod tests {
         let l = &lines[0];
         assert_eq!((l.res.as_str(), l.tries, l.node), ("accepted", 3, A));
         assert_eq!((l.vid.clone(), l.code), (vote_id_hex(vid), Some(40901)));
-        assert_eq!(ledger.entries()[&vid].accepted, [A].into());
+        assert_eq!(ledger.entries().unwrap()[&vid].accepted, [A].into());
     }
 }
