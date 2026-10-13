@@ -27,5 +27,9 @@ pub async fn info(State(st): State<AppState>) -> Json<Info> {
         settled_by_self: m.settled_by_self.load(Ordering::Relaxed),
         synced_from_others: m.synced_from_others.load(Ordering::Relaxed),
         lost_races: m.lost_races.load(Ordering::Relaxed),
+        bisections: m.bisections.load(Ordering::Relaxed),
+        isolated_votes: m.isolated_votes.load(Ordering::Relaxed),
+        held_batches: m.held_batches.load(Ordering::Relaxed),
+        guest_rejections: m.guest_rejections.load(Ordering::Relaxed),
     })
 }

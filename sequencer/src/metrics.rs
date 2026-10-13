@@ -17,6 +17,14 @@ pub struct Metrics {
     pub stalled_reads: AtomicU64,
     /// Results requests built for elections holding this node's key.
     pub finalize_attempts: AtomicU64,
+    /// Batches the prover failed for good, requeued for bisection.
+    pub bisections: AtomicU64,
+    /// Votes errored alone by a bisection.
+    pub isolated_votes: AtomicU64,
+    /// Batches held pending after a node-side check failed.
+    pub held_batches: AtomicU64,
+    /// Batches the guest rejected (fail mask); their votes are errored.
+    pub guest_rejections: AtomicU64,
     /// Proving-time model the batch budget sizes against.
     pub prove: ProveModel,
 }

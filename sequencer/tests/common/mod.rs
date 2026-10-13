@@ -1749,6 +1749,12 @@ pub struct FakeProver {
     pub fail_batches: Mutex<u32>,
     /// Next N batch proofs fail permanently (the prover refused the input).
     pub fail_batches_permanent: Mutex<u32>,
+    /// Every batch proof holding this vote id fails permanently.
+    pub fail_vid: Mutex<Option<u64>>,
+    /// While set, every batch snark carries a zeroed program vk.
+    pub wrong_vk: Mutex<bool>,
+    /// Next N results proofs fail permanently (a `failed` job).
+    pub fail_results_permanent: Mutex<u32>,
     /// When each batch proof was requested (virtual time under a paused
     /// runtime), for backoff tests.
     pub call_times: Mutex<Vec<tokio::time::Instant>>,
@@ -1772,6 +1778,9 @@ impl FakeProver {
             fail_results: Mutex::new(0),
             fail_batches: Mutex::new(0),
             fail_batches_permanent: Mutex::new(0),
+            fail_vid: Mutex::new(None),
+            wrong_vk: Mutex::new(false),
+            fail_results_permanent: Mutex::new(0),
             call_times: Mutex::new(Vec::new()),
             sizes: Mutex::new(Vec::new()),
             reported: Mutex::new(None),
@@ -1841,13 +1850,18 @@ impl Prover for FakeProver {
                 return Err(ProverError::permanent("prover returned 400: bad input"));
             }
         }
+        if let Some(x) = *self.fail_vid.lock().unwrap()
+            && request.public_inputs.iter().any(|p| p[1] == x.to_string())
+        {
+            return Err(ProverError::permanent("job failed: guest panicked"));
+        }
         let mut p = *expected;
         if let Some(mask) = self.fail_mask.lock().unwrap().take() {
             p.ok = false;
             p.fail_mask = mask;
         }
         let mut vk = release::BATCH_PROGRAM_VK;
-        if std::mem::take(&mut *self.tamper_vk.lock().unwrap()) {
+        if std::mem::take(&mut *self.tamper_vk.lock().unwrap()) || *self.wrong_vk.lock().unwrap() {
             vk = [0u8; 32];
         }
         Ok((
@@ -1875,6 +1889,13 @@ impl Prover for FakeProver {
             if *n > 0 {
                 *n -= 1;
                 return Err(ProverError::transient("scripted transient results failure"));
+            }
+        }
+        {
+            let mut n = self.fail_results_permanent.lock().unwrap();
+            if *n > 0 {
+                *n -= 1;
+                return Err(ProverError::permanent("job failed: results guest crashed"));
             }
         }
         let mut root = [0u8; 32];

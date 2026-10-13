@@ -627,6 +627,18 @@ pub struct Info {
     /// Batches lost to another sequencer settling first.
     #[serde(default)]
     pub lost_races: u64,
+    /// Batches the prover failed for good, requeued for bisection.
+    #[serde(default)]
+    pub bisections: u64,
+    /// Votes errored alone by a bisection.
+    #[serde(default)]
+    pub isolated_votes: u64,
+    /// Batches held pending after a node-side check failed.
+    #[serde(default)]
+    pub held_batches: u64,
+    /// Batches the guest rejected; their votes are errored.
+    #[serde(default)]
+    pub guest_rejections: u64,
 }
 
 /// On-chain process status (the registry enum, lowercase).

@@ -286,11 +286,15 @@ async fn guest_failure_errors_votes_no_retry() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(prover.calls(), 1);
     assert_eq!(s.chain.voters(), 0);
+    assert_eq!(node.metrics.guest_rejections.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 0);
     shutdown.cancel();
 }
 
+/// A proof our own checks refuse (here the program vk pin) holds the votes
+/// pending: requeued, never errored, settled once a proof passes.
 #[tokio::test]
-async fn tampered_program_vk_rejected() {
+async fn tampered_program_vk_holds_the_votes() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
@@ -311,13 +315,14 @@ async fn tampered_program_vk_rejected() {
     let v = fake_vote(&s.env, 0, &[1, 2], 5);
     let vid = v.pkg.vote_id;
     h.submit(v).await.unwrap();
-    wait_until("vote errored", async || {
-        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    wait_until("vote settled on the retry", async || {
+        all_settled(&h, &[vid]).await
     })
     .await;
-    let sv = h.status(vid).await.unwrap().unwrap();
-    assert!(sv.error.unwrap().contains("vk"), "vk pin named");
-    assert_eq!(s.chain.voters(), 0);
+    assert_eq!(prover.calls(), 2);
+    assert_eq!(node.metrics.held_batches.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 0);
+    assert_eq!(s.chain.voters(), 1);
     shutdown.cancel();
 }
 
@@ -4841,5 +4846,85 @@ async fn shorten_enters_flush_and_closes_admission() {
     wait_until("closed", async || !h.snapshot().await.unwrap().accepting).await;
     let late = fake_vote(&s.env, 2, &[1, 1], 7);
     assert!(matches!(h.submit(late).await, Err(ActorError::Closed(_))));
+    shutdown.cancel();
+}
+
+// ------------------------------------------------------- failed batches
+
+// Votes `0..n` of the election, submitted in order.
+async fn submit_n(h: &ActorHandle, s: &TestSetup, n: usize, kseed: u64) -> Vec<u64> {
+    let mut vids = Vec::new();
+    for i in 0..n {
+        let v = fake_vote(&s.env, i, &[1, 2], kseed + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    vids
+}
+
+async fn vote_error(h: &ActorHandle, vid: u64) -> String {
+    h.status(vid)
+        .await
+        .unwrap()
+        .unwrap()
+        .error
+        .unwrap_or_default()
+}
+
+/// A node-side check failure (the program vk pin) on every proof holds the
+/// votes: requeued with the usual backoff, never bisected, never errored,
+/// and settled once the proofs pass.
+#[tokio::test(start_paused = true)]
+async fn held_check_failure_settles_after_the_fix() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.wrong_vk.lock().unwrap() = true;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 3, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 3, 600).await;
+    wait_long("held three times", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 3
+    })
+    .await;
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    assert!(prover.sizes().iter().all(|n| *n == 3), "never bisected");
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 0);
+    *prover.wrong_vk.lock().unwrap() = false;
+    wait_long("settled", async || all_settled(&h, &vids).await).await;
+    shutdown.cancel();
+}
+
+/// Held votes still pending at the close carry the held reason.
+#[tokio::test(start_paused = true)]
+async fn held_votes_close_with_the_held_reason() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.wrong_vk.lock().unwrap() = true;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 2, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 2, 700).await;
+    wait_long("held, nothing in flight", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+            && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Canceled);
+    for vid in &vids {
+        wait_long("errored", async || {
+            vote_status(&h, *vid).await == Some(VoteStatus::Error)
+        })
+        .await;
+        let e = vote_error(&h, *vid).await;
+        assert!(e.starts_with("process closed (held: "), "{e}");
+        assert!(e.contains("program vk"), "{e}");
+    }
     shutdown.cancel();
 }

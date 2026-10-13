@@ -718,8 +718,13 @@ pub(crate) enum JobOutcome {
     Landed(TxReceipt),
     /// The guest published `ok = 0` with this fail mask.
     Guest(u32),
-    /// Prover failure or a proof that fails our checks; not retried.
+    /// The prover failed the job for good (a `failed` job, a refused
+    /// input, undecodable publics); not retried.
     Failed(String),
+    /// The node's own checks refused the proof or the L1 settlement (a
+    /// publics or pin mismatch): every batch fails alike, so the votes are
+    /// held pending, never bisected.
+    Held(String),
     /// The settlement reverted with this error name.
     Reverted(String),
     /// The settlement reverted on-chain and no replay names why: a race.
@@ -859,6 +864,9 @@ struct Actor {
     /// `StatusChanged`, at a time no head shows yet: no seal until a head
     /// does, so the budget never sees the new end with a stale clock.
     end_moved: bool,
+    /// The last node-side check failure that held votes pending, named in
+    /// their close reason. Our landing clears it.
+    held_reason: Option<String>,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -1003,6 +1011,7 @@ pub(crate) fn spawn_actor(
         failed_cycles: 0,
         failed_pause: None,
         end_moved: false,
+        held_reason: None,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1473,7 +1482,8 @@ impl Actor {
             }
         }
         if !self.vote_at_stale && self.chain_time != 0 && self.chain_time >= self.grace_end() {
-            self.close_out("process closed");
+            let reason = self.closed_reason();
+            self.close_out(&reason);
         }
         // Landed-but-unconfirmed flight: if the chain never showed our root
         // by the deadline (the tx reorged out), roll back and requeue.
@@ -1567,6 +1577,14 @@ impl Actor {
         } else {
             self.resync_after = None;
             self.resync_backoff_ms = 0;
+        }
+    }
+
+    /// The close reason of a pending vote: held votes name why.
+    fn closed_reason(&self) -> String {
+        match &self.held_reason {
+            Some(m) => format!("process closed (held: {m})"),
+            None => "process closed".into(),
         }
     }
 
@@ -2295,7 +2313,7 @@ impl Actor {
         if posted {
             match &outcome {
                 JobOutcome::Guest(mask) => self.failed_cycle(&format!("guest mask {mask:#x}")),
-                JobOutcome::Failed(e) => self.failed_cycle(e),
+                JobOutcome::Failed(e) | JobOutcome::Held(e) => self.failed_cycle(e),
                 JobOutcome::Transient(e) if !f.proved => self.failed_cycle(e),
                 _ => {}
             }
@@ -2316,12 +2334,30 @@ impl Actor {
                 let bits = fail_bits(mask).join(", ");
                 let msg = format!("guest rejected the batch: {bits} (mask {mask:#x})");
                 error!(pid = %hex::encode(self.pid31), %msg, "batch failed in the guest");
+                self.metrics.guest_rejections.fetch_add(1, Ordering::SeqCst);
                 self.set_status(&vids, VoteStatus::Error, Some(&msg));
             }
             JobOutcome::Failed(msg) => {
                 self.rollback_flight(&f);
                 error!(pid = %hex::encode(self.pid31), ?msg, "batch proof failed");
                 self.set_status(&vids, VoteStatus::Error, Some(&msg));
+            }
+            JobOutcome::Held(msg) => {
+                // Every batch fails this way until the node or the prover is
+                // fixed: hold the votes pending, the close errors them.
+                self.rollback_flight(&f);
+                self.metrics.held_batches.fetch_add(1, Ordering::SeqCst);
+                let secs = self.prove_backoff();
+                error!(
+                    pid = %hex::encode(self.pid31),
+                    votes = vids.len(),
+                    retry_in = secs,
+                    %msg,
+                    "batch failed a node-side check; votes held pending"
+                );
+                self.held_reason = Some(msg);
+                self.requeue_flight(f);
+                return; // the backoff streak continues
             }
             JobOutcome::Reverted(name) if name == "InvalidStateRoot" => {
                 if self.race_lost(f).await {
@@ -2374,7 +2410,7 @@ impl Actor {
                     return;
                 }
                 warn!(pid = %hex::encode(self.pid31), "window closed while the batch was in flight");
-                self.set_status(&vids, VoteStatus::Error, Some("process closed"));
+                self.set_status(&vids, VoteStatus::Error, Some(&self.closed_reason()));
             }
             JobOutcome::Reverted(name) => {
                 self.rollback_flight(&f);
@@ -2524,6 +2560,7 @@ impl Actor {
         self.await_sync = false;
         self.failed_cycles = 0;
         self.failed_pause = None;
+        self.held_reason = None;
         self.metrics.settled_by_self.fetch_add(1, Ordering::SeqCst);
         info!(
             pid = %hex::encode(self.pid31),
@@ -2543,7 +2580,8 @@ impl Actor {
                 self.pause_hold = None;
                 // Ended flushes through the grace; the tick closes out at its end.
                 if new == ProcessStatus::Canceled {
-                    self.close_out("process closed");
+                    let reason = self.closed_reason();
+                    self.close_out(&reason);
                 }
                 if new == ProcessStatus::Results {
                     self.mark_finalized();
@@ -2592,7 +2630,8 @@ impl Actor {
                 self.record.onchain.results = results;
                 self.record.onchain.status = ProcessStatus::Results;
                 self.mark_finalized();
-                self.close_out("process closed");
+                let reason = self.closed_reason();
+                self.close_out(&reason);
                 // StatusChanged(→RESULTS) precedes this in the same tx, so
                 // mark_finalized's early return must not swallow the
                 // results: persist unconditionally (idempotent).
@@ -3110,25 +3149,25 @@ async fn proved(job: &JobInput) -> Result<PlonkSnark, JobOutcome> {
         return Err(JobOutcome::Guest(got.fail_mask));
     }
     if got != job.expected {
-        return Err(JobOutcome::Failed(
+        return Err(JobOutcome::Held(
             "proved publics do not match the prepared batch".into(),
         ));
     }
     match BatchPublics::from_public_values(&snark.public_values) {
         Ok(pv) if pv == job.expected => {}
         _ => {
-            return Err(JobOutcome::Failed(
+            return Err(JobOutcome::Held(
                 "snark public values do not match the batch".into(),
             ));
         }
     }
     if snark.program_vk != release::BATCH_PROGRAM_VK {
-        return Err(JobOutcome::Failed(
+        return Err(JobOutcome::Held(
             "program vk is not the pinned batch circuit vk".into(),
         ));
     }
     if snark.root_c_vadcop_final != release::ROOT_C_VADCOP_FINAL {
-        return Err(JobOutcome::Failed(
+        return Err(JobOutcome::Held(
             "root_c_vadcop_final is not the pinned setup".into(),
         ));
     }
@@ -3173,7 +3212,7 @@ impl From<crate::l1da::Settled> for JobOutcome {
             S::Reverted(name) => JobOutcome::Reverted(name),
             S::Lost(e) => JobOutcome::Lost(e),
             S::Transient(e) => JobOutcome::Transient(e),
-            S::Failed(e) => JobOutcome::Failed(e),
+            S::Failed(e) => JobOutcome::Held(e),
         }
     }
 }
