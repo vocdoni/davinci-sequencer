@@ -34,13 +34,17 @@ Before the end, the time budget can cap batches below the transaction capacity: 
 the cold estimate with a 240 s floor and the default margins. The estimate follows the prover's
 real cost after a few batches, and past the end the whole grace window counts.
 
-Time from pressing END to results on-chain, with a 240 s grace and a sequencer key:
+Time from pressing END to results on-chain, with a 150 s grace and a sequencer key:
+
+Those times were measured in blob mode on a registry with a 150 s grace. On the OP preset
+(L1-blob mode, floor 240 s, default 300 s), each row is longer by the extra grace plus the
+Ethereum leg of each landing (about 110 s); the OP figures will come from new benchmarks.
 
 | Backlog at the end | Last landing | Grace end | Results |
 |---|---|---|---|
-| none | before the end | end + 240 s | ~4.3–4.5 min |
-| one round | end + ~75 s | end + ~315 s | ~5.5 min |
-| k rounds (nf = 16) | end + k·~70 s | last landing + 240 s | ~(1.2·k + 4.3) min |
+| none | before the end | end + 150 s | ~2.8–3.0 min |
+| one round | end + ~75 s | end + ~225 s | ~4.0 min |
+| k rounds (nf = 16) | end + k·~70 s | last landing + 150 s | ~(1.2·k + 2.8) min |
 
 A DKG key adds the committee's decryption round, 1 to 5 minutes, after the request at the grace
 end. A shortened end drains during the notice and lands in the first row, about 4.4 minutes from
