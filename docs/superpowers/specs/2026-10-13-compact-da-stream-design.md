@@ -172,12 +172,12 @@ identity.
   - docs: `docs/lifecycle.md:96`, `docs/configuration.md:72`, `docs/benchmarks.md` where it quotes
     cell counts;
   - `ZISKEMU=1` dry runs against the new ELF;
-  - **batch size (owner to confirm the reading):** the `--batch-max` default becomes 512, down from
-    1024 (`config.rs:343` and its test at `:811`); the guest limit `MAX_BATCH_SIZE` stays 1024. At
-    12 fields and above the single-transaction blob cap already holds a batch below 512 (504 at
-    12, 379 at 16) until the core sub-project adds several blob transactions per transition, and
-    the seal budget on OP split 256 × 16 in the benchmarks until the core sub-project raises the
-    grace floor; the default binds only at few fields.
+  - **batch size (confirmed by the owner):** the `--batch-max` default becomes 512, down from 1024
+    (`config.rs:343` and its test at `:811`); the guest limit `MAX_BATCH_SIZE` stays 1024. 512
+    must settle at every field count: the core sub-project adds several Ethereum blob transactions
+    per transition (a 512 × 16 steady batch needs 9 blobs, 2 transactions) and raises the OP
+    registry's grace floor so the seal budget fits a 512-vote proof. Until then an L1-blob node
+    still holds a batch to one transaction's 6 blobs (504 at 12 fields, 379 at 16).
 - **davinci-contracts:** no Solidity change, but `ProcessRegistry.batchProgramVK` is immutable
   (`src/ProcessRegistry.sol:90`), so the new vk needs the registry redeploy the core sub-project
   plans. `test/vectors/main.go:643` passes the accumulator to `BuildTransitionBlobs` (signature
