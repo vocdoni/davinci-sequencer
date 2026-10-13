@@ -2273,12 +2273,14 @@ mod l1_blob_mode {
     }
 
     impl TwoChains {
-        fn da(&self) -> L1Da {
+        /// Posts in chunks of `chunk` blobs.
+        fn da(&self, chunk: usize) -> L1Da {
             L1Da::new(
                 self.l1c.clone(),
                 self.db.clone(),
                 u128::MAX,
                 Duration::from_millis(100),
+                chunk,
             )
             .unwrap()
         }
@@ -2430,7 +2432,7 @@ mod l1_blob_mode {
             }
         );
         assert!(t.l1c.cell_proofs(), "anvil --hardfork osaka: v1 sidecars");
-        let da = t.da();
+        let da = t.da(6);
         let (pid, p, pk) = t.process().await;
         let (blobs1, snark1) = transition(&pid, p.state_root, [0x91; 32], 0, &pk, 1);
         // Blob mode's entry point is refused on this registry.
@@ -2522,7 +2524,9 @@ mod l1_blob_mode {
         let head = t.l1_head().await;
         t.set_origin(head).await;
         let origin = t.c.l1_origin().await.unwrap();
-        let Anchor::At { top, hash } = choose_anchor(posted2.block, head, origin, Some(rec)) else {
+        let Anchor::At { top, hash } =
+            choose_anchor(posted2.block, posted2.block, head, origin, Some(rec))
+        else {
             panic!("a deep proof anchors at the record");
         };
         assert_eq!((top, hash), (rec.number, rec.hash));
@@ -2558,7 +2562,7 @@ mod l1_blob_mode {
         let t = two_chains().await;
         // Initialises the mode cell: events() pairs L1 events strictly from here on.
         t.c.da_mode().await.unwrap();
-        let da = t.da();
+        let da = t.da(6);
         let (pid, p, pk) = t.process().await;
         let (blobs, snark) = transition(&pid, p.state_root, [0x91; 32], 0, &pk, 1);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -2594,8 +2598,8 @@ mod l1_blob_mode {
             cancel: CancellationToken::new(),
         };
         let posting = Posting {
-            post: Ok(posted),
-            recorded: None,
+            posts: vec![posted],
+            ..Posting::default()
         };
         let out = settle(&da, &t.c, &job, &snark, posting).await;
         stop.cancel();
@@ -2618,7 +2622,7 @@ mod l1_blob_mode {
             return;
         }
         let t = two_chains().await;
-        let da = Arc::new(t.da());
+        let da = Arc::new(t.da(6));
         let (pid, p, pk) = t.process().await;
         let (blobs, _) = transition(&pid, p.state_root, [0x91; 32], 0, &pk, 1);
         let _: serde_json::Value = t

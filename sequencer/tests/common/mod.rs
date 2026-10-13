@@ -2023,9 +2023,18 @@ pub async fn start_l1_node_cfg(
     shutdown: CancellationToken,
 ) -> Node {
     chain.attach_l1(&l1);
-    let da =
-        davinci_sequencer::l1da::L1Da::new(Arc::new(l1), db.clone(), u128::MAX, cfg.poll_interval)
-            .unwrap();
+    // Chunks of the per-transaction cap the config names, else six.
+    let chunk = cfg
+        .max_blobs_per_tx
+        .unwrap_or(davinci_zkvm_sdk::limits::TX_BLOB_CAP);
+    let da = davinci_sequencer::l1da::L1Da::new(
+        Arc::new(l1),
+        db.clone(),
+        u128::MAX,
+        cfg.poll_interval,
+        chunk,
+    )
+    .unwrap();
     let deps = Deps {
         db,
         contracts: Arc::new(chain.clone()),

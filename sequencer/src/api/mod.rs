@@ -176,10 +176,9 @@ fn check_da(da: &RegistryDa, cfg: &Config) -> anyhow::Result<()> {
 /// L1-blob mode: the Ethereum side, checked against the network's.
 async fn connect_l1(
     cfg: &Config,
-    db: &crate::storage::Db,
     l1_block: alloy::primitives::Address,
     signing: bool,
-) -> anyhow::Result<(Arc<L1Rpc>, Arc<L1Da>)> {
+) -> anyhow::Result<Arc<L1Rpc>> {
     let rpc = L1Rpc::connect(
         &cfg.l1_rpc_url,
         &cfg.l1_send_rpc_url,
@@ -201,14 +200,7 @@ async fn connect_l1(
         max_post_fee = cfg.l1_max_post_fee,
         "L1-blob mode: blobs go to Ethereum"
     );
-    let rpc = Arc::new(rpc);
-    let da = L1Da::new(
-        rpc.clone(),
-        db.clone(),
-        cfg.l1_max_post_fee,
-        cfg.poll_interval,
-    )?;
-    Ok((rpc, Arc::new(da)))
+    Ok(Arc::new(rpc))
 }
 
 /// Connects, checks the chain, opens the deployment's database and spawns
@@ -243,7 +235,7 @@ async fn start(
     let mut cfg = cfg;
     let l1 = match da {
         RegistryDa::L1Blobs { l1_block, .. } => {
-            Some(connect_l1(&cfg, &db, l1_block, contracts.signer().is_some()).await?)
+            Some(connect_l1(&cfg, l1_block, contracts.signer().is_some()).await?)
         }
         RegistryDa::Blobs => None,
     };
@@ -263,12 +255,23 @@ async fn start(
     }
     // Batches are sized for the chain that carries the blobs.
     let (advertised, blob_chain) = match &l1 {
-        Some((rpc, _)) => (rpc.chain_blob_cap(), rpc.chain_id()),
+        Some(rpc) => (rpc.chain_blob_cap(), rpc.chain_id()),
         None => (contracts.chain_blob_cap(), contracts.chain_id()),
     };
     let cap = crate::web3::resolve_blob_cap(cfg.max_blobs_per_tx, advertised, blob_chain);
     cfg.max_blobs_per_tx = Some(cap);
     tracing::info!(cap, "blob cap per transaction");
+    // L1-blob mode posts a transition in chunks of the per-transaction cap.
+    let l1 = match l1 {
+        Some(rpc) => Some(Arc::new(L1Da::new(
+            rpc,
+            db.clone(),
+            cfg.l1_max_post_fee,
+            cfg.poll_interval,
+            cap,
+        )?)),
+        None => None,
+    };
     let prover = Arc::new(ProverService::new(
         cfg.prover_url.as_str(),
         cfg.prover_poll,
@@ -282,7 +285,7 @@ async fn start(
         clock: Arc::new(SystemClock),
         grace,
         tasks,
-        l1: l1.map(|(_, da)| da),
+        l1,
     };
     let addr = format!("{}:{}", cfg.api_host, cfg.api_port);
     let node = spawn_node(cfg, deps, shutdown).await?;

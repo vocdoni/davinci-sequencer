@@ -5,17 +5,18 @@ mod common;
 
 use common::*;
 use davinci_sequencer::l1da::{
-    GONE_FOR, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, PROOF_FAIL_FOR, PostError, Poster,
-    Posting, Settled, settle,
+    GONE_FOR, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, PROOF_FAIL_FOR, PostError, Posted,
+    Poster, Posting, Settled, chunks, settle, with_post,
 };
 use davinci_sequencer::storage::L1PostRecord;
 use davinci_sequencer::web3::L1Chain;
 use davinci_sequencer::web3::L1Receipt;
 use davinci_sequencer::web3::L1SendError;
 use davinci_sequencer::web3::SignedBlobTx;
-use davinci_sequencer::web3::l1proof::L1BlobProof;
-use davinci_zkvm_sdk::blob::{TransitionData, build_blobs};
-use davinci_zkvm_sdk::limits::VOTE_ID_MIN;
+use davinci_sequencer::web3::l1proof::{L1BlobProof, verify_local};
+use davinci_zkvm_sdk::ballot::Ballot;
+use davinci_zkvm_sdk::blob::{TransitionData, blob_count, build_blobs};
+use davinci_zkvm_sdk::limits::{TX_BLOB_CAP, VOTE_ID_MIN};
 
 const PID: [u8; 31] = [7; 31];
 const ROOT: [u8; 32] = [1; 32];
@@ -27,6 +28,20 @@ fn blobs(seed: u8) -> TransitionBlobs {
         num_fields: 1,
     };
     build_blobs(&t, &Fr::from(u64::from(seed)), &[seed; 32]).unwrap()
+}
+
+/// A transition of `n` blobs (2 or more): 128 (n - 1) 16-field updates.
+fn wide_blobs(n: usize) -> TransitionBlobs {
+    let u = 128 * (n - 1);
+    assert_eq!(blob_count(0, u, 16), n);
+    let t = TransitionData {
+        vote_ids: vec![],
+        updates: (0..u as u64)
+            .map(|k| (0x10 + k, Ballot::identity()))
+            .collect(),
+        num_fields: 16,
+    };
+    build_blobs(&t, &Fr::from(n as u64), &[n as u8; 32]).unwrap()
 }
 
 fn poster(l1: &FakeL1, db: &Db, cap: u128) -> Poster {
@@ -373,6 +388,7 @@ struct Rig {
     s: TestSetup,
     l1: FakeL1,
     da: L1Da,
+    db: Db,
     snark: PlonkSnark,
     blobs: TransitionBlobs,
     _dir: TempDir,
@@ -385,12 +401,20 @@ fn rig() -> Rig {
 // `poll` paces the poster and the settle loop; FakeL1 mines a block per
 // poll, so 12 s is Ethereum's pace.
 fn rig_with(poll: Duration) -> Rig {
+    rig_of(poll, blobs(9), TX_BLOB_CAP)
+}
+
+/// A transition of `n` blobs, posted in chunks of `chunk`.
+fn rig_chunked(poll: Duration, n: usize, chunk: usize) -> Rig {
+    rig_of(poll, wide_blobs(n), chunk)
+}
+
+fn rig_of(poll: Duration, blobs: TransitionBlobs, chunk: usize) -> Rig {
     let s = setup(2, 8, None);
     let l1 = FakeL1::new();
     s.chain.attach_l1(&l1);
     let (dir, db) = fresh_db();
-    let da = L1Da::new(Arc::new(l1.clone()), db, u128::MAX, poll).unwrap();
-    let blobs = blobs(9);
+    let da = L1Da::new(Arc::new(l1.clone()), db.clone(), u128::MAX, poll, chunk).unwrap();
     let p = BatchPublics {
         ok: true,
         fail_mask: 0,
@@ -416,6 +440,7 @@ fn rig_with(poll: Duration) -> Rig {
         s,
         l1,
         da,
+        db,
         snark,
         blobs,
         _dir: dir,
@@ -433,15 +458,19 @@ impl Rig {
         }
     }
 
+    /// Every chunk posted, the proof already done (nothing recorded).
     async fn posting(&self, job: &L1Job<'_>) -> Posting {
-        Posting {
-            post: self
-                .da
-                .poster
-                .post(&job.pid, &job.root_before, job.blobs, job.deadline)
-                .await,
-            recorded: None,
-        }
+        with_post(&self.da, &self.s.chain, job, std::future::ready(()))
+            .await
+            .1
+    }
+
+    fn vhs(&self) -> Vec<B256> {
+        self.blobs
+            .versioned_hashes
+            .iter()
+            .map(|h| B256::from(*h))
+            .collect()
     }
 }
 
@@ -450,7 +479,7 @@ async fn settle_lands_with_the_l1_blocks() {
     let r = rig();
     let job = r.job();
     let posting = r.posting(&job).await;
-    let posted = *posting.post.as_ref().unwrap();
+    let posted = posting.posts[0];
     let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
     assert!(matches!(out, Settled::Landed(_)), "{out:?}");
     assert_eq!(r.s.chain.root(), [0x42; 32]);
@@ -482,7 +511,7 @@ async fn a_recorded_origin_anchors_a_deep_proof() {
     let r = rig();
     let job = r.job();
     let posting = r.posting(&job).await;
-    let n = posting.post.as_ref().unwrap().block;
+    let n = posting.posts[0].block;
     r.l1.pin_origin(Some(n));
     let rec = r.s.chain.record_l1_origin().await.unwrap();
     assert_eq!(rec.number, n);
@@ -503,7 +532,7 @@ async fn a_proof_too_deep_without_a_record_reposts() {
     let r = rig();
     let job = r.job();
     let posting = r.posting(&job).await;
-    let n = posting.post.as_ref().unwrap().block;
+    let n = posting.posts[0].block;
     r.l1.mine(80);
     r.l1.pin_origin(Some(n + 70));
     let driver = async {
@@ -596,8 +625,8 @@ async fn a_lagging_receipt_does_not_repost() {
     // Poster and settle loop share the lagging view.
     let lag = Arc::new(Lagging::new(&r.l1));
     let (dir, db) = fresh_db();
-    r.da = L1Da::new(lag.clone(), db, u128::MAX, poll).unwrap();
-    r._dir = dir;
+    r.da = L1Da::new(lag.clone(), db.clone(), u128::MAX, poll, TX_BLOB_CAP).unwrap();
+    (r.db, r._dir) = (db, dir);
     let job = L1Job {
         deadline: later(),
         ..r.job()
@@ -675,5 +704,369 @@ async fn reposts_are_bounded() {
         r.l1.mined_posts(),
         1 + MAX_REPOSTS as usize,
         "the fourth re-post ends the settle"
+    );
+}
+
+// ---------------------------------------------------------------- chunks
+
+#[tokio::test]
+async fn a_chunked_transition_lands_with_every_transaction_in_order() {
+    // Three blobs in chunks of two: blobs 0-1 in one transaction, blob 2 in
+    // the next, posted once the first is mined.
+    let r = rig_chunked(Duration::from_millis(5), 3, 2);
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let p = posting.posts.clone();
+    assert_eq!(p.len(), 2, "{posting:?}");
+    assert!(posting.error.is_none());
+    assert_eq!((p[0].nonce, p[1].nonce), (0, 1));
+    assert!(p[1].block > p[0].block);
+    let s = r.l1.sends();
+    assert_eq!(s.len(), 2);
+    assert!(
+        s[1].head >= p[0].block,
+        "the second waited for the first: {s:?}"
+    );
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let last = r.s.chain.l1_last().unwrap();
+    assert_eq!(last.vhs, r.vhs(), "versioned hashes in transition order");
+    assert_eq!(last.blocks, vec![p[0].block, p[0].block, p[1].block]);
+    // One header chain from the anchor down to the oldest chunk's block.
+    assert!(r.s.chain.l1_last_headers() as u64 > p[1].block - p[0].block);
+    assert_eq!((r.l1.mined_posts(), r.s.chain.l1_records()), (2, 0));
+    assert!(r.db.l1_posts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_origin_is_recorded_only_once_the_last_chunk_is_mined() {
+    // Three blobs, one per transaction.
+    let r = rig_chunked(Duration::from_millis(5), 3, 1);
+    r.l1.pin_origin(Some(0));
+    let job = r.job();
+    let (done, proved) = tokio::sync::oneshot::channel::<()>();
+    let driver = async {
+        wait_until("three chunks mined", async || r.l1.mined_posts() == 3).await;
+        let b: Vec<u64> =
+            r.l1.sends()
+                .iter()
+                .map(|x| r.l1.block_of(&x.hash).unwrap())
+                .collect();
+        // OP's origin at an older chunk's block: a record there could not
+        // anchor the newer transactions.
+        for n in [b[0], b[1]] {
+            r.l1.pin_origin(Some(n));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(r.s.chain.l1_records(), 0, "recorded below the newest chunk");
+        }
+        r.l1.pin_origin(Some(b[2]));
+        wait_until("origin recorded", async || r.s.chain.l1_records() == 1).await;
+        // The origin runs 30 blocks ahead before the proof is ready.
+        r.l1.mine(30);
+        r.l1.pin_origin(Some(b[2] + 30));
+        done.send(()).unwrap();
+        (b[0], b[2])
+    };
+    let ((_, posting), (oldest, newest)) = tokio::join!(
+        with_post(&r.da, &r.s.chain, &job, async {
+            proved.await.ok();
+        }),
+        driver
+    );
+    assert_eq!(posting.recorded.map(|o| o.number), Some(newest));
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.s.chain.l1_records(), 1, "recorded once");
+    assert_eq!(
+        r.s.chain.l1_last_headers() as u64,
+        newest - oldest + 1,
+        "anchored at the record: headers from the newest chunk down to the oldest"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_chunk_gone_is_posted_again_alone() {
+    let r = rig_chunked(Duration::from_secs(1), 3, 2);
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
+    let posting = r.posting(&job).await;
+    let p = posting.posts.clone();
+    // An Ethereum reorg drops the block with the second chunk only.
+    assert_eq!(r.l1.head_number(), p[1].block);
+    r.l1.reorg(1);
+    assert_eq!(r.l1.mined_posts(), 1);
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let s = r.l1.sends();
+    assert_eq!(s.len(), 3, "the lost chunk alone: {s:?}");
+    assert_eq!(s[2].nonce, 1, "at the freed nonce");
+    assert_eq!(s[2].fees, s[1].fees.doubled(), "priced over the reorged tx");
+    let b2 = r.l1.block_of(&s[2].hash).unwrap();
+    assert_eq!(r.l1.block_of(&s[0].hash), Some(p[0].block), "chunk 0 kept");
+    assert_eq!(
+        r.s.chain.l1_last().unwrap().blocks,
+        vec![p[0].block, p[0].block, b2]
+    );
+    assert_eq!(r.l1.mined_posts(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reposted_first_chunk_may_land_after_the_second() {
+    // Chunk 0's transaction is gone; chunk 1 is mined. Chunk 0 goes out
+    // again and lands in a newer block than chunk 1: the proof still lists
+    // the transactions in chunk order.
+    let r = rig_chunked(Duration::from_secs(1), 3, 2);
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
+    let c = chunks(&r.blobs, 2);
+    let p1 =
+        r.da.poster
+            .post(&job.pid, &job.root_before, &c[1], job.deadline)
+            .await
+            .unwrap();
+    let lost = Posted {
+        tx: B256::repeat_byte(0xdd),
+        nonce: 7,
+        block: p1.block,
+    };
+    let posting = Posting {
+        posts: vec![lost, p1],
+        ..Posting::default()
+    };
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let s = r.l1.sends();
+    assert_eq!(s.len(), 2, "{s:?}");
+    let b0 = r.l1.block_of(&s[1].hash).unwrap();
+    assert!(b0 > p1.block);
+    let last = r.s.chain.l1_last().unwrap();
+    assert_eq!(last.vhs, r.vhs());
+    assert_eq!(last.blocks, vec![b0, b0, p1.block]);
+}
+
+#[tokio::test]
+async fn a_proof_too_deep_posts_every_chunk_again() {
+    let r = rig_chunked(Duration::from_millis(5), 3, 2);
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let b0 = posting.posts[0].block;
+    r.l1.mine(80);
+    r.l1.pin_origin(Some(b0 + 70));
+    let driver = async {
+        wait_until("re-posted", async || r.l1.mined_posts() == 4).await;
+        r.l1.pin_origin(None);
+    };
+    let (out, ()) = tokio::join!(settle(&r.da, &r.s.chain, &job, &r.snark, posting), driver);
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let s = r.l1.sends();
+    assert_eq!(s.len(), 4, "both chunks again: {s:?}");
+    let (n0, n1) = (
+        r.l1.block_of(&s[2].hash).unwrap(),
+        r.l1.block_of(&s[3].hash).unwrap(),
+    );
+    assert!(n0 > b0 + 70 && n1 > n0);
+    assert_eq!(r.s.chain.l1_last().unwrap().blocks, vec![n0, n0, n1]);
+}
+
+#[tokio::test]
+async fn reposts_of_a_chunked_transition_are_bounded() {
+    let r = rig_chunked(Duration::from_millis(5), 3, 2);
+    r.s.chain.revert_simulates("TxTooOld", 100);
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("re-posts")),
+        "{out:?}"
+    );
+    // Two chunks, then MAX_REPOSTS full re-posts of two.
+    assert_eq!(r.l1.mined_posts(), 2 * (1 + MAX_REPOSTS as usize));
+}
+
+/// An Ethereum whose fees jump above any cap once a post is mined, until
+/// `calm`.
+struct Spiky {
+    inner: FakeL1,
+    calm: AtomicBool,
+}
+
+#[async_trait]
+impl L1Chain for Spiky {
+    fn sender(&self) -> Option<Address> {
+        self.inner.sender()
+    }
+    async fn head(&self) -> Result<u64, Web3Error> {
+        self.inner.head().await
+    }
+    async fn nonce(&self) -> Result<u64, Web3Error> {
+        self.inner.nonce().await
+    }
+    async fn fees(&self) -> Result<L1Market, Web3Error> {
+        let mut m = self.inner.fees().await?;
+        if self.inner.mined_posts() > 0 && !self.calm.load(Ordering::SeqCst) {
+            m.base_fee *= 1000;
+        }
+        Ok(m)
+    }
+    async fn sign_blob_tx(
+        &self,
+        nonce: u64,
+        fees: &L1Fees,
+        blobs: &TransitionBlobs,
+    ) -> Result<SignedBlobTx, Web3Error> {
+        self.inner.sign_blob_tx(nonce, fees, blobs).await
+    }
+    async fn send_blob_tx(&self, tx: &SignedBlobTx) -> Result<(), L1SendError> {
+        self.inner.send_blob_tx(tx).await
+    }
+    async fn receipt(&self, tx: B256) -> Result<Option<L1Receipt>, Web3Error> {
+        self.inner.receipt(tx).await
+    }
+    async fn tx_known(&self, tx: B256) -> Result<bool, Web3Error> {
+        self.inner.tx_known(tx).await
+    }
+    async fn build_proof(&self, txs: &[B256], top: u64) -> Result<L1BlobProof, Web3Error> {
+        self.inner.build_proof(txs, top).await
+    }
+}
+
+#[tokio::test]
+async fn a_fee_spike_between_chunks_waits_for_the_second() {
+    // Chunk 0 goes out; then the base fee jumps a thousandfold, past the
+    // cap: chunk 1 waits, retried each poll, and goes out once fees fall.
+    // Chunk 0 is never posted again.
+    let mut r = rig_chunked(Duration::from_millis(5), 3, 2);
+    let spiky = Arc::new(Spiky {
+        inner: r.l1.clone(),
+        calm: AtomicBool::new(false),
+    });
+    let cap = L1Fees::offer(&r.l1.market()).cost(2) * 3;
+    let (dir, db) = fresh_db();
+    r.da = L1Da::new(spiky.clone(), db.clone(), cap, Duration::from_millis(5), 2).unwrap();
+    (r.db, r._dir) = (db, dir);
+    let job = r.job();
+    let driver = async {
+        wait_until("chunk 0 mined", async || r.l1.mined_posts() == 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(r.l1.sends().len(), 1, "chunk 1 sent above the cap");
+        spiky.calm.store(true, Ordering::SeqCst);
+    };
+    let ((_, posting), ()) = tokio::join!(
+        with_post(&r.da, &r.s.chain, &job, std::future::ready(())),
+        driver
+    );
+    assert_eq!(posting.posts.len(), 2, "{posting:?}");
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let s = r.l1.sends();
+    assert_eq!(s.iter().map(|x| x.nonce).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(r.l1.mined_posts(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fee_spike_that_never_calms_stops_at_the_deadline() {
+    // Chunk 0 mined, then fees stay above the cap: the retry loop must not
+    // outlive the job's deadline (the flight would hold the process's single
+    // slot until fees fall, however long after the grace end).
+    let mut r = rig_chunked(Duration::from_millis(5), 3, 2);
+    let spiky = Arc::new(Spiky {
+        inner: r.l1.clone(),
+        calm: AtomicBool::new(false), // never set
+    });
+    let cap = L1Fees::offer(&r.l1.market()).cost(2) * 3;
+    let (dir, db) = fresh_db();
+    r.da = L1Da::new(spiky.clone(), db.clone(), cap, Duration::from_millis(5), 2).unwrap();
+    (r.db, r._dir) = (db, dir);
+    let job = L1Job {
+        deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+        ..r.job()
+    };
+    let (_, posting) = with_post(&r.da, &r.s.chain, &job, std::future::ready(())).await;
+    assert_eq!(posting.posts.len(), 1, "{posting:?}");
+    assert!(
+        matches!(posting.error, Some(PostError::Deadline)),
+        "{posting:?}"
+    );
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("deadline")),
+        "{out:?}"
+    );
+    assert_eq!(r.l1.sends().len(), 1);
+}
+
+#[tokio::test]
+async fn two_transitions_interleave_their_chunks() {
+    // Two processes' transitions through one Ethereum account at once: the
+    // posts go out one at a time at consecutive nonces, and each transition
+    // keeps its own chunks, in order.
+    let r = rig_chunked(Duration::from_millis(5), 3, 2);
+    let other = wide_blobs(4);
+    let job_a = r.job();
+    let job_b = L1Job {
+        pid: [9; 31],
+        root_before: [9; 32],
+        blobs: &other,
+        ..r.job()
+    };
+    let ((_, pa), (_, pb)) = tokio::join!(
+        with_post(&r.da, &r.s.chain, &job_a, std::future::ready(())),
+        with_post(&r.da, &r.s.chain, &job_b, std::future::ready(()))
+    );
+    let mut nonces: Vec<u64> = pa.posts.iter().chain(&pb.posts).map(|p| p.nonce).collect();
+    nonces.sort();
+    assert_eq!(nonces, [0, 1, 2, 3]);
+    let origin = r.l1.origin();
+    for (posting, blobs) in [(&pa, &r.blobs), (&pb, &other)] {
+        assert_eq!(posting.posts.len(), 2);
+        assert!(posting.posts[0].block < posting.posts[1].block);
+        let txs: Vec<B256> = posting.posts.iter().map(|p| p.tx).collect();
+        let proof = r.l1.build_proof(&txs, origin.number).await.unwrap();
+        let (vhs, _) = verify_local(&proof, origin.hash).unwrap();
+        let want: Vec<B256> = blobs
+            .versioned_hashes
+            .iter()
+            .map(|h| B256::from(*h))
+            .collect();
+        assert_eq!(vhs, want);
+    }
+    let out = settle(&r.da, &r.s.chain, &job_a, &r.snark, pa).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_single_chunk_repost_drops_the_recorded_origin() {
+    // OP's origin reached the second chunk and was recorded; then a reorg
+    // drops that chunk's block. The chunk goes out again alone, the stale
+    // record anchors nothing, and the proof anchors at the current origin.
+    let r = rig_chunked(Duration::from_secs(1), 3, 2);
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
+    let posting = r.posting(&job).await;
+    let p = posting.posts.clone();
+    r.l1.pin_origin(Some(p[1].block));
+    let rec = r.s.chain.record_l1_origin().await.unwrap();
+    r.l1.pin_origin(None);
+    r.l1.reorg(1);
+    let posting = Posting {
+        recorded: Some(rec),
+        ..posting
+    };
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    let s = r.l1.sends();
+    assert_eq!(s.len(), 3, "one chunk again, not all: {s:?}");
+    let b1 = r.l1.block_of(&s[2].hash).unwrap();
+    assert!(b1 > rec.number);
+    assert_eq!(r.s.chain.l1_records(), 1);
+    assert_eq!(
+        r.s.chain.l1_last().unwrap().blocks,
+        vec![p[0].block, p[0].block, b1]
     );
 }

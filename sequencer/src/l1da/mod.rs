@@ -30,22 +30,66 @@ pub struct L1Da {
     pub poster: Poster,
     /// Pace of the settle loop and the poster (the chain poll interval).
     pub poll: Duration,
+    /// Most blobs one Ethereum transaction carries (the per-transaction
+    /// cap): a transition goes out in chunks of this many.
+    pub chunk: usize,
 }
 
 impl L1Da {
-    /// `fee_cap`: the most one post may cost at the fees it offers, in wei.
+    /// `fee_cap`: the most one post may cost at the fees it offers, in wei;
+    /// `chunk`: the per-transaction blob cap (at least 1).
     pub fn new(
         l1: Arc<dyn L1Chain>,
         db: Db,
         fee_cap: u128,
         poll: Duration,
+        chunk: usize,
     ) -> Result<Self, StorageError> {
         Ok(L1Da {
             poster: Poster::new(l1.clone(), db, fee_cap, poll)?,
             l1,
             poll,
+            chunk: chunk.max(1),
         })
     }
+}
+
+/// `blobs` split in order into transactions of at most `per_tx` blobs (the
+/// last may be shorter), each with its commitments, openings and versioned
+/// hashes. Chunk `i` holds blobs `per_tx * i ..`, so the chunks' versioned
+/// hashes in chunk order are the transition's: the order the registry opens
+/// its commitments in. The per-blob vectors must have the length of `blobs`
+/// (`build_blobs` output always does); unequal ones would panic on a slice.
+pub fn chunks(blobs: &TransitionBlobs, per_tx: usize) -> Vec<TransitionBlobs> {
+    let per_tx = per_tx.max(1);
+    let n = blobs.blobs.len();
+    debug_assert!(
+        [
+            blobs.commitments.len(),
+            blobs.zs.len(),
+            blobs.ys.len(),
+            blobs.proofs.len(),
+            blobs.versioned_hashes.len()
+        ]
+        .iter()
+        .all(|&l| l == n),
+        "per-blob vectors of unequal length"
+    );
+    (0..blobs.blobs.len())
+        .step_by(per_tx)
+        .map(|a| {
+            let b = (a + per_tx).min(blobs.blobs.len());
+            TransitionBlobs {
+                blobs: blobs.blobs[a..b].to_vec(),
+                commitments: blobs.commitments[a..b].to_vec(),
+                zs: blobs.zs[a..b].to_vec(),
+                ys: blobs.ys[a..b].to_vec(),
+                proofs: blobs.proofs[a..b].to_vec(),
+                versioned_hashes: blobs.versioned_hashes[a..b].to_vec(),
+                digest: blobs.digest,
+            }
+        })
+        .collect()
 }
 
 impl L1Da {
@@ -70,9 +114,12 @@ pub struct L1Job<'a> {
 }
 
 /// What [`with_post`] leaves for [`settle`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Posting {
-    pub post: Result<Posted, PostError>,
+    /// The chunks mined while proving, in chunk order (the first ones).
+    pub posts: Vec<Posted>,
+    /// Why posting stopped before the last chunk, if it did.
+    pub error: Option<PostError>,
     /// OP's origin recorded with `record()` while the proof was not ready.
     pub recorded: Option<L1Origin>,
 }
@@ -88,48 +135,76 @@ pub enum Settled {
     Failed(String),
 }
 
-/// Runs `prove` while posting the batch's blobs. Once the post is mined, if
-/// OP's origin reaches its block before the proof is ready, records that
-/// origin on OP once, so a late proof still anchors close to the blobs.
+/// Posts `chunks` in order, one transaction at a time: each waits until the
+/// one before is mined (the window-1 poster). Fee-cap and L1 trouble are
+/// retried each poll; any other error, or the flight's end, stops the run.
+/// Returns the mined posts and the error that stopped it early.
+async fn post_chunks(
+    da: &L1Da,
+    job: &L1Job<'_>,
+    chunks: &[TransitionBlobs],
+) -> (Vec<Posted>, Option<PostError>) {
+    let mut posts = Vec::with_capacity(chunks.len());
+    for c in chunks {
+        loop {
+            match da
+                .poster
+                .post(&job.pid, &job.root_before, c, job.deadline)
+                .await
+            {
+                Ok(p) => {
+                    posts.push(p);
+                    break;
+                }
+                // Fee cap, L1 trouble: wait and post again while the proof runs.
+                Err(e @ (PostError::FeeCap { .. } | PostError::L1(_))) => {
+                    warn!(pid = %hex::encode(job.pid), error = %e, "L1 post failed; retrying");
+                    // A fee spike between chunks must not hold the flight past
+                    // the job's deadline; `settle` then posts the missing chunk
+                    // and gets `Deadline` from its own `timeout_at`.
+                    if tokio::time::Instant::now() >= job.deadline {
+                        return (posts, Some(PostError::Deadline));
+                    }
+                    if !da.pause(&job.cancel).await {
+                        return (posts, Some(e));
+                    }
+                }
+                Err(e) => return (posts, Some(e)),
+            }
+        }
+    }
+    (posts, None)
+}
+
+/// Runs `prove` while posting the batch's blobs, in chunks of the
+/// per-transaction cap. Once the last chunk is mined, if OP's origin reaches
+/// its block before the proof is ready, records that origin on OP once, so
+/// a late proof still anchors close to the blobs.
 pub async fn with_post<T>(
     da: &L1Da,
     chain: &dyn Chain,
     job: &L1Job<'_>,
     prove: impl Future<Output = T>,
 ) -> (T, Posting) {
-    let post = async {
-        loop {
-            match da
-                .poster
-                .post(&job.pid, &job.root_before, job.blobs, job.deadline)
-                .await
-            {
-                // Fee cap, L1 trouble: wait and post again while the proof runs.
-                Err(e @ (PostError::FeeCap { .. } | PostError::L1(_))) => {
-                    warn!(pid = %hex::encode(job.pid), error = %e, "L1 post failed; retrying");
-                    if !da.pause(&job.cancel).await {
-                        return Err(e);
-                    }
-                }
-                r => return r,
-            }
-        }
-    };
+    let chunks = chunks(job.blobs, da.chunk);
+    let post = post_chunks(da, job, &chunks);
     tokio::pin!(prove);
     tokio::pin!(post);
-    let mut posted: Option<Result<Posted, PostError>> = None;
+    let mut posted: Option<(Vec<Posted>, Option<PostError>)> = None;
     let mut recorded = None;
     let mut record_tried = false;
     let proved = loop {
-        let block = match &posted {
-            Some(Ok(p)) if !record_tried => Some(p.block),
+        // The newest chunk's block, once every chunk is mined: a recorded
+        // origin below it could not anchor the transactions above it.
+        let newest = match &posted {
+            Some((p, None)) if !record_tried => p.iter().map(|p| p.block).max(),
             _ => None,
         };
         tokio::select! {
             out = &mut prove => break out,
             p = &mut post, if posted.is_none() => posted = Some(p),
-            _ = tokio::time::sleep(da.poll), if block.is_some() => {
-                if let Some(n) = block
+            _ = tokio::time::sleep(da.poll), if newest.is_some() => {
+                if let Some(n) = newest
                     && let Ok(o) = chain.l1_origin().await
                     && o.number >= n
                 {
@@ -147,11 +222,18 @@ pub async fn with_post<T>(
             }
         }
     };
-    let post = match posted {
+    let (posts, error) = match posted {
         Some(p) => p,
         None => post.await,
     };
-    (proved, Posting { post, recorded })
+    (
+        proved,
+        Posting {
+            posts,
+            error,
+            recorded,
+        },
+    )
 }
 
 /// Why the registry's DA mode and the configuration disagree, if they do.
@@ -174,9 +256,55 @@ pub fn mode_error(da: &crate::web3::RegistryDa, l1_configured: bool) -> Option<S
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
+    use davinci_zkvm_sdk::blob::{BLOB_SIZE, Blob};
 
     use super::*;
     use crate::web3::RegistryDa;
+
+    fn fake_blobs(n: usize) -> TransitionBlobs {
+        let blob = |i: usize| -> Blob {
+            vec![i as u8; BLOB_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap()
+        };
+        TransitionBlobs {
+            blobs: (0..n).map(blob).collect(),
+            commitments: (0..n).map(|i| [i as u8; 48]).collect(),
+            zs: (0..n).map(|i| [i as u8 ^ 0x10; 32]).collect(),
+            ys: (0..n).map(|i| [i as u8 ^ 0x20; 32]).collect(),
+            proofs: (0..n).map(|i| [i as u8 ^ 0x30; 48]).collect(),
+            versioned_hashes: (0..n).map(|i| [i as u8 ^ 0x40; 32]).collect(),
+            digest: [7; 32],
+        }
+    }
+
+    #[test]
+    fn chunks_keep_the_blob_order() {
+        let t = fake_blobs(13);
+        let c = chunks(&t, 6);
+        let sizes = |c: &[TransitionBlobs]| c.iter().map(|c| c.blobs.len()).collect::<Vec<_>>();
+        assert_eq!(sizes(&c), [6, 6, 1]);
+        for (k, c) in c.iter().enumerate() {
+            for j in 0..c.blobs.len() {
+                let i = 6 * k + j;
+                assert_eq!(c.blobs[j][0], i as u8);
+                assert_eq!(c.commitments[j], t.commitments[i]);
+                assert_eq!((c.zs[j], c.ys[j]), (t.zs[i], t.ys[i]));
+                assert_eq!(c.proofs[j], t.proofs[i]);
+                assert_eq!(c.versioned_hashes[j], t.versioned_hashes[i]);
+            }
+            assert_eq!(c.digest, t.digest);
+        }
+        // Concatenated in chunk order: the transition's versioned hashes.
+        let vhs: Vec<[u8; 32]> = c.iter().flat_map(|c| c.versioned_hashes.clone()).collect();
+        assert_eq!(vhs, t.versioned_hashes);
+        assert_eq!(sizes(&chunks(&t, 32)), [13]);
+        assert_eq!(sizes(&chunks(&fake_blobs(9), 6)), [6, 3]);
+        assert_eq!(sizes(&chunks(&fake_blobs(6), 6)), [6]);
+        // A zero cap is one blob per transaction.
+        assert_eq!(sizes(&chunks(&fake_blobs(2), 0)), [1, 1]);
+    }
 
     #[test]
     fn the_registry_mode_must_match_the_configuration() {

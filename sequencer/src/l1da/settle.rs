@@ -1,7 +1,8 @@
-//! Settling a proved batch whose blobs are on Ethereum: wait for the blob
-//! transaction's block and for OP's origin, anchor the L1 proof where OP
-//! accepts it, check it locally, simulate and send. The blobs are posted
-//! again when their transaction is gone or the proof would be too deep.
+//! Settling a proved batch whose blobs are on Ethereum, in one or more blob
+//! transactions (chunks): wait for every chunk's block and for OP's origin,
+//! anchor the L1 proof where OP accepts it, check it locally, simulate and
+//! send. A chunk whose transaction is gone is posted again alone; a proof
+//! that would be too deep posts every chunk again.
 
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use davinci_zkvm_sdk::client::PlonkSnark;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::{L1Da, L1Job, PostError, Posting, Settled};
+use super::{L1Da, L1Job, PostError, Posted, Posting, Settled, chunks};
 use crate::actor::Chain;
 use crate::web3::l1proof::verify_local;
 use crate::web3::{L1Origin, RevertReason, Web3Error, revert_message};
@@ -37,8 +38,8 @@ pub const GONE_FOR: Duration = Duration::from_secs(36);
 /// How long building or anchoring the L1 proof may keep failing before the
 /// blobs are posted again (a fresh blob block usually fixes it).
 pub const PROOF_FAIL_FOR: Duration = Duration::from_secs(60);
-/// Re-posts of the blobs in one settlement before the batch goes back to the
-/// queue (each is an L1 blob transaction).
+/// Re-posts in one settlement before the batch goes back to the queue: one
+/// chunk posted again counts one, every chunk posted again counts one.
 pub const MAX_REPOSTS: u32 = 3;
 /// Seal to landing in L1-blob mode cannot beat the Ethereum leg: blob
 /// inclusion plus OP's L1 origin lag (~7 blocks) plus the reorg margin,
@@ -56,21 +57,30 @@ pub enum Anchor {
     Repost,
 }
 
-/// The anchor of a proof for blob block `n` (with `origin.number >= n`):
-/// the current origin while that takes at most [`CURRENT_MAX_HEADERS`]
-/// headers (up to [`TOP_ABOVE_ORIGIN`] above it, within our L1 head), else a
-/// recorded origin at or above `n`, else the current origin up to
-/// [`MAX_L1_PROOF_HEADERS`]; deeper, or [`L1_MAX_AGE`] behind, a re-post.
-pub fn choose_anchor(n: u64, head: u64, origin: L1Origin, recorded: Option<L1Origin>) -> Anchor {
-    let behind = origin.number.saturating_sub(n);
+/// The anchor of a proof whose blob transactions sit in blocks `oldest`
+/// to `newest`. Depth counts from `oldest`: the current origin while that
+/// takes at most [`CURRENT_MAX_HEADERS`] headers (up to [`TOP_ABOVE_ORIGIN`]
+/// above it, within our L1 head), else a recorded origin at or above
+/// `newest` (the verifier rejects a transaction above its anchor), else the
+/// current origin up to [`MAX_L1_PROOF_HEADERS`]; deeper, or [`L1_MAX_AGE`]
+/// behind, a re-post. Waits while OP's origin or our L1 head is below
+/// `newest`.
+pub fn choose_anchor(
+    oldest: u64,
+    newest: u64,
+    head: u64,
+    origin: L1Origin,
+    recorded: Option<L1Origin>,
+) -> Anchor {
+    let behind = origin.number.saturating_sub(oldest);
     if behind >= L1_MAX_AGE {
         return Anchor::Repost;
     }
     let current = behind + 1 + TOP_ABOVE_ORIGIN;
     if current > CURRENT_MAX_HEADERS
         && let Some(r) = recorded
-        && r.number >= n
-        && r.number - n < MAX_L1_PROOF_HEADERS
+        && r.number >= newest
+        && r.number - oldest < MAX_L1_PROOF_HEADERS
     {
         return Anchor::At {
             top: r.number,
@@ -80,7 +90,7 @@ pub fn choose_anchor(n: u64, head: u64, origin: L1Origin, recorded: Option<L1Ori
     if current > MAX_L1_PROOF_HEADERS {
         return Anchor::Repost;
     }
-    if head < origin.number {
+    if origin.number < newest || head < origin.number {
         return Anchor::Wait;
     }
     Anchor::At {
@@ -119,14 +129,19 @@ macro_rules! repost {
     };
 }
 
-/// Settles `job`'s proved batch on OP. Waits (within the deadline) for the
-/// blob transaction to have [`REORG_MARGIN`] blocks on top and for OP's
-/// origin to reach it, then sends the transition with an L1 proof anchored by
-/// [`choose_anchor`]. A vanished blob transaction, a too-deep proof, one
-/// that fails to build or anchor for [`PROOF_FAIL_FOR`], or `TxTooOld` post
-/// the blobs again; `L1OriginMismatch` rebuilds the proof from fresh reads,
-/// up to [`MAX_PROOF_RETRIES`] times. Other reverts end the job with their
-/// name, as in blob mode.
+/// Settles `job`'s proved batch on OP. Posts the chunks [`with_post`]
+/// left unposted, then waits (within the deadline) for every chunk's
+/// transaction to have [`REORG_MARGIN`] blocks on top and for OP's origin to
+/// reach the newest, and sends the transition with one L1 proof of every
+/// chunk transaction, in chunk order, anchored by [`choose_anchor`]. A chunk
+/// whose transaction vanished is posted again alone; a too-deep proof, one
+/// that fails to build or anchor for [`PROOF_FAIL_FOR`], or `TxTooOld` posts
+/// every chunk again; each counts one of [`MAX_REPOSTS`].
+/// `L1OriginMismatch` rebuilds the proof from fresh reads, up to
+/// [`MAX_PROOF_RETRIES`] times. Other reverts end the job with their name,
+/// as in blob mode.
+///
+/// [`with_post`]: super::with_post
 pub async fn settle(
     da: &L1Da,
     chain: &dyn Chain,
@@ -135,25 +150,26 @@ pub async fn settle(
     posting: Posting,
 ) -> Settled {
     let pid = hex::encode(job.pid);
+    let chunks = chunks(job.blobs, da.chunk);
     let want: Vec<B256> = job
         .blobs
         .versioned_hashes
         .iter()
         .map(|h| B256::from(*h))
         .collect();
-    let mut post = match posting.post {
-        Ok(p) => Some(p),
-        Err(e) => {
-            warn!(%pid, error = %e, "L1 post during proving failed; posting again");
-            None
-        }
-    };
+    if let Some(e) = &posting.error {
+        warn!(%pid, error = %e, "L1 post during proving failed; posting again");
+    }
+    // One entry per chunk, in chunk order; `None` is (re)posted first.
+    let mut posts: Vec<Option<Posted>> = (0..chunks.len())
+        .map(|i| posting.posts.get(i).copied())
+        .collect();
     let mut recorded = posting.recorded;
     let mut retries = 0u32;
     let mut reposts = 0u32;
-    // Since when the post's receipt reads as unknown.
-    let mut gone: Option<Instant> = None;
-    // Since when the proof of this post fails to build or anchor.
+    // Since when each chunk's receipt reads as unknown.
+    let mut gone: Vec<Option<Instant>> = vec![None; chunks.len()];
+    // Since when the proof of these posts fails to build or anchor.
     let mut proof_failing: Option<Instant> = None;
     loop {
         if job.cancel.is_cancelled() {
@@ -162,57 +178,67 @@ pub async fn settle(
         if Instant::now() >= job.deadline {
             return Settled::Transient("L1 settlement past the batch deadline".into());
         }
-        let p = match post {
-            Some(p) => p,
-            None => match da
+        if let Some(i) = posts.iter().position(Option::is_none) {
+            match da
                 .poster
-                .post(&job.pid, &job.root_before, job.blobs, job.deadline)
+                .post(&job.pid, &job.root_before, &chunks[i], job.deadline)
                 .await
             {
                 Ok(p) => {
-                    post = Some(p);
+                    posts[i] = Some(p);
+                    // A recorded origin below the new post anchors nothing.
                     recorded = None;
                     proof_failing = None;
-                    p
                 }
                 Err(e @ (PostError::Deadline | PostError::NoSigner | PostError::Storage(_))) => {
                     return Settled::Transient(e.to_string());
                 }
                 // Fee cap, L1 trouble: wait and post again within the deadline.
                 Err(e) => {
-                    warn!(%pid, error = %e, "L1 post failed; retrying");
+                    warn!(%pid, chunk = i, error = %e, "L1 post failed; retrying");
                     pause_or_abort!(da, job);
-                    continue;
                 }
-            },
-        };
-        let rc = match da.l1.receipt(p.tx).await {
-            Ok(Some(rc)) => {
-                gone = None;
-                rc
             }
-            Ok(None) if gone.is_none_or(|t| t.elapsed() < GONE_FOR) => {
-                if gone.is_none() {
-                    gone = Some(Instant::now());
-                    warn!(%pid, tx = %p.tx, "L1 blob transaction not found; re-checking");
+            continue;
+        }
+        let txs: Vec<Posted> = posts.iter().flatten().copied().collect();
+        let mut blocks = Vec::with_capacity(txs.len());
+        let mut lost = None;
+        for (i, p) in txs.iter().enumerate() {
+            match da.l1.receipt(p.tx).await {
+                Ok(Some(rc)) => {
+                    gone[i] = None;
+                    blocks.push(rc.block);
                 }
-                pause_or_abort!(da, job);
-                continue;
+                Ok(None) if gone[i].is_none_or(|t| t.elapsed() < GONE_FOR) => {
+                    if gone[i].is_none() {
+                        gone[i] = Some(Instant::now());
+                        warn!(%pid, chunk = i, tx = %p.tx, "L1 blob transaction not found; re-checking");
+                    }
+                }
+                Ok(None) => {
+                    lost = Some(i);
+                    break;
+                }
+                Err(e) => warn!(%pid, error = %e, "L1 receipt read failed"),
             }
-            Ok(None) => {
-                gone = None;
-                repost!(reposts, "the blob transaction is gone");
-                warn!(%pid, tx = %p.tx, "L1 blob transaction gone (dropped or reorged out); posting again");
-                post = None;
-                continue;
-            }
-            Err(e) => {
-                warn!(%pid, error = %e, "L1 receipt read failed");
-                pause_or_abort!(da, job);
-                continue;
-            }
+        }
+        if let Some(i) = lost {
+            gone[i] = None;
+            repost!(reposts, "a blob transaction is gone");
+            warn!(%pid, chunk = i, tx = %txs[i].tx,
+                "L1 blob transaction gone (dropped or reorged out); posting its chunk again");
+            posts[i] = None;
+            continue;
+        }
+        // A receipt still unknown or unread: look again next poll.
+        if blocks.len() < txs.len() {
+            pause_or_abort!(da, job);
+            continue;
+        }
+        let (Some(&oldest), Some(&newest)) = (blocks.iter().min(), blocks.iter().max()) else {
+            return Settled::Failed("a transition without blobs".into());
         };
-        let n = rc.block;
         let (head, origin) = match (da.l1.head().await, chain.l1_origin().await) {
             (Ok(h), Ok(o)) => (h, o),
             (Err(e), _) | (_, Err(e)) => {
@@ -221,11 +247,11 @@ pub async fn settle(
                 continue;
             }
         };
-        if head < n + REORG_MARGIN || origin.number < n {
+        if head < newest + REORG_MARGIN || origin.number < newest {
             pause_or_abort!(da, job);
             continue;
         }
-        let (top, anchor) = match choose_anchor(n, head, origin, recorded) {
+        let (top, anchor) = match choose_anchor(oldest, newest, head, origin, recorded) {
             Anchor::At { top, hash } => (top, hash),
             Anchor::Wait => {
                 pause_or_abort!(da, job);
@@ -233,16 +259,18 @@ pub async fn settle(
             }
             Anchor::Repost => {
                 repost!(reposts, "no anchor close enough");
-                warn!(%pid, n, origin = origin.number, "the L1 proof would be too deep; posting the blobs again");
-                post = None;
+                warn!(%pid, oldest, origin = origin.number,
+                    "the L1 proof would be too deep; posting every chunk again");
+                posts.fill(None);
                 continue;
             }
         };
-        let built = match da.l1.build_proof(&[p.tx], top).await {
+        let hashes: Vec<B256> = txs.iter().map(|p| p.tx).collect();
+        let built = match da.l1.build_proof(&hashes, top).await {
             Ok(proof) => match verify_local(&proof, anchor) {
                 Ok((vhs, _)) if vhs == want => Ok(proof),
                 Ok(_) => {
-                    return Settled::Failed("the L1 blob transaction carries other blobs".into());
+                    return Settled::Failed("the L1 blob transactions carry other blobs".into());
                 }
                 Err(e) => Err(format!("the L1 proof does not anchor: {e}")),
             },
@@ -254,11 +282,11 @@ pub async fn settle(
                 proof
             }
             // A lagging or pruning endpoint: retry each poll; past the
-            // window a new blob block usually helps.
+            // window new blob blocks usually help.
             Err(e) if proof_failing.is_some_and(|t| t.elapsed() >= PROOF_FAIL_FOR) => {
                 repost!(reposts, "the L1 proof could not be built or anchored");
-                warn!(%pid, error = %e, "the L1 proof kept failing; posting the blobs again");
-                post = None;
+                warn!(%pid, error = %e, "the L1 proof kept failing; posting every chunk again");
+                posts.fill(None);
                 continue;
             }
             Err(e) => {
@@ -277,8 +305,8 @@ pub async fn settle(
                 .await
             {
                 Ok(rc) => {
-                    info!(%pid, l1_block = n, headers = proof.headers.len(), tx = %rc.tx_hash,
-                        "L1-blob transition sent");
+                    info!(%pid, l1_block = newest, l1_oldest = oldest, l1_txs = txs.len(),
+                        headers = proof.headers.len(), tx = %rc.tx_hash, "L1-blob transition sent");
                     return Settled::Landed(rc);
                 }
                 Err(Web3Error::Revert(RevertReason::Revert { name, data })) => named(name, &data),
@@ -310,8 +338,8 @@ pub async fn settle(
             }
             "TxTooOld" => {
                 repost!(reposts, "TxTooOld");
-                warn!(%pid, n, "the blob transaction is too old for the verifier; posting again");
-                post = None;
+                warn!(%pid, oldest, "a blob transaction is too old for the verifier; posting every chunk again");
+                posts.fill(None);
             }
             _ => return Settled::Reverted(refused),
         }
@@ -334,14 +362,14 @@ mod tests {
         let n = 100;
         // At the origin: two headers above it, capped by our head.
         assert_eq!(
-            choose_anchor(n, 101, o(100), None),
+            choose_anchor(n, n, 101, o(100), None),
             Anchor::At {
                 top: 101,
                 hash: o(100).hash
             }
         );
         assert_eq!(
-            choose_anchor(n, 120, o(110), None),
+            choose_anchor(n, n, 120, o(110), None),
             Anchor::At {
                 top: 112,
                 hash: o(110).hash
@@ -349,7 +377,7 @@ mod tests {
         );
         // 16 headers from the current origin is the limit (origin + 2 - n + 1)...
         assert_eq!(
-            choose_anchor(n, 200, o(113), Some(o(101))),
+            choose_anchor(n, n, 200, o(113), Some(o(101))),
             Anchor::At {
                 top: 115,
                 hash: o(113).hash
@@ -357,7 +385,7 @@ mod tests {
         );
         // ...past it, the recorded origin anchors: headers 101 down to 100.
         assert_eq!(
-            choose_anchor(n, 200, o(114), Some(o(101))),
+            choose_anchor(n, n, 200, o(114), Some(o(101))),
             Anchor::At {
                 top: 101,
                 hash: o(101).hash
@@ -365,21 +393,83 @@ mod tests {
         );
         // Without a record, up to 64 headers from the current origin...
         assert_eq!(
-            choose_anchor(n, 200, o(161), None),
+            choose_anchor(n, n, 200, o(161), None),
             Anchor::At {
                 top: 163,
                 hash: o(161).hash
             }
         );
         // ...then the blobs go out again.
-        assert_eq!(choose_anchor(n, 200, o(162), None), Anchor::Repost);
+        assert_eq!(choose_anchor(n, n, 200, o(162), None), Anchor::Repost);
         // A record from before the blob block anchors nothing for it.
-        assert_eq!(choose_anchor(n, 200, o(162), Some(o(99))), Anchor::Repost);
+        assert_eq!(
+            choose_anchor(n, n, 200, o(162), Some(o(99))),
+            Anchor::Repost
+        );
         // Our L1 RPC behind OP's origin: wait for it.
-        assert_eq!(choose_anchor(n, 105, o(110), None), Anchor::Wait);
+        assert_eq!(choose_anchor(n, n, 105, o(110), None), Anchor::Wait);
         // As old as the verifier's MAX_AGE: post again, record or not.
         assert_eq!(
-            choose_anchor(n, n + 8000, o(n + L1_MAX_AGE), Some(o(101))),
+            choose_anchor(n, n, n + 8000, o(n + L1_MAX_AGE), Some(o(101))),
+            Anchor::Repost
+        );
+    }
+
+    // Chunks in blocks 100 (oldest) and 105 (newest).
+    #[test]
+    fn depth_counts_from_the_oldest_chunk_and_anchors_cover_the_newest() {
+        let (old, new) = (100, 105);
+        // OP's origin between the two blocks: wait for it to reach the newest.
+        assert_eq!(choose_anchor(old, new, 200, o(103), None), Anchor::Wait);
+        // At the newest: headers from origin + 2 down to the oldest.
+        assert_eq!(
+            choose_anchor(old, new, 200, o(105), None),
+            Anchor::At {
+                top: 107,
+                hash: o(105).hash
+            }
+        );
+        // A record at oldest + 1 < newest must not anchor: the verifier would
+        // reject the newest transaction above it. The current origin does.
+        assert_eq!(
+            choose_anchor(old, new, 200, o(150), Some(o(101))),
+            Anchor::At {
+                top: 152,
+                hash: o(150).hash
+            }
+        );
+        // ...and past the header budget nothing anchors: post again.
+        assert_eq!(
+            choose_anchor(old, new, 300, o(170), Some(o(101))),
+            Anchor::Repost
+        );
+        // A record at the newest anchors, headers 105 down to 100.
+        assert_eq!(
+            choose_anchor(old, new, 300, o(170), Some(o(105))),
+            Anchor::At {
+                top: 105,
+                hash: o(105).hash
+            }
+        );
+        // The header budget counts from the oldest chunk: 64 headers from
+        // origin + 2 down to block 100 is the most, however recent the newest.
+        assert_eq!(
+            choose_anchor(old, 140, 300, o(161), None),
+            Anchor::At {
+                top: 163,
+                hash: o(161).hash
+            }
+        );
+        assert_eq!(choose_anchor(old, 140, 300, o(162), None), Anchor::Repost);
+        // So does MAX_AGE.
+        assert_eq!(
+            choose_anchor(
+                old,
+                old + 50,
+                old + 8000,
+                o(old + L1_MAX_AGE),
+                Some(o(old + 50))
+            ),
             Anchor::Repost
         );
     }
