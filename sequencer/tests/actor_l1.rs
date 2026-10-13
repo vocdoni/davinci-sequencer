@@ -1071,3 +1071,38 @@ async fn l1_bisection_cycles_post_only_after_the_proof() {
     shutdown.cancel();
     miner.abort();
 }
+
+/// A proof-first retry needs chunks for the exposed set the failed attempt
+/// left: 130 live overwritten slots take two one-blob transactions. The
+/// 150 s window leaves one chunk after a full-size proof, yet the retry
+/// must still seal (fewer votes, both chunks), not wait for a wider window.
+#[tokio::test]
+async fn l1_proof_first_retry_is_sized_for_its_exposed_set() {
+    let s = setup(16, 130, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    // 150 − 30 (base) − 93 (lag) − 24 (second chunk) leaves 3 s to prove.
+    let cfg = chunked_cfg(&dir, &s, 130, &["--l1-settle-lag", "93s"]);
+    let (_node, h) = chunked_node(&s, &l1, prover.clone(), &dir, cfg, &shutdown).await;
+    let first = submit(&h, &s, 0..130, 4000).await;
+    wait_until("first votes settled", async || {
+        all_settled(&h, &first).await
+    })
+    .await;
+    // Overwrites of every slot; one of them fails in the prover.
+    *prover.fail_vid.lock().unwrap() = Some(fake_vote(&s.env, 129, &[1, 2], 5129).pkg.vote_id);
+    submit(&h, &s, 0..130, 5000).await;
+    wait_until("the failed attempt and its retry", async || {
+        prover.calls() >= 3
+    })
+    .await;
+    let sizes = prover.sizes();
+    assert_eq!(sizes[..2], [130, 130]);
+    assert!(
+        sizes[2] < 130,
+        "the retry is sized for both chunks: {sizes:?}"
+    );
+    shutdown.cancel();
+}

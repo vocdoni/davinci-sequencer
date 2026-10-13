@@ -1337,6 +1337,15 @@ impl Actor {
         Some(due.min(flush_at).max(paused))
     }
 
+    /// Exposed slots still occupied: the refreshes every re-attempt carries.
+    /// A failed read counts as live.
+    fn live_exposed(&self) -> usize {
+        self.exposed
+            .iter()
+            .filter(|s| !matches!(self.state.slot_ballot(**s), Ok(None)))
+            .count()
+    }
+
     /// Most votes the next seal takes: `--batch-max`, or less while a
     /// bisection halves a failing batch.
     fn seal_max(&self) -> usize {
@@ -1829,8 +1838,9 @@ impl Actor {
         // chunk after the first adds a post to it, so a short window takes
         // a batch of fewer chunks. While bisecting the job is proof-first:
         // the leg follows the proof, so it gets what a proof of the intended
-        // size leaves (one chunk at least), and the proof what the leg leaves:
-        // base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
+        // size leaves, but never fewer chunks than the live exposed set
+        // (which rides every re-attempt) needs; the proof gets what the leg
+        // leaves: base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
         let spv = self.metrics.prove.spv(nf);
         let proof_first = self.deps.l1.is_some() && (self.bisect.is_some() || self.prover_hold);
         let (max_blobs, leg) = match &self.deps.l1 {
@@ -1842,17 +1852,15 @@ impl Actor {
                 } else {
                     window
                 };
-                let chunks = match crate::l1da::chunks_fit(
-                    after,
-                    self.l1_settle_lag,
-                    self.settle_margin,
-                ) {
-                    Some(c) => c,
-                    None if proof_first => 1,
-                    None => {
-                        debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
-                        return;
-                    }
+                let fit = crate::l1da::chunks_fit(after, self.l1_settle_lag, self.settle_margin);
+                let chunks = if proof_first {
+                    let need = blob::blob_count(1, 1 + self.live_exposed(), nf).div_ceil(l1.chunk);
+                    fit.unwrap_or(1).max(need)
+                } else if let Some(c) = fit {
+                    c
+                } else {
+                    debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
+                    return;
                 };
                 let leg = if proof_first {
                     self.l1_settle_lag.saturating_add(
