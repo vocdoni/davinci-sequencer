@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::fixture::ballot_mode_nf;
 
 /// The two sequencer nodes of a campaign.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeId {
     A,
