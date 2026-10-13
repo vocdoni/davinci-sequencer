@@ -298,6 +298,11 @@ impl Rig {
         self.start(r).await
     }
 
+    /// The knobs the node runs with (`None`: the base config's).
+    pub fn knobs(&self, r: Role) -> Option<&Knobs> {
+        self.knobs[r.idx()].as_ref()
+    }
+
     /// The node's `POST /prove` calls so far, oldest first.
     pub fn prove_calls(&self, r: Role) -> Vec<ProveCall> {
         self.calls
