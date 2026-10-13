@@ -5147,3 +5147,81 @@ async fn failed_results_proof_is_retried_not_latched() {
     .await;
     shutdown.cancel();
 }
+
+/// Ruling 22: with node A's prover failing every batch, foreign landings
+/// (B's, synced by A) never clear A's hold or its isolated count, so no
+/// fourth vote errors; A's own landing after the prover recovers does, and
+/// a later failing vote is isolated again.
+#[tokio::test(start_paused = true)]
+async fn foreign_landings_do_not_clear_a_bisection_hold() {
+    let s = setup(2, 8, None);
+    let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let shutdown = CancellationToken::new();
+    let prover_a = FakeProver::open();
+    *prover_a.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let node_a = start_node_cfg(
+        Db::open_in(dir_a.path()).unwrap(),
+        s.chain.with_signer(0xa1),
+        prover_a.clone(),
+        test_config_with(dir_a.path(), &s.census_dir, 5, "0s", TIMERS),
+        shutdown.clone(),
+    )
+    .await;
+    let node_b = start_node(
+        Db::open_in(dir_b.path()).unwrap(),
+        dir_b.path(),
+        &s,
+        s.chain.with_signer(0xb2),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let (ha, hb) = (handle(&node_a).await, handle(&node_b).await);
+    let isolated = || node_a.metrics.isolated_votes.load(Ordering::SeqCst);
+    let vids_a = submit_n(&ha, &s, 5, 900).await;
+    s.chain.advance_time(400);
+    wait_long("three isolated on A", async || isolated() == 3).await;
+    // Two foreign landings, each followed by enough of A's attempts to
+    // isolate another vote if the hold had been cleared.
+    for (k, i) in [5usize, 6].into_iter().enumerate() {
+        let calls = prover_a.calls();
+        let v = fake_vote(&s.env, i, &[1, 2], 950 + i as u64);
+        let vid = v.pkg.vote_id;
+        hb.submit(v).await.unwrap();
+        wait_long("B landed, A synced", async || {
+            all_settled(&hb, &[vid]).await
+                && node_a.metrics.synced_from_others.load(Ordering::SeqCst) == k as u64 + 1
+        })
+        .await;
+        s.chain.advance_time(400);
+        wait_long("A retried after the sync", async || {
+            prover_a.calls() >= calls + 3
+        })
+        .await;
+        assert_eq!(isolated(), 3, "a foreign landing cleared the hold");
+    }
+    for vid in &vids_a[3..] {
+        assert_eq!(vote_status(&ha, *vid).await, Some(VoteStatus::Pending));
+    }
+    // The prover recovers: A's own landing clears the hold.
+    *prover_a.fail_batches_permanent.lock().unwrap() = 0;
+    wait_long("A's held votes landed", async || {
+        all_settled(&ha, &vids_a[3..]).await
+    })
+    .await;
+    let x = fake_vote(&s.env, 0, &[2, 1], 990);
+    let y = fake_vote(&s.env, 1, &[2, 1], 991);
+    let (vx, vy) = (x.pkg.vote_id, y.pkg.vote_id);
+    *prover_a.fail_vid.lock().unwrap() = Some(vx);
+    ha.submit(x).await.unwrap();
+    ha.submit(y).await.unwrap();
+    s.chain.advance_time(400);
+    wait_long("x isolated, y settled", async || {
+        vote_status(&ha, vx).await == Some(VoteStatus::Error) && all_settled(&ha, &[vy]).await
+    })
+    .await;
+    assert_eq!(isolated(), 4);
+    shutdown.cancel();
+}

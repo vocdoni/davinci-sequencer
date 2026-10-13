@@ -94,7 +94,9 @@ in `error` only if the election closes first. Other failures:
   prover's reason and `(isolated by bisection)`. Retries back off up to 30 s. After three such
   votes in a row the node takes the prover to fail every input: it stops erroring and keeps
   retrying full batches. A landing (the node's own or a synced one) ends the bisection once its
-  votes are settled, and so do the close and a restart (the state is in memory).
+  votes are settled, and so do the close and a restart (the state is in memory). The count and
+  the hold end only at the node's own landing or a restart: another sequencer's landing says
+  nothing about this node's prover.
 - A proof the node's own checks refuse (public outputs, program key or `rootCVadcopFinal` other
   than the pins), and in L1-blob mode an Ethereum proof that carries other blobs, would fail the
   same way for every batch: the votes stay pending under the usual backoff, never bisected or

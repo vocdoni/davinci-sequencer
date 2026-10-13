@@ -770,14 +770,12 @@ const RESULTS_FAILS_BEFORE_HOLD: u32 = 3;
 const RESULTS_HOLD_RETRY: u64 = 300;
 
 /// Set after a prover-side `Failed`: the votes of the last failed batch, the
-/// cap of the next seal, the prover's reason, and how many single-vote
-/// batches failed in a row. In memory only (a restart retries at full size).
+/// cap of the next seal and the prover's reason. In memory only (a restart
+/// retries at full size).
 struct Bisect {
     suspect: BTreeSet<u64>,
     cap: usize,
     reason: String,
-    isolated: u32,
-    hold: bool,
 }
 
 struct Flight {
@@ -890,6 +888,13 @@ struct Actor {
     end_moved: bool,
     /// Bisection of a batch the prover failed for good; `None` otherwise.
     bisect: Option<Bisect>,
+    /// Single-vote batches the prover failed and the actor errored since our
+    /// last landing; at [`ISOLATED_BEFORE_HOLD`] it sets `prover_hold`. Only
+    /// our own landing (or a restart) clears both: another sequencer's says
+    /// nothing about our prover.
+    isolated: u32,
+    /// The prover fails every input: retry full batches, error nothing.
+    prover_hold: bool,
     /// The last node-side check failure that held votes pending, named in
     /// their close reason. Our landing clears it.
     held_reason: Option<String>,
@@ -1038,6 +1043,8 @@ pub(crate) fn spawn_actor(
         failed_pause: None,
         end_moved: false,
         bisect: None,
+        isolated: 0,
+        prover_hold: false,
         held_reason: None,
         tx: tx.clone(),
     };
@@ -1334,7 +1341,7 @@ impl Actor {
     /// bisection halves a failing batch.
     fn seal_max(&self) -> usize {
         match &self.bisect {
-            Some(b) if !b.hold => self.batch_max.min(b.cap),
+            Some(b) if !self.prover_hold => self.batch_max.min(b.cap),
             _ => self.batch_max,
         }
     }
@@ -1825,7 +1832,7 @@ impl Actor {
         // size leaves (one chunk at least), and the proof what the leg leaves:
         // base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
         let spv = self.metrics.prove.spv(nf);
-        let proof_first = self.deps.l1.is_some() && self.bisect.is_some();
+        let proof_first = self.deps.l1.is_some() && (self.bisect.is_some() || self.prover_hold);
         let (max_blobs, leg) = match &self.deps.l1 {
             Some(l1) => {
                 let window = deadline.saturating_sub(now);
@@ -2338,22 +2345,29 @@ impl Actor {
         let vids: BTreeSet<u64> = f.prepared.vote_ids.iter().copied().collect();
         self.metrics.bisections.fetch_add(1, Ordering::SeqCst);
         let secs = self.prove_backoff_upto(BISECT_BACKOFF_MAX);
+        if self.prover_hold {
+            error!(
+                pid = %hex::encode(self.pid31),
+                votes = n,
+                retry_in = secs,
+                %reason,
+                "batch proof failed; holding its votes pending"
+            );
+            self.requeue_flight(f);
+            return;
+        }
         let mut isolate = false;
         let mut b = match self.bisect.take() {
             None => Bisect {
                 suspect: vids,
                 cap: n,
                 reason,
-                isolated: 0,
-                hold: false,
             },
             Some(mut b) => {
-                if !b.hold {
-                    b.suspect = vids;
-                    b.cap = n.div_ceil(2).max(1);
-                    isolate = n == 1;
-                }
+                b.suspect = vids;
+                b.cap = n.div_ceil(2).max(1);
                 b.reason = reason;
+                isolate = n == 1;
                 b
             }
         };
@@ -2364,10 +2378,10 @@ impl Actor {
             for vid in &f.prepared.vote_ids {
                 b.suspect.remove(vid);
             }
-            b.isolated += 1;
+            self.isolated += 1;
             self.metrics.isolated_votes.fetch_add(1, Ordering::SeqCst);
-            if b.isolated >= ISOLATED_BEFORE_HOLD {
-                b.hold = true;
+            if self.isolated >= ISOLATED_BEFORE_HOLD {
+                self.prover_hold = true;
                 error!(pid = %hex::encode(self.pid31), "prover fails every batch; holding votes pending");
             }
         } else {
@@ -2375,7 +2389,6 @@ impl Actor {
                 pid = %hex::encode(self.pid31),
                 votes = n,
                 cap = b.cap,
-                hold = b.hold,
                 retry_in = secs,
                 reason = %b.reason,
                 "batch proof failed; requeued for bisection"
@@ -2385,9 +2398,14 @@ impl Actor {
         self.bisect = Some(b);
     }
 
-    /// A landing, ours or synced: suspects no longer pending are settled
-    /// (or closed). None left ends the bisection; else the rest seals whole.
-    fn bisect_landed(&mut self) {
+    /// A landing: suspects no longer pending are settled (or closed). None
+    /// left ends the bisection; else the rest seals whole. Only our own
+    /// landing (`own`) clears the isolated count and the hold.
+    fn bisect_landed(&mut self, own: bool) {
+        if own {
+            self.isolated = 0;
+            self.prover_hold = false;
+        }
         let Some(b) = self.bisect.as_mut() else {
             return;
         };
@@ -2703,7 +2721,7 @@ impl Actor {
         self.failed_cycles = 0;
         self.failed_pause = None;
         self.held_reason = None;
-        self.bisect_landed();
+        self.bisect_landed(true);
         self.metrics.settled_by_self.fetch_add(1, Ordering::SeqCst);
         info!(
             pid = %hex::encode(self.pid31),
@@ -3017,7 +3035,7 @@ impl Actor {
         // Pending votes another sequencer settled for us are done. Votes
         // whose slot got overwritten stay pending: their id is not in the tree.
         self.settle_pending_in_tree();
-        self.bisect_landed();
+        self.bisect_landed(false);
         self.error_new_slots_if_full();
         info!(
             pid = %hex::encode(self.pid31),
