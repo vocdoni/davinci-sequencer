@@ -43,6 +43,9 @@ enum Cmd {
         l1_eth: Option<String>,
         #[arg(long, value_delimiter = ',', required = true)]
         confirm: Vec<Address>,
+        /// Record the transfers as inflows in `<campaign>/budget.json`.
+        #[arg(long)]
+        campaign: Option<PathBuf>,
     },
     /// Print the go/no-go gate; exit 0 on a go, 3 on a no-go.
     Gate {
@@ -128,6 +131,7 @@ async fn real_main() -> Result<ExitCode> {
             to_l1,
             l1_eth,
             confirm,
+            campaign,
         } => {
             let op = pair(to_op, &op_eth, money::FUND_MAX_OP, &confirm)?;
             let l1 = pair(to_l1, &l1_eth, money::FUND_MAX_L1, &confirm)?;
@@ -147,6 +151,20 @@ async fn real_main() -> Result<ExitCode> {
                 .to_string();
             if l1.is_some() && l1_rpc.is_empty() {
                 bail!("DAVINCI_E2E_L1_RPC");
+            }
+            if let Some(dir) = &campaign {
+                for (t, l1_side) in [(op, false), (l1, true)] {
+                    if let Some((to, a)) = t {
+                        money::record_inflow(dir, to, l1_side, a)?;
+                    }
+                }
+            }
+            if let Some(dir) = &campaign {
+                for (t, l1_side) in [(op, false), (l1, true)] {
+                    if let Some((to, a)) = t {
+                        money::record_inflow(dir, to, l1_side, a)?;
+                    }
+                }
             }
             money::fund(&owner, &op_rpc, &l1_rpc, op, l1).await?;
         }

@@ -92,7 +92,7 @@ pub fn vote_loss(events: &[(NodeId, Kind)]) -> BTreeMap<NodeId, VoteLoss> {
         match k {
             Kind::Bisect { .. } => v.bisections += 1,
             Kind::Isolated { .. } => v.isolated += 1,
-            Kind::Held { .. } => v.held += 1,
+            Kind::Held { .. } | Kind::ProverHold { .. } => v.held += 1,
             Kind::RefreshOverflow { .. } => v.refresh_overflow += 1,
             Kind::GuestRejected { .. } => v.guest_rejection += 1,
             Kind::FinalizeFailed { .. } => v.finalize_failed += 1,
@@ -172,6 +172,10 @@ pub fn findings(
             Kind::Held { error, .. } => {
                 held += 1;
                 held_d.push(format!("{nn}: {error}"));
+            }
+            Kind::ProverHold { .. } => {
+                held += 1;
+                held_d.push(format!("{nn}: prover holds every batch"));
             }
             Kind::RefreshOverflow { votes, .. } => ovf += votes,
             Kind::GuestRejected { mask, .. } => {
