@@ -12,6 +12,7 @@ pub mod money;
 pub mod plan;
 pub mod report;
 pub mod rig;
+pub mod run;
 pub mod scenarios;
 pub mod schedule;
 pub mod submit;

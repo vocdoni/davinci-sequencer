@@ -32,7 +32,7 @@ impl Role {
 }
 
 /// The batching knobs a scenario varies.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Knobs {
     pub batch_max: usize,
     pub batch_time: String,

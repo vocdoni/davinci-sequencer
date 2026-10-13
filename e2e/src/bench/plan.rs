@@ -831,7 +831,7 @@ async fn election_key(rig: &Rig, n: NodeId, pid: &[u8; 31]) -> Result<Point> {
 
 /// Waits until A and B list `e`, accept votes and serve its census: the
 /// last voter's Merkle proof (a CSP census has none to serve).
-async fn wait_served(rig: &Rig, e: &Election, seed: &Seed) -> Result<()> {
+pub async fn wait_served(rig: &Rig, e: &Election, seed: &Seed) -> Result<()> {
     let (pid, tag) = (e.snap.pid, e.spec.tag.as_str());
     let last = seed.voter_key(tag, e.spec.voters.saturating_sub(1));
     let last = eth_address(last.verifying_key());
