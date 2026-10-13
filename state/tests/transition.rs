@@ -866,3 +866,18 @@ fn select_batch_within_clamps_to_the_blob_cap_and_rejects_zero() {
         .unwrap_err();
     assert!(matches!(err, Error::Invalid(_)), "{err}");
 }
+
+#[test]
+fn a_refresh_set_over_the_cap_still_overflows_in_a_short_window() {
+    // MAX_REFRESH binds whatever the window, so a short window must not
+    // turn the permanent overflow into a wait.
+    let env = env(1, 2100);
+    let mut st = committed_state(&env, MAX_REFRESH + 2);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    let vote = vec![fake_vote(&env, MAX_REFRESH + 2, &[1], 900_001)];
+    let must = slots_of(0..MAX_REFRESH + 1);
+    let err = st
+        .select_batch_within(&vote, u64::MAX, &must, usize::MAX, TX_BLOB_CAP)
+        .unwrap_err();
+    assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
+}

@@ -308,7 +308,10 @@ impl<S: Storage> ProcessState<S> {
 
     /// [`Self::select_batch`] within at most `max_blobs` blobs (never above
     /// the blob cap): a node whose landing time fits fewer blob
-    /// transactions sizes the batch down to them. `prepare` keeps checking
+    /// transactions sizes the batch down to them. If only `max_blobs` is too
+    /// small for the exposed set this returns `Ok((vec![], true))` (wait for
+    /// a wider window); `RefreshOverflow` means the blob cap or `MAX_REFRESH`
+    /// binds (permanent). `prepare` keeps checking
     /// the blob cap, which a selection made here never passes.
     pub fn select_batch_within<'a>(
         &self,
