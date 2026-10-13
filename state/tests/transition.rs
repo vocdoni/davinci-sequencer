@@ -826,3 +826,43 @@ fn a_512_vote_steady_batch_at_sixteen_fields_takes_nine_blobs_in_l1_mode() {
     assert_eq!(b.blobs.blobs.len(), 9);
     assert_eq!(b.expected.n_blobs, 9);
 }
+
+#[test]
+fn a_window_shortfall_is_not_a_refresh_overflow() {
+    // 800 exposed 16-field slots overflow six blobs but fit 32: with a
+    // six-blob window nothing fits for now, which is not a permanent error.
+    let env = env(16, 1300);
+    let mut st = committed_state(&env, 900);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    let pending: Vec<VerifiedVote> = (900..910)
+        .map(|i| fake_vote(&env, i, &[1], 70_000 + i as u64))
+        .collect();
+    let must = slots_of(0..800);
+    assert!(blob_count(1, 801, 16) > TX_BLOB_CAP && blob_count(1, 801, 16) <= MAX_BLOBS);
+    let (sel, blocked) = st
+        .select_batch_within(&pending, u64::MAX, &must, usize::MAX, TX_BLOB_CAP)
+        .unwrap();
+    assert!(sel.is_empty() && blocked);
+    let (sel, _) = st
+        .select_batch(&pending, u64::MAX, &must, usize::MAX)
+        .unwrap();
+    assert!(!sel.is_empty());
+}
+
+#[test]
+fn select_batch_within_clamps_to_the_blob_cap_and_rejects_zero() {
+    let env = env(16, 1024);
+    let st = committed_state(&env, 512);
+    assert_eq!(st.blob_cap(), TX_BLOB_CAP);
+    let pending: Vec<VerifiedVote> = (512..1024)
+        .map(|i| fake_vote(&env, i, &[1], 80_000 + i as u64))
+        .collect();
+    let (sel, blocked) = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, MAX_BLOBS)
+        .unwrap();
+    assert_eq!((sel.len(), blocked), (379, true));
+    let err = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, 0)
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "{err}");
+}

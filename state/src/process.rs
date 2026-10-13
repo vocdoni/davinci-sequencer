@@ -290,7 +290,7 @@ impl<S: Storage> ProcessState<S> {
     /// (and `MAX_BATCH_SIZE`) votes, and the whole transition (refreshes
     /// included) within the blob cap ([`Self::set_blob_cap`]). Votes that
     /// don't fit are left for a later batch; the flag is true when the blob
-    /// or refresh cap turned one away (the transaction is full).
+    /// or refresh cap turned one away (the allowed blobs are full).
     ///
     /// The refresh count is at least the live `must_include` slots (the
     /// exposed set `prepare` will keep), so a large exposed set shrinks the
@@ -318,6 +318,9 @@ impl<S: Storage> ProcessState<S> {
         max_votes: usize,
         max_blobs: usize,
     ) -> Result<(Vec<&'a VerifiedVote>, bool), Error> {
+        if max_blobs == 0 {
+            return Err(Error::Invalid("max_blobs must be at least 1".into()));
+        }
         let cap = max_blobs.min(self.blob_cap);
         let nf = self.cfg.ballot_mode.num_fields;
         let occupied_before = self.occupied.len();
@@ -371,6 +374,18 @@ impl<S: Storage> ProcessState<S> {
         // One vote with its own refreshes always fits, so an empty batch
         // here means the exposed set alone is too large.
         if out.is_empty() && blocked {
+            // A window below the blob cap is only a shortfall for now, not
+            // a permanent overflow: confirm against the full cap first.
+            if max_blobs < self.blob_cap {
+                self.select_batch_within(
+                    pending,
+                    max_voters,
+                    must_include,
+                    max_votes,
+                    self.blob_cap,
+                )?;
+                return Ok((out, true));
+            }
             return Err(Error::RefreshOverflow { exposed, votes: 1 });
         }
         Ok((out, blocked))
