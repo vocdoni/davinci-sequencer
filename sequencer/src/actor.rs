@@ -2399,7 +2399,8 @@ impl Actor {
     }
 
     /// A landing: suspects no longer pending are settled (or closed). None
-    /// left ends the bisection; else the rest seals whole. Only our own
+    /// left ends the bisection; else the rest seals whole, up to the
+    /// current cap. Only our own
     /// landing (`own`) clears the isolated count and the hold.
     fn bisect_landed(&mut self, own: bool) {
         if own {
@@ -2412,10 +2413,11 @@ impl Actor {
         let pending: std::collections::HashSet<u64> =
             self.pending.iter().map(|v| v.pkg.vote_id).collect();
         b.suspect.retain(|v| pending.contains(v));
+        // A landing that settled none of them must not undo the halving.
         if b.suspect.is_empty() {
             self.bisect = None;
         } else {
-            b.cap = b.suspect.len();
+            b.cap = b.cap.min(b.suspect.len()).max(1);
         }
     }
 

@@ -5225,3 +5225,69 @@ async fn foreign_landings_do_not_clear_a_bisection_hold() {
     assert_eq!(isolated(), 4);
     shutdown.cancel();
 }
+
+/// A foreign landing between bisection cycles keeps the halved cap: 4
+/// votes fail twice (cap now 2), another sequencer lands two unrelated
+/// votes, and the next seal is still 2, not the failed batch's 4.
+#[tokio::test(start_paused = true)]
+async fn foreign_landing_keeps_the_halved_bisection_cap() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_vid.lock().unwrap() = Some(fake_vote(&s.env, 3, &[1, 2], 1003).pkg.vote_id);
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    submit_n(&h, &s, 4, 1000).await;
+    wait_long("two failures, nothing in flight", async || {
+        prover.calls() == 2 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.settle_externally(&foreign_batch(&s, 6, 7));
+    wait_long("synced", async || {
+        node.metrics.synced_from_others.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("third attempt", async || prover.calls() >= 3).await;
+    assert_eq!(prover.sizes()[..3], [4, 4, 2]);
+    shutdown.cancel();
+}
+
+/// A lost race (`InvalidStateRoot`) on a halved bisection batch keeps the
+/// halved cap once the winner is synced.
+#[tokio::test(start_paused = true)]
+async fn lost_race_keeps_the_halved_bisection_cap() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    *prover.fail_vid.lock().unwrap() = Some(fake_vote(&s.env, 3, &[1, 2], 1103).pkg.vote_id);
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    submit_n(&h, &s, 4, 1100).await;
+    for k in 1..=2 {
+        wait_long("attempt", async || prover.calls() == k).await;
+        prover.release(1);
+    }
+    // The halved batch [0, 1] proves, but another sequencer lands first and
+    // its event is not seen yet: the settlement reverts InvalidStateRoot.
+    wait_long("halved attempt", async || prover.calls() == 3).await;
+    assert_eq!(prover.sizes(), [4, 4, 2]);
+    let block = s.chain.settle_externally(&foreign_batch(&s, 6, 7));
+    s.chain.hide_block(Some(block));
+    prover.release(1);
+    wait_long("lost the race", async || {
+        node.metrics.lost_races.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    s.chain.hide_block(None);
+    wait_long("synced", async || {
+        node.metrics.synced_from_others.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("next attempt", async || prover.calls() == 4).await;
+    assert_eq!(prover.sizes(), [4, 4, 2, 2]);
+    shutdown.cancel();
+}
