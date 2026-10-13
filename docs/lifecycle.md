@@ -137,8 +137,11 @@ Each batch:
 6. A blob transaction that disappears (dropped, or reorged out of Ethereum) is posted again
    alone, at the account's next nonce, so it may land after the transactions that follow it. A
    missing receipt counts as gone only after 36 s, since a lagging endpoint reads the same. A
-   proof that cannot be built or anchored for 60 s also posts every transaction again. Re-posts
-   (one transaction or all) are capped at 3 per batch; then the votes go back to the queue.
+   proof that cannot be built (Ethereum RPC trouble) or anchored for 60 s also posts every
+   transaction again. A proof that fails for 60 s in a way no post fixes (a header the node cannot
+   re-encode to its hash, headers that do not chain, a bad trie proof) puts the votes back in the
+   queue without posting. Re-posts (one transaction or all) are capped at 3 per batch; then the
+   votes go back to the queue.
 7. Commits when its `ProcessStateTransitioned` event reaches `--confirmations`, not at the receipt:
    OP's unsafe blocks reorg with Ethereum. If the event is still missing after 90 s, the node
    looks at the registry: while it still shows the settlement's root the node keeps waiting (no

@@ -16,6 +16,16 @@ use davinci_sequencer::web3::{
 };
 use davinci_zkvm_sdk::blob::{Blob, TransitionBlobs};
 
+/// A `build_proof` failure scripted to persist: no re-post fixes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofFault {
+    /// `Web3Error::Data`, as `L1Rpc` reports a header this build cannot
+    /// encode.
+    Data,
+    /// A proof whose header chain does not link (`verify_local` refuses it).
+    BrokenChain,
+}
+
 /// One send the chain saw, accepted or not.
 #[derive(Clone, Debug)]
 pub struct L1Send {
@@ -64,6 +74,7 @@ struct L1Inner {
     refuse_next: u32,
     /// `build_proof` fails until then.
     proofs_fail_until: Option<tokio::time::Instant>,
+    proof_fault: Option<ProofFault>,
     sends: Vec<L1Send>,
     /// Sets the blocks of a reorg apart from the ones they replace.
     epoch: u8,
@@ -184,6 +195,7 @@ impl FakeL1 {
             drop_next: 0,
             refuse_next: 0,
             proofs_fail_until: None,
+            proof_fault: None,
             sends: Vec::new(),
             epoch: 0,
         };
@@ -269,6 +281,11 @@ impl FakeL1 {
     /// `build_proof` fails for `d` from now (a lagging or pruning endpoint).
     pub fn fail_proofs_for(&self, d: std::time::Duration) {
         self.lock().proofs_fail_until = Some(tokio::time::Instant::now() + d);
+    }
+
+    /// Every `build_proof` fails with `f` until set to `None`.
+    pub fn fault_proofs(&self, f: Option<ProofFault>) {
+        self.lock().proof_fault = f;
     }
 
     pub fn market(&self) -> L1Market {
@@ -492,6 +509,11 @@ impl L1Chain for FakeL1 {
         {
             return Err(Web3Error::Rpc("scripted proof failure".into()));
         }
+        if i.proof_fault == Some(ProofFault::Data) {
+            return Err(Web3Error::Data(
+                "header of block 1 does not hash to its block hash".into(),
+            ));
+        }
         let located = txs
             .iter()
             .map(|h| locate(&i, h).ok_or_else(|| Web3Error::Rpc(format!("no receipt for {h}"))))
@@ -504,7 +526,7 @@ impl L1Chain for FakeL1 {
         if top < oldest || top > head_of(&i) {
             return Err(Web3Error::Rpc(format!("top {top} out of range")));
         }
-        let headers = (oldest..=top)
+        let mut headers = (oldest..=top)
             .rev()
             .map(|n| {
                 let b = &i.blocks[n as usize];
@@ -527,6 +549,11 @@ impl L1Chain for FakeL1 {
                 }
             })
             .collect();
+        if i.proof_fault == Some(ProofFault::BrokenChain)
+            && let Some(last) = headers.last().cloned()
+        {
+            headers.push(last);
+        }
         Ok(L1BlobProof { headers, txs })
     }
 }

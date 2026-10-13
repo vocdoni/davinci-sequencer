@@ -10,7 +10,7 @@ pub mod l1;
 
 use davinci_sequencer::l1da::L1_MAX_AGE;
 use davinci_sequencer::web3::l1proof::{L1BlobProof, verify_local};
-pub use l1::{FakeL1, L1Send};
+pub use l1::{FakeL1, L1Send, ProofFault};
 pub use std::collections::HashMap;
 pub use std::path::{Path, PathBuf};
 pub use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

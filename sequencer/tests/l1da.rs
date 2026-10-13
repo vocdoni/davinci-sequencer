@@ -707,6 +707,61 @@ async fn reposts_are_bounded() {
     );
 }
 
+// A proof no fresh post can fix (a header this build cannot encode, a
+// header chain that does not link): retried for PROOF_FAIL_FOR without
+// posting, then the settle ends.
+async fn a_faulty_proof_does_not_repost(fault: ProofFault) {
+    let r = rig_chunked(Duration::from_secs(12), 3, 2);
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
+    let posting = r.posting(&job).await;
+    assert_eq!(posting.posts.len(), 2);
+    r.l1.fault_proofs(Some(fault));
+    let t0 = tokio::time::Instant::now();
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("no new post can fix")),
+        "{fault:?}: {out:?}"
+    );
+    assert!(t0.elapsed() >= PROOF_FAIL_FOR, "retried first");
+    assert!(t0.elapsed() < PROOF_FAIL_FOR + Duration::from_secs(60));
+    assert_eq!(r.l1.sends().len(), 2, "{fault:?}: no re-post");
+    assert_eq!(r.l1.mined_posts(), 2);
+    assert_eq!(r.s.chain.l1_simulates(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_proof_data_error_does_not_repost() {
+    a_faulty_proof_does_not_repost(ProofFault::Data).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_broken_header_chain_does_not_repost() {
+    a_faulty_proof_does_not_repost(ProofFault::BrokenChain).await;
+}
+
+// A chain that stops linking for a few polls (a reorg between header
+// reads) lands once it links again, with the same posts.
+#[tokio::test(start_paused = true)]
+async fn a_header_chain_broken_for_a_while_lands_without_reposting() {
+    let r = rig_with(Duration::from_secs(12));
+    let job = L1Job {
+        deadline: later(),
+        ..r.job()
+    };
+    let posting = r.posting(&job).await;
+    r.l1.fault_proofs(Some(ProofFault::BrokenChain));
+    let heal = async {
+        tokio::time::sleep(PROOF_FAIL_FOR / 2).await;
+        r.l1.fault_proofs(None);
+    };
+    let (out, ()) = tokio::join!(settle(&r.da, &r.s.chain, &job, &r.snark, posting), heal);
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.l1.sends().len(), 1);
+}
+
 // ---------------------------------------------------------------- chunks
 
 #[tokio::test]

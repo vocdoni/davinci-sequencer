@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use super::{L1Da, L1Job, PostError, Posted, Posting, Settled, chunks};
 use crate::actor::Chain;
-use crate::web3::l1proof::verify_local;
+use crate::web3::l1proof::{L1ProofError, verify_local};
 use crate::web3::{L1Origin, RevertReason, Web3Error, revert_message};
 
 /// L1 blocks on top of the blob block before a proof is built (reorg margin).
@@ -36,7 +36,8 @@ pub const MAX_PROOF_RETRIES: u32 = 5;
 /// load-balanced endpoints lag a block or two (12 s each).
 pub const GONE_FOR: Duration = Duration::from_secs(36);
 /// How long building or anchoring the L1 proof may keep failing before the
-/// blobs are posted again (a fresh blob block usually fixes it).
+/// blobs are posted again (a fresh blob block usually fixes RPC trouble), or
+/// the settle ends when no post can fix the failure.
 pub const PROOF_FAIL_FOR: Duration = Duration::from_secs(60);
 /// Re-posts in one settlement before the batch goes back to the queue: one
 /// chunk posted again counts one, every chunk posted again counts one.
@@ -135,8 +136,10 @@ macro_rules! repost {
 /// reach the newest, and sends the transition with one L1 proof of every
 /// chunk transaction, in chunk order, anchored by [`choose_anchor`]. A chunk
 /// whose transaction vanished is posted again alone; a too-deep proof, one
-/// that fails to build or anchor for [`PROOF_FAIL_FOR`], or `TxTooOld` posts
-/// every chunk again; each counts one of [`MAX_REPOSTS`].
+/// that fails to build (RPC trouble) or anchor for [`PROOF_FAIL_FOR`], or
+/// `TxTooOld` posts every chunk again; each counts one of [`MAX_REPOSTS`].
+/// A proof that keeps failing otherwise (bad header, broken chain, bad trie
+/// proof) ends the settle after [`PROOF_FAIL_FOR`] without a post.
 /// `L1OriginMismatch` rebuilds the proof from fresh reads, up to
 /// [`MAX_PROOF_RETRIES`] times. Other reverts end the job with their name,
 /// as in blob mode.
@@ -266,30 +269,42 @@ pub async fn settle(
             }
         };
         let hashes: Vec<B256> = txs.iter().map(|p| p.tx).collect();
+        // The error, and whether a fresh post may fix it: endpoint trouble
+        // and an anchor that moved may; a header or proof this build cannot
+        // reproduce fails the same way on any post.
         let built = match da.l1.build_proof(&hashes, top).await {
             Ok(proof) => match verify_local(&proof, anchor) {
                 Ok((vhs, _)) if vhs == want => Ok(proof),
                 Ok(_) => {
                     return Settled::Failed("the L1 blob transactions carry other blobs".into());
                 }
-                Err(e) => Err(format!("the L1 proof does not anchor: {e}")),
+                Err(e @ (L1ProofError::NoAnchor(_) | L1ProofError::AboveOrigin(_))) => {
+                    Err((true, format!("the L1 proof does not anchor: {e}")))
+                }
+                Err(e) => Err((false, format!("the L1 proof does not verify: {e}"))),
             },
-            Err(e) => Err(format!("the L1 proof build failed: {e}")),
+            Err(e @ Web3Error::Rpc(_)) => Err((true, format!("the L1 proof build failed: {e}"))),
+            Err(e) => Err((false, format!("the L1 proof build failed: {e}"))),
         };
         let proof = match built {
             Ok(proof) => {
                 proof_failing = None;
                 proof
             }
+            // Retried each poll (a reorg between reads clears); past the
+            // window the batch goes back to the queue without a post.
+            Err((false, e)) if proof_failing.is_some_and(|t| t.elapsed() >= PROOF_FAIL_FOR) => {
+                return Settled::Transient(format!("{e}; no new post can fix it"));
+            }
             // A lagging or pruning endpoint: retry each poll; past the
             // window new blob blocks usually help.
-            Err(e) if proof_failing.is_some_and(|t| t.elapsed() >= PROOF_FAIL_FOR) => {
+            Err((true, e)) if proof_failing.is_some_and(|t| t.elapsed() >= PROOF_FAIL_FOR) => {
                 repost!(reposts, "the L1 proof could not be built or anchored");
                 warn!(%pid, error = %e, "the L1 proof kept failing; posting every chunk again");
                 posts.fill(None);
                 continue;
             }
-            Err(e) => {
+            Err((_, e)) => {
                 proof_failing.get_or_insert_with(Instant::now);
                 warn!(%pid, error = %e, "retrying the L1 proof");
                 pause_or_abort!(da, job);
