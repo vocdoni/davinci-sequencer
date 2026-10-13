@@ -12,7 +12,7 @@ use davinci_zkvm_sdk::blob::blob_count;
 use davinci_zkvm_sdk::census::slot_key_address;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_from_dec, fr_to_le};
-use davinci_zkvm_sdk::limits::{MAX_REFRESH, TX_BLOB_CAP, required_refresh};
+use davinci_zkvm_sdk::limits::{MAX_BLOBS, MAX_REFRESH, TX_BLOB_CAP, required_refresh};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde_json::Value;
@@ -366,16 +366,19 @@ fn select_batch_respects_blob_cap() {
 
 #[test]
 fn select_batch_respects_a_lower_blob_cap() {
-    // Gnosis takes two blobs per block: 400 new 16-field votes fit six
-    // blobs, not two.
+    // A chain that takes two blobs per transaction: 400 new 16-field votes
+    // fit six blobs, not two. The cap goes up to the guest's MAX_BLOBS.
     let env = env(16, 400);
     let mut st = new_state(&env);
     assert_eq!(st.blob_cap(), TX_BLOB_CAP);
-    for bad in [0, TX_BLOB_CAP + 1] {
+    for bad in [0, MAX_BLOBS + 1] {
         let err = st.set_blob_cap(bad).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)), "{err}");
     }
     assert_eq!(st.blob_cap(), TX_BLOB_CAP);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    assert_eq!(st.blob_cap(), MAX_BLOBS);
+    st.set_blob_cap(TX_BLOB_CAP).unwrap();
 
     let pending: Vec<VerifiedVote> = (0..400)
         .map(|i| fake_vote(&env, i, &[1], 30_000 + i as u64))
@@ -787,4 +790,39 @@ fn a_512_vote_queue_at_sixteen_fields_seals_what_six_blobs_hold() {
         .prepare(&sel, &mut StdRng::seed_from_u64(17), &none())
         .unwrap();
     assert_eq!(b.blobs.blobs.len(), TX_BLOB_CAP);
+}
+
+#[test]
+fn a_512_vote_steady_batch_at_sixteen_fields_takes_nine_blobs_in_l1_mode() {
+    // In L1-blob mode the per-batch cap is MAX_BLOBS: the node posts the
+    // blobs in several transactions. A steady 512 x 16 batch (one refresh per
+    // new vote) is nine blobs, all revotes thirteen: --batch-max 512 stays
+    // under MAX_BLOBS at any field count.
+    assert_eq!(blob_count(512, 512 + 512, 16), 9);
+    assert_eq!(blob_count(512, 512 + 1024, 16), 13);
+    let env = env(16, 1024);
+    let mut st = committed_state(&env, 512);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    let pending: Vec<VerifiedVote> = (512..1024)
+        .map(|i| fake_vote(&env, i, &[1], 60_000 + i as u64))
+        .collect();
+    let (sel, blocked) = st.select_batch(&pending, u64::MAX, &none(), 512).unwrap();
+    assert_eq!((sel.len(), blocked), (512, false));
+    // A landing window that fits one six-blob transaction sizes it down to
+    // what six blobs hold, as a one-transaction chain does.
+    let (six, blocked) = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, TX_BLOB_CAP)
+        .unwrap();
+    assert_eq!((six.len(), blocked), (379, true));
+    // Never above the blob cap.
+    let (all, _) = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, MAX_BLOBS + 10)
+        .unwrap();
+    assert_eq!(all.len(), 512);
+    let sel: Vec<VerifiedVote> = sel.into_iter().cloned().collect();
+    let b = st
+        .prepare(&sel, &mut StdRng::seed_from_u64(18), &none())
+        .unwrap();
+    assert_eq!(b.blobs.blobs.len(), 9);
+    assert_eq!(b.expected.n_blobs, 9);
 }

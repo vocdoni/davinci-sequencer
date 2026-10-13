@@ -14,7 +14,9 @@ use davinci_zkvm_sdk::ballot::Ballot;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::Ciphertext;
 use davinci_zkvm_sdk::groth16::BallotVerifier;
-use davinci_zkvm_sdk::limits::{MAX_BATCH_SIZE, MAX_REFRESH, NUM_FIELDS, SMT_LEVELS, TX_BLOB_CAP};
+use davinci_zkvm_sdk::limits::{
+    MAX_BATCH_SIZE, MAX_BLOBS, MAX_REFRESH, NUM_FIELDS, SMT_LEVELS, TX_BLOB_CAP,
+};
 use davinci_zkvm_sdk::types::SnarkJsVk;
 use davinci_zkvm_sdk::{blob, limits, release};
 
@@ -133,7 +135,8 @@ pub struct ProcessState<S: Storage> {
     pub(crate) occupied: Vec<u64>,
     /// The process ballot VK, hash-checked against the 0x07 leaf.
     pub(crate) vk: SnarkJsVk,
-    /// Most blobs one transition may use: the chain's per-tx limit.
+    /// Most blobs one transition may use: the chain's per-tx limit, or the
+    /// guest's `MAX_BLOBS` when the blobs go out in several transactions.
     pub(crate) blob_cap: usize,
 }
 
@@ -219,12 +222,14 @@ impl<S: Storage> ProcessState<S> {
         &self.cfg
     }
 
-    /// Caps the blobs of every batch `select_batch` and `prepare` size, for
-    /// chains that take fewer than `TX_BLOB_CAP` per transaction.
+    /// Caps the blobs of every batch `select_batch` and `prepare` size
+    /// (`TX_BLOB_CAP` by default): lower for chains that take fewer per
+    /// transaction, up to the guest's `MAX_BLOBS` for a node that posts one
+    /// transition in several transactions.
     pub fn set_blob_cap(&mut self, cap: usize) -> Result<(), Error> {
-        if cap == 0 || cap > TX_BLOB_CAP {
+        if cap == 0 || cap > MAX_BLOBS {
             return Err(Error::Invalid(format!(
-                "blob cap {cap} not in 1..={TX_BLOB_CAP}"
+                "blob cap {cap} not in 1..={MAX_BLOBS}"
             )));
         }
         self.blob_cap = cap;
@@ -283,10 +288,9 @@ impl<S: Storage> ProcessState<S> {
     /// FIFO batch selection: at most one vote per slot, no reused vote id,
     /// the on-chain `max_voters` cap on distinct voters, at most `max_votes`
     /// (and `MAX_BATCH_SIZE`) votes, and the whole transition (refreshes
-    /// included) within the blob cap (`TX_BLOB_CAP` unless
-    /// [`Self::set_blob_cap`] lowered it). Votes that don't fit are left for
-    /// a later batch; the flag is true when the blob or refresh cap turned
-    /// one away (the transaction is full).
+    /// included) within the blob cap ([`Self::set_blob_cap`]). Votes that
+    /// don't fit are left for a later batch; the flag is true when the blob
+    /// or refresh cap turned one away (the transaction is full).
     ///
     /// The refresh count is at least the live `must_include` slots (the
     /// exposed set `prepare` will keep), so a large exposed set shrinks the
@@ -299,6 +303,22 @@ impl<S: Storage> ProcessState<S> {
         must_include: &BTreeSet<u64>,
         max_votes: usize,
     ) -> Result<(Vec<&'a VerifiedVote>, bool), Error> {
+        self.select_batch_within(pending, max_voters, must_include, max_votes, self.blob_cap)
+    }
+
+    /// [`Self::select_batch`] within at most `max_blobs` blobs (never above
+    /// the blob cap): a node whose landing time fits fewer blob
+    /// transactions sizes the batch down to them. `prepare` keeps checking
+    /// the blob cap, which a selection made here never passes.
+    pub fn select_batch_within<'a>(
+        &self,
+        pending: &'a [VerifiedVote],
+        max_voters: u64,
+        must_include: &BTreeSet<u64>,
+        max_votes: usize,
+        max_blobs: usize,
+    ) -> Result<(Vec<&'a VerifiedVote>, bool), Error> {
+        let cap = max_blobs.min(self.blob_cap);
         let nf = self.cfg.ballot_mode.num_fields;
         let occupied_before = self.occupied.len();
         let mut out: Vec<&VerifiedVote> = Vec::new();
@@ -335,7 +355,7 @@ impl<S: Storage> ProcessState<S> {
             let w1 = w + overwrite as usize;
             let e1 = exposed.saturating_sub((overwrite && must_include.contains(&v.slot)) as usize);
             let r = limits::required_refresh(n, w1, occupied_before).max(e1);
-            if r > MAX_REFRESH || blob::blob_count(n, n + r, nf) > self.blob_cap {
+            if r > MAX_REFRESH || blob::blob_count(n, n + r, nf) > cap {
                 blocked = true;
                 continue;
             }
