@@ -5109,3 +5109,41 @@ async fn restart_mid_bisection_seals_full_size() {
     assert_eq!(prover2.sizes(), vec![4]);
     shutdown2.cancel();
 }
+
+/// A results proof that fails for good once is retried after a cooldown,
+/// not latched: the results land without a restart.
+#[tokio::test]
+async fn failed_results_proof_is_retried_not_latched() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_results_permanent.lock().unwrap() = 1;
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 40);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
+    wait_until("results on chain", async || !s.chain.results().is_empty()).await;
+    assert_eq!(prover.results_calls(), 2);
+    wait_until("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    shutdown.cancel();
+}

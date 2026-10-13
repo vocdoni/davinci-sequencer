@@ -506,7 +506,8 @@ pub(crate) enum Msg {
     ForceRefreshOverflow,
 }
 
-/// How a finalize attempt failed: permanent latches, transient re-arms.
+/// How a finalize attempt failed: transient re-arms after a short cooldown,
+/// permanent after a longer one (never latched).
 /// `wait` is not a failure: the DKG has not decrypted yet, poll again.
 /// `gate` is not one either: a Council ceremony has not opened decryption.
 /// `dkg_requested` is the request flag the attempt last saw on-chain.
@@ -762,6 +763,11 @@ const BISECT_BACKOFF_MAX: u64 = 30;
 /// Single-vote batches errored in a row before the actor stops erroring
 /// and holds every vote pending (the prover fails every input).
 const ISOLATED_BEFORE_HOLD: u32 = 3;
+/// Results: consecutive failed attempts before the retries slow to
+/// [`RESULTS_HOLD_RETRY`]; until then they back off up to
+/// [`BISECT_BACKOFF_MAX`].
+const RESULTS_FAILS_BEFORE_HOLD: u32 = 3;
+const RESULTS_HOLD_RETRY: u64 = 300;
 
 /// Set after a prover-side `Failed`: the votes of the last failed batch, the
 /// cap of the next seal, the prover's reason, and how many single-vote
@@ -839,8 +845,9 @@ struct Actor {
     resync_after: Option<tokio::time::Instant>,
     resync_backoff_ms: u64,
     finalizing: bool,
-    /// Latched only on a permanent finalize failure (bad proof, revert).
-    finalize_failed: bool,
+    /// Consecutive finalize attempts that failed for good (a failed results
+    /// proof, a refused check, a revert): retried, never latched.
+    results_failures: u32,
     finalize_attempts: u32,
     /// Consecutive attempts that found the Council decryption gate closed.
     gate_polls: u32,
@@ -1012,7 +1019,7 @@ pub(crate) fn spawn_actor(
         resync_after: None,
         resync_backoff_ms: 0,
         finalizing: false,
-        finalize_failed: false,
+        results_failures: 0,
         finalize_attempts: 0,
         gate_polls: 0,
         finalize_after: None,
@@ -1190,6 +1197,7 @@ impl Actor {
                 if generation == self.generation {
                     self.finalizing = false;
                     self.finalize_attempts = 0;
+                    self.results_failures = 0;
                     self.held = Some((root, snark));
                 }
             }
@@ -1212,10 +1220,7 @@ impl Actor {
                 }
                 match result {
                     Ok(()) => self.mark_finalized(),
-                    Err(f) if f.permanent => {
-                        self.finalize_failed = true;
-                        error!(pid = %hex::encode(self.pid31), e = ?f.msg, "finalize failed");
-                    }
+                    Err(f) if f.permanent => self.results_failed(&f.msg),
                     Err(f) if f.gate => {
                         // A Council ceremony opens decryption on its own
                         // schedule, possibly months after the end: back off
@@ -2821,7 +2826,31 @@ impl Actor {
         }
     }
 
+    /// A finalize attempt that failed for good (a failed results proof or
+    /// check, a revert): retried after a cooldown, never latched, and from
+    /// the [`RESULTS_FAILS_BEFORE_HOLD`]th in a row held to one attempt per
+    /// [`RESULTS_HOLD_RETRY`] seconds.
+    fn results_failed(&mut self, msg: &str) {
+        self.results_failures = self.results_failures.saturating_add(1);
+        let n = self.results_failures;
+        let secs = if n >= RESULTS_FAILS_BEFORE_HOLD {
+            RESULTS_HOLD_RETRY
+        } else {
+            (1u64 << n).min(BISECT_BACKOFF_MAX)
+        };
+        self.finalize_after =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        error!(
+            pid = %hex::encode(self.pid31),
+            %msg,
+            failures = n,
+            retry_in = secs,
+            "results failed; retrying"
+        );
+    }
+
     fn mark_finalized(&mut self) {
+        self.results_failures = 0;
         if self.record.local == LocalStatus::Finalized {
             return;
         }
@@ -3046,7 +3075,6 @@ impl Actor {
 
     fn maybe_finalize(&mut self) {
         if self.finalizing
-            || self.finalize_failed
             || self.in_flight.is_some()
             || self.record.local != LocalStatus::Active
             // Observers never settle, even when they hold the election key.
@@ -3129,8 +3157,7 @@ impl Actor {
         let (request, tally) = match cpu(|| self.state.results_request(&sk, &mut OsRng)) {
             Ok(r) => r,
             Err(e) => {
-                self.finalize_failed = true;
-                error!(pid = %hex::encode(self.pid31), %e, "results_request failed");
+                self.results_failed(&format!("results request: {e}"));
                 return;
             }
         };
@@ -3170,8 +3197,7 @@ impl Actor {
                     sibs,
                 )),
                 Err(e) => {
-                    self.finalize_failed = true;
-                    error!(pid = %hex::encode(self.pid31), %e, "dkg_results_inputs failed");
+                    self.results_failed(&format!("DKG results inputs: {e}"));
                     self.record.note = Some(format!("DKG results request: {e}"));
                     self.put_record();
                     return;
