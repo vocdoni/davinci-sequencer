@@ -79,12 +79,14 @@ pub fn shards(wave: &Wave, seed: &Seed, size: u32) -> Vec<ShardId> {
 }
 
 /// Host `host` of `hosts` takes the shards whose index is `host` mod `hosts`.
-pub fn assigned(all: &[ShardId], host: usize, hosts: usize) -> Vec<ShardId> {
-    all.iter()
+pub fn assigned(all: &[ShardId], host: usize, hosts: usize) -> Result<Vec<ShardId>> {
+    ensure!(host < hosts, "host {host} out of range for {hosts} hosts");
+    Ok(all
+        .iter()
         .enumerate()
-        .filter(|(i, _)| *i % hosts.max(1) == host)
+        .filter(|(i, _)| i % hosts == host)
         .map(|(_, s)| s.clone())
-        .collect()
+        .collect())
 }
 
 pub fn shard_path(campaign: &Path, wave: u32, s: &ShardId) -> PathBuf {
@@ -148,7 +150,8 @@ fn read_meta(path: &Path) -> Result<ShardMeta> {
 /// damaged shard fails on its sha256 and not on its JSON.
 pub fn read_shard(path: &Path) -> Result<(ShardMeta, Vec<BallotRecord>)> {
     let meta = read_meta(path)?;
-    let got = sha256_file(path)?;
+    let body = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let got = hex::encode(Sha256::digest(&body));
     if got != meta.sha256 {
         bail!(
             "{}: sha256 {got} does not match the meta's {}",
@@ -156,7 +159,6 @@ pub fn read_shard(path: &Path) -> Result<(ShardMeta, Vec<BallotRecord>)> {
             meta.sha256
         );
     }
-    let body = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let recs = body
         .split(|b| *b == b'\n')
         .filter(|l| !l.is_empty())
@@ -178,9 +180,21 @@ pub fn read_shard(path: &Path) -> Result<(ShardMeta, Vec<BallotRecord>)> {
 
 /// Done once the meta exists and the shard's hash matches it.
 pub fn done(path: &Path) -> bool {
-    read_meta(path)
-        .and_then(|m| Ok(sha256_file(path)? == m.sha256))
-        .unwrap_or(false)
+    let Ok(m) = read_meta(path) else {
+        return false;
+    };
+    // The meta must describe the shard its path names: file name always,
+    // tag when the path has the `w<N>/<tag>/` layout of `shard_path`.
+    let name = format!("r{}-{}-{}.jsonl", m.round, m.from, m.to);
+    let name_ok = path.file_name().is_some_and(|n| *n == *name);
+    let dir = path.parent();
+    let in_layout = dir
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|w| w.to_str())
+        .is_some_and(|w| w.starts_with('w') && w[1..].parse::<u32>().is_ok());
+    let tag_ok = !in_layout || dir.and_then(Path::file_name).is_some_and(|t| *t == *m.tag);
+    name_ok && tag_ok && sha256_file(path).is_ok_and(|h| h == m.sha256)
 }
 
 /// An identity ballot with a zero proof and signature.
@@ -297,10 +311,13 @@ mod tests {
         .unwrap();
         let all = shards(plan.wave(1).unwrap(), &seed, SHARD);
         for hosts in 1..=3 {
-            let mut got: Vec<_> = (0..hosts).flat_map(|h| assigned(&all, h, hosts)).collect();
+            let mut got: Vec<_> = (0..hosts)
+                .flat_map(|h| assigned(&all, h, hosts).unwrap())
+                .collect();
             got.sort_by(|a, b| (&a.tag, a.round, a.from).cmp(&(&b.tag, b.round, b.from)));
             assert_eq!(got, all);
         }
+        assert!(assigned(&all, 2, 2).is_err() && assigned(&all, 0, 0).is_err());
         // Every planned ballot falls in exactly one shard.
         for e in &plan.wave(1).unwrap().elections {
             for (r, v) in e.ballots(&seed) {
