@@ -101,6 +101,12 @@ the beacon API and the confirmation depth, so a Gnosis node needs only the key a
 boot the node checks that the registry and its verifier pin the proof programs this release
 proves, and refuses to start otherwise.
 
+The `optimism` preset runs a node on OP Mainnet in L1-blob mode: transitions settle on OP and
+their blobs go to Ethereum. Such a node also needs a dedicated Ethereum key for its blob posts
+(`DAVINCI_L1_PRIVKEY_FILE`, funded on Ethereum, used by nothing else) and Ethereum endpoints (the
+preset lists public ones); see [configuration.md](docs/configuration.md#l1-blob-mode) and
+[deployments.md](docs/deployments.md#op-mainnet).
+
 ### Configuration
 
 Every flag has a `DAVINCI_*` environment variable. The ones operators usually set:

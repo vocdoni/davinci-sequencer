@@ -130,7 +130,29 @@ mainnet, `--l1-settle-lag`) overlaps the proof, and `--settle-margin` (default `
 covers the OP leg. A batch seals only while both the estimated proof and the Ethereum leg, each
 plus the margin, end before the window can close. While the election is open that is
 `now + graceFloor`, so `--l1-settle-lag` plus `--settle-margin` must stay under the registry's
-grace floor (150 s on OP); otherwise nothing seals before the end and the node warns at boot.
+grace floor (150 s on OP); otherwise nothing could seal while a window is open, so a signing
+node refuses to boot (an observer only warns).
+
+On OP Mainnet:
+
+- Keep the L1-blob defaults: `--settle-margin 30s` and `--l1-settle-lag 110s`. Do not carry a
+  blob-mode `DAVINCI_SETTLE_MARGIN=60s` into an `optimism` node (110 + 60 > 150), and do not lower
+  `--l1-settle-lag` below about 100 s: a post settled about 72 s after it was sent in the live run,
+  and the rest is headroom for a missed slot or a wider origin lag.
+- Organizers should keep the grace at the 180 s default or above, not the 150 s floor: after the
+  end, a follow-up batch can seal only within `grace - 140 s` of the previous landing.
+- `--l1-rpc-url` must include an endpoint that takes 1.5 MB request bodies (a six-blob send):
+  publicnode refuses them, dRPC takes them, and the node sends a blob transaction to every listed
+  endpoint, so the preset's pair works. With your own endpoint, set it as `--l1-send-rpc-url`.
+- `--blob-source` must name beacon APIs that keep full blobs; after PeerDAS only supernodes and
+  archives do. publicnode's served recent and day-old slots when the preset was filled in;
+  lodestar's public endpoint refused blob requests (403). Production followers should add a beacon
+  node of their own.
+- `--l1-max-post-fee` bounds what one post may cost at the fees it offers (twice the base fee and
+  twice the blob base fee); a replacement doubles them. A one-blob post cost about 2 µETH at
+  0.08 gwei and 0.004 gwei; the 0.001 ETH default leaves room for spikes and replacements.
+- Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the
+  node logs why at debug level ("no time to land an L1-blob batch", "no batch fits").
 
 ## Data directory
 
