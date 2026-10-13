@@ -5,6 +5,7 @@ pub mod ballots;
 pub mod chain_view;
 pub mod ledger;
 pub mod metrics;
+pub mod money;
 pub mod plan;
 pub mod report;
 pub mod rig;
