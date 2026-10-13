@@ -58,7 +58,6 @@ impl<S: Storage> ProcessState<S> {
                 t.num_fields
             )));
         }
-        let accumulator = self.results_after(t)?;
         for &vid in &t.vote_ids {
             if vid < VOTE_ID_MIN {
                 return Err(Error::Invalid(format!("vote id {vid:#x} below 2^63")));
@@ -83,6 +82,7 @@ impl<S: Storage> ProcessState<S> {
                 new_slots.push(*slot);
             }
         }
+        let accumulator = self.results_after(t)?;
         self.tree.update_with_proof(
             &key_bytes(KEY_RESULTS),
             &leaf_value_bytes(&ballot_leaf_hash(&accumulator)),

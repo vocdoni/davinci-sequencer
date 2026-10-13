@@ -364,5 +364,8 @@ fn occupied_slot_without_a_ballot_is_an_error() {
         num_fields: 2,
     };
     let err = b.results_after(&t).unwrap_err();
-    assert!(matches!(err, davinci_state::Error::Invalid(_)), "{err}");
+    assert!(
+        matches!(&err, davinci_state::Error::Invalid(m) if m.contains("no stored ballot")),
+        "{err:?}"
+    );
 }
