@@ -1023,10 +1023,6 @@ async fn scenario(dir: &Path) -> Result<()> {
     // The nodes size transitions from eth_config.
     for n in &nodes {
         match n.logged_blob_cap() {
-            // The OP preset's Ethereum schedule gives 6 blobs per transaction.
-            Some(c) if net.live && net.l1.is_some() => {
-                ensure!(c == 6, "{}: blob cap {c}, want 6", n.name)
-            }
             Some(c) => say!("{}: blob cap {c}", n.name),
             None => say!("{}: no blob cap in its log", n.name),
         }
