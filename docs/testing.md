@@ -165,7 +165,14 @@ refreshes: nine blobs, posted as two Ethereum transactions and settled in one pr
 takes the registry's 600 s ceiling grace, so a fresh node's proving estimate fits the batch after
 the end; the node then publishes the results. `DAVINCI_E2E_RECORD_DIR` writes the first batch
 job's snark and register dump in davinci-zkvm's `rust-sdk/testdata` format. A run takes about 30
-minutes, half of it the grace window, and wants the shared prover's queue empty:
+minutes, half of it the grace window, and wants the shared prover's queue empty.
+
+`DAVINCI_E2E_L1_BIG_VOTES` sets the vote count N (1 to 1024, default 512; the node runs with
+`--batch-max N`). The expected blob count is derived from the encoding, `blob_count(N, 2N, 16)`,
+and the expected transaction count is that over 6 blobs per transaction, rounded up: 9 blobs in 2
+transactions for 512, 7 in 2 for 384. The run prints the expectation first. A prover host with
+limited memory may need a smaller N: an RTX 5090 host with 59 GB of RAM ran out of memory proving
+512 votes with their 512 refreshes, and about 370 proved, so use 384 there:
 
 ```bash
 DAVINCI_E2E_L1_BIG=1 DAVINCI_E2E_DA=l1-blobs DAVINCI_E2E_GRACE=300,240,600,1800,60 \

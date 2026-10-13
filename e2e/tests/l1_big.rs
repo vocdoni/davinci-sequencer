@@ -1,18 +1,20 @@
-//! One 512-vote, 16-field transition in L1-blob mode, with the real prover.
+//! One N-vote (512 by default), 16-field transition in L1-blob mode, with the real prover.
 //! Gated by `DAVINCI_E2E_L1_BIG=1`. On two anvils it needs
 //! `DAVINCI_E2E_DA=l1-blobs` and the OP Mainnet registry's grace window,
 //! `DAVINCI_E2E_GRACE=300,240,600,1800,60`; live (`DAVINCI_E2E_LIVE=1`) it
 //! runs on the `optimism` preset with the `op_live` environment.
 //!
 //! One node with the L1-blob defaults (`--l1-settle-lag 110s`,
-//! `--settle-margin 30s`, `--prove-base 30s`) and `--batch-max 512`. 512
-//! first votes settle in whatever batches the seal budget allows. Then the
-//! organizer pauses the process, 512 new voters vote, and the organizer ends
-//! it: the flush seals all 512 votes with 512 silent refreshes, nine blobs,
-//! which go out as two Ethereum blob transactions and settle in one proof
-//! within the grace. The process takes the registry's ceiling grace (600 s),
-//! so the node's cold proving estimate (0.8 s a vote at 16 fields) fits 512
-//! votes after the end. The node then publishes the results, which must
+//! `--settle-margin 30s`, `--prove-base 30s`) and `--batch-max N`. N is
+//! `DAVINCI_E2E_L1_BIG_VOTES` (1 to 1024, default 512; a prover host with
+//! less memory needs a smaller one, e.g. 384). N first votes settle in
+//! whatever batches the seal budget allows. Then the organizer pauses the
+//! process, N new voters vote, and the organizer ends it: the flush seals all
+//! N votes with N silent refreshes, `blob_count(N, 2N, 16)` blobs (9 for 512,
+//! 7 for 384), which go out as `ceil(blobs / 6)` Ethereum blob transactions
+//! and settle in one proof within the grace. The process takes the registry's
+//! ceiling grace (600 s), so the node's cold proving estimate (0.8 s a vote
+//! at 16 fields) fits the votes after the end. The node then publishes the results, which must
 //! equal the tally.
 //!
 //! With `DAVINCI_E2E_RECORD_DIR`, the first batch job's snark and register
@@ -40,8 +42,38 @@ use davinci_zkvm_sdk::types::JobId;
 
 /// The OP Mainnet registry's grace window.
 const OP_GRACE: (u32, u32, u32, u32, u32) = (300, 240, 600, 1800, 60);
-const N: usize = 512;
 const NF: u8 = 16;
+/// Blobs per Ethereum blob transaction.
+const TX_BLOBS: usize = 6;
+
+/// The vote count: `DAVINCI_E2E_L1_BIG_VOTES`, 1 to 1024, default 512.
+fn votes() -> Result<usize> {
+    let Ok(v) = std::env::var("DAVINCI_E2E_L1_BIG_VOTES") else {
+        return Ok(512);
+    };
+    match v.trim().parse::<usize>() {
+        Ok(n) if (1..=1024).contains(&n) => Ok(n),
+        _ => bail!("DAVINCI_E2E_L1_BIG_VOTES={v:?}: want an integer from 1 to 1024"),
+    }
+}
+
+/// The blobs and Ethereum transactions of the after-end batch: `n` votes and
+/// `n` silent refreshes (`2n` updates) at `nf` fields.
+fn expected(n: usize, nf: u8) -> (usize, usize) {
+    let blobs = davinci_zkvm_sdk::blob::blob_count(n, 2 * n, nf);
+    (blobs, blobs.div_ceil(TX_BLOBS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expected;
+
+    #[test]
+    fn expected_blobs_and_txs() {
+        assert_eq!(expected(384, 16), (7, 2));
+        assert_eq!(expected(512, 16), (9, 2));
+    }
+}
 
 /// The job ids of the node's `/prove` calls, in order.
 fn prove_tap(jobs: Arc<Mutex<Vec<String>>>) -> Tap {
@@ -73,6 +105,11 @@ async fn l1_big_batch() -> Result<()> {
 }
 
 async fn l1_big() -> Result<()> {
+    let n = votes()?;
+    let (want_blobs, want_txs) = expected(n, NF);
+    eprintln!(
+        "{n} votes x {NF} fields: expecting {want_blobs} blobs in {want_txs} Ethereum transactions"
+    );
     let prover_url =
         std::env::var("DAVINCI_ZKVM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let health = ProverClient::new(&prover_url).health().await?;
@@ -100,7 +137,7 @@ async fn l1_big() -> Result<()> {
         ) == OP_GRACE,
         "the registry's grace is {g:?}: on anvil set DAVINCI_E2E_GRACE=300,240,600,1800,60"
     );
-    let r = run(&net, &org, &prover_url, dir.path(), ballot_prover).await;
+    let r = run(&net, &org, &prover_url, dir.path(), ballot_prover, n).await;
     if r.is_ok() {
         eprintln!("PASSED");
     }
@@ -117,7 +154,9 @@ async fn run(
     prover_url: &str,
     dir: &Path,
     ballot_prover: tokio::task::JoinHandle<Result<BallotProver>>,
+    n: usize,
 ) -> Result<()> {
+    let (want_blobs, want_txs) = expected(n, NF);
     let bin = tokio::task::spawn_blocking(node::sequencer_bin).await??;
     let census_dir = dir.join("census");
     std::fs::create_dir_all(&census_dir)?;
@@ -133,12 +172,12 @@ async fn run(
         c.prove_base,
         c.flush_horizon,
     ) = (None, None, None, None);
-    c.batch_max = N;
+    c.batch_max = n;
     c.batch_time = "30s".into();
     let node = Node::start(&bin, &c).await?;
     eprintln!("node at {} log {}", node.url, node.log.display());
 
-    let voters = fx::bench_voters(2 * N);
+    let voters = fx::bench_voters(2 * n);
     let (census, tree) = fx::merkle_census_of(&voters)?;
     let uri = fx::write_census(&census_dir, "big.json", &census)?;
     let (metadata, metadata_hash) = fx::write_metadata(&census_dir, "big-metadata.json", "big")?;
@@ -149,7 +188,7 @@ async fn run(
             process_id: next,
             start_time: 0,
             duration: 2 * 3600,
-            max_voters: 2 * N as u64,
+            max_voters: 2 * n as u64,
             ballot_mode: fx::ballot_mode_nf(NF),
             census_origin: 1,
             census_root: tree.root(),
@@ -205,30 +244,30 @@ async fn run(
         Ok(all.into_iter().filter(|p| p.pid == pid).collect())
     };
 
-    // Phase 1: the first 512 voters, in the batches the seal budget allows.
+    // Phase 1: the first N voters, in the batches the seal budget allows.
     let phase1 = Instant::now();
-    submit(&node, &reqs[..N]).await?;
-    settled(&node, &pid, &reqs[..N]).await?;
+    submit(&node, &reqs[..n]).await?;
+    settled(&node, &pid, &reqs[..n]).await?;
     let first = ours().await?;
-    eprintln!("first 512 votes settled in {} transitions", first.len());
+    eprintln!("first {n} votes settled in {} transitions", first.len());
     // Wall time, not the proving rate: it includes the batch timer and the
     // Ethereum and OP legs of every transition.
     eprintln!(
-        "phase 1 wall time: {:.2} s per vote from submit to settled ({:.0} s for {N})",
-        phase1.elapsed().as_secs_f64() / N as f64,
+        "phase 1 wall time: {:.2} s per vote from submit to settled ({:.0} s for {n})",
+        phase1.elapsed().as_secs_f64() / n as f64,
         phase1.elapsed().as_secs_f64()
     );
     prover_rates(prover_url, &jobs).await;
 
-    // Phase 2: 512 new voters while paused, then the end; the flush seals them all.
+    // Phase 2: N new voters while paused, then the end; the flush seals them all.
     org.pause_process(&pid).await?;
     wait_status(&node, &pid, ProcessStatus::Paused).await?;
-    submit(&node, &reqs[N..]).await?;
+    submit(&node, &reqs[n..]).await?;
     org.end_process(&pid).await?;
     let ended = Instant::now();
-    settled(&node, &pid, &reqs[N..]).await?;
+    settled(&node, &pid, &reqs[n..]).await?;
     eprintln!(
-        "512 x 16 settled {:.0} s after the end",
+        "{n} x {NF} settled {:.0} s after the end",
         ended.elapsed().as_secs_f64()
     );
     let posts = ours().await?;
@@ -238,35 +277,40 @@ async fn run(
         posts.len() - first.len()
     );
     let big = posts.last().context("no L1 settlement")?;
-    ensure!(big.vhs.len() == 9, "{} blobs, want 9", big.vhs.len());
     ensure!(
-        big.l1_txs.len() == 2,
-        "{} Ethereum transactions, want 2",
+        big.vhs.len() == want_blobs,
+        "{} blobs, want {want_blobs}",
+        big.vhs.len()
+    );
+    ensure!(
+        big.l1_txs.len() == want_txs,
+        "{} Ethereum transactions, want {want_txs}",
         big.l1_txs.len()
     );
     let sealed = node.log_lines(&["batch sealed"]);
     let line = sealed.last().context("no seal logged")?;
     ensure!(
-        line.contains("votes=512") && line.contains("reason=flush"),
+        line.contains(&format!("votes={n} ")) && line.contains("reason=flush"),
         "the last seal: {line}"
     );
     let settled_p = RegistryReader::connect(&net.rpc, net.registry)?
         .process(&pid)
         .await?;
     ensure!(
-        settled_p.voters_count == 2 * N as u64,
+        settled_p.voters_count == 2 * n as u64,
         "{} voters",
         settled_p.voters_count
     );
     eprintln!(
-        "nine blobs in Ethereum blocks {:?} ({} transactions), OP tx {}",
+        "{} blobs in Ethereum blocks {:?} ({} transactions), OP tx {}",
+        big.vhs.len(),
         big.l1_blocks,
         big.l1_txs.len(),
         big.op_tx
     );
 
     // The node holds the key: after the grace, the results equal the tally.
-    let ballots: Vec<Vec<u64>> = (0..2 * N).map(|v| fx::choices_nf(v, NF as usize)).collect();
+    let ballots: Vec<Vec<u64>> = (0..2 * n).map(|v| fx::choices_nf(v, NF as usize)).collect();
     let want = fx::expected_tally(&ballots);
     let got = wait::until(
         "the results",

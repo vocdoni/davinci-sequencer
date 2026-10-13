@@ -71,7 +71,7 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--datadir` | `DAVINCI_DATADIR` | `~/.davinci-sequencer` | One `<chain id>-<registry>/sequencer.redb` per deployment. |
 | `--api-host` | `DAVINCI_API_HOST` | `0.0.0.0` | API listen address. |
 | `--api-port` | `DAVINCI_API_PORT` | `9090` | API port. |
-| `--batch-max` | `DAVINCI_BATCH_MAX` | `512` | Pending votes that seal a batch at once, and the largest batch (1 to 1024). |
+| `--batch-max` | `DAVINCI_BATCH_MAX` | `512` | Pending votes that seal a batch at once, and the largest batch (1 to 1024). The prover's host memory limits the largest batch at high field counts: on an RTX 5090 host with 59 GB of RAM, 512 votes at 16 fields with their refreshes ran out of memory while about 370 proved, so set it below that there (384 is used). |
 | `--batch-time` | `DAVINCI_BATCH_TIME` | `15m` | Age of the oldest pending vote at which a batch of at least `--min-mix` slots seals (±10% jitter). |
 | `--min-mix` | `DAVINCI_MIN_MIX` | `2` | Distinct slots a timer batch needs; fewer wait for `--solo-wait`. |
 | `--solo-wait` | `DAVINCI_SOLO_WAIT` | 3 × batch time | Age at which a batch below `--min-mix` seals anyway (±10% jitter). Never below `--batch-time`. |
