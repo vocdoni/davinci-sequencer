@@ -74,6 +74,8 @@ pub struct Classified {
     /// `(vote id, transition)` of every vote id on chain that the ledger
     /// never sent.
     pub phantoms: Vec<(u64, u64)>,
+    /// Planned vote ids with no ledger line: their fate is unknown.
+    pub missing: Vec<u64>,
 }
 
 /// Allowed reasons match by substring, except that a held batch closed at
@@ -143,13 +145,16 @@ fn off_chain(
     Verdict::Lost { status }
 }
 
-/// One verdict per ledger vote id against `rows` (one election's, in any
-/// order) and the statuses the nodes that took each vote report.
+/// One verdict per ledger vote id against `rows` and the statuses the nodes
+/// that took each vote report. `e`, `rows` and `planned` (the vote ids the
+/// run scheduled) are one election's: entries of another election would
+/// read as never landed.
 pub fn classify(
     e: &BTreeMap<u64, Entry>,
     rows: &[TransitionRow],
     st: &BTreeMap<(u64, NodeId), NodeStatus>,
     allowed: &[&str],
+    planned: &BTreeSet<u64>,
 ) -> Classified {
     let mut landed: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     let mut phantoms = Vec::new();
@@ -215,7 +220,16 @@ pub fn classify(
             (vid, v)
         })
         .collect();
-    Classified { verdicts, phantoms }
+    let missing = planned
+        .iter()
+        .filter(|v| !e.contains_key(v))
+        .copied()
+        .collect();
+    Classified {
+        verdicts,
+        phantoms,
+        missing,
+    }
 }
 
 /// The tally and counters the chain order implies.
@@ -365,13 +379,25 @@ impl Classified {
                 format!("phantom {} in transition {t}", vote_id_hex(*vid)),
             );
         }
+        for vid in &self.missing {
+            *a.counts.entry("missing".into()).or_default() += 1;
+            note(
+                &mut a,
+                "missing",
+                format!("missing {}: planned, but no ledger line", vote_id_hex(*vid)),
+            );
+        }
         for (kind, n) in noted {
             if n > MAX_NOTES {
                 a.notes.push(format!("{kind}: {} more", n - MAX_NOTES));
             }
         }
         let has = |k: &str| a.counts.get(k).is_some_and(|n| *n > 0);
-        a.no_vote_lost = !(has("lost") || has("twice") || has("inconsistent") || has("phantom"));
+        a.no_vote_lost = !(has("lost")
+            || has("twice")
+            || has("inconsistent")
+            || has("phantom")
+            || has("missing"));
         a.clean = a.unexpected.is_empty() && a.stale_errors.is_empty();
         a
     }
@@ -505,6 +531,10 @@ mod tests {
             ..Entry::test()
         }
     }
+    /// Every ledger vote id was planned.
+    fn keys(e: &BTreeMap<u64, Entry>) -> BTreeSet<u64> {
+        e.keys().copied().collect()
+    }
     fn row(i: u64, vids: &[u64]) -> TransitionRow {
         TransitionRow {
             index: i,
@@ -537,7 +567,7 @@ mod tests {
             ((8, B), NodeStatus::Error("settlement reverted: X".into())),
         ]
         .into();
-        let c = classify(&e, &rows, &st, &["process closed"]);
+        let c = classify(&e, &rows, &st, &["process closed"], &keys(&e));
         assert_eq!(
             c.verdicts[&1],
             Verdict::Settled {
@@ -586,7 +616,8 @@ mod tests {
         assert!(matches!(c.verdicts[&9], Verdict::Inconsistent(_))); // refused everywhere, yet on chain
         assert_eq!(c.phantoms, vec![(99, 2)]);
         assert!(c.summary().no_vote_lost == false); // because of 4, 6, 7, 9 and the phantom, not 8
-        let s8 = classify(&[(8, acc(B, 8))].into(), &[row(1, &[8])], &st, &[]).summary();
+        let e8: BTreeMap<u64, Entry> = [(8, acc(B, 8))].into();
+        let s8 = classify(&e8, &[row(1, &[8])], &st, &[], &keys(&e8)).summary();
         assert!(s8.no_vote_lost && !s8.clean); // stale error is a finding only
 
         // Ruling 20: an isolated vote errors with the prover's reason; a finding, not a loss.
@@ -596,12 +627,12 @@ mod tests {
             NodeStatus::Error("prover: job failed (isolated by bisection)".into()),
         )]
         .into();
-        let s = classify(&only3, &[], &st2, &["process closed"]).summary();
+        let s = classify(&only3, &[], &st2, &["process closed"], &keys(&only3)).summary();
         assert!(s.no_vote_lost && !s.clean);
         // A held batch closed at the end is never the allowed `process closed`.
         let held = "process closed (held: proved publics do not match)";
         let st3: BTreeMap<_, _> = [((3, A), NodeStatus::Error(held.into()))].into();
-        let c3 = classify(&only3, &[], &st3, &["process closed"]);
+        let c3 = classify(&only3, &[], &st3, &["process closed"], &keys(&only3));
         assert_eq!(
             c3.verdicts[&3],
             Verdict::Errored {
@@ -637,7 +668,13 @@ mod tests {
             "prover: job failed: oom (isolated by bisection)",
             "settlement reverted: InvalidStateRoot",
         ] {
-            let c = classify(&only3, &[], &one(NodeStatus::Error(r.into())), &allowed);
+            let c = classify(
+                &only3,
+                &[],
+                &one(NodeStatus::Error(r.into())),
+                &allowed,
+                &keys(&only3),
+            );
             assert_eq!(
                 c.verdicts[&3],
                 Verdict::Errored {
@@ -650,7 +687,13 @@ mod tests {
             assert_eq!(s.unexpected[r], 1);
         }
         // Accepted, then nothing on the node: lost, not "never admitted".
-        let c = classify(&only3, &[], &one(NodeStatus::Unknown), &allowed);
+        let c = classify(
+            &only3,
+            &[],
+            &one(NodeStatus::Unknown),
+            &allowed,
+            &keys(&only3),
+        );
         assert_eq!(
             c.verdicts[&3],
             Verdict::Lost {
@@ -664,6 +707,7 @@ mod tests {
             &[],
             &one(NodeStatus::Error("process closed".into())),
             &allowed,
+            &keys(&u3),
         );
         assert_eq!(
             c.verdicts[&3],
@@ -673,14 +717,14 @@ mod tests {
             }
         );
         // An uncertain send with no answer from the node is not proven absent.
-        let c = classify(&u3, &[], &BTreeMap::new(), &allowed);
+        let c = classify(&u3, &[], &BTreeMap::new(), &allowed, &keys(&u3));
         assert!(matches!(c.verdicts[&3], Verdict::Lost { .. }));
         // An uncertain send that settled is settled, and a refused-only vote
         // that never landed is not an accepted vote.
-        let c = classify(&u3, &[row(0, &[3])], &BTreeMap::new(), &allowed);
+        let c = classify(&u3, &[row(0, &[3])], &BTreeMap::new(), &allowed, &keys(&u3));
         assert!(matches!(c.verdicts[&3], Verdict::Settled { .. }));
         let r3: BTreeMap<u64, Entry> = [(3, refd(A, 3))].into();
-        let s = classify(&r3, &[], &BTreeMap::new(), &allowed).summary();
+        let s = classify(&r3, &[], &BTreeMap::new(), &allowed, &keys(&r3)).summary();
         assert!(s.no_vote_lost && s.clean);
         // Errored on one node, still open on the other: lost.
         let both: BTreeMap<u64, Entry> = [(
@@ -696,7 +740,7 @@ mod tests {
             ((3, B), NodeStatus::Open("aggregated".into())),
         ]
         .into();
-        let c = classify(&both, &[], &st, &allowed);
+        let c = classify(&both, &[], &st, &allowed, &keys(&both));
         assert_eq!(
             c.verdicts[&3],
             Verdict::Lost {
@@ -705,7 +749,13 @@ mod tests {
         );
         // Only the later of a voter's two settled ballots counts.
         let two: BTreeMap<u64, Entry> = [(3, acc(A, 5)), (4, acc(B, 5))].into();
-        let c = classify(&two, &[row(0, &[4]), row(1, &[3])], &BTreeMap::new(), &[]);
+        let c = classify(
+            &two,
+            &[row(0, &[4]), row(1, &[3])],
+            &BTreeMap::new(),
+            &[],
+            &keys(&two),
+        );
         assert_eq!(
             (c.verdicts[&3].clone(), c.verdicts[&4].clone()),
             (
@@ -721,6 +771,28 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn a_planned_vote_without_a_ledger_line_fails() {
+        let e: BTreeMap<u64, Entry> = [(1, acc(A, 1))].into();
+        let rows = [row(0, &[1])];
+        let c = classify(&e, &rows, &BTreeMap::new(), &[], &[1, 2].into());
+        assert_eq!(c.missing, vec![2]);
+        let s = c.summary();
+        assert!(!s.no_vote_lost && s.clean);
+        assert_eq!(s.counts["missing"], 1);
+        assert!(
+            s.notes.iter().any(|n| n.contains("missing")),
+            "{:?}",
+            s.notes
+        );
+        // An empty ledger against a plan is no pass either.
+        let s = classify(&BTreeMap::new(), &[], &BTreeMap::new(), &[], &[1].into()).summary();
+        assert!(!s.no_vote_lost);
+        // The full plan passes.
+        let s = classify(&e, &rows, &BTreeMap::new(), &[], &[1].into()).summary();
+        assert!(s.no_vote_lost);
     }
 
     #[test]

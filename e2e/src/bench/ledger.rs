@@ -41,8 +41,9 @@ pub enum Attempt {
 /// was resent.
 ///
 /// A refusal on a resend is uncertain: the first attempt may have admitted
-/// the vote and the retry met a later condition (41201 after the end, 42903,
-/// 40002 on a replay). Only 40901 on a resend means the first attempt got in.
+/// the vote and the retry met a later condition (41201 after the end, 40002
+/// on a replay). Only 40901 on a resend means the first attempt got in; 429
+/// and 40902 are retried whether or not a try was resent.
 pub fn judge(r: &Result<(), davinci_client::Error>, resent: bool) -> Attempt {
     use davinci_client::Error as E;
     let (status, code) = match r {
@@ -246,8 +247,9 @@ impl Ledger {
         self.lock()?.flush()
     }
 
-    pub fn entries(&self) -> BTreeMap<u64, Entry> {
-        self.inner.lock().map(|g| g.map.clone()).unwrap_or_default()
+    /// A poisoned lock is an error: an empty map would read as no votes.
+    pub fn entries(&self) -> Result<BTreeMap<u64, Entry>> {
+        Ok(self.lock()?.map.clone())
     }
 
     /// The entries of a ledger file. A last line without its newline is a
@@ -366,7 +368,7 @@ mod tests {
         std::io::Write::write_all(&mut f, &torn.as_bytes()[..torn.len() / 2]).unwrap();
         drop(f);
 
-        let e = l.entries();
+        let e = l.entries().unwrap();
         assert_eq!(e.len(), 2);
         assert_eq!(e[&v1].accepted, [A].into());
         assert_eq!(e[&v1].refused, vec![(B, 40901)]);
