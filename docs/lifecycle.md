@@ -96,11 +96,13 @@ in `error` only if the election closes first. Other failures:
   retrying full batches. A landing (the node's own or a synced one) ends the bisection once its
   votes are settled, and so do the close and a restart (the state is in memory). The count and
   the hold end only at the node's own landing or a restart: another sequencer's landing says
-  nothing about this node's prover.
+  nothing about this node's prover. While it holds, a batch carries only the held votes, so
+  votes cast meanwhile do not widen the exposed set (see [security.md](security.md)).
 - A proof the node's own checks refuse (public outputs, program key or `rootCVadcopFinal` other
   than the pins), and in L1-blob mode an Ethereum proof that carries other blobs, would fail the
   same way for every batch: the votes stay pending under the usual backoff, never bisected or
-  errored. Votes still held at the close end in `process closed (held: <reason>)`.
+  errored, and the retries carry only the held votes. Votes still held at the close end in
+  `process closed (held: <reason>)`.
 - A circuit failure (the guest's fail mask) errors the votes at once. Admission repeats every
   per-vote check, so it means a node bug.
 

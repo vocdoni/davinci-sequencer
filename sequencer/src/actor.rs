@@ -1347,12 +1347,25 @@ impl Actor {
     }
 
     /// Most votes the next seal takes: `--batch-max`, or less while a
-    /// bisection halves a failing batch.
+    /// bisection halves a failing batch. While held nothing can land, so
+    /// only the pending exposed votes ride the cycles: fresh ones would just
+    /// widen the exposed set.
     fn seal_max(&self) -> usize {
-        match &self.bisect {
-            Some(b) if !self.prover_hold => self.batch_max.min(b.cap),
-            _ => self.batch_max,
+        let mut max = self.batch_max;
+        if let Some(b) = &self.bisect
+            && !self.prover_hold
+        {
+            max = max.min(b.cap);
         }
+        if self.prover_hold || self.held_reason.is_some() {
+            let exposed = self
+                .pending
+                .iter()
+                .filter(|v| self.exposed_vids.contains(&v.pkg.vote_id))
+                .count();
+            max = max.min(exposed.max(1));
+        }
+        max
     }
 
     fn accepting(&self) -> bool {

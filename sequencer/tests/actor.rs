@@ -5291,3 +5291,105 @@ async fn lost_race_keeps_the_halved_bisection_cap() {
     assert_eq!(prover.sizes(), [4, 4, 2, 2]);
     shutdown.cancel();
 }
+
+/// While held (a node-side check failure, or a prover failing everything)
+/// nothing can land, so fresh votes must not join the cycles: their slots
+/// would ratchet into the exposed set. Overwrites arriving cycle after
+/// cycle leave the exposed set as it was, and nothing errors.
+async fn hold_seals_only_exposed_votes(prover_hold: bool) {
+    let s = setup(2, 40, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        40,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let first = submit_n(&h, &s, 40, 100).await;
+    wait_long("40 settled", async || all_settled(&h, &first).await).await;
+    // Overwrites that end up held.
+    let n_held = if prover_hold { 5 } else { 2 };
+    if prover_hold {
+        *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    } else {
+        *prover.wrong_vk.lock().unwrap() = true;
+    }
+    let mut vids = Vec::new();
+    for i in 0..n_held {
+        let v = fake_vote(&s.env, i, &[2, 1], 200 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    s.chain.advance_time(400);
+    wait_long("holding", async || {
+        let held = if prover_hold {
+            node.metrics.isolated_votes.load(Ordering::SeqCst) == 3
+        } else {
+            node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+        };
+        held && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    let exposed = || node.db.exposed(&pid_fr()).unwrap().unwrap().slots.len();
+    let slots: std::collections::BTreeSet<u64> = node
+        .db
+        .exposed(&pid_fr())
+        .unwrap()
+        .unwrap()
+        .slots
+        .into_iter()
+        .collect();
+    let e0 = slots.len();
+    let fresh: Vec<usize> = (n_held..40)
+        .filter(|i| !slots.contains(&fake_vote(&s.env, *i, &[1, 2], 1).slot))
+        .take(3)
+        .collect();
+    assert_eq!(fresh.len(), 3);
+    for i in fresh {
+        let calls = prover.calls();
+        let v = fake_vote(&s.env, i, &[2, 1], 300 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        s.chain.advance_time(400);
+        wait_long("another held cycle", async || {
+            prover.calls() > calls && !h.snapshot().await.unwrap().in_flight
+        })
+        .await;
+        assert_eq!(exposed(), e0, "a fresh vote widened the exposed set");
+    }
+    let mut held = Vec::new();
+    for vid in &vids {
+        let st = vote_status(&h, *vid).await;
+        if st == Some(VoteStatus::Error) {
+            let e = vote_error(&h, *vid).await;
+            assert!(prover_hold && e.contains("isolated by bisection"), "{e}");
+        } else {
+            held.push(*vid);
+        }
+    }
+    *prover.fail_batches_permanent.lock().unwrap() = 0;
+    *prover.wrong_vk.lock().unwrap() = false;
+    for _ in 0..3 {
+        s.chain.advance_time(400);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+    wait_long("held votes settled", async || all_settled(&h, &held).await).await;
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_process_seals_only_its_exposed_votes() {
+    hold_seals_only_exposed_votes(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn prover_hold_seals_only_its_exposed_votes() {
+    hold_seals_only_exposed_votes(true).await;
+}
