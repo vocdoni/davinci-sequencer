@@ -30,6 +30,7 @@ use davinci_client::SequencerClient;
 use davinci_client::api::{ProcessId, VoteRequest, VoteStatus};
 use davinci_client::organizer::{KeyMode, NewProcess, Organizer, ProcessRegistry, RegistryReader};
 use davinci_client::prover::BallotProver;
+use davinci_e2e::bench::metrics::rfc3339;
 use davinci_e2e::chain;
 use davinci_e2e::cost::{self, TxCost};
 use davinci_e2e::fixture as fx;
@@ -244,30 +245,6 @@ async fn transitions(net: &Net, from: u64, pids: &HashSet<[u8; 31]>) -> Result<V
         });
     }
     Ok(out)
-}
-
-/// Seconds since the epoch of an RFC 3339 UTC time, as the prover's chrono
-/// writes it (`2026-09-28T10:34:32.105321716Z`).
-fn rfc3339(s: &str) -> Option<f64> {
-    let s = s.strip_suffix('Z').or_else(|| s.strip_suffix("+00:00"))?;
-    let (date, time) = s.split_once('T')?;
-    let mut d = date.splitn(3, '-').map(|x| x.parse::<i64>().ok());
-    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
-    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
-    let mut t = hms.splitn(3, ':').map(|x| x.parse::<i64>().ok());
-    let (h, mi, se) = (t.next()??, t.next()??, t.next()??);
-    let frac: f64 = if frac.is_empty() {
-        0.0
-    } else {
-        format!("0.{frac}").parse().ok()?
-    };
-    // Days from the civil date (Hinnant).
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + day - 1;
-    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
-    Some((days * 86_400 + h * 3600 + mi * 60 + se) as f64 + frac)
 }
 
 /// One process of the run.
