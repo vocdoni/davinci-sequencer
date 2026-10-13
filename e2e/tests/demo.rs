@@ -1,4 +1,4 @@
-//! Demo elections on a live deployment (Gnosis by default), gated by
+//! Demo elections on a live deployment (OP Mainnet by default), gated by
 //! `DAVINCI_E2E_DEMO`, one phase per run, for the election set
 //! `DAVINCI_DEMO_WAVE` names (1, the default, 2 or 3; see
 //! `davinci_e2e::demo::Wave`):
@@ -746,8 +746,8 @@ fn rate_limited(e: &ClientError) -> bool {
     matches!(e, ClientError::Chain(m) if m.contains("429") || m.contains("Too Many Requests"))
 }
 
-/// Process `pid` as the registry has it, riding out RPC rate limits: every
-/// public Gnosis RPC answers 429 to a busy host for a minute or two.
+/// Process `pid` as the registry has it, riding out RPC rate limits: public
+/// RPCs answer 429 to a busy host for a minute or two.
 async fn read_process(org: &Organizer, pid: &[u8; 31]) -> Result<OnchainProcess> {
     let mut tries = 0;
     loop {
@@ -1055,8 +1055,8 @@ impl Run {
                     .and_then(|e| e.census_contract.as_deref())
                     .context("no census contract")?
                     .parse()?;
-                let uri = if self.chain_id == 100 {
-                    format!("https://gnosisscan.io/address/{a}")
+                let uri = if self.chain_id == 10 {
+                    format!("https://optimistic.etherscan.io/address/{a}")
                 } else {
                     format!("onchain://{a}")
                 };

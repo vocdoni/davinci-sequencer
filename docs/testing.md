@@ -129,8 +129,9 @@ repeated, premature or made on the wrong key mode.
 
 ### Live runs
 
-With `DAVINCI_E2E_LIVE=1` the same scenario runs on an existing deployment, by default the
-`gnosis` preset. It needs key files in `DAVINCI_E2E_ORGANIZER_KEY` and
+With `DAVINCI_E2E_LIVE=1` the same scenario runs on an existing blob-mode deployment
+(`DAVINCI_E2E_NETWORK` names its preset; the default, `optimism`, takes the compact run below).
+It needs key files in `DAVINCI_E2E_ORGANIZER_KEY` and
 `DAVINCI_E2E_SEQUENCER_KEYS` (comma-separated), with 0.05 of the native token in every account,
 and checks the registry pins before it starts. Only addresses are printed. `e2e/src/net.rs`
 documents the overrides (`DAVINCI_E2E_RPC`, `DAVINCI_E2E_NODE_RPCS`, `DAVINCI_E2E_BEACON`,
@@ -138,8 +139,8 @@ documents the overrides (`DAVINCI_E2E_RPC`, `DAVINCI_E2E_NODE_RPCS`, `DAVINCI_E2
 committee behind the registry's DKG adapter (`DAVINCI_E2E_DKG_MANAGER` overrides it). Every run
 ends with its gas bill, counting only the processes it created.
 
-The full scenario does not run live in L1-blob mode. With `DAVINCI_E2E_NETWORK=optimism`
-(an L1-blob preset), `DAVINCI_E2E_OP_LIVE=1 DAVINCI_E2E_LIVE=1` runs a compact one instead
+The full scenario does not run live in L1-blob mode. On the `optimism` preset (the default,
+in L1-blob mode), `DAVINCI_E2E_OP_LIVE=1 DAVINCI_E2E_LIVE=1` runs a compact one instead
 (`e2e/tests/e2e/op_live.rs`): one signing node and an observer, a Merkle process with eight
 voters and three revotes and a CSP process with three, batches of four, the signing node killed
 once its first blob transaction is in Ethereum's pool and restarted, both results and, with

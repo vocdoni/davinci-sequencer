@@ -617,7 +617,7 @@ pub async fn aid_for(rpc: &str, adapter: Address, pid: [u8; 31]) -> Result<[u8; 
 }
 
 /// Longest wait for the committee's next epoch once its pool is spent: its
-/// nodes open one on their own, Live about two minutes later on Gnosis.
+/// nodes open one on their own, Live about two minutes later on a public chain.
 const EPOCH_WAIT: Duration = Duration::from_secs(5 * 60);
 
 /// Waits (timeouts scaled) until `adapter` has a Live epoch with a free pool

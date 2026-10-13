@@ -78,8 +78,9 @@ To build a batch, the actor:
 A background job proves the batch. The node accepts the proof only when the circuit reports
 success, every public output equals the node's own value, and the program verification key and
 `rootCVadcopFinal` equal the release pins. It then simulates `submitStateTransition` and sends the
-blob transaction. A node keeps at most one batch in flight per process; processes run in
-parallel.
+blob transaction. On OP Mainnet (the `optimism` preset) the registry is in L1-blob mode and the
+blobs go to Ethereum instead, see [L1-blob mode](#l1-blob-mode-op-stack). A node keeps at most
+one batch in flight per process; processes run in parallel.
 
 Transient prover errors back off (up to about 5 minutes) with the votes still pending, and end
 in `error` only if the election closes first. A prover refusal, or a circuit failure, errors the

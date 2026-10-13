@@ -17,7 +17,7 @@ How the end, the flush and the grace window interact is described in
 
 ## Planning figures
 
-The figures below are for one RTX 5090 prover and a Gnosis-style chain with 2 blobs per
+The figures below are for one RTX 5090 prover and a chain with 2 blobs per
 transaction, in steady state (as many refreshes as votes). `nf` is the number of ballot fields.
 Transitions of one election serialize on its state root, so the ceiling holds whatever the number
 of nodes.

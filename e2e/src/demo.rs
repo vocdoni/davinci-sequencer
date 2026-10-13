@@ -2349,7 +2349,7 @@ mod tests {
                 let span = (s.round1 as u64 - 1) * MEETING_GAP;
                 assert!((5 * MINUTE..=10 * MINUTE).contains(&span), "{at}");
             }
-            // Past the move, the last votes go in well inside Gnosis'
+            // Past the move, the last votes go in well inside the registry's
             // 60 s noticeMin, and one comes after the new end.
             if let Lifecycle::MeetingCloses { after } = s.lifecycle {
                 assert!(after >= 1 && after < s.round1, "{at}");

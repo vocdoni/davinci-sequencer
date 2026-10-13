@@ -52,24 +52,6 @@ impl Network {
     }
 }
 
-/// Gnosis Chain, registry R2 (the production beta): DKG and Council key
-/// modes.
-pub const GNOSIS: Network = Network {
-    name: "gnosis",
-    chain_id: 100,
-    registry: address!("20b96e465CA7C3536B9C733571ec1eCf42b2eA21"),
-    start_block: 48_633_301,
-    rpc_urls: &[
-        "https://gnosis-rpc.publicnode.com",
-        "https://gnosis-rpc.blockreq.com/v1/rpc/public",
-        "https://rpc.gnosischain.com",
-        "https://gnosis.drpc.org",
-    ],
-    blob_source: "beacon:https://rpc-gbc.gnosischain.com",
-    confirmations: 3,
-    da: NetworkDa::Blobs,
-};
-
 /// OP Mainnet in L1-blob mode: transitions settle on OP, their blobs live on
 /// Ethereum (deployed 2026-10-12, see docs/deployments.md). Blob sends need an
 /// Ethereum RPC that takes 1.5 MB bodies: publicnode refuses them, dRPC takes
@@ -96,11 +78,12 @@ pub const OPTIMISM: Network = Network {
     },
 };
 
-/// Every known deployment.
-pub const NETWORKS: &[Network] = &[GNOSIS, OPTIMISM];
+/// Every known deployment. The Gnosis registries are retired (their
+/// program vks are v0.1's): see docs/deployments.md.
+pub const NETWORKS: &[Network] = &[OPTIMISM];
 
 /// The deployment a node and the tooling use unless told otherwise.
-pub const DEFAULT: &Network = &GNOSIS;
+pub const DEFAULT: &Network = &OPTIMISM;
 
 /// The known deployment called `name` (case-insensitive).
 pub fn by_name(name: &str) -> Option<&'static Network> {
@@ -114,19 +97,16 @@ mod tests {
 
     #[test]
     fn lookup() {
-        assert_eq!(by_name(" Gnosis "), Some(&GNOSIS));
+        assert_eq!(by_name(" Optimism "), Some(&OPTIMISM));
         assert_eq!(by_name("custom"), None);
+        // Gnosis is retired.
+        assert_eq!(by_name("gnosis"), None);
+        assert_eq!(DEFAULT, &OPTIMISM);
         assert_eq!(by_name(DEFAULT.name), Some(DEFAULT));
         assert_eq!(
-            GNOSIS.beacon_urls(),
-            ["https://rpc-gbc.gnosischain.com"].to_vec()
+            OPTIMISM.beacon_urls(),
+            ["https://ethereum-beacon-api.publicnode.com"].to_vec()
         );
-    }
-
-    #[test]
-    fn gnosis_preset_is_deployed() {
-        assert_ne!(GNOSIS.registry, Address::ZERO, "gnosis registry unset");
-        assert_ne!(GNOSIS.start_block, 0, "gnosis start block unset");
     }
 
     #[test]
@@ -161,6 +141,5 @@ mod tests {
         assert!(!l1_rpc_urls.is_empty());
         // Followers read the blobs from Ethereum beacon APIs.
         assert!(!OPTIMISM.beacon_urls().is_empty());
-        assert_eq!(GNOSIS.da, NetworkDa::Blobs);
     }
 }

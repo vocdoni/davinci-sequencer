@@ -1,5 +1,5 @@
 //! The chain a run uses: a fresh anvil with the contracts, or with
-//! `DAVINCI_E2E_LIVE=1` an existing deployment (Gnosis by default). Key
+//! `DAVINCI_E2E_LIVE=1` an existing deployment (OP Mainnet by default). Key
 //! files are read in-process; only addresses are ever printed.
 //!
 //! Live env: `DAVINCI_E2E_RPC` (organizer and harness reads),
@@ -8,7 +8,7 @@
 //! (a `,` list), `DAVINCI_E2E_REGISTRY`, `DAVINCI_E2E_FROM_BLOCK`,
 //! `DAVINCI_E2E_CONFIRMATIONS`, `DAVINCI_E2E_POLL`, `DAVINCI_E2E_TIMEOUT_SCALE`.
 //! Unset, they default to the deployment of `davinci_client::networks` named
-//! by `DAVINCI_E2E_NETWORK` (default `gnosis`). `DAVINCI_E2E_MIN_BALANCE`
+//! by `DAVINCI_E2E_NETWORK` (default `optimism`). `DAVINCI_E2E_MIN_BALANCE`
 //! (native token, decimal) overrides the least balance of each funded account.
 //! With `DAVINCI_E2E_DKG=1`, `DAVINCI_E2E_DKG_MANAGER` names the external
 //! committee's DKGManager. Unset, it is the manager of the registry's adapter.
@@ -26,7 +26,7 @@ use alloy::primitives::{Address, U256, utils::format_ether, utils::parse_ether};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail, ensure};
-use davinci_client::networks::{self, GNOSIS, Network, NetworkDa, OP_L1_BLOCK};
+use davinci_client::networks::{self, Network, NetworkDa, OP_L1_BLOCK, OPTIMISM};
 use davinci_client::organizer::{Organizer, RegistryDa, verify_registry};
 
 use crate::chain::{self, Anvil, DEV_KEYS};
@@ -34,16 +34,12 @@ use crate::dkg::{self, DkgStack, DkgWiring};
 use crate::l1::{self, L1Net};
 use crate::node::NodeConfig;
 
-/// Least balance each funded account needs for a live run (0.05 xDAI).
+/// Least balance each funded account needs, unless `DAVINCI_E2E_MIN_BALANCE`
+/// or an L1-blob preset says otherwise (0.05 native).
 pub const MIN_BALANCE: u128 = 50_000_000_000_000_000;
 
 /// The same on an L1-blob preset, where OP gas is cheap: 0.00005 ETH.
 pub const MIN_BALANCE_L1: u128 = 50_000_000_000_000;
-
-/// Organizer and harness RPC on Gnosis: the network's last (publicnode, its
-/// first, rate-limits organizer bursts).
-#[cfg(test)]
-const GNOSIS_RPC: &str = GNOSIS.rpc_urls[GNOSIS.rpc_urls.len() - 1];
 
 /// Live node RPC lists (seq1, seq2, seq3, observer): the network's RPCs
 /// rotated, so each node starts on another endpoint and fails over to the next.
@@ -55,14 +51,9 @@ fn node_rpcs_of(n: &Network) -> String {
         .join(";")
 }
 
-#[cfg(test)]
-fn gnosis_node_rpcs() -> String {
-    node_rpcs_of(&GNOSIS)
-}
-
-/// The live deployment's preset: `DAVINCI_E2E_NETWORK` (default `gnosis`).
+/// The live deployment's preset: `DAVINCI_E2E_NETWORK` (default `optimism`).
 pub fn preset() -> Result<&'static Network> {
-    let name = env_or("DAVINCI_E2E_NETWORK", GNOSIS.name);
+    let name = env_or("DAVINCI_E2E_NETWORK", OPTIMISM.name);
     networks::by_name(&name).with_context(|| format!("DAVINCI_E2E_NETWORK={name}: no such preset"))
 }
 
@@ -520,17 +511,17 @@ mod tests {
             node_lists(" a, b ;c;; d,"),
             ["a,b", "c", "d"].map(String::from)
         );
-        let live = node_lists(&gnosis_node_rpcs());
+        let live = node_lists(&node_rpcs_of(&OPTIMISM));
         assert_eq!(live.len(), 4);
         assert!(
             live.iter()
                 .all(|l| l.split(',').count() == 2 && !l.contains(' '))
         );
-        // The three signing sequencers start on different endpoints.
+        // The signing sequencers start on different endpoints, as far as
+        // the preset lists them.
         let first: std::collections::HashSet<_> =
             live[..3].iter().map(|l| l.split(',').next()).collect();
-        assert_eq!(first.len(), 3);
-        assert!(GNOSIS.rpc_urls.contains(&GNOSIS_RPC));
+        assert_eq!(first.len(), OPTIMISM.rpc_urls.len().min(3));
     }
 
     #[test]

@@ -953,31 +953,34 @@ mod tests {
     }
 
     #[test]
-    fn gnosis_is_the_default_network() {
-        let g = &networks::GNOSIS;
+    fn optimism_is_the_default_network() {
+        let o = &networks::OPTIMISM;
         let c = Config::parse_args(["davinci-sequencer"]).unwrap();
-        assert_eq!(c.network, NetworkChoice::Known(g));
-        assert_eq!(c.registry, g.registry);
+        assert_eq!(c.network, NetworkChoice::Known(o));
+        assert_eq!(c.registry, o.registry);
         assert!(!c.registry_explicit());
-        assert_eq!(c.start_block, Some(g.start_block));
-        assert_eq!(c.confirmations, 3);
+        assert_eq!(c.start_block, Some(o.start_block));
+        assert_eq!(c.confirmations, 1);
         let rpcs: Vec<&str> = c.rpc_url.iter().map(|u| u.as_str()).collect();
         assert_eq!(
             rpcs,
             [
-                "https://gnosis-rpc.publicnode.com/",
-                "https://gnosis-rpc.blockreq.com/v1/rpc/public",
-                "https://rpc.gnosischain.com/",
-                "https://gnosis.drpc.org/",
+                "https://optimism-rpc.publicnode.com/",
+                "https://mainnet.optimism.io/",
             ]
         );
-        assert_eq!(c.blob_source, g.blob_source.parse().unwrap());
+        assert_eq!(c.blob_source, o.blob_source.parse().unwrap());
+        // L1-blob mode, with the L1-blob margin.
+        assert!(c.l1_mode());
+        assert_eq!(c.settle_margin, Duration::from_secs(30));
         assert_eq!(
-            Config::parse_args(["davinci-sequencer", "--network", "GNOSIS"])
+            Config::parse_args(["davinci-sequencer", "--network", "OPTIMISM"])
                 .unwrap()
                 .network,
-            NetworkChoice::Known(g)
+            NetworkChoice::Known(o)
         );
+        // Gnosis is retired.
+        assert!(Config::parse_args(["davinci-sequencer", "--network", "gnosis"]).is_err());
     }
 
     // Each explicit setting replaces the network's; the network's start
@@ -988,8 +991,8 @@ mod tests {
         assert!(c.registry_explicit());
         assert_eq!(c.registry, REG.parse::<Address>().unwrap());
         assert_eq!(c.start_block, None);
-        assert_eq!(c.rpc_url.len(), networks::GNOSIS.rpc_urls.len());
-        assert_eq!(c.confirmations, 3);
+        assert_eq!(c.rpc_url.len(), networks::OPTIMISM.rpc_urls.len());
+        assert_eq!(c.confirmations, 1);
         let c = Config::parse_args([
             "davinci-sequencer",
             "--start-block",
@@ -1002,7 +1005,7 @@ mod tests {
             "anvil",
         ])
         .unwrap();
-        assert_eq!(c.registry, networks::GNOSIS.registry);
+        assert_eq!(c.registry, networks::OPTIMISM.registry);
         assert_eq!(c.start_block, Some(7));
         assert_eq!(c.confirmations, 0);
         assert_eq!(c.rpc_url, [Url::parse("http://a:8545").unwrap()]);
@@ -1029,9 +1032,9 @@ mod tests {
     #[test]
     fn chain_id_must_match_the_network() {
         let c = Config::parse_args(["davinci-sequencer"]).unwrap();
-        assert!(c.check_chain_id(100).is_ok());
+        assert!(c.check_chain_id(10).is_ok());
         let e = c.check_chain_id(31337).unwrap_err().to_string();
-        assert!(e.contains("31337") && e.contains("gnosis"), "{e}");
+        assert!(e.contains("31337") && e.contains("optimism"), "{e}");
         // An explicit registry may live on another chain.
         let c = Config::parse_args(["davinci-sequencer", "--registry", REG]).unwrap();
         assert!(c.check_chain_id(31337).is_ok());
@@ -1175,8 +1178,6 @@ mod tests {
         assert_eq!(c.confirmations, 1);
         assert_eq!(c.blob_source, o.blob_source.parse().unwrap());
         assert_eq!(c.start_block, None);
-        // Gnosis stays in blob mode.
-        assert!(!Config::parse_args(["davinci-sequencer"]).unwrap().l1_mode());
         // The zero address is refused as an explicit registry too.
         let mut args = base();
         args[4] = "0x0000000000000000000000000000000000000000";

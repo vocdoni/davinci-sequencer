@@ -25,8 +25,9 @@
 //! to the scope. The vk fail-fast compares against the SDK release pins; the
 //! prover's `/health` carries no vks.
 //!
-//! `DAVINCI_E2E_LIVE=1` runs the same scenario on an existing deployment
-//! (Gnosis by default, see `davinci_e2e::net`): the registry pins are checked
+//! `DAVINCI_E2E_LIVE=1` runs the same scenario on an existing blob-mode
+//! deployment (`DAVINCI_E2E_NETWORK`, see `davinci_e2e::net`; the L1-blob
+//! default has its compact `op_live` run instead): the registry pins are checked
 //! first, the accounts must hold 0.05 native each, nodes read blobs from the
 //! beacon API, and timeouts scale by `DAVINCI_E2E_TIMEOUT_SCALE`. Opt-in
 //! extras: `DAVINCI_E2E_RESILIENCE=1` (full RPC, prover and beacon outages
@@ -1019,11 +1020,12 @@ async fn scenario(dir: &Path) -> Result<()> {
             n.log.display()
         );
     }
-    // The nodes size transitions from eth_config: 2 blobs on Gnosis.
+    // The nodes size transitions from eth_config.
     for n in &nodes {
         match n.logged_blob_cap() {
-            Some(c) if net.live && net.l1.is_none() => {
-                ensure!(c == 2, "{}: blob cap {c}, want 2", n.name)
+            // The OP preset's Ethereum schedule gives 6 blobs per transaction.
+            Some(c) if net.live && net.l1.is_some() => {
+                ensure!(c == 6, "{}: blob cap {c}, want 6", n.name)
             }
             Some(c) => say!("{}: blob cap {c}", n.name),
             None => say!("{}: no blob cap in its log", n.name),

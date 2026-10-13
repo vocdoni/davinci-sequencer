@@ -131,7 +131,7 @@ pub const USER_AGENT: &str = concat!("davinci-client/", env!("CARGO_PKG_VERSION"
 /// Default wait for a transaction receipt.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Retries of a rate-limited request, a second apart: the public Gnosis RPCs
+/// Retries of a rate-limited request, a second apart: public RPCs
 /// refuse a busy host for a minute or two at a time, so three minutes.
 const RATE_LIMIT_RETRIES: u32 = 180;
 const RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
