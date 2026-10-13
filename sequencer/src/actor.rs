@@ -849,8 +849,8 @@ struct Actor {
     /// seal before this instant or the next status event.
     pause_hold: Option<tokio::time::Instant>,
     /// L1-blob mode: consecutive cycles that posted blobs but did not land.
-    /// Any landing (ours or synced) resets it and the pause; in memory only,
-    /// so a restart does too.
+    /// Our landing resets it, a synced one takes one off; both end the
+    /// pause. In memory only, so a restart resets it too.
     failed_cycles: u32,
     /// No seal before this instant after [`FAILED_CYCLES_BEFORE_PAUSE`]
     /// failed cycles.
@@ -2289,11 +2289,14 @@ impl Actor {
             return; // a stale job of an aborted flight
         };
         let vids = f.prepared.vote_ids.clone();
-        // Blobs went out and the proof failed: a failed cycle.
-        if posted && !f.proved {
+        // Blobs went out and the batch failed: a failed cycle. A settle
+        // `Transient` counts in its arm (it may have landed after all), an
+        // unhandled revert in the generic `Reverted` arm.
+        if posted {
             match &outcome {
                 JobOutcome::Guest(mask) => self.failed_cycle(&format!("guest mask {mask:#x}")),
-                JobOutcome::Failed(e) | JobOutcome::Transient(e) => self.failed_cycle(e),
+                JobOutcome::Failed(e) => self.failed_cycle(e),
+                JobOutcome::Transient(e) if !f.proved => self.failed_cycle(e),
                 _ => {}
             }
         }
@@ -2376,6 +2379,9 @@ impl Actor {
             JobOutcome::Reverted(name) => {
                 self.rollback_flight(&f);
                 let msg = format!("settlement reverted: {name}");
+                if posted {
+                    self.failed_cycle(&msg);
+                }
                 error!(pid = %hex::encode(self.pid31), ?msg, "settlement reverted");
                 self.set_status(&vids, VoteStatus::Error, Some(&msg));
             }
@@ -2797,7 +2803,10 @@ impl Actor {
             .synced_from_others
             .fetch_add(1, Ordering::SeqCst);
         self.await_sync = false;
-        self.failed_cycles = 0;
+        // Another sequencer landing says nothing about our own cycles: it
+        // ends the pause but takes only one off the streak, so a broken node
+        // in a busy election still pauses.
+        self.failed_cycles = self.failed_cycles.saturating_sub(1);
         self.failed_pause = None;
         // Pending votes another sequencer settled for us are done. Votes
         // whose slot got overwritten stay pending: their id is not in the tree.

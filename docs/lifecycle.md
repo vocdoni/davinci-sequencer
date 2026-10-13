@@ -150,13 +150,14 @@ Each batch:
    requeued, like a lost race.
 
 The node bounds the spend of cycles that keep failing. A failed cycle posted at least one blob
-transaction but did not land: the settlement gave up (any of the give-ups above, an OP send
-failure, the deadline), or the proof failed after a post. After three in a row the node pauses
-sealing for that process for 10 minutes, and each further failed cycle doubles the pause, up to
-an hour. Each pause logs an error with its length, the count and the last failure; the votes stay
-pending (the grace end errors them as usual) and `nextSealNotBefore` shows the pause end. A
-landing, the node's own or another sequencer's, resets the count and ends the pause; so does a
-restart.
+transaction but did not land: the settlement gave up (any of the give-ups above, an OP send failure,
+the deadline), it reverted with an error the node does not handle, or the batch failed after a post.
+After three in a row the node pauses sealing for that process for 10 minutes, and each further
+failed cycle doubles the pause, up to an hour. Each pause logs an error with its length, the count
+and the last failure; the votes stay pending (the grace end errors them as usual) and
+`nextSealNotBefore` shows the pause end. The node's own landing resets the count; another
+sequencer's ends the pause but takes only one off the count, so a node that keeps failing still
+pauses when others land often. A restart resets both.
 
 The registry emits `ProcessStateTransitionedL1(processId, l1BlockNumbers, versionedHashes)` right
 after `ProcessStateTransitioned`; the node merges the two and fetches the blobs from Ethereum:

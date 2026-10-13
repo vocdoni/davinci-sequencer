@@ -809,36 +809,57 @@ async fn l1_a_landing_resets_the_failed_cycle_count() {
     miner.abort();
 }
 
-/// Another sequencer's landing ends the pause at once.
-#[tokio::test(start_paused = true)]
-async fn l1_a_foreign_landing_ends_the_pause() {
-    let s = setup(2, 8, None);
-    let l1 = FakeL1::new();
-    let miner = mine_every_12s(&l1);
-    l1.fault_proofs(Some(ProofFault::Data));
-    let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let shutdown = CancellationToken::new();
-    let (prover_a, prover_b) = (FakeProver::open(), FakeProver::open());
-    let node_a = start_l1_node(
-        Db::open_in(dir_a.path()).unwrap(),
-        dir_a.path(),
-        &s,
+// Nodes A and B on one chain, each posting from its own Ethereum account.
+async fn two_l1_nodes(
+    s: &TestSetup,
+    l1: &FakeL1,
+    provers: (Arc<FakeProver>, Arc<FakeProver>),
+    dirs: &(TempDir, TempDir),
+    shutdown: &CancellationToken,
+) -> (Node, Node) {
+    let a = start_l1_node(
+        Db::open_in(dirs.0.path()).unwrap(),
+        dirs.0.path(),
+        s,
         s.chain.with_signer(0xa1),
         l1.clone(),
-        prover_a.clone(),
+        provers.0,
         3,
         shutdown.clone(),
     )
     .await;
-    let node_b = start_l1_node(
-        Db::open_in(dir_b.path()).unwrap(),
-        dir_b.path(),
-        &s,
+    let b = start_l1_node(
+        Db::open_in(dirs.1.path()).unwrap(),
+        dirs.1.path(),
+        s,
         s.chain.with_signer(0xb2),
         l1.with_sender(0x2b),
-        prover_b.clone(),
+        provers.1,
         3,
         shutdown.clone(),
+    )
+    .await;
+    (a, b)
+}
+
+/// Another sequencer's landing ends the pause at once but keeps the streak
+/// (less one): the next failed cycle pauses again.
+#[tokio::test(start_paused = true)]
+async fn l1_a_foreign_landing_ends_the_pause_but_keeps_the_streak() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let shutdown = CancellationToken::new();
+    let (prover_a, prover_b) = (FakeProver::open(), FakeProver::open());
+    // A's proofs fail after its posts, four times.
+    *prover_a.fail_batches.lock().unwrap() = 4;
+    let (node_a, node_b) = two_l1_nodes(
+        &s,
+        &l1,
+        (prover_a.clone(), prover_b.clone()),
+        &dirs,
+        &shutdown,
     )
     .await;
     let (ha, hb) = (handle(&node_a).await, handle(&node_b).await);
@@ -847,16 +868,67 @@ async fn l1_a_foreign_landing_ends_the_pause() {
         prover_a.calls() == 3 && !ha.snapshot().await.unwrap().in_flight
     })
     .await;
-    l1.fault_proofs(None);
     let vids_b = submit(&hb, &s, 3..6, 40).await;
     wait_secs("B settled", 120, async || all_settled(&hb, &vids_b).await).await;
-    // Well inside A's 10 min pause.
-    wait_secs("A settled after syncing B", 200, async || {
-        all_settled(&ha, &vids_a).await
+    // Well inside A's 10 min pause: A seals again, and fails a fourth time.
+    wait_secs("A sealed after syncing B", 120, async || {
+        prover_a.calls() == 4 && !ha.snapshot().await.unwrap().in_flight
     })
     .await;
-    assert_eq!(prover_a.calls(), 4);
     assert_eq!(node_a.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    // Streak 3 − 1 + 1 = 3: paused again.
+    tokio::time::sleep(Duration::from_secs(400)).await;
+    assert_eq!(prover_a.calls(), 4, "paused again");
+    all_pending(&ha, &vids_a).await;
+    shutdown.cancel();
+    miner.abort();
+}
+
+/// Foreign landings between our failed cycles do not hold the pause off:
+/// two failures, a foreign landing, two more failures reach the streak of 3.
+#[tokio::test(start_paused = true)]
+async fn l1_foreign_landings_between_failed_cycles_still_pause() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let shutdown = CancellationToken::new();
+    // A's proofs fail after its posts, each when the test releases it.
+    let (prover_a, prover_b) = (FakeProver::gated(), FakeProver::open());
+    *prover_a.fail_batches.lock().unwrap() = 100;
+    let (node_a, node_b) = two_l1_nodes(
+        &s,
+        &l1,
+        (prover_a.clone(), prover_b.clone()),
+        &dirs,
+        &shutdown,
+    )
+    .await;
+    let (ha, hb) = (handle(&node_a).await, handle(&node_b).await);
+    let vids_a = submit(&ha, &s, 0..3, 50).await;
+    for k in 1..=2 {
+        wait_secs("A proving", 120, async || prover_a.calls() == k).await;
+        prover_a.release(1);
+    }
+    // A's third attempt is in flight when B lands: A loses it and syncs.
+    wait_secs("A proving again", 120, async || prover_a.calls() == 3).await;
+    let vids_b = submit(&hb, &s, 3..6, 60).await;
+    wait_secs("A synced B", 120, async || {
+        node_a.metrics.synced_from_others.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(all_settled(&hb, &vids_b).await);
+    for k in 4..=5 {
+        wait_secs("A proving", 120, async || prover_a.calls() == k).await;
+        prover_a.release(1);
+    }
+    wait_secs("A's fifth attempt failed", 120, async || {
+        !ha.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(400)).await;
+    assert_eq!(prover_a.calls(), 5, "paused");
+    all_pending(&ha, &vids_a).await;
     shutdown.cancel();
     miner.abort();
 }
@@ -917,4 +989,36 @@ async fn l1_first_flush_after_an_end_uses_the_grace() {
     assert_eq!(prover.sizes(), vec![15]);
     assert_eq!(l1.mined_posts(), 1);
     shutdown.cancel();
+}
+
+/// A settlement that reverts with a name the node does not handle errors
+/// its votes, but the cycle posted blobs: three such cycles pause sealing.
+#[tokio::test(start_paused = true)]
+async fn l1_reverted_posted_cycles_count() {
+    let s = setup(2, 16, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    s.chain.revert_simulates("UnhandledRevert", 100);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
+    for (k, voters) in [0..3, 3..6, 6..9].into_iter().enumerate() {
+        let vids = submit(&h, &s, voters, 2000 + 10 * k as u64).await;
+        wait_secs("the batch reverted", 300, async || {
+            for vid in &vids {
+                if vote_status(&h, *vid).await != Some(VoteStatus::Error) {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+    }
+    let fourth = submit(&h, &s, 9..12, 2100).await;
+    tokio::time::sleep(Duration::from_secs(400)).await;
+    assert_eq!(prover.calls(), 3, "the fourth batch waits for the pause");
+    all_pending(&h, &fourth).await;
+    shutdown.cancel();
+    miner.abort();
 }
