@@ -1761,7 +1761,7 @@ impl Actor {
         // unaccounted. So the batch_max and budget caps go into the
         // selection, and a re-proof drop re-runs it over what is left.
         let selected: Vec<VerifiedVote> = loop {
-            let sized: Vec<VerifiedVote> = match self.state.select_batch_within(
+            let (sized, blocked): (Vec<VerifiedVote>, bool) = match self.state.select_batch_within(
                 &self.pending,
                 max_voters,
                 &self.exposed,
@@ -1770,7 +1770,7 @@ impl Actor {
             ) {
                 // A window too small for the exposed set yields an empty
                 // selection and waits; an overflow is permanent.
-                Ok((refs, _)) => refs.into_iter().cloned().collect(),
+                Ok((refs, blocked)) => (refs.into_iter().cloned().collect(), blocked),
                 Err(StateError::RefreshOverflow { .. }) => {
                     self.refresh_overflow();
                     return;
@@ -1781,7 +1781,7 @@ impl Actor {
                 }
             };
             if sized.is_empty() {
-                if max_blobs < self.state.blob_cap() {
+                if blocked && max_blobs < self.state.blob_cap() {
                     debug!(pid = %hex::encode(self.pid31), max_blobs, cap = self.state.blob_cap(), "the exposed set needs more blob transactions than the window fits");
                 }
                 return;
