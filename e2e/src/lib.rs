@@ -24,8 +24,10 @@ pub fn redact_urls(s: &str) -> String {
     let mut rest = s;
     while let Some(i) = rest.find("://") {
         let scheme_start = rest[..i]
-            .rfind(|c: char| !c.is_ascii_alphabetic())
-            .map_or(0, |p| p + 1);
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_ascii_alphabetic())
+            .map_or(0, |(p, c)| p + c.len_utf8());
         let scheme = &rest[scheme_start..i];
         if scheme != "http" && scheme != "https" {
             out.push_str(&rest[..i + 3]);
@@ -61,5 +63,7 @@ mod tests {
         );
         assert_eq!(redact_urls("a http://h:8545/k b"), "a http://h:8545 b");
         assert_eq!(redact_urls("no url, ftp://x/y"), "no url, ftp://x/y");
+        let r = redact_urls("x \u{201c}https://u:p@h/k\u{201d} y");
+        assert!(!r.contains("u:p") && !r.contains("/k"), "{r}");
     }
 }

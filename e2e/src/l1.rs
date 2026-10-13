@@ -433,7 +433,7 @@ pub struct L1Post {
     /// One entry per blob, as `ProcessStateTransitionedL1` lists them.
     pub l1_blocks: Vec<u64>,
     pub vhs: Vec<B256>,
-    /// The Ethereum transactions that carry `vhs`, in block order.
+    /// The Ethereum transactions that carry `vhs`, in chunk order.
     pub l1_txs: Vec<B256>,
 }
 

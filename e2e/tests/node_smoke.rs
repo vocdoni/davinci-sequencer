@@ -50,7 +50,8 @@ async fn smoke(url: &str) -> Result<()> {
         info.chain_id
     );
     let mut dir = WorkDir::new("davinci-node-smoke-")?;
-    let csp = fx::csp_key();
+    // Fresh per run, memory only: the repo-derived key would let anyone mint proofs.
+    let csp = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
     // Nothing fetches the document; keep the operator's paths off the chain.
     let (_, metadata_hash) = fx::write_metadata(dir.path(), "smoke.json", "node smoke")?;
     let metadata = "davinci-e2e://node-smoke/metadata.json".to_string();
