@@ -138,6 +138,19 @@ documents the overrides (`DAVINCI_E2E_RPC`, `DAVINCI_E2E_NODE_RPCS`, `DAVINCI_E2
 committee behind the registry's DKG adapter (`DAVINCI_E2E_DKG_MANAGER` overrides it). Every run
 ends with its gas bill, counting only the processes it created.
 
+The full scenario does not run live in L1-blob mode. With `DAVINCI_E2E_NETWORK=optimism`
+(an L1-blob preset), `DAVINCI_E2E_OP_LIVE=1 DAVINCI_E2E_LIVE=1` runs a compact one instead
+(`e2e/tests/e2e/op_live.rs`): one signing node and an observer, a Merkle process with eight
+voters and three revotes and a CSP process with three, batches of four, the signing node killed
+once its first blob transaction is in Ethereum's pool and restarted, both results and, with
+`DAVINCI_E2E_NEGATIVE=1`, the L1 negatives. Besides the organizer and sequencer key files it
+needs `DAVINCI_E2E_L1_KEYS` (one dedicated Ethereum key file per sequencer, never the
+organizer's account) and reads `DAVINCI_E2E_L1_RPC` (Ethereum RPCs, default the preset's),
+`DAVINCI_E2E_L1_SEND_RPC` (endpoints that take 1.5 MB bodies), `DAVINCI_E2E_L1_MAX_POST_FEE`
+(default `0.00015eth`), `DAVINCI_E2E_L1_MIN_BALANCE` (default 0.0002 ETH) and
+`DAVINCI_E2E_MIN_BALANCE` (OP; default 0.00005 ETH on an L1-blob preset). `DAVINCI_E2E_BEACON`
+then names Ethereum beacon APIs that keep full blobs. A run posts about six blob transactions.
+
 ## Docker runner
 
 `e2e/bench.sh` runs the e2e crate in the `e2e/Dockerfile.bench` image, with nothing native on the
