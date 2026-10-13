@@ -4,6 +4,7 @@
 //! holds the demo elections of `tests/demo.rs`.
 #![forbid(unsafe_code)]
 
+pub mod bench;
 pub mod census;
 pub mod chain;
 pub mod cost;
