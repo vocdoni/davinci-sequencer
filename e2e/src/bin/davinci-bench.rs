@@ -10,6 +10,7 @@ use alloy::primitives::{Address, U256};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use davinci_e2e::bench::r#gen::{GenOpts, gen_wave};
+use davinci_e2e::bench::merge::{Verify, check_snapshots, merge_wave};
 use davinci_e2e::bench::money;
 use davinci_e2e::bench::plan::{ElectionSpec, NodeId, Plan, Seed};
 use davinci_e2e::fixture;
@@ -76,6 +77,19 @@ enum Cmd {
         threads: usize,
         #[arg(long, env = "CIRCOM_ARTIFACTS")]
         artifacts: PathBuf,
+    },
+    /// Verify and join both hosts' shards into `ballots/w<N>/`.
+    Merge {
+        #[arg(long, env = "DAVINCI_BENCH_DIR")]
+        campaign: PathBuf,
+        #[arg(long)]
+        wave: u32,
+        /// Skip the Groth16 check of every proof.
+        #[arg(long)]
+        skip_proofs: bool,
+        /// Also compare the plan's snapshots with the registry at this RPC.
+        #[arg(long)]
+        rpc: Option<String>,
     },
 }
 
@@ -212,6 +226,31 @@ async fn real_main() -> Result<ExitCode> {
                 "gen host {host}/{hosts}: {} shards ({} skipped), {} ballots in {:.0}s",
                 st.shards, st.skipped, st.ballots, st.secs
             );
+        }
+        Cmd::Merge {
+            campaign,
+            wave,
+            skip_proofs,
+            rpc,
+        } => {
+            let plan = Plan::load(&campaign)?;
+            let seed = Seed::load(&campaign.join("secret").join("seed"))?;
+            if let Some(rpc) = rpc {
+                check_snapshots(&plan, wave, &rpc).await?;
+                println!("snapshots match the registry");
+            }
+            let v = if skip_proofs {
+                Verify::Skip
+            } else {
+                Verify::Full
+            };
+            let idx = tokio::task::block_in_place(|| merge_wave(&campaign, &plan, wave, &seed, v))?;
+            for (tag, i) in &idx {
+                println!(
+                    "{tag}: {} ballots {:?} sha256 {}",
+                    i.ballots, i.rounds, i.sha256
+                );
+            }
         }
         Cmd::Gate { campaign } => {
             let r = money::gate_check(campaign.as_deref(), &[]).await?;
