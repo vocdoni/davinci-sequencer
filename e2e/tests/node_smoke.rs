@@ -40,9 +40,11 @@ async fn node_smoke() -> Result<()> {
         "{url}: chain {}, registry or observer mode differ",
         info.chain_id
     );
-    let dir = WorkDir::new("davinci-node-smoke-")?;
+    let mut dir = WorkDir::new("davinci-node-smoke-")?;
     let csp = fx::csp_key();
-    let (metadata, metadata_hash) = fx::write_metadata(dir.path(), "smoke.json", "node smoke")?;
+    // Nothing fetches the document; keep the operator's paths off the chain.
+    let (_, metadata_hash) = fx::write_metadata(dir.path(), "smoke.json", "node smoke")?;
+    let metadata = "davinci-e2e://node-smoke/metadata.json".to_string();
     let next = org.next_process_id().await?;
     let pk = node.new_key(&next).await?;
     let pid = org
@@ -63,11 +65,22 @@ async fn node_smoke() -> Result<()> {
         .await?
         .pid;
     eprintln!("process {}", ProcessId(pid));
-    let r = vote(&org, &node, &rpc, registry, &pid, &csp).await;
+    let limit = net::scaled(Duration::from_secs(45 * 60));
+    let r = match tokio::time::timeout(limit, vote(&org, &node, &rpc, registry, &pid, &csp)).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("the smoke election took over {limit:?}")),
+    };
     if r.is_err() {
+        // Only READY or PAUSED processes can be cancelled; after an end this fails.
         let _ = org.cancel_process(&pid).await;
     }
-    r
+    dir.ok = r.is_ok();
+    if let Err(e) = &r {
+        eprintln!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}")));
+    }
+    // The chain may embed an RPC URL: only the redacted copy above is printed.
+    ensure!(r.is_ok(), "node smoke failed; see the FAILED line");
+    Ok(())
 }
 
 async fn vote(

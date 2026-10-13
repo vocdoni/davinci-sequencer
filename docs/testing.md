@@ -181,6 +181,8 @@ voters and the node's election key, created with the organizer key file
 `DAVINCI_E2E_ORGANIZER_KEY`. The organizer ends it once the votes are queued; the node seals them
 in its flush, settles them and publishes the tally, which must match. It spawns nothing and takes
 about 10 minutes, most of it the grace window.
+The host that runs it needs the circom artifacts (`CIRCOM_ARTIFACTS`, else `../davinci-circom/artifacts`)
+to prove the three ballots.
 
 ## Docker runner
 

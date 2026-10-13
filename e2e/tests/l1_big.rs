@@ -94,11 +94,12 @@ async fn l1_big_batch() -> Result<()> {
     let r = run(&net, &org, &prover_url, dir.path(), ballot_prover).await;
     match &r {
         Ok(()) => eprintln!("PASSED"),
-        Err(e) => eprintln!("FAILED: {e:#}"),
+        Err(e) => eprintln!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}"))),
     }
     let c = org.cancel_open().await;
     dir.ok = r.is_ok();
-    r?;
+    // The chain may embed an RPC URL: only the redacted copy above is printed.
+    ensure!(r.is_ok(), "l1_big failed; see the FAILED line");
     c.context("cancel the open processes")?;
     Ok(())
 }
@@ -200,25 +201,23 @@ async fn run(
     // Phase 1: the first 512 voters, in the batches the seal budget allows.
     let phase1 = Instant::now();
     submit(&node, &reqs[..N]).await?;
+    // The root of the first settled transition, for the fixture check.
+    settled(&node, &pid, &reqs[..1]).await?;
+    let root1 = RegistryReader::connect(&net.rpc, net.registry)?
+        .process(&pid)
+        .await?
+        .state_root;
     settled(&node, &pid, &reqs[..N]).await?;
     let first = ours().await?;
     eprintln!("first 512 votes settled in {} transitions", first.len());
-    // What the node measured: the benchmarks sub-project decides from this
-    // whether a warmed node fits 512 x 16 inside the 300 s default grace.
+    // Wall time, not the proving rate: it includes the batch timer and the
+    // Ethereum and OP legs of every transition.
     eprintln!(
-        "phase 1: {:.2} s per vote from submit to settled ({:.0} s for {N}, including the Ethereum legs)",
+        "phase 1 wall time: {:.2} s per vote from submit to settled ({:.0} s for {N})",
         phase1.elapsed().as_secs_f64() / N as f64,
         phase1.elapsed().as_secs_f64()
     );
-    if let Some(out) = std::env::var_os("DAVINCI_E2E_RECORD_DIR") {
-        let id = jobs.lock().ok().and_then(|j| j.first().cloned());
-        record(
-            prover_url,
-            &id.context("no /prove call seen")?,
-            Path::new(&out),
-        )
-        .await?;
-    }
+    prover_rates(prover_url, &jobs).await;
 
     // Phase 2: 512 new voters while paused, then the end; the flush seals them all.
     org.pause_process(&pid).await?;
@@ -281,7 +280,60 @@ async fn run(
     ensure!(got == want, "results {got:?}, tally {want:?}");
     eprintln!("results on-chain = tally");
     drop(node);
+    prover_rates(prover_url, &jobs).await;
+
+    // The fixture last, so a failed recording never hides the assertions above.
+    if let Some(out) = std::env::var_os("DAVINCI_E2E_RECORD_DIR") {
+        let id = jobs.lock().ok().and_then(|j| j.first().cloned());
+        let r = match id {
+            Some(id) => record(prover_url, &id, Path::new(&out), &root1).await,
+            None => Err(anyhow::anyhow!("no /prove call seen")),
+        };
+        if let Err(e) = r {
+            eprintln!(
+                "WARNING: fixture not recorded: {}",
+                davinci_e2e::redact_urls(&format!("{e:#}"))
+            );
+            bail!("the batch fixture was not recorded (see the WARNING line)");
+        }
+    }
     Ok(())
+}
+
+/// The prover's measured seconds per vote for each batch job the node
+/// posted, and their mean (the warmed figure for the 300 s grace question).
+/// A failed read is a warning.
+async fn prover_rates(prover_url: &str, jobs: &Mutex<Vec<String>>) {
+    let ids: Vec<String> = jobs.lock().map(|j| j.clone()).unwrap_or_default();
+    let pc = ProverClient::new(prover_url);
+    let mut rates = Vec::new();
+    for id in &ids {
+        let r: Result<f64> = async {
+            let jid = JobId::parse(id)?;
+            let ms = pc.job(&jid).await?.elapsed_ms.context("no elapsed_ms")?;
+            let p = BatchPublics::parse(&pc.publics(&jid).await?)?;
+            ensure!(p.voters > 0, "no voters");
+            Ok(ms as f64 / 1000.0 / f64::from(p.voters))
+        }
+        .await;
+        match r {
+            Ok(v) => {
+                eprintln!("prover job {id}: {v:.3} s per vote");
+                rates.push(v);
+            }
+            Err(e) => eprintln!(
+                "WARNING: prover job {id}: {}",
+                davinci_e2e::redact_urls(&format!("{e:#}"))
+            ),
+        }
+    }
+    if !rates.is_empty() {
+        eprintln!(
+            "prover rate: mean {:.3} s per vote over {} jobs",
+            rates.iter().sum::<f64>() / rates.len() as f64,
+            rates.len()
+        );
+    }
 }
 
 async fn submit(node: &Node, reqs: &[VoteRequest]) -> Result<()> {
@@ -334,12 +386,19 @@ async fn wait_status(node: &Node, pid: &[u8; 31], status: ProcessStatus) -> Resu
 
 /// Writes job `id`'s snark (the key order of davinci-zkvm's testdata) and
 /// its 256-byte register dump into `out`.
-async fn record(prover_url: &str, id: &str, out: &Path) -> Result<()> {
+async fn record(prover_url: &str, id: &str, out: &Path, root1: &[u8; 32]) -> Result<()> {
     let pc = ProverClient::new(prover_url);
     let id = JobId::parse(id)?;
     let s = pc.snark(&id).await?;
     let regs = pc.publics(&id).await?;
     ensure!(regs.len() == 256, "{} register bytes", regs.len());
+    let p = BatchPublics::parse(&regs)?;
+    let mut rev = p.root_after;
+    rev.reverse();
+    ensure!(
+        p.ok && (p.root_after == *root1 || rev == *root1),
+        "job {id} is not the first settled transition of this run"
+    );
     std::fs::create_dir_all(out)?;
     let json = format!(
         "{{\n  \"program_vk\": \"0x{}\",\n  \"root_c_vadcop_final\": \"0x{}\",\n  \"public_values\": \"0x{}\",\n  \"proof_bytes\": \"0x{}\"\n}}\n",
@@ -350,7 +409,6 @@ async fn record(prover_url: &str, id: &str, out: &Path) -> Result<()> {
     );
     std::fs::write(out.join("snark_batch.json"), json)?;
     std::fs::write(out.join("publics_batch.bin"), &regs)?;
-    let p = BatchPublics::parse(&regs)?;
     eprintln!(
         "recorded job {id} in {}: voters {} overwrites {} n_blobs {} occupied_before {} \
          nproofs {} n_public {} log_n {}",
