@@ -161,6 +161,10 @@ On OP Mainnet:
   (twice the base fee and twice the blob base fee); a replacement doubles them. A one-blob post
   cost about 2 µETH at 0.08 gwei and 0.004 gwei; the 0.001 ETH default leaves room for spikes and
   replacements. A batch of three transactions, re-posted at most three times, sends at most 12.
+  The cost counts `21000 × max fee + blobs × 131072 × blob fee`, so at the default the gas term
+  alone reaches the cap at an Ethereum base fee of about 24 gwei, whatever the blob fee; above it
+  every post waits. Each replacement doubles every fee, so from a 1 gwei base fee about four
+  replacements fit under the default.
 - Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the
   node logs why at debug level ("no time to land an L1-blob batch", "no batch fits", "the exposed set needs more blob
   transactions than the window fits").
