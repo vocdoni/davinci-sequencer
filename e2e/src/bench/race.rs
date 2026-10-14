@@ -2,6 +2,7 @@
 //! the same root, one lands, and the loser's detection, recovery and waste
 //! are read from the logs, the chain and the prover tap.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::B256;
@@ -16,7 +17,7 @@ use super::chain_view::{self, JobRow, TransitionRow};
 use super::metrics::{Kind, LogEvent, LogTail, kind};
 use super::plan::{Election, NodeId};
 use super::rig::{Rig, Role};
-use super::run::{Ctx, op_provider, prover_url, role_of};
+use super::run::{Ctx, info, op_provider, prover_url, role_of};
 use super::submit::{Route, SubmitStats, Submitter};
 use crate::proxy::Proxy;
 
@@ -67,6 +68,34 @@ pub struct RaceRow {
     pub wasted_posts: u64,
     /// Their receipts' cost (filled in by the caller).
     pub wasted_wei: u128,
+    /// Per node (`a`, `b`, `o`), the round's `/info` deltas of
+    /// [`ROUND_COUNTERS`] (filled in by the caller).
+    pub counters: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+/// The `/info` counters a race moves (spec §9, step 4).
+pub const ROUND_COUNTERS: [&str; 3] = ["lostRaces", "settledBySelf", "syncedFromOthers"];
+
+/// The round's deltas of [`ROUND_COUNTERS`] per node, from `/info` read
+/// before the burst and after the round; a node missing from either read is
+/// left out.
+pub fn counter_deltas(
+    before: &BTreeMap<String, BTreeMap<String, u64>>,
+    after: &BTreeMap<String, BTreeMap<String, u64>>,
+) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let mut out = BTreeMap::new();
+    for (node, a) in after {
+        let Some(b) = before.get(node) else { continue };
+        let d: BTreeMap<String, u64> = ROUND_COUNTERS
+            .iter()
+            .filter_map(|k| {
+                let (x, y) = (a.get(*k)?, b.get(*k)?);
+                Some((k.to_string(), x.saturating_sub(*y)))
+            })
+            .collect();
+        out.insert(node.clone(), d);
+    }
+    out
 }
 
 /// A seal gap above this is no race (spec §9).
@@ -145,6 +174,7 @@ pub fn race_row(
         wasted_job_s: None,
         wasted_posts: 0,
         wasted_wei: 0,
+        counters: BTreeMap::new(),
     };
     let Some(loser) = winner.map(other) else {
         return row;
@@ -299,8 +329,19 @@ fn opt_s(v: Option<f64>) -> String {
 impl RaceRow {
     /// One report line.
     pub fn line(&self) -> String {
+        let mut counters = String::new();
+        for k in ROUND_COUNTERS {
+            let v: Vec<String> = self
+                .counters
+                .iter()
+                .filter_map(|(n, c)| c.get(k).map(|v| format!("{n} {v}")))
+                .collect();
+            if !v.is_empty() {
+                counters.push_str(&format!(", {k} {}", v.join(" ")));
+            }
+        }
         format!(
-            "winner {} path {} gap {} detect {} recover {} wasted job {} posts {} ({:.2} µETH)",
+            "winner {} path {} gap {} detect {} recover {} wasted job {} posts {} ({:.2} µETH){counters}",
             self.winner.map_or("none".into(), |n| n.to_string()),
             serde_json::to_value(self.path)
                 .ok()
@@ -503,6 +544,7 @@ pub async fn race_round(rc: &RaceCtx<'_>, round: usize, votes: Vec<BallotRecord>
         t.poll();
     }
     let calls0 = [Role::A, Role::B].map(|r| rig.prove_calls(r).len());
+    let info0 = info(rig).await;
     let mut ev: [Vec<LogEvent>; 2] = Default::default();
     // 3. Burst: both nodes at once.
     let at = rc.t0.elapsed();
@@ -546,6 +588,7 @@ pub async fn race_round(rc: &RaceCtx<'_>, round: usize, votes: Vec<BallotRecord>
     if complete {
         jobs_done(rig, &calls).await;
     }
+    let counters = counter_deltas(&info0, &info(rig).await);
     for (t, e) in tails.iter_mut().zip(&mut ev) {
         e.extend(t.poll());
     }
@@ -560,6 +603,7 @@ pub async fn race_round(rc: &RaceCtx<'_>, round: usize, votes: Vec<BallotRecord>
         wasted_job_s: None,
         wasted_posts: 0,
         wasted_wei: 0,
+        counters: BTreeMap::new(),
     };
     if landed.is_some() {
         let logs =
@@ -588,6 +632,7 @@ pub async fn race_round(rc: &RaceCtx<'_>, round: usize, votes: Vec<BallotRecord>
             }
         }
     }
+    row.counters = counters;
     Ok(Round {
         row,
         stats,
@@ -643,6 +688,60 @@ mod tests {
         let mut v: Vec<BallotRecord> = (0..6).map(rec).collect();
         v[0].round = 2;
         assert!(rounds(&spec, v).is_err());
+    }
+
+    #[test]
+    fn counters_move_per_round() {
+        let m = |v: &[(&str, &[(&str, u64)])]| -> BTreeMap<String, BTreeMap<String, u64>> {
+            v.iter()
+                .map(|(n, c)| {
+                    let c = c.iter().map(|(k, x)| (k.to_string(), *x)).collect();
+                    (n.to_string(), c)
+                })
+                .collect()
+        };
+        let before = m(&[
+            (
+                "a",
+                &[("lostRaces", 1), ("settledBySelf", 4), ("bisections", 0)],
+            ),
+            ("b", &[("lostRaces", 2), ("settledBySelf", 3)]),
+        ]);
+        let after = m(&[
+            (
+                "a",
+                &[("lostRaces", 1), ("settledBySelf", 5), ("bisections", 1)],
+            ),
+            ("b", &[("lostRaces", 3), ("settledBySelf", 3)]),
+            ("o", &[("syncedFromOthers", 9)]),
+        ]);
+        let d = counter_deltas(&before, &after);
+        // Only the race's counters, and no node missing a read.
+        assert_eq!(
+            d,
+            m(&[
+                ("a", &[("lostRaces", 0), ("settledBySelf", 1)]),
+                ("b", &[("lostRaces", 1), ("settledBySelf", 0)]),
+            ])
+        );
+        let row = RaceRow {
+            round: 1,
+            winner: Some(NodeId::A),
+            path: LossPath::Event,
+            seal_gap_s: 0.5,
+            detect_s: None,
+            recover_s: None,
+            wasted_job_s: None,
+            wasted_posts: 1,
+            wasted_wei: 0,
+            counters: d,
+        };
+        assert!(
+            row.line()
+                .ends_with(", lostRaces a 0 b 1, settledBySelf a 1 b 0"),
+            "{}",
+            row.line()
+        );
     }
 
     #[test]
@@ -712,6 +811,7 @@ mod tests {
         assert_eq!(r.recover_s, Some(4.0));
         assert_eq!(r.wasted_job_s, Some(22.0));
         assert_eq!((r.wasted_posts, r.wasted_wei), (1, 0));
+        assert!(r.counters.is_empty());
 
         let b = loser("lost the settlement race, waiting for sync");
         let r = race_row(2, &landing, &a, &b, &jobs);

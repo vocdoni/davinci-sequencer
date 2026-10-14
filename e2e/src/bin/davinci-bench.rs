@@ -138,6 +138,14 @@ enum Cmd {
         /// Scenario names, or `all` for the wave's in order.
         #[arg(long, value_delimiter = ',', required = true)]
         scenario: Vec<String>,
+        /// The owner's caps (ETH) over those the first `gate` wrote into
+        /// `budget.json`, which keeps them.
+        #[arg(long, env = "DAVINCI_BENCH_CAP_L1")]
+        cap_l1: Option<String>,
+        #[arg(long, env = "DAVINCI_BENCH_CAP_OP")]
+        cap_op: Option<String>,
+        #[arg(long, env = "DAVINCI_BENCH_CAP_ORG")]
+        cap_org: Option<String>,
         #[command(flatten)]
         rig: RigArgs,
     },
@@ -655,6 +663,9 @@ async fn real_main() -> Result<ExitCode> {
             campaign,
             wave,
             scenario,
+            cap_l1,
+            cap_op,
+            cap_org,
             rig,
         } => {
             require_live("run")?;
@@ -666,10 +677,19 @@ async fn real_main() -> Result<ExitCode> {
             let scs = bench_run::select(scenarios(wave, plan.scale(wave)?), &scenario)?;
             let seed = load_seed(&campaign)?;
             let path = campaign.join("budget.json");
-            let budget: money::Budget = serde_json::from_slice(
+            let mut budget: money::Budget = serde_json::from_slice(
                 &std::fs::read(&path).context("budget.json: run `gate --campaign` first")?,
             )
             .with_context(|| format!("parse {}", path.display()))?;
+            if budget.set_caps(cap_l1.as_deref(), cap_op.as_deref(), cap_org.as_deref())? {
+                std::fs::write(&path, serde_json::to_vec_pretty(&budget)?)
+                    .with_context(|| format!("write {}", path.display()))?;
+                println!("budget.json: caps updated");
+            }
+            println!(
+                "caps (wei): L1 {} per key | OP {} per key | organizer {}",
+                budget.caps.l1_per_key, budget.caps.op_per_key, budget.caps.organizer_op
+            );
             held_step(false, async move |h: &mut Held| {
                 let net = Net::open(&campaign).await?;
                 check_plan(&plan, &net)?;

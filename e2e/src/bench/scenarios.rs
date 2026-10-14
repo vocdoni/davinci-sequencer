@@ -113,10 +113,10 @@ const X23_ROUNDS: usize = 5;
 const SKEW: Duration = Duration::from_secs(150);
 /// X3's loser runs this many OP blocks (about 5 min) behind on events.
 const LAG: u64 = 150;
-/// The same 5 min on a dry's anvil (1 s blocks): at 150 blocks the loser's
-/// held proof ends only seconds before it sees the winner, so the revert
-/// path would turn into the event path.
-const LAG_DRY: u64 = 300;
+/// The same 5 min on anvil's 1 s blocks: at 150 blocks the loser's held
+/// proof ends only seconds before it sees the winner, so the revert path
+/// would turn into the event path. See [`on_anvil`].
+const LAG_ANVIL: u64 = 300;
 /// X4's two AGM ends are this far apart, so their flushes do not share a
 /// node's Ethereum window.
 const X4_STAGGER: u64 = 360;
@@ -177,8 +177,9 @@ fn wave3(scale: f64) -> Vec<ElectionSpec> {
         .iter()
         .map(|&(tag, voters)| {
             let voters = (scaled(voters as usize, scale) as u32).max(MIN_VOTERS);
-            // C7's end-of-election cap holds the flush for 120 s.
-            let grace = if tag == "C7" { 600 } else { GRACE };
+            // C7's end-of-election cap holds the flush for 120 s, then two
+            // restarts and a flush race's loser re-proving must fit.
+            let grace = if tag == "C7" { 900 } else { GRACE };
             spec(tag, tag, 8, 1, voters, 1, 0, grace)
         })
         .collect();
@@ -315,11 +316,15 @@ pub struct PostBound {
 const POST_GAS: u128 = 21_000;
 
 impl PostBound {
-    /// µETH at `exec` wei per gas and `blob` wei per blob gas.
+    /// Wei at `exec` wei per gas and `blob` wei per blob gas.
+    pub fn wei(&self, exec: u128, blob: u128) -> u128 {
+        u128::from(self.txs) * POST_GAS * exec
+            + u128::from(self.blobs) * u128::from(crate::cost::GAS_PER_BLOB) * blob
+    }
+
+    /// The same in µETH.
     pub fn ueth(&self, exec: u128, blob: u128) -> f64 {
-        let wei = u128::from(self.txs) * POST_GAS * exec
-            + u128::from(self.blobs) * u128::from(crate::cost::GAS_PER_BLOB) * blob;
-        wei as f64 / 1e12
+        self.wei(exec, blob) as f64 / 1e12
     }
 
     /// `n` attempts at a batch of `votes` fresh votes at `nf` fields.
@@ -555,6 +560,20 @@ fn wave1_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
     out
 }
 
+/// `sc` as a dry runs it on anvil, whose OP blocks come every second rather
+/// than every 2 s: a race's lag keeps its 5 min.
+pub fn on_anvil(mut sc: Scenario) -> Scenario {
+    if let Kind::Race(r) = &mut sc.kind
+        && r.lag_confirmations.is_some()
+    {
+        r.lag_confirmations = Some(LAG_ANVIL);
+        if let Some((n, _)) = r.skew {
+            sc.knobs[node_idx(n)].confirmations = Some(LAG_ANVIL);
+        }
+    }
+    sc
+}
+
 /// Both nodes seal at K, never on the timer.
 pub fn race_knobs(k: usize) -> Knobs {
     Knobs {
@@ -591,8 +610,7 @@ fn wave2_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
             k,
             rounds: race_rounds(rounds, scale),
             skew: skew.map(|n| (n, SKEW)),
-            // Below scale 1 is a dry, on anvil.
-            lag_confirmations: lag.then_some(if scale < 1.0 { LAG_DRY } else { LAG }),
+            lag_confirmations: lag.then_some(LAG),
         };
         let mut knobs = [race_knobs(k), race_knobs(k)];
         // The lag holds for the whole scenario rather than a restart per
@@ -1193,10 +1211,21 @@ mod tests {
         );
         assert!(x5.allowed.is_empty());
         assert!(all.iter().all(|s| s.wave == 2 && s.chaos.is_empty()));
-        // A dry keeps X3's lag at about 5 min on anvil's 1 s blocks.
-        let dry = scenarios(2, 0.3);
-        let x3 = dry.iter().find(|s| s.name == "X3").unwrap();
-        assert_eq!(race_of(x3).lag_confirmations, Some(300));
+        // On anvil (a dry, whatever its scale) X3's lag keeps its 5 min at
+        // 1 s blocks; other scenarios are as they are.
+        for scale in [1.0, 0.3] {
+            let all = scenarios(2, scale);
+            let x3 = all.iter().find(|s| s.name == "X3").unwrap();
+            assert_eq!(race_of(x3).lag_confirmations, Some(150), "at {scale}");
+            let a = on_anvil(x3.clone());
+            let (loser, _) = race_of(&a).skew.unwrap();
+            assert_eq!(race_of(&a).lag_confirmations, Some(300));
+            assert_eq!(a.knobs[node_idx(loser)].confirmations, Some(300));
+            assert_eq!(a.knobs[1 - node_idx(loser)].confirmations, None);
+            let x2 = all.iter().find(|s| s.name == "X2-a").unwrap();
+            assert_eq!(on_anvil(x2.clone()).knobs, x2.knobs);
+            assert_eq!(on_anvil(x2.clone()).kind, x2.kind);
+        }
     }
 
     /// The live URL layout (spec §6): each node's OP list as the preset

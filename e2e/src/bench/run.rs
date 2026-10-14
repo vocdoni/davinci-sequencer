@@ -32,7 +32,8 @@ use super::race;
 use super::report::{self, Finding, Progress, ScenarioReport, Throughput};
 use super::rig::{Rig, Role};
 use super::scenarios::{
-    Cell, EST_BLOB_WEI, EST_EXEC_WEI, End, Kind, Lane, Scenario, post_bound, scaled, scenarios,
+    Cell, EST_BLOB_WEI, EST_EXEC_WEI, End, Kind, Lane, Scenario, on_anvil, post_bound, scaled,
+    scenarios,
 };
 use super::schedule;
 use super::submit::{Route, SubmitStats, Submitter};
@@ -653,19 +654,46 @@ async fn end_after_settled(
     )
 }
 
-/// Why a scenario stopped early.
+/// Why a scenario stopped early, or never started.
 #[derive(Clone, Debug, PartialEq)]
 enum Stop {
+    /// An account reached its cap: the run ends.
     Budget(String),
     Fees(String),
+    /// The scenario's bound does not fit a key's room: skipped, the run
+    /// goes on (a later scenario may fit).
+    Fit(String),
 }
 
 impl Stop {
     fn label(&self) -> String {
         match self {
-            Stop::Budget(w) => format!("budget: {w}"),
+            Stop::Budget(w) | Stop::Fit(w) => format!("budget: {w}"),
             Stop::Fees(w) => format!("on fees: {w}"),
         }
+    }
+}
+
+/// Spec §13's stop rule ahead of a scenario: its posts can cost a key up to
+/// `need` wei, which must fit what each of A and B may still spend.
+pub fn fits(b: &Budget, now: &Balances, need: u128) -> std::result::Result<(), String> {
+    let short: Vec<String> = ["seq-a.l1", "seq-b.l1"]
+        .into_iter()
+        .zip(b.room_l1(now))
+        .filter(|(_, room)| U256::from(need) > *room)
+        .map(|(n, room)| {
+            let room = u128::try_from(room).map_or(f64::INFINITY, |r| r as f64);
+            format!("{n} may spend {:.1} µETH more", room / 1e12)
+        })
+        .collect();
+    if short.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "its posts can cost up to {:.1} µETH per key; {}",
+            need as f64 / 1e12,
+            short.join(", ")
+        ))
     }
 }
 
@@ -720,16 +748,26 @@ fn budget_breach(ctx: &Ctx, now: &Balances) -> Option<String> {
 }
 
 /// The fee gate and the budget before a scenario: `None` on a go; a budget
-/// breach stops at once, a fee breach after `GATE_WAIT`.
-async fn gate_wait(ctx: &Ctx) -> Result<Option<Stop>> {
+/// breach stops at once, a fee breach after `GATE_WAIT`. On a fee go,
+/// `need` (the scenario's per-key bound at those fees, wei) must fit what
+/// each key may still spend, or the scenario is skipped.
+async fn gate_wait(ctx: &Ctx, need: impl Fn(&Fees) -> u128) -> Result<Option<Stop>> {
     let start = Instant::now();
     loop {
-        if ctx.budget.is_some()
-            && let Some(w) = budget_breach(ctx, &balances(&ctx.net).await?)
-        {
+        let now = match &ctx.budget {
+            Some(_) => Some(balances(&ctx.net).await?),
+            None => None,
+        };
+        if let Some(w) = now.as_ref().and_then(|n| budget_breach(ctx, n)) {
             return Ok(Some(Stop::Budget(w)));
         }
-        let Some(w) = fee_breach(&ctx.net, read_fees(&ctx.net).await) else {
+        let fees = read_fees(&ctx.net).await;
+        let Some(w) = fee_breach(&ctx.net, fees) else {
+            if let (Some(b), Some(n), Some(f)) = (&ctx.budget, &now, &fees)
+                && let Err(w) = fits(b, n, need(f))
+            {
+                return Ok(Some(Stop::Fit(w)));
+            }
             return Ok(None);
         };
         if start.elapsed() >= GATE_WAIT {
@@ -965,6 +1003,17 @@ async fn close_chaos(
         println!("chaos {}: {}", row.name, row.line());
         report.chaos.insert(row.name.clone(), row.line());
     }
+    let unfired = c.unfired();
+    for (n, l) in &unfired {
+        println!("chaos {n}: {l}");
+        report.chaos.insert(n.clone(), l.clone());
+    }
+    if !unfired.is_empty() {
+        let names: Vec<&str> = unfired.iter().map(|(n, _)| n.as_str()).collect();
+        report
+            .params
+            .insert("chaos never triggered".into(), names.join(", "));
+    }
     *slot = None;
     r
 }
@@ -998,7 +1047,21 @@ async fn chaos_step(
         elapsed: t0.elapsed(),
         ended_for: first_end.map(|e| Duration::from_secs_f64((unix_now() - e).max(0.0))),
         pending_nonce_gap: if c.wants_pending() {
-            chaos::pending_gap(net).await.unwrap_or([false; 2])
+            match chaos::pending_gap(net).await {
+                Ok(g) => g,
+                // An entry waiting on it cannot fire: say so, and the
+                // report lists it as never triggered.
+                Err(e) => {
+                    let e = crate::redact_urls(&format!("{e:#}"));
+                    if c.pending_error(&e) {
+                        println!(
+                            "chaos: pending-nonce read failed ({} so far): {e}",
+                            c.pending_errors()
+                        );
+                    }
+                    [false; 2]
+                }
+            }
         } else {
             [false; 2]
         },
@@ -1422,7 +1485,7 @@ fn latency(
 }
 
 /// `/info` counters by node name, summed over each node's incarnations.
-async fn info(rig: &Rig) -> BTreeMap<String, BTreeMap<String, u64>> {
+pub(super) async fn info(rig: &Rig) -> BTreeMap<String, BTreeMap<String, u64>> {
     let mut out = BTreeMap::new();
     for (name, r) in [("a", Role::A), ("b", Role::B), ("o", Role::O)] {
         if let Some(c) = rig.counters(r).await {
@@ -1567,9 +1630,18 @@ pub async fn run_scenario_in(
     sc: &Scenario,
     chaos: &mut ChaosSlot,
 ) -> Result<ScenarioReport> {
+    // A dry runs on anvil, whose OP blocks are 1 s.
+    let anvil_sc;
+    let sc = if ctx.net.live {
+        sc
+    } else {
+        anvil_sc = on_anvil(sc.clone());
+        &anvil_sc
+    };
     let wave = ctx.plan.wave(sc.wave)?;
     // The scale the elections were planned at: bursts are sized from it.
     let scale = wave.scale;
+    let specs: Vec<ElectionSpec> = wave.elections.iter().map(|e| e.spec.clone()).collect();
     let name = format!("w{}/{}", sc.wave, sc.name);
     let dir = run_dir(&ctx.campaign, sc.wave, &sc.name);
     let mut report = ScenarioReport {
@@ -1605,12 +1677,21 @@ pub async fn run_scenario_in(
     let tags: Vec<String> = lanes.iter().map(|(l, _)| l.tag.clone()).collect();
     report.params.insert("elections".into(), tags.join(","));
 
-    // 1. Fee gate and budget.
-    if let Some(s) = gate_wait(ctx).await? {
-        println!("{name}: stopped {}", s.label());
+    // 1. Fee gate and budget, and the scenario's bound against the room
+    // each key has left.
+    let need = |f: &Fees| {
+        post_bound(sc, &specs, scale)
+            .map(|b| b.wei(f.base + f.tip, f.blob))
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+    };
+    if let Some(s) = gate_wait(ctx, need).await? {
         let key = if matches!(s, Stop::Budget(_)) {
+            println!("{name}: stopped {}", s.label());
             "stopped"
         } else {
+            println!("{name}: skipped: {}", s.label());
             "skipped"
         };
         return skipped(ctx, &dir, report, key, s.label());
@@ -1712,7 +1793,6 @@ pub async fn run_scenario_in(
     if !injections.is_empty() {
         *chaos = Some((Controller::new(injections), t0));
     }
-    let specs: Vec<ElectionSpec> = wave.elections.iter().map(|e| e.spec.clone()).collect();
     let fees_now = if ctx.net.live {
         read_fees(&ctx.net).await
     } else {
@@ -1911,9 +1991,10 @@ pub async fn run_scenario_in(
                 continue;
             }
             let pid = e.snap.pid;
+            // `Fit` only comes before a scenario starts.
             let how = match s {
                 Stop::Budget(_) => Close::Cancel,
-                Stop::Fees(_) => Close::End(End::Now {
+                Stop::Fees(_) | Stop::Fit(_) => Close::End(End::Now {
                     after: Duration::ZERO,
                 }),
             };
@@ -2577,6 +2658,45 @@ mod tests {
         ));
         assert_eq!(sealed_or_synced(&ev, Role::B, "p", 30.0), (0, true));
         assert_eq!(sealed_or_synced(&ev, Role::B, "p", 33.0), (0, false));
+    }
+
+    #[test]
+    fn a_scenario_must_fit_each_keys_room() {
+        use crate::bench::money::Caps;
+        use crate::bench::scenarios::wave_specs;
+        let x1 = &scenarios(2, 1.0)[0];
+        let b = post_bound(x1, &wave_specs(2, 1.0), 1.0);
+        let need = b[0]
+            .wei(EST_EXEC_WEI, EST_BLOB_WEI)
+            .max(b[1].wei(EST_EXEC_WEI, EST_BLOB_WEI));
+        // X1: 20 one-blob posts, about 52.5 µETH per key.
+        assert_eq!(need, 52_485_760_000_000);
+        let ueth = |x: u64| U256::from(x) * U256::from(1_000_000_000_000u64);
+        let budget = Budget {
+            start: Balances {
+                l1: [ueth(1000), ueth(1000)],
+                ..Balances::default()
+            },
+            inflows: Balances::default(),
+            caps: Caps {
+                l1_per_key: ueth(900),
+                op_per_key: ueth(150),
+                organizer_op: ueth(300),
+            },
+        };
+        // B spent 850 of its 900: 50 left, below X1's bound.
+        let mut now = budget.start.clone();
+        now.l1[1] -= ueth(850);
+        let err = fits(&budget, &now, need).unwrap_err();
+        assert!(
+            err.contains("seq-b.l1 may spend 50.0") && !err.contains("seq-a"),
+            "{err}"
+        );
+        assert!(err.contains("52.5 µETH per key"), "{err}");
+        // 60 left fits.
+        now.l1[1] += ueth(10);
+        assert!(fits(&budget, &now, need).is_ok());
+        assert_eq!(Stop::Fit(err).label().split(':').next(), Some("budget"));
     }
 
     #[test]
