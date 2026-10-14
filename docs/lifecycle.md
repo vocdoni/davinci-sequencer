@@ -353,6 +353,19 @@ node syncs from the chain. If its own transaction landed before the crash, those
 through that sync without being proved again. A bisection in progress is forgotten: the next
 batch is full size.
 
+A landing is two writes: the state tree with its committed record, then the votes, the
+transition record and the process record together. The tree's record is authoritative, so a
+crash between the two reopens at it: the batch's votes settle from the tree, the pinned root
+follows the chain once a read shows the tree's root there, and the missing transition record is
+rewritten from its event and blobs.
+
+Events the monitor routed into an actor's queue die with the process, and the event cursor has
+already moved past them. At boot, and whenever a landing makes the actor re-read the process,
+the node therefore merges `getProcess` into its record: status, duration, grace, max voters,
+census, metadata, the DKG request and results, with the same effects as their events. A read
+whose chain head is behind the newest block the node has seen (the cursor, at boot) is not used.
+A chain root the node has not seen makes it sync before it seals again.
+
 In L1-blob mode the node records each Ethereum blob transaction, with the sending account, before
 sending it and drops the record once it is mined. After a restart the batch is proved again (its
 secrets died with the process) and its first post replaces a still-pending transaction at its
@@ -360,5 +373,5 @@ nonce with doubled fees instead of queueing behind it, whichever of the batch's 
 was. Records of another account (a rotated L1 key) are dropped at start. Transactions mined
 before the crash are wasted.
 
-A datadir written by the previous release (storage schema 8) is upgraded in place on first start:
-schema 9 only adds the `l1_posts` table.
+A datadir written by an earlier release (storage schema 8 or 9) is upgraded in place on first
+start: schema 9 adds the `l1_posts` table, and schema 10 stops using the `committed` table.
