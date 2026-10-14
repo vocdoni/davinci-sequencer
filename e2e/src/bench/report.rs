@@ -115,6 +115,8 @@ pub enum FindingKind {
     ResultsFailed,
     ObserverIncomplete,
     PendingAfterWait,
+    /// Canceled before its results (the budget stop): none are expected.
+    Canceled,
 }
 
 /// One row of the findings table: a kind of trouble in one election.

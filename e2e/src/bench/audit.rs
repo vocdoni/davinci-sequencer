@@ -326,6 +326,10 @@ pub struct AuditResult {
     /// The next three stay false until [`AuditResult::check`] runs.
     pub tally_ok: bool,
     pub results_ok: bool,
+    /// The registry against the chain order and the transitions; the run
+    /// ANDs in the nodes' `/info` deltas over the scenario. Those counters
+    /// live in memory and reset when a node restarts, so a scenario that
+    /// kills a node (Task 20) must sum per-incarnation deltas.
     pub counters_ok: bool,
     pub observer_incomplete: bool,
     pub stale_errors: BTreeMap<NodeId, usize>,
