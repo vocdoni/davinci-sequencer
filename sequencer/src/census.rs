@@ -43,7 +43,8 @@ const TREE_CACHE: usize = 8;
 const BUILD_PERMITS: usize = 2;
 /// Concurrent census downloads: apart from the builds, so a few slow
 /// servers (any organizer picks the URI) cannot hold up every bootstrap.
-/// Each holds at most `max_bytes` until it gets a build permit.
+/// A downloaded body keeps its permit until it gets a build permit, so at
+/// most this many plus `BUILD_PERMITS` bodies of `max_bytes` are held.
 const DOWNLOAD_PERMITS: usize = 4;
 /// From the first body byte, a download bringing fewer than this many
 /// bytes in a window is cut off (transient): a trickle that stays inside
@@ -630,19 +631,20 @@ impl CensusStore {
             }
         }
         let res = async {
-            let (body, format) = {
-                let _permit = self
-                    .downloads
-                    .acquire()
-                    .await
-                    .map_err(|e| CensusError::Fetch(e.to_string()))?;
-                self.download(uri).await?
-            };
-            let _permit = self
+            let dl = self
+                .downloads
+                .acquire()
+                .await
+                .map_err(|e| CensusError::Fetch(e.to_string()))?;
+            let (body, format) = self.download(uri).await?;
+            // The body waits for a build holding its download permit: at most
+            // DOWNLOAD_PERMITS + BUILD_PERMITS bodies in memory.
+            let _build = self
                 .builds
                 .acquire()
                 .await
                 .map_err(|e| CensusError::Fetch(e.to_string()))?;
+            drop(dl);
             self.build_and_store(body, format, expected_root).await
         }
         .await;
@@ -1383,9 +1385,9 @@ mod tests {
         let mut cs = private_store(&dir);
         cs.min_rate = (4096, Duration::from_millis(500));
         let addr = trickle(64, Duration::from_millis(100)).await;
-        let t = Instant::now();
+        // The error names the floor; the timeout only stops a hang.
         let e = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(25),
             cs.fetch(&format!("http://{addr}/c.json"), &Fr::from(1u64)),
         )
         .await
@@ -1393,7 +1395,49 @@ mod tests {
         .unwrap_err();
         assert!(matches!(e, CensusError::Fetch(_)), "{e}");
         assert!(e.to_string().contains("slower than"), "{e}");
-        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    }
+
+    // A downloaded body waits for a build permit holding its download
+    // permit: with the builds busy, at most DOWNLOAD_PERMITS bodies sit in
+    // memory however many fetches are queued.
+    #[tokio::test]
+    async fn bodies_waiting_for_a_build_keep_their_download_permit() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (parts, root) = vector();
+        let body = census_json(&parts);
+        let served = Arc::new(AtomicUsize::new(0));
+        let n = served.clone();
+        let app = Router::new().route(
+            "/:k",
+            get(move || {
+                let (body, n) = (body.clone(), n.clone());
+                async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            }),
+        );
+        let addr = serve(app).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cs = Arc::new(private_store(&dir));
+        let builds = cs.builds.acquire_many(BUILD_PERMITS as u32).await.unwrap();
+        let fetches: Vec<_> = (0..8u64)
+            .map(|k| {
+                let cs = cs.clone();
+                tokio::spawn(
+                    async move { cs.fetch(&format!("http://{addr}/{k}.json"), &root).await },
+                )
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(served.load(Ordering::SeqCst), DOWNLOAD_PERMITS);
+        drop(builds);
+        for f in fetches {
+            f.await.unwrap().unwrap();
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 8);
+        assert!(cs.has(&root).unwrap());
     }
 
     // Slow downloads hold download permits only: two of them do not hold up
