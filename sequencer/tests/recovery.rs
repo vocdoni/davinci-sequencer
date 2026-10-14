@@ -593,3 +593,77 @@ async fn crash_inside_genesis_creation_respawns() {
         shutdown.cancel();
     }
 }
+
+/// The rebuild after a reorg drops the tree and the log in one write and
+/// re-creates the genesis after it. A crash in between (here: the genesis
+/// writes fail) reopens at genesis and the resync takes it to the chain.
+#[tokio::test(start_paused = true)]
+async fn crash_after_the_rebuild_dropped_the_tree_reopens() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1200 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_until("settled", async || all_settled(&h, &vids).await).await;
+    }
+    s.chain.reorg_out_last_transition();
+    let v2 = fake_vote(&s.env, 2, &[1, 2], 1202);
+    vids.push(v2.pkg.vote_id);
+    h.submit(v2).await.unwrap();
+    // Diverged, and the rebuild a while off: from here no tree write lands.
+    wait_until("the revert", async || {
+        node.metrics.lost_races.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    db.fail_next_arbo_writes(u32::MAX);
+    for _ in 0..200 {
+        if node.metrics.rebuilds.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    assert!(db.transitions(&pid_fr()).unwrap().is_empty());
+    shutdown.cancel();
+    drop((h, node, db));
+
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    for _ in 0..200 {
+        if all_settled(&h, &vids).await && h.snapshot().await.unwrap().root == s.chain.root() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(all_settled(&h, &vids).await, "not every vote settled");
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(s.chain.voters(), 3);
+    shutdown.cancel();
+}

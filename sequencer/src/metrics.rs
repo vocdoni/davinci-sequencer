@@ -27,6 +27,9 @@ pub struct Metrics {
     pub guest_rejections: AtomicU64,
     /// Reorgs seen at the monitor's event cursor (events re-routed).
     pub reorgs: AtomicU64,
+    /// Processes rebuilt from the chain after a reorg took transitions
+    /// they had committed.
+    pub rebuilds: AtomicU64,
     /// Proving-time model the batch budget sizes against.
     pub prove: ProveModel,
 }

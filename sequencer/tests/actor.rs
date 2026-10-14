@@ -6817,3 +6817,262 @@ async fn reincluded_transition_is_a_noop_while_idle() {
 async fn reincluded_transition_does_not_abort_a_flight() {
     reincluded_transition_is_a_noop(true).await;
 }
+
+// ------------------------------------------- ahead of the chain (reorgs)
+
+/// Slots a transition changed, from its stored blobs.
+fn updated_slots(db: &Db, nf: u8, index: u64) -> Vec<u64> {
+    let blobs = db.blobs(&pid_fr(), index).unwrap();
+    decode_blobs(&blobs, nf)
+        .unwrap()
+        .updates
+        .iter()
+        .map(|(s, _)| *s)
+        .collect()
+}
+
+/// The stored transition that settled `vid`.
+fn transition_of(db: &Db, nf: u8, vid: u64) -> u64 {
+    db.transitions(&pid_fr())
+        .unwrap()
+        .iter()
+        .find(|t| {
+            let blobs = db.blobs(&pid_fr(), t.index).unwrap();
+            decode_blobs(&blobs, nf).unwrap().vote_ids.contains(&vid)
+        })
+        .unwrap()
+        .index
+}
+
+/// A reorg takes our committed transition: the node, ahead of the chain,
+/// notices at the next revert, waits for the chain to come back, then
+/// rebuilds from the chain. The batch's votes go back to pending and
+/// re-seal on the chain's root, covering every slot the lost batch exposed
+/// (24 occupied slots: a batch refreshes a random 16 of them); the
+/// transition the chain kept stays settled.
+#[tokio::test(start_paused = true)]
+async fn reorged_out_own_transition_rebuilds_and_reseals() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        24,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let kept = submit_n(&h, &s, 24, 1000).await;
+    wait_long("24 settled", async || all_settled(&h, &kept).await).await;
+    let lone = |i: usize| fake_vote(&s.env, i, &[1, 2], 1000 + i as u64);
+    let (v24, v25) = (lone(24), lone(25));
+    let vids = [v24.pkg.vote_id, v25.pkg.vote_id];
+    h.submit(v24).await.unwrap();
+    s.chain.advance_time(400);
+    wait_long("v24 settled", async || all_settled(&h, &vids[..1]).await).await;
+    let lost = updated_slots(&db, nf, 1);
+    s.chain.reorg_out_last_transition();
+    // The next batch seals on our root and reverts, which re-reads the chain.
+    h.submit(v25).await.unwrap();
+    s.chain.advance_time(400);
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(all_settled(&h, &kept).await, "a kept vote was touched");
+    wait_long("all settled on the chain's root", async || {
+        all_settled(&h, &vids).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 26);
+    assert!(h.snapshot().await.unwrap().synced);
+    let note = db.process(&pid_fr()).unwrap().unwrap().note.unwrap();
+    assert!(note.contains("reorg"), "{note}");
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, vids[0]));
+    for slot in lost {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out an exposed slot"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
+
+/// A reorg takes a peer's transition and another peer's batch lands from
+/// the same root: the node, holding the first one, sees the chain fork from
+/// a root it passed, rebuilds and follows the new branch. The vote the lost
+/// transition had settled goes back to pending and settles again.
+#[tokio::test(start_paused = true)]
+async fn reorged_out_peer_transition_follows_the_new_branch() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    // Ours waits for company; a peer settles it first.
+    let a = fake_vote(&s.env, 0, &[1, 2], 1100);
+    h.submit(a.clone()).await.unwrap();
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&a)));
+    wait_long("a settled by the peer", async || {
+        all_settled(&h, &[a.pkg.vote_id]).await
+    })
+    .await;
+    s.chain.reorg_out_last_transition();
+    let b = fake_vote(&s.env, 1, &[2, 1], 1101);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&b)));
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("on the new branch", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.root == s.chain.root() && snap.synced
+    })
+    .await;
+    assert!(h.vote_id_proof(b.pkg.vote_id).await.is_ok());
+    assert_eq!(
+        vote_status(&h, a.pkg.vote_id).await,
+        Some(VoteStatus::Pending)
+    );
+    s.chain.advance_time(400);
+    wait_long("a settled again", async || {
+        all_settled(&h, &[a.pkg.vote_id]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    // Every exposed vote settled: the widened set is gone.
+    wait_long("exposed set cleared", async || {
+        db.exposed(&pid_fr()).unwrap().is_none()
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// A reorg the new branch undoes within the wait (it re-includes our
+/// transition) rebuilds nothing. Meanwhile nothing seals on our root: the
+/// monitor's rewind routes an old transition again, whose re-read shows
+/// the chain behind us. The read back at our root ends the divergence and
+/// the held vote seals at once.
+#[tokio::test(start_paused = true)]
+async fn reorg_undone_within_the_wait_does_not_rebuild() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1300 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    let ev = s.chain.reorg_out_last_transition();
+    let block = s.chain.reinclude_transition(0);
+    wait_long("the old transition routed again", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    let calls = prover.calls();
+    let v2 = fake_vote(&s.env, 2, &[1, 2], 1302);
+    vids.push(v2.pkg.vote_id);
+    h.submit(v2).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(prover.calls(), calls, "sealed on a root the chain left");
+    s.chain.restore_transition(ev);
+    let mut settled = false;
+    for _ in 0..30 {
+        if all_settled(&h, &vids).await {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(settled, "the held vote waited out the divergence");
+    tokio::time::sleep(Duration::from_secs(200)).await;
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 0);
+    assert_eq!(s.chain.voters(), 3);
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// A reorg takes two of our transitions and the new branch re-includes only
+/// the first: the wait restarts at that progress, then the node rebuilds
+/// from where the chain stopped and re-seals the lost vote.
+#[tokio::test(start_paused = true)]
+async fn reorg_partly_undone_rebuilds_from_where_the_chain_stops() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..3 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1400 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    s.chain.reorg_out_last_transition();
+    let e1 = s.chain.reorg_out_last_transition();
+    let block = s.chain.reinclude_transition(0);
+    wait_long("the old transition routed again", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    s.chain.restore_transition(e1);
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("all settled on the chain's root", async || {
+        all_settled(&h, &vids).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 3);
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}

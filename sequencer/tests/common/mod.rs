@@ -775,6 +775,59 @@ impl FakeChain {
         i.history.clear();
     }
 
+    /// A reorg takes the newest transition: its event is gone and the root,
+    /// counters and batch number are back where it found them. Returns the
+    /// event, for `restore_transition`.
+    pub fn reorg_out_last_transition(&self) -> RegistryEvent {
+        let mut i = self.inner.lock().unwrap();
+        let is_t = |e: &RegistryEvent| matches!(e.kind, EventKind::StateTransitioned { .. });
+        let at = i.events.iter().rposition(is_t).unwrap();
+        let ev = i.events.remove(at);
+        let EventKind::StateTransitioned { old_root, .. } = ev.kind else {
+            unreachable!()
+        };
+        let (voters, overwrites) = i
+            .events
+            .iter()
+            .rev()
+            .find_map(|e| match e.kind {
+                EventKind::StateTransitioned {
+                    voters, overwrites, ..
+                } => Some((voters, overwrites)),
+                _ => None,
+            })
+            .unwrap_or((0, 0));
+        i.proc.state_root = old_root;
+        i.proc.voters_count = voters;
+        i.proc.overwritten_count = overwrites;
+        i.proc.batch_number -= 1;
+        i.history.clear();
+        ev
+    }
+
+    /// The new branch re-includes a transition a reorg took, in a new block.
+    pub fn restore_transition(&self, mut ev: RegistryEvent) {
+        let mut i = self.inner.lock().unwrap();
+        let EventKind::StateTransitioned {
+            old_root,
+            new_root,
+            voters,
+            overwrites,
+            ..
+        } = ev.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(old_root, i.proc.state_root);
+        i.proc.state_root = new_root;
+        i.proc.voters_count = voters;
+        i.proc.overwritten_count = overwrites;
+        i.proc.batch_number += 1;
+        i.block += 1;
+        ev.block = i.block;
+        i.events.push(ev);
+    }
+
     /// The `n`-th transition event (from 0) again, in a new block: a reorg
     /// branch that re-included the same transaction higher up.
     pub fn reinclude_transition(&self, n: usize) -> u64 {

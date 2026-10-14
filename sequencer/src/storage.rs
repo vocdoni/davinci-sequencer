@@ -744,6 +744,42 @@ impl Db {
         })
     }
 
+    /// A reorg took transitions the process committed: drops its tree
+    /// table, every transition and blob, puts `vids` back in the queue
+    /// (pending, at its head in this order), and stores the exposed set and
+    /// the process record, in one commit. The tree is re-created at genesis
+    /// after it; a crash in between reopens at genesis (no stored tree).
+    pub fn reset_process(
+        &self,
+        pid: &Fr,
+        vids: &[u64],
+        exposed: &ExposedRecord,
+        process: &ProcessRecord,
+    ) -> Result<()> {
+        self.write(|tx| {
+            let name = Self::arbo_table(pid);
+            tx.delete_table(TableDefinition::<&[u8], &[u8]>::new(&name))
+                .map_err(db_err)?;
+            let (lo, hi) = prefix_range(&pid_key(pid), 40);
+            tx.open_table(TRANSITIONS)
+                .map_err(db_err)?
+                .retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
+                .map_err(db_err)?;
+            let (lo, hi) = prefix_range(&pid_key(pid), 42);
+            tx.open_table(BLOBS)
+                .map_err(db_err)?
+                .retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
+                .map_err(db_err)?;
+            tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_prepend(tx, pid, vids)?;
+            tx.open_table(EXPOSED)
+                .map_err(db_err)?
+                .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
+                .map_err(db_err)?;
+            tx_put_process(tx, process)
+        })
+    }
+
     /// Stores a transition and its blobs in one commit, replacing any blobs
     /// stored before under the same index.
     pub fn put_transition(&self, pid: &Fr, t: &TransitionRecord, blobs: &[Blob]) -> Result<()> {

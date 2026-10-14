@@ -901,6 +901,14 @@ struct Actor {
     /// The last node-side check failure that held votes pending, named in
     /// their close reason. Our landing clears it.
     held_reason: Option<String>,
+    /// The chain left our log at transition `.0`: it sits at that
+    /// transition's old root, or forked from it (since `.1`). If that holds
+    /// for [`LANDED_EVENT_WAIT`], a reorg took transitions we committed and
+    /// the process is rebuilt from the chain.
+    diverged: Option<(u64, tokio::time::Instant)>,
+    /// A rebuild dropped the tree and re-creating its genesis failed:
+    /// retried before anything touches the state.
+    state_lost: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -1074,6 +1082,8 @@ pub(crate) fn spawn_actor(
         isolated: 0,
         prover_hold: None,
         held_reason: None,
+        diverged: None,
+        state_lost: false,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1569,7 +1579,7 @@ impl Actor {
         // An Ignored actor never runs. A Finalized one never seals or
         // finalizes, but follows the chain to its final root (resync, then
         // the close-out of what is left).
-        if self.record.local == LocalStatus::Ignored {
+        if self.record.local == LocalStatus::Ignored || !self.reopen_state() {
             return;
         }
         // Our results receipt saw no event in time: a chain read decides.
@@ -1616,6 +1626,10 @@ impl Actor {
             {
                 warn!(pid = %hex::encode(self.pid31), "results transaction never confirmed; resubmitting");
             }
+        }
+        self.maybe_rebuild().await;
+        if self.state_lost {
+            return;
         }
         // Landed-but-unconfirmed flight: if the chain never showed our root
         // by the deadline (the tx reorged out), roll back and requeue.
@@ -1712,6 +1726,21 @@ impl Actor {
         self.read_block = self.read_block.max(block);
         let committed = self.state.committed().root;
         let before = self.record.onchain.clone();
+        let passed = self.passed_index(&p.state_root);
+        // At a root we passed: lag, or a reorg took our later transitions.
+        // Back at our root (or our flight's), the chain came back.
+        match passed {
+            Some(i) => self.diverge(i, true),
+            None if p.state_root == committed
+                || self
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|f| f.prepared.new_root == p.state_root) =>
+            {
+                self.diverged = None
+            }
+            None => {}
+        }
         // The chain is at our tree's root and the pin is not: the record
         // write after a commit was lost.
         if p.state_root == committed && before.state_root != committed {
@@ -1723,7 +1752,7 @@ impl Actor {
         // it. A root we passed would be a reorg, not a target.
         if matches!(p.status, ProcessStatus::Canceled | ProcessStatus::Results)
             && p.state_root != self.record.onchain.state_root
-            && !self.passed_root(&p.state_root)
+            && passed.is_none()
         {
             info!(pid = %hex::encode(self.pid31), root = %format!("0x{}", hex::encode(p.state_root)), "process closed at a root not reached yet; syncing to it");
             self.record.onchain.state_root = p.state_root;
@@ -1739,7 +1768,7 @@ impl Actor {
                 .in_flight
                 .as_ref()
                 .is_none_or(|f| f.prepared.new_root != p.state_root)
-            && !self.passed_root(&p.state_root)
+            && passed.is_none()
         {
             info!(pid = %hex::encode(self.pid31), root = %format!("0x{}", hex::encode(p.state_root)), "chain at an unknown root; syncing before the next seal");
             self.await_sync = true;
@@ -1779,13 +1808,242 @@ impl Actor {
         pinned
     }
 
-    /// Whether `root` is the old root of a transition in our log: a chain
-    /// read showing it lags. A failed read counts as not passed.
-    fn passed_root(&self, root: &[u8; 32]) -> bool {
+    /// The index of the transition in our log leaving `root`, a root we
+    /// passed: a chain read showing it lags or lost our later transitions.
+    /// A failed read counts as not passed.
+    fn passed_index(&self, root: &[u8; 32]) -> Option<u64> {
         match self.deps.db.transitions(&self.pid) {
-            Ok(ts) => ts.iter().any(|t| t.old_root == *root),
+            Ok(ts) => ts.iter().find(|t| t.old_root == *root).map(|t| t.index),
             Err(e) => {
                 error!(pid = %hex::encode(self.pid31), %e, "transitions read");
+                None
+            }
+        }
+    }
+
+    /// The chain left our log at transition `index`: it sits at that
+    /// transition's old root (`at_root`), or forked from it. A read further
+    /// along our log restarts the wait (the chain is taking it back).
+    fn diverge(&mut self, index: u64, at_root: bool) {
+        let now = tokio::time::Instant::now();
+        self.diverged = match self.diverged {
+            Some((d, _)) if at_root && index > d => Some((index, now)),
+            Some((d, t)) => Some((d.min(index), t)),
+            None => {
+                warn!(pid = %hex::encode(self.pid31), index, at_root, "the chain left our transition log; rebuilding from it unless it comes back");
+                Some((index, now))
+            }
+        };
+    }
+
+    /// The chain left our log for [`LANDED_EVENT_WAIT`]: a fresh read still
+    /// off our root rebuilds the process from the chain.
+    async fn maybe_rebuild(&mut self) {
+        let Some((d, since)) = self.diverged else {
+            return;
+        };
+        if tokio::time::Instant::now() < since + LANDED_EVENT_WAIT {
+            return;
+        }
+        let p = match self.fresh_read().await {
+            Ok((_, _, p)) => p,
+            Err(e) => {
+                debug!(pid = %hex::encode(self.pid31), %e, "divergence read; retrying");
+                return;
+            }
+        };
+        if p.state_root == self.state.committed().root
+            || self
+                .in_flight
+                .as_ref()
+                .is_some_and(|f| f.prepared.new_root == p.state_root)
+        {
+            self.diverged = None;
+            return;
+        }
+        let d = match self.passed_index(&p.state_root) {
+            Some(i) if i > d => return self.diverge(i, true),
+            Some(i) => i,
+            None => d,
+        };
+        self.rebuild_from_chain(d, &p);
+    }
+
+    /// Settled votes whose id is not in the tree at `root`: those the
+    /// transitions after it settled. Every past root stays readable (tree
+    /// nodes are never deleted).
+    fn settled_after(&self, root: &[u8; 32]) -> Result<Vec<u64>, String> {
+        let e = |e: &dyn std::fmt::Display| e.to_string();
+        let ids = self
+            .deps
+            .db
+            .vote_ids_with_status(&self.pid, &[VoteStatus::Settled])
+            .map_err(|x| e(&x))?;
+        let storage = self.deps.db.arbo_storage(&self.pid).map_err(|x| e(&x))?;
+        let tree = arbo::Tree::new(storage, davinci_zkvm_sdk::limits::SMT_LEVELS, arbo::Sha256)
+            .map_err(|x| e(&x))?;
+        let mut out = Vec::new();
+        for vid in ids {
+            // The state tree's vote-id key: 8 bytes little-endian.
+            if !tree
+                .gen_proof_at(root, &vid.to_le_bytes())
+                .map_err(|x| e(&x))?
+                .exists
+            {
+                out.push(vid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// A reorg took transitions from index `d` on, which we committed. In
+    /// one write: drop the tree and the log, put the votes those transitions
+    /// settled back in the queue (the close-out errors them after the
+    /// resync if the window closed), widen the exposed set by every slot
+    /// they changed (their blobs are public), pin the chain's root. Then
+    /// re-create the genesis and replay the chain from its blobs.
+    fn rebuild_from_chain(&mut self, d: u64, p: &OnchainProcess) {
+        let pid = hex::encode(self.pid31);
+        let log = match self.deps.db.transitions(&self.pid) {
+            Ok(l) => l,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: transitions read");
+                return;
+            }
+        };
+        let Some(fork) = log.iter().find(|t| t.index == d).map(|t| t.old_root) else {
+            error!(%pid, d, "rebuild: no transition at the divergence");
+            self.diverged = None;
+            return;
+        };
+        let genesis = match genesis_root(self.state.config()) {
+            Ok(g) => g,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: genesis root");
+                return;
+            }
+        };
+        // A flight on our root can never land now.
+        if let Some(f) = self.in_flight.take() {
+            self.rollback_flight(&f);
+            self.requeue_flight(f);
+        }
+        let unsettle = match cpu(|| self.settled_after(&fork)) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: settled votes");
+                return;
+            }
+        };
+        let mut back: Vec<(u64, VerifiedVote)> = Vec::new();
+        for vid in &unsettle {
+            match self.deps.db.vote(&self.pid, *vid) {
+                Ok(Some(sv)) => match unpack_vote(&sv.package) {
+                    Ok(v) => back.push((sv.created_at, v)),
+                    // Pending in storage: recover() errors it at a restart.
+                    Err(e) => warn!(%pid, vid, %e, "unreadable stored vote"),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    error!(%pid, %e, "rebuild: vote read");
+                    return;
+                }
+            }
+        }
+        back.sort_by_key(|(at, _)| *at);
+        // Re-seals of these votes cover every slot of the public batches
+        // that carried them.
+        let nf = self.state.config().ballot_mode.num_fields;
+        let mut slots = self.exposed.clone();
+        let lost = log.iter().filter(|t| t.index >= d);
+        for t in lost.clone().filter(|_| !unsettle.is_empty()) {
+            let td = match self.deps.db.blobs(&self.pid, t.index) {
+                Ok(b) if !b.is_empty() => cpu(|| decode_blobs(&b, nf)).ok(),
+                _ => None,
+            };
+            match td {
+                Some(td) if td.vote_ids.iter().any(|v| unsettle.contains(v)) => {
+                    slots.extend(td.updates.iter().map(|(s, _)| *s));
+                }
+                Some(_) => {}
+                None => {
+                    warn!(%pid, index = t.index, "rebuild: blobs of a lost transition unreadable; its slots stay out of the exposed set")
+                }
+            }
+        }
+        let mut vids = self.exposed_vids.clone();
+        vids.extend(back.iter().map(|(_, v)| v.pkg.vote_id));
+        let exposed = crate::storage::ExposedRecord {
+            slots: slots.iter().copied().collect(),
+            vote_ids: vids.iter().copied().collect(),
+        };
+        let depth = lost.count();
+        let mut record = self.record.clone();
+        record.onchain.state_root = p.state_root;
+        record.onchain.voters_count = p.voters_count;
+        record.onchain.overwritten_count = p.overwritten_count;
+        record.note = Some(format!(
+            "rebuilt from the chain: a reorg took {depth} committed transitions"
+        ));
+        let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
+        self.state.release_reads();
+        if let Err(e) = self
+            .deps
+            .db
+            .reset_process(&self.pid, &order, &exposed, &record)
+        {
+            error!(%pid, %e, "rebuild write failed; retrying");
+            return;
+        }
+        error!(
+            %pid,
+            depth,
+            index = d,
+            unsettled = order.len(),
+            root = %format!("0x{}", hex::encode(p.state_root)),
+            "a reorg took transitions we committed; rebuilt the process from the chain"
+        );
+        self.metrics.rebuilds.fetch_add(1, Ordering::SeqCst);
+        self.record = record;
+        self.exposed = slots;
+        self.exposed_vids = vids;
+        for (at, v) in back {
+            self.pending.push(v);
+            self.pending_at.push(at);
+        }
+        self.sort_pending();
+        self.next_index = 0;
+        self.last_tx_block = 0;
+        self.log_root = genesis;
+        self.await_sync = true;
+        self.resync_after = None;
+        self.resync_backoff_ms = 0;
+        self.pin_deadline = None;
+        self.diverged = None;
+        self.cap_est = None;
+        self.held = None;
+        self.vote_at_stale = true;
+        self.state_lost = true;
+        self.reopen_state();
+    }
+
+    /// Re-creates the genesis a rebuild left to do; false while that fails.
+    fn reopen_state(&mut self) -> bool {
+        if !self.state_lost {
+            return true;
+        }
+        let cfg = self.state.config().clone();
+        let cap = self.state.blob_cap();
+        match open_state(&self.deps.db, &self.pid, &cfg)
+            .and_then(|mut s| s.set_blob_cap(cap).map(|()| s).map_err(ierr))
+        {
+            Ok(s) => {
+                self.state = s;
+                self.state_lost = false;
+                true
+            }
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "re-creating the rebuilt process failed; retrying");
                 false
             }
         }
@@ -2010,6 +2268,8 @@ impl Actor {
             || self.pending.is_empty()
             || self.record.local != LocalStatus::Active
             || self.deps.contracts.signer().is_none()
+            // The chain left our log: our root may never land.
+            || self.diverged.is_some()
             // Never seal off a stale root: wait until the committed tree
             // matches the pinned on-chain root (resync closes the gap).
             || self.state.committed().root != self.record.onchain.state_root
@@ -2942,6 +3202,8 @@ impl Actor {
         }
         self.metrics.lost_races.fetch_add(1, Ordering::SeqCst);
         self.await_sync = true;
+        // Re-read: a chain at a root we passed is a reorg, not a race.
+        self.vote_at_stale = true;
         warn!(pid = %hex::encode(self.pid31), "lost the settlement race, waiting for sync");
         self.requeue_flight(f);
         false
@@ -3041,6 +3303,11 @@ impl Actor {
     }
 
     async fn on_event(&mut self, ev: RegistryEvent) {
+        // No tree to apply it to: the rebuild's resync replays transitions
+        // from the creation and its read merges the fields.
+        if !self.reopen_state() {
+            return;
+        }
         // A backlog event older than a merged chain read would rewind the
         // record (an older duration closing the window early). Transitions
         // still apply: the read does not move the tree.
@@ -3403,15 +3670,21 @@ impl Actor {
     /// Whether this transition is already in the local log (a replay), by
     /// its roots: a reorg branch can re-include the same transaction in a
     /// later block. Roots never repeat, so one leaving the committed root
-    /// is new.
-    fn seen_tx(&self, old_root: &[u8; 32], new_root: &[u8; 32]) -> bool {
+    /// is new; one leaving a root we passed for another is the chain
+    /// forking there.
+    fn seen_tx(&mut self, old_root: &[u8; 32], new_root: &[u8; 32]) -> bool {
         if *old_root == self.state.committed().root {
             return false;
         }
         match self.deps.db.transitions(&self.pid) {
-            Ok(ts) => ts
-                .iter()
-                .any(|t| t.old_root == *old_root && t.new_root == *new_root),
+            Ok(ts) => match ts.iter().find(|t| t.old_root == *old_root) {
+                Some(t) if t.new_root == *new_root => true,
+                Some(t) => {
+                    self.diverge(t.index, false);
+                    false
+                }
+                None => false,
+            },
             Err(e) => {
                 error!(pid = %hex::encode(self.pid31), %e, "transitions read");
                 false
@@ -3521,6 +3794,7 @@ impl Actor {
                 return;
             }
         };
+        let mut log: Option<Vec<crate::storage::TransitionRecord>> = None;
         for ev in events {
             if *ev.kind.pid() != self.pid31 {
                 continue;
@@ -3558,8 +3832,8 @@ impl Actor {
                 .await;
                 continue;
             }
-            if old_root == committed
-                && !self
+            if old_root == committed {
+                if !self
                     .apply_sync(
                         ev.block,
                         ev.tx_hash.0,
@@ -3570,8 +3844,24 @@ impl Actor {
                         l1,
                     )
                     .await
+                {
+                    return;
+                }
+                continue;
+            }
+            // Leaving a root we passed for another: the chain forked there.
+            let ts = log.get_or_insert_with(|| {
+                self.deps.db.transitions(&self.pid).unwrap_or_else(|e| {
+                    error!(pid = %hex::encode(self.pid31), %e, "transitions read");
+                    Vec::new()
+                })
+            });
+            if let Some(i) = ts
+                .iter()
+                .find(|t| t.old_root == old_root && t.new_root != new_root)
+                .map(|t| t.index)
             {
-                return;
+                self.diverge(i, false);
             }
         }
     }
@@ -3581,6 +3871,7 @@ impl Actor {
             // Our results transaction awaits its event.
             || self.results_sent.is_some()
             || self.in_flight.is_some()
+            || self.diverged.is_some()
             || self.record.local != LocalStatus::Active
             // Observers never settle, even when they hold the election key.
             || self.deps.contracts.signer().is_none()
