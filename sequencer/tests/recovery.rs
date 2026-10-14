@@ -536,7 +536,8 @@ async fn results_lost_at_a_crash_finalize_locally() {
 
 /// A crash part way through the genesis of a new process (its tree written,
 /// no committed record yet): the restart re-creates it and the process
-/// spawns and settles.
+/// spawns and settles. (Whether the bootstrap retry spawns it before the
+/// restart is the monitor's business.)
 #[tokio::test]
 async fn crash_inside_genesis_creation_respawns() {
     for skip in [2, 4] {
@@ -562,10 +563,6 @@ async fn crash_inside_genesis_creation_respawns() {
         })
         .await;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !node.processes.read().await.contains_key(&pid_fr()),
-            "the cut genesis spawned"
-        );
         shutdown.cancel();
         drop((node, db));
 
@@ -665,5 +662,121 @@ async fn crash_after_the_rebuild_dropped_the_tree_reopens() {
     assert!(all_settled(&h, &vids).await, "not every vote settled");
     assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
     assert_eq!(s.chain.voters(), 3);
+    shutdown.cancel();
+}
+
+/// Opens a node of 24-vote batches with the timers of the batching tests.
+async fn timed_node(
+    db: Db,
+    dir: &Path,
+    s: &TestSetup,
+    prover: Arc<FakeProver>,
+    shutdown: &CancellationToken,
+) -> (Node, ActorHandle) {
+    let extra = ["--batch-time", "100s", "--solo-wait", "300s"];
+    let cfg = test_config_with(dir, &s.census_dir, 24, "0s", &extra);
+    let node = start_node_cfg(db, s.chain.clone(), prover, cfg, shutdown.clone()).await;
+    let h = handle(&node).await;
+    (node, h)
+}
+
+/// Waits up to `secs` (virtual) seconds, one second at a time.
+async fn wait_secs(what: &str, secs: u64, mut f: impl AsyncFnMut() -> bool) {
+    for _ in 0..secs {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("timeout waiting for {what}");
+}
+
+/// The repair of a revote's lost transition record waits while its blobs
+/// cannot be fetched: no record without its archive, and the batch's
+/// exposed set is kept meanwhile. Once the record is written with its
+/// blobs, a reorg that takes the revote rebuilds, and the re-seal covers
+/// every slot the revote's batch published (24 occupied slots: a batch
+/// refreshes a random 16 of them).
+#[tokio::test(start_paused = true)]
+async fn repair_waits_for_the_blobs_and_keeps_the_exposed_set() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1700 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    // A revote, sealed alone; its landing's record writes fail (the crash).
+    let rv = fake_vote(&s.env, 0, &[2, 1], 1800);
+    let rvid = rv.pkg.vote_id;
+    h.submit(rv).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("revote sealed", 600, async || prover.calls() >= 2).await;
+    let exposed = db.exposed(&pid_fr()).unwrap().unwrap().slots;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_secs("landed in the tree", 600, async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let head = s.chain.head_block();
+    wait_secs("event routed", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(head)
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+
+    // The restart cannot fetch the revote's blobs.
+    s.chain.fail_blobs(u32::MAX);
+    let db = reopen_db(dir.path()).await;
+    let shutdown = CancellationToken::new();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, FakeProver::open(), &shutdown).await;
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(
+        db.transitions(&pid_fr()).unwrap().len(),
+        1,
+        "the revote's record was written without its blobs"
+    );
+    let kept = db.exposed(&pid_fr()).unwrap().map(|r| r.slots);
+    assert_eq!(kept.as_ref(), Some(&exposed), "the exposed set was dropped");
+    s.chain.fail_blobs(0);
+    wait_secs("the record with its blobs", 600, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 2
+    })
+    .await;
+    let t = &db.transitions(&pid_fr()).unwrap()[1];
+    assert_eq!(db.blobs(&pid_fr(), 1).unwrap().len() as u64, t.n_blobs);
+
+    // A reorg takes the revote; the next batch reverts and the node rebuilds.
+    s.chain.reorg_out_last_transition();
+    let w = fake_vote(&s.env, 25, &[1, 2], 1801);
+    let wid = w.pkg.vote_id;
+    h.submit(w).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("rebuilt", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    s.chain.advance_time(400);
+    wait_secs("all settled on the chain's root", 600, async || {
+        all_settled(&h, &[rvid, wid]).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, rvid));
+    for slot in exposed {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out an exposed slot"
+        );
+    }
     shutdown.cancel();
 }

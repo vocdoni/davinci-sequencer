@@ -6820,30 +6820,6 @@ async fn reincluded_transition_does_not_abort_a_flight() {
 
 // ------------------------------------------- ahead of the chain (reorgs)
 
-/// Slots a transition changed, from its stored blobs.
-fn updated_slots(db: &Db, nf: u8, index: u64) -> Vec<u64> {
-    let blobs = db.blobs(&pid_fr(), index).unwrap();
-    decode_blobs(&blobs, nf)
-        .unwrap()
-        .updates
-        .iter()
-        .map(|(s, _)| *s)
-        .collect()
-}
-
-/// The stored transition that settled `vid`.
-fn transition_of(db: &Db, nf: u8, vid: u64) -> u64 {
-    db.transitions(&pid_fr())
-        .unwrap()
-        .iter()
-        .find(|t| {
-            let blobs = db.blobs(&pid_fr(), t.index).unwrap();
-            decode_blobs(&blobs, nf).unwrap().vote_ids.contains(&vid)
-        })
-        .unwrap()
-        .index
-}
-
 /// A reorg takes our committed transition: the node, ahead of the chain,
 /// notices at the next revert, waits for the chain to come back, then
 /// rebuilds from the chain. The batch's votes go back to pending and

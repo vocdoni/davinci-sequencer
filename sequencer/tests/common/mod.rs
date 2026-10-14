@@ -2163,6 +2163,33 @@ pub fn peer_batch_of(
         .unwrap()
 }
 
+/// Slots a transition changed, from its stored blobs.
+pub fn updated_slots(db: &Db, nf: u8, index: u64) -> Vec<u64> {
+    let blobs = db.blobs(&pid_fr(), index).unwrap();
+    davinci_zkvm_sdk::blob::decode_blobs(&blobs, nf)
+        .unwrap()
+        .updates
+        .iter()
+        .map(|(s, _)| *s)
+        .collect()
+}
+
+/// The stored transition that settled `vid`.
+pub fn transition_of(db: &Db, nf: u8, vid: u64) -> u64 {
+    db.transitions(&pid_fr())
+        .unwrap()
+        .iter()
+        .find(|t| {
+            let blobs = db.blobs(&pid_fr(), t.index).unwrap();
+            davinci_zkvm_sdk::blob::decode_blobs(&blobs, nf)
+                .unwrap()
+                .vote_ids
+                .contains(&vid)
+        })
+        .unwrap()
+        .index
+}
+
 // ------------------------------------------------------------ node setup
 
 pub struct TestSetup {

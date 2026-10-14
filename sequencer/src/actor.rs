@@ -2832,7 +2832,9 @@ impl Actor {
     /// An errored exposed vote recast later is a fresh transition, like any
     /// cross-batch revote; the exposed set only ties re-attempts of one batch.
     fn maybe_clear_exposed(&mut self) {
-        if self.exposed_vids.is_empty() {
+        // The last landing has no record (nor archive) yet: its sealed slots
+        // live only here, and a rebuild would need them.
+        if self.exposed_vids.is_empty() || self.log_root != self.state.committed().root {
             return;
         }
         for vid in &self.exposed_vids {
@@ -3492,9 +3494,9 @@ impl Actor {
 
     /// The record of a transition the tree applied but whose record write
     /// was lost (a crash between the two, or a failed write): the next one
-    /// after the log, met again as its event or in a gap replay. Its blobs
-    /// are fetched best-effort, its counts come from the event's totals, and
-    /// batch votes the lost write left unsettled settle with it.
+    /// after the log, met again as its event or in a gap replay. It waits
+    /// for its blobs, its counts come from the event's totals, and batch
+    /// votes the lost write left unsettled settle with it.
     #[allow(clippy::too_many_arguments)] // the event's fields, as routed
     async fn record_missing(
         &mut self,
@@ -3516,10 +3518,15 @@ impl Actor {
             }
             Some(l) => self.deps.blobs.blobs_for_l1(&l.blocks, &l.vhs).await,
         };
-        let blobs = fetched.unwrap_or_else(|e| {
-            warn!(pid = %hex::encode(self.pid31), ?e, "blobs of an unrecorded transition unavailable; recording it without them");
-            Vec::new()
-        });
+        // No record without its archive: a rebuild after a reorg needs the
+        // blobs to know which slots the batch published. The resync retries.
+        let blobs = match fetched {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(pid = %hex::encode(self.pid31), ?e, "blobs of an unrecorded transition unavailable; retrying");
+                return;
+            }
+        };
         let (log, vids) = match (
             self.deps.db.transitions(&self.pid),
             self.deps
