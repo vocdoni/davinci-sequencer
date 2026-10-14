@@ -215,6 +215,49 @@ fn create_prepare_commit_and_rollback() {
     assert_eq!(&tally[2..], &[0u64; 14]);
 }
 
+/// `open_stored` reopens at the committed record the storage holds (the
+/// one written with the slot store), rewinding a prepared batch; an empty
+/// storage holds no process, and `open` still refuses another record.
+#[test]
+fn open_stored_reopens_at_the_stored_record() {
+    let env = env(2, 8);
+    let store = arbo::MemoryStorage::new();
+    let err = ProcessState::open_stored(env.cfg.clone(), store.clone())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, Error::Invalid(m) if m.contains("no process")),
+        "{err:?}"
+    );
+
+    let mut st = ProcessState::create(env.cfg.clone(), store.clone()).unwrap();
+    let mut rng = StdRng::seed_from_u64(5);
+    let votes: Vec<_> = (0..3)
+        .map(|i| fake_vote(&env, i, &[1, 2], 300 + i as u64))
+        .collect();
+    let b = st.prepare(&votes, &mut rng, &none()).unwrap();
+    st.commit(&b).unwrap();
+    let committed = st.committed();
+    // A second batch prepared but never committed: the tree moved on.
+    let more = vec![fake_vote(&env, 4, &[0, 1], 310)];
+    let b2 = st.prepare(&more, &mut rng, &none()).unwrap();
+    assert_eq!(st.root(), b2.new_root);
+    drop(st);
+
+    let st = ProcessState::open_stored(env.cfg.clone(), store.clone()).unwrap();
+    assert_eq!(st.committed(), committed);
+    assert_eq!(st.root(), committed.root);
+    assert_eq!(st.occupied(), 3);
+    assert!(st.has_vote_id(votes[0].pkg.vote_id).unwrap());
+    assert!(!st.has_vote_id(more[0].pkg.vote_id).unwrap());
+    drop(st);
+
+    let mut stale = committed.clone();
+    stale.root = genesis_root(&env.cfg).unwrap();
+    assert!(ProcessState::open(env.cfg.clone(), store.clone(), &stale).is_err());
+    ProcessState::open(env.cfg.clone(), store, &committed).unwrap();
+}
+
 #[test]
 fn check_publics_bites_on_tampering() {
     let env = env(2, 4);

@@ -194,13 +194,25 @@ impl<S: Storage> ProcessState<S> {
     /// Opens an existing state and rewinds to `committed` (drops any
     /// prepared-but-uncommitted tree nodes).
     pub fn open(cfg: ProcessConfig, storage: S, committed: &Committed) -> Result<Self, Error> {
+        Self::open_at(cfg, storage, Some(committed))
+    }
+
+    /// Opens an existing state at the committed record it stores, which is
+    /// written in one batch with the slot store it describes, and rewinds
+    /// to it. Fails with "storage holds no process" before `create`.
+    pub fn open_stored(cfg: ProcessConfig, storage: S) -> Result<Self, Error> {
+        Self::open_at(cfg, storage, None)
+    }
+
+    // `want`, when given, must equal the stored record.
+    fn open_at(cfg: ProcessConfig, storage: S, want: Option<&Committed>) -> Result<Self, Error> {
         let db = Shared(Arc::new(storage));
         let vk = load_vk(&cfg)?;
         let stored = db
             .get(KEY_COMMITTED)?
             .ok_or_else(|| Error::Invalid("storage holds no process".into()))?;
-        let stored = committed_from_bytes(&stored)?;
-        if stored != *committed {
+        let committed = committed_from_bytes(&stored)?;
+        if want.is_some_and(|w| *w != committed) {
             return Err(Error::Invalid(
                 "stored committed record differs from the given one".into(),
             ));
@@ -214,7 +226,7 @@ impl<S: Storage> ProcessState<S> {
             cfg,
             db,
             tree,
-            committed: committed.clone(),
+            committed,
             occupied: occ_from_bytes(&occ)?,
             vk,
             blob_cap: TX_BLOB_CAP,
