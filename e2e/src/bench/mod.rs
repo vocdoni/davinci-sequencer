@@ -10,6 +10,7 @@ pub mod merge;
 pub mod metrics;
 pub mod money;
 pub mod plan;
+pub mod race;
 pub mod report;
 pub mod rig;
 pub mod run;
