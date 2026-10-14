@@ -1983,6 +1983,15 @@ impl Prover for FakeProver {
     }
 }
 
+/// Another sequencer's batch of `votes`, built on the genesis root.
+pub fn foreign_batch_of(s: &TestSetup, votes: &[VerifiedVote]) -> davinci_state::PreparedBatch {
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    other
+        .prepare(votes, &mut StdRng::seed_from_u64(7), &Default::default())
+        .unwrap()
+}
+
 // ------------------------------------------------------------ node setup
 
 pub struct TestSetup {

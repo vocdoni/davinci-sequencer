@@ -5865,3 +5865,317 @@ async fn lagging_read_does_not_rewind_the_record() {
     assert_eq!(stored(&node.db), end + 5_000);
     shutdown.cancel();
 }
+
+// ------------------------------------------- close-out from chain truth
+
+/// Another sequencer's landing extends the grace while its event is not
+/// routed yet: a heartbeat past the old grace end must not error a vote the
+/// extended window still settles. Once the event shows, the in-flight vote
+/// is requeued by the lost race and both settle in the extension.
+#[tokio::test]
+async fn close_out_waits_for_a_landing_the_events_have_not_shown() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let end = s.chain.end_time();
+    s.chain.advance_time(DURATION - 10);
+    beats().await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 1_400);
+    let b = fake_vote(&s.env, 1, &[1, 2], 1_401);
+    let vids = [a.pkg.vote_id, b.pkg.vote_id];
+    h.submit(a).await.unwrap();
+    h.submit(b).await.unwrap();
+    // A seals (flush) and sits in the prover; B waits.
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.advance_time(110);
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.settle_externally(&foreign_batch_of(
+        &s,
+        &[
+            fake_vote(&s.env, 2, &[1, 2], 70),
+            fake_vote(&s.env, 3, &[2, 3], 71),
+        ],
+    ));
+    assert_eq!(s.chain.grace_end(), end + 100 + GRACE.default_grace);
+    // Past the old grace end, inside the new one.
+    s.chain.advance_time(60);
+    beats().await;
+    assert!(s.chain.time() < s.chain.grace_end());
+    assert_eq!(
+        vote_status(&h, vids[1]).await,
+        Some(VoteStatus::Pending),
+        "closed at the stale grace end"
+    );
+    s.chain.hide_block(None);
+    prover.release(10);
+    wait_until("both settled in the extended window", async || {
+        for vid in vids {
+            assert_ne!(vote_status(&h, vid).await, Some(VoteStatus::Error));
+        }
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// A pending vote another sequencer settled, whose sync lags (blob fetches
+/// fail) when the grace ends: it settles from the sync, never errors.
+#[tokio::test]
+async fn close_out_settles_synced_votes_before_erroring() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    // Below every seal trigger: it waits.
+    let x = fake_vote(&s.env, 0, &[1, 2], 1_450);
+    let vid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    s.chain.fail_blobs(3);
+    s.chain.settle_externally(&foreign_batch_of(&s, &[x]));
+    wait_until("first sync attempt failed", async || {
+        s.chain.fail_blobs_left() < 3
+    })
+    .await;
+    s.chain.pass_grace();
+    wait_until("settled from the sync", async || {
+        let st = vote_status(&h, vid).await;
+        assert_ne!(st, Some(VoteStatus::Error), "closed out before the sync");
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// The close-out takes the chain's word, not the record's: an extension
+/// whose event is not routed yet keeps the window open past the old grace
+/// end, and at the real one a read from an endpoint behind the chain (an
+/// unknown root) closes nothing until a good read confirms it.
+#[tokio::test]
+async fn close_out_refuses_a_lagging_read() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    // An observer never seals: the vote waits for the close.
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.observer(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1_500);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.extend_duration(500);
+    s.chain.advance_time(DURATION + GRACE.default_grace + 10);
+    beats().await;
+    assert!(s.chain.time() < s.chain.end_time());
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed at the old grace end"
+    );
+
+    s.chain.hide_block(None);
+    s.chain.lag_process(u32::MAX);
+    s.chain.pass_grace();
+    beats().await;
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed on a lagging read"
+    );
+    s.chain.lag_process(0);
+    wait_until("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    let sv = h.status(vid).await.unwrap().unwrap();
+    assert_eq!(sv.error.as_deref(), Some("process closed"));
+    shutdown.cancel();
+}
+
+/// Results land while the node is behind: a foreign transition that
+/// settled pending X is not applied yet. The node resyncs first (X settles,
+/// the tree reaches the chain's final root) and only then closes out the
+/// rest; until then it does not report itself synced.
+#[tokio::test]
+async fn results_while_behind_resync_first_then_close_out() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.advance_time(DURATION - 10);
+    beats().await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 1_600);
+    let x = fake_vote(&s.env, 1, &[1, 2], 1_601);
+    let (vid_a, vid_x) = (a.pkg.vote_id, x.pkg.vote_id);
+    h.submit(a.clone()).await.unwrap();
+    h.submit(x.clone()).await.unwrap();
+    wait_until("sealed", async || prover.calls() == 1).await;
+    // Another sequencer settles X; its event is not routed yet.
+    s.chain.advance_time(20);
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    let fb = foreign_batch_of(&s, &[x.clone(), fake_vote(&s.env, 3, &[2, 3], 71)]);
+    s.chain.settle_externally(&fb);
+    s.chain.pass_grace();
+    s.chain.set_results_externally(vec![3, 4]);
+    wait_until("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    beats().await;
+    assert_ne!(
+        vote_status(&h, vid_x).await,
+        Some(VoteStatus::Error),
+        "closed out while behind"
+    );
+    assert!(
+        !h.snapshot().await.unwrap().synced,
+        "synced against the pin alone"
+    );
+
+    // A's proof is still out: past RESULTS it can only revert, so the
+    // resync does not wait for it.
+    s.chain.hide_block(None);
+    wait_until("X settled", async || {
+        let st = vote_status(&h, vid_x).await;
+        assert_ne!(st, Some(VoteStatus::Error), "closed out while behind");
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    // A can never settle now: closed once the tree is at the final root.
+    wait_until("A closed", async || {
+        vote_status(&h, vid_a).await == Some(VoteStatus::Error)
+    })
+    .await;
+    prover.release(10);
+    beats().await;
+    assert_eq!(vote_status(&h, vid_a).await, Some(VoteStatus::Error));
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(snap.root, s.chain.root());
+    assert!(snap.synced);
+    let (p, root) = h.vote_id_proof(vid_x).await.unwrap();
+    let tp = davinci_client::api::TrackerProof {
+        process_id: davinci_client::api::ProcessId(pid31()),
+        vote_id: vid_x,
+        root,
+        siblings: p.siblings,
+    };
+    assert!(davinci_client::api::verify_tracker(&tp, &s.chain.root()));
+    assert!(h.slot_ballot(x.slot).await.unwrap().is_some());
+    assert!(h.slot_ballot(a.slot).await.unwrap().is_none());
+    shutdown.cancel();
+}
+
+/// A Finalized process restarted behind the chain (the transition before
+/// the results never reached it) catches up to the final root, without
+/// sealing anything.
+#[tokio::test]
+async fn finalized_actor_keeps_following_the_chain() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    beats().await;
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    s.chain.fail_process(u32::MAX);
+    s.chain.pass_grace();
+    s.chain.set_results_externally(vec![3, 5]);
+    wait_until("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    beats().await;
+    // No read has shown the final root yet.
+    assert!(
+        !h.snapshot().await.unwrap().synced,
+        "synced against the pin alone"
+    );
+    // The first read makes the final root the target, persisted.
+    s.chain.fail_process(0);
+    wait_until("final root pinned", async || {
+        node.db
+            .process(&pid_fr())
+            .unwrap()
+            .unwrap()
+            .onchain
+            .state_root
+            == s.chain.root()
+    })
+    .await;
+    assert!(!h.snapshot().await.unwrap().synced);
+    shutdown.cancel();
+    drop((h, node));
+
+    s.chain.hide_block(None);
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    wait_until("caught up with the final root", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.root == s.chain.root() && snap.synced
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().local, LocalStatus::Finalized);
+    assert_eq!(node.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    assert_eq!(prover.calls(), 0);
+    shutdown.cancel();
+}

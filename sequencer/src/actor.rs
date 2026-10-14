@@ -1170,7 +1170,11 @@ impl Actor {
                     status: self.record.onchain.status,
                     local: self.record.local,
                     accepting: self.accepting(),
-                    synced: c.root == self.record.onchain.state_root && !self.await_sync,
+                    // Finalized: the final root needs a chain read; the
+                    // events may never have shown the transitions before it.
+                    synced: c.root == self.record.onchain.state_root
+                        && !self.await_sync
+                        && (self.record.local != LocalStatus::Finalized || !self.vote_at_stale),
                 });
             }
             Msg::Event(ev) => {
@@ -1502,13 +1506,14 @@ impl Actor {
         Ok(n)
     }
 
-    /// Runs after every message: close out a closed grace window, seal a
-    /// due batch, kick finalization. The monitor's Head messages are the
-    /// heartbeat that drives this.
+    /// Runs after every message: reconcile with the chain (resync), close
+    /// out a closed window, seal a due batch, kick finalization. The
+    /// monitor's Head messages are the heartbeat that drives this.
     async fn tick(&mut self) {
-        // A Finalized (or Ignored) actor is read-only: it serves proofs
-        // from the committed tree and must not resync, seal or finalize.
-        if self.record.local != LocalStatus::Active {
+        // An Ignored actor never runs. A Finalized one never seals or
+        // finalizes, but follows the chain to its final root (resync, then
+        // the close-out of what is left).
+        if self.record.local == LocalStatus::Ignored {
             return;
         }
         // Events carry no block time: read the landing time the grace end
@@ -1517,7 +1522,7 @@ impl Actor {
         // (or an endpoint stuck behind the events) is logged and counted.
         if self.vote_at_stale {
             let why = match self.fresh_read().await {
-                Ok(p) => {
+                Ok((_, p)) => {
                     self.vote_at_stale = !self.apply_read(&p);
                     format!(
                         "chain root 0x{} is not the pinned one",
@@ -1540,10 +1545,6 @@ impl Actor {
             } else {
                 self.stale_ticks = 0;
             }
-        }
-        if !self.vote_at_stale && self.chain_time != 0 && self.chain_time >= self.grace_end() {
-            let reason = self.closed_reason();
-            self.close_out(&reason);
         }
         // Landed-but-unconfirmed flight: if the chain never showed our root
         // by the deadline (the tx reorged out), roll back and requeue.
@@ -1590,18 +1591,25 @@ impl Actor {
                 self.put_record();
             }
         }
+        // Reconcile before anything closes: a vote a synced transition
+        // settled must never be errored.
+        self.maybe_resync().await;
+        self.maybe_close_out().await;
+        if self.record.local != LocalStatus::Active {
+            return;
+        }
         self.maybe_clear_exposed();
         self.maybe_register_census().await;
         self.maybe_recheck_census().await;
-        self.maybe_resync().await;
         self.maybe_seal().await;
         self.maybe_finalize();
     }
 
-    /// `getProcess`, from an endpoint whose head has every block this actor
-    /// acted on: a lagging one could rewind what the events moved.
-    async fn fresh_read(&self) -> Result<OnchainProcess, String> {
-        let (block, _) = self
+    /// The head time and `getProcess`, from an endpoint whose head has every
+    /// block this actor acted on: a lagging one could rewind what the events
+    /// moved.
+    async fn fresh_read(&self) -> Result<(u64, OnchainProcess), String> {
+        let (block, time) = self
             .deps
             .contracts
             .head()
@@ -1613,11 +1621,13 @@ impl Actor {
                 self.seen_block
             ));
         }
-        self.deps
+        let p = self
+            .deps
             .contracts
             .process(&self.pid31)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok((time, p))
     }
 
     /// Applies a fresh chain read: heals a pin left behind the committed
@@ -1633,6 +1643,16 @@ impl Actor {
         if p.state_root == committed && before.state_root != committed {
             warn!(pid = %hex::encode(self.pid31), "pin behind the committed tree; re-pinning at the chain root");
             self.record.onchain.state_root = committed;
+        }
+        // Canceled and RESULTS freeze the root: the read's root is the final
+        // target, even when the events never showed the transitions before
+        // it. A root we passed would be a reorg, not a target.
+        if matches!(p.status, ProcessStatus::Canceled | ProcessStatus::Results)
+            && p.state_root != self.record.onchain.state_root
+            && !self.passed_root(&p.state_root)
+        {
+            info!(pid = %hex::encode(self.pid31), root = %format!("0x{}", hex::encode(p.state_root)), "process closed at a root not reached yet; syncing to it");
+            self.record.onchain.state_root = p.state_root;
         }
         let pinned = p.state_root == self.record.onchain.state_root;
         // A root that is not ours, not one we passed and not our flight's:
@@ -1674,11 +1694,6 @@ impl Actor {
         }
         if o.status != before.status {
             self.status_moved(o.status);
-            // RESULTS comes with ResultsSet in one transaction.
-            if o.status == ProcessStatus::Results {
-                let reason = self.closed_reason();
-                self.close_out(&reason);
-            }
         }
         self.put_record();
         pinned
@@ -1712,7 +1727,15 @@ impl Actor {
             return;
         }
         if self.in_flight.is_some() {
-            return; // an own settlement or its event will resolve first
+            if self.record.local != LocalStatus::Finalized {
+                return; // an own settlement or its event will resolve first
+            }
+            // Past RESULTS a flight can only revert: drop it so the tree can
+            // follow the chain (its votes settle from the sync or close).
+            if let Some(f) = self.in_flight.take() {
+                self.rollback_flight(&f);
+                self.requeue_flight(f);
+            }
         }
         if let Some(t) = self.resync_after
             && tokio::time::Instant::now() < t
@@ -1740,6 +1763,55 @@ impl Actor {
             self.resync_after = None;
             self.resync_backoff_ms = 0;
         }
+    }
+
+    /// A cancel or the results closed the process for good: no grace end
+    /// to wait for.
+    fn close_requested(&self) -> bool {
+        self.record.local == LocalStatus::Finalized
+            || matches!(
+                self.record.onchain.status,
+                ProcessStatus::Canceled | ProcessStatus::Results
+            )
+    }
+
+    /// Errors the pending votes once the chain closed the window: nothing in
+    /// flight, the tree at the pinned root, and a fresh read (head first,
+    /// then the process) at that root with the head past its grace end, or
+    /// the process canceled or with results. A landing in a block up to the
+    /// head is in the read; a later one is past the grace end, which the
+    /// registry refuses. Anything else waits for the next heartbeat.
+    async fn maybe_close_out(&mut self) {
+        let committed = self.state.committed().root;
+        if self.pending.is_empty()
+            || self.in_flight.is_some()
+            || self.await_sync
+            || committed != self.record.onchain.state_root
+            || !(self.close_requested()
+                || (self.chain_time != 0 && self.chain_time >= self.grace_end()))
+        {
+            return;
+        }
+        let (time, p) = match self.fresh_read().await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(pid = %hex::encode(self.pid31), %e, "close-out read; retrying");
+                return;
+            }
+        };
+        // The read is also the refresh: a moved grace end, status or root
+        // lands in the record (and latches a sync) before the decision.
+        self.vote_at_stale = !self.apply_read(&p);
+        if p.state_root != committed
+            || self.await_sync
+            || committed != self.record.onchain.state_root
+            || !(self.close_requested() || time >= p.grace_end(self.deps.grace.grace_max_total))
+        {
+            return;
+        }
+        self.settle_pending_in_tree();
+        let reason = self.closed_reason();
+        self.close_out(&reason);
     }
 
     /// The close reason of a pending vote: held votes name why (a node-side
@@ -2899,10 +2971,7 @@ impl Actor {
             }
             EventKind::ResultsSet { results, .. } => {
                 self.record.onchain.results = results;
-                self.record.onchain.status = ProcessStatus::Results;
-                self.mark_finalized();
-                let reason = self.closed_reason();
-                self.close_out(&reason);
+                self.status_moved(ProcessStatus::Results);
                 // StatusChanged(→RESULTS) precedes this in the same tx, so
                 // mark_finalized's early return must not swallow the
                 // results: persist unconditionally (idempotent).
@@ -2947,9 +3016,10 @@ impl Actor {
         self.record.onchain.status = new;
         self.pause_hold = None;
         // Ended flushes through the grace; the tick closes out at its end.
-        if new == ProcessStatus::Canceled {
-            let reason = self.closed_reason();
-            self.close_out(&reason);
+        // Canceled and RESULTS close out from the tick too, once a read
+        // shows the tree at the chain's final root.
+        if matches!(new, ProcessStatus::Canceled | ProcessStatus::Results) {
+            self.vote_at_stale = true;
         }
         if new == ProcessStatus::Results {
             self.mark_finalized();
