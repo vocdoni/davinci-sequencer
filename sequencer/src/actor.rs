@@ -1988,7 +1988,16 @@ impl Actor {
         // Re-seals of these votes cover every slot of the public batches
         // that carried them.
         let nf = self.state.config().ballot_mode.num_fields;
+        // Synced batches lost before their record: kept apart until now.
+        let synced = match self.deps.db.sync_coverage(&self.pid) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: synced slot coverage");
+                return;
+            }
+        };
         let mut slots = self.exposed.clone();
+        slots.extend(synced.iter().flat_map(|r| r.slots.iter().copied()));
         let lost = log.iter().filter(|t| t.index >= d);
         for t in lost.clone().filter(|_| !unsettle.is_empty()) {
             let td = match self.deps.db.blobs(&self.pid, t.index) {
@@ -2006,6 +2015,7 @@ impl Actor {
             }
         }
         let mut vids = self.exposed_vids.clone();
+        vids.extend(synced.iter().flat_map(|r| r.vote_ids.iter().copied()));
         vids.extend(back.iter().map(|(_, v)| v.pkg.vote_id));
         let exposed = crate::storage::ExposedRecord {
             slots: slots.iter().copied().collect(),
@@ -3795,7 +3805,8 @@ impl Actor {
         };
         // A public batch carrying votes of ours: should a reorg take it before
         // its record is written, their re-seal must cover its slots. Durable
-        // before the transition becomes authoritative.
+        // before the transition becomes authoritative, and kept apart from
+        // the live exposed set (only a rebuild reads it).
         let ours: Vec<u64> = {
             let mine: std::collections::HashSet<u64> = self
                 .pending
@@ -3810,20 +3821,25 @@ impl Actor {
                 .collect()
         };
         if !ours.is_empty() {
-            let mut slots = self.exposed.clone();
-            slots.extend(td.updates.iter().map(|(s, _)| *s));
-            let mut vids = self.exposed_vids.clone();
-            vids.extend(ours);
-            let rec = crate::storage::ExposedRecord {
-                slots: slots.iter().copied().collect(),
-                vote_ids: vids.iter().copied().collect(),
-            };
-            if let Err(e) = self.deps.db.put_exposed(&self.pid, &rec) {
-                error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's exposed slots");
+            let stored = self.deps.db.sync_coverage(&self.pid).and_then(|old| {
+                let mut slots: BTreeSet<u64> =
+                    old.iter().flat_map(|r| r.slots.iter().copied()).collect();
+                slots.extend(td.updates.iter().map(|(s, _)| *s));
+                let mut vids: BTreeSet<u64> = old
+                    .iter()
+                    .flat_map(|r| r.vote_ids.iter().copied())
+                    .collect();
+                vids.extend(ours);
+                let rec = crate::storage::ExposedRecord {
+                    slots: slots.into_iter().collect(),
+                    vote_ids: vids.into_iter().collect(),
+                };
+                self.deps.db.put_sync_coverage(&self.pid, &rec)
+            });
+            if let Err(e) = stored {
+                error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's slot coverage");
                 return false;
             }
-            self.exposed = slots;
-            self.exposed_vids = vids;
         }
         let before = self.state.committed();
         if let Err(e) = cpu(|| self.state.apply_synced(&td, new_root)) {

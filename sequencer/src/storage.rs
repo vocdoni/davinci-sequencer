@@ -56,6 +56,9 @@ const EXPOSED: Bytes = TableDefinition::new("exposed");
 // nonce (BE8) -> `L1PostRecord`: blob transactions of the node's Ethereum
 // account not yet seen mined (L1-blob mode).
 const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
+// pid -> `ExposedRecord`: slots of synced batches that carried our votes,
+// for a rebuild if one is reorged out before its record is written.
+const SYNC_COVERAGE: Bytes = TableDefinition::new("sync_coverage");
 /// Schemas this build upgrades in place: 9 only added `l1_posts`, 10 stopped
 /// using the `committed` table (the tree's own record is authoritative).
 const UPGRADES_FROM: [u64; 2] = [8, 9];
@@ -414,6 +417,7 @@ impl Db {
                 META_BYTES,
                 EXPOSED,
                 L1_POSTS,
+                SYNC_COVERAGE,
             ] {
                 tx.open_table(t).map_err(db_err)?;
             }
@@ -629,6 +633,19 @@ impl Db {
             .transpose()
     }
 
+    /// Stores the slot coverage of synced batches that carried our votes,
+    /// before the sync makes one authoritative. The next transition record
+    /// (or a rebuild) drops it in its own commit.
+    pub fn put_sync_coverage(&self, pid: &Fr, rec: &ExposedRecord) -> Result<()> {
+        self.put(SYNC_COVERAGE, &pid_key(pid), &encode(rec)?)
+    }
+
+    pub fn sync_coverage(&self, pid: &Fr) -> Result<Option<ExposedRecord>> {
+        self.get(SYNC_COVERAGE, &pid_key(pid))?
+            .map(|v| decode("sync_coverage", &v))
+            .transpose()
+    }
+
     pub fn clear_exposed(&self, pid: &Fr) -> Result<()> {
         self.write(|tx| {
             let mut t = tx.open_table(EXPOSED).map_err(db_err)?;
@@ -798,6 +815,11 @@ impl Db {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;
             tx_remove(tx, pid, vids)?;
             tx_put_transition(tx, pid, t, blobs)?;
+            // The log has the synced transition: its archive covers it.
+            tx.open_table(SYNC_COVERAGE)
+                .map_err(db_err)?
+                .remove(pid_key(pid).as_slice())
+                .map_err(db_err)?;
             tx_put_process(tx, process)
         })
     }
@@ -833,6 +855,10 @@ impl Db {
             tx.open_table(EXPOSED)
                 .map_err(db_err)?
                 .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
+                .map_err(db_err)?;
+            tx.open_table(SYNC_COVERAGE)
+                .map_err(db_err)?
+                .remove(pid_key(pid).as_slice())
                 .map_err(db_err)?;
             tx_put_process(tx, process)
         })
