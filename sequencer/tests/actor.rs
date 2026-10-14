@@ -7076,3 +7076,97 @@ async fn reorg_partly_undone_rebuilds_from_where_the_chain_stops() {
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
     shutdown.cancel();
 }
+
+/// Two faults inside one prepare: a tree write after the first insert and
+/// prepare's own reset of the root. The node points the tree back at its
+/// committed root itself, so the retry seals without a restart.
+#[tokio::test]
+async fn prepare_double_fault_resets_the_tree_in_run() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 710);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 711);
+    let vids = [v0.pkg.vote_id, v1.pkg.vote_id];
+    h.submit(v0).await.unwrap();
+    // The first vote-id insert lands, the second and the reset fail.
+    db.fail_arbo_writes_after(1, 2);
+    h.submit(v1).await.unwrap();
+    h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0);
+    for vid in vids {
+        assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    }
+    wait_until("both settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// The DKG flavour of a reorg that took our committed transition, with no
+/// vote left to seal: the results request fails on the chain's root, which
+/// re-reads the chain, so the node rebuilds, closes the lost vote out (the
+/// window has closed) and finalizes at the chain's root.
+#[tokio::test(start_paused = true)]
+async fn reorged_out_own_transition_rebuilds_and_finalizes_in_dkg_mode() {
+    let s = setup(2, 8, None);
+    s.chain.set_key_mode(KeyMode::DkgAutomatic);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1500 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    // The landing's read is done before the reorg: nothing re-reads.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    s.chain.reorg_out_last_transition();
+    s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("requested at the chain's root", async || {
+        s.chain.dkg_calls().0.0 == 1
+    })
+    .await;
+    s.chain.dkg_combine(vec![1, 2]);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(vote_status(&h, vids[0]).await, Some(VoteStatus::Settled));
+    assert_eq!(vote_status(&h, vids[1]).await, Some(VoteStatus::Error));
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}

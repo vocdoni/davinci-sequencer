@@ -442,6 +442,12 @@ impl<S: Storage> ProcessState<S> {
         Ok(())
     }
 
+    /// Points the tree back at the committed root, after a failed prepare
+    /// whose own reset failed. The committed record is authoritative.
+    pub fn reset_to_committed(&mut self) -> Result<(), Error> {
+        Ok(self.tree.set_root(&self.committed.root)?)
+    }
+
     /// Drops a prepared batch: the tree goes back to the committed root.
     /// Slot writes were never applied, so nothing else moves.
     pub fn rollback(&mut self, b: &PreparedBatch) -> Result<(), Error> {

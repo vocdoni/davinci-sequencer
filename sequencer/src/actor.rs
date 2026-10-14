@@ -520,6 +520,8 @@ pub(crate) enum Msg {
     /// Test hook: the refresh-overflow path (the real trigger needs
     /// hundreds of live exposed slots).
     ForceRefreshOverflow,
+    /// The monitor saw a reorg: re-read the process at the next tick.
+    Reread,
 }
 
 /// How a finalize attempt failed: transient re-arms after a short cooldown,
@@ -582,6 +584,10 @@ impl ActorHandle {
 
     pub(crate) async fn head(&self, block: u64, time: u64) {
         let _ = self.tx.send(Msg::Head { block, time }).await;
+    }
+
+    pub(crate) async fn reread(&self) {
+        let _ = self.tx.send(Msg::Reread).await;
     }
 
     /// Test hook: runs the refresh-overflow path directly.
@@ -1241,6 +1247,7 @@ impl Actor {
                 posted,
             } => self.on_job_done(generation, outcome, posted).await,
             Msg::ForceRefreshOverflow => self.refresh_overflow(),
+            Msg::Reread => self.vote_at_stale = true,
             Msg::ResultsHeld {
                 generation,
                 root,
@@ -1314,12 +1321,13 @@ impl Actor {
                         debug!(pid = %hex::encode(self.pid31), e = ?f.msg, "waiting for the DKG");
                     }
                     Err(f) => {
-                        // A moved root: drop the held proof and re-read the
-                        // chain, so the retry proves at the root it has.
+                        // A moved root: drop the held proof. Re-read the chain
+                        // on any failure: one that names another root (or none:
+                        // a DKG request off ours) may be a reorg we are past.
                         if f.msg.contains("InvalidStateRoot") {
                             self.held = None;
-                            self.vote_at_stale = true;
                         }
+                        self.vote_at_stale = true;
                         // Transient trouble re-arms after a cooldown.
                         self.finalize_attempts += 1;
                         let secs = (1u64 << self.finalize_attempts.min(6)).min(60);
@@ -2500,6 +2508,10 @@ impl Actor {
             Err(e) => {
                 let secs = self.prove_backoff();
                 error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "prepare failed; votes stay pending");
+                // prepare's own reset of the root is best-effort.
+                if let Err(e) = self.state.reset_to_committed() {
+                    error!(pid = %hex::encode(self.pid31), %e, "tree reset after a failed prepare");
+                }
                 return;
             }
         };
