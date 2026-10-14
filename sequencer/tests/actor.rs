@@ -6607,3 +6607,50 @@ async fn results_read_at_the_head_does_not_finalize_until_confirmed() {
     assert_eq!(s.chain.results_submits(), 1);
     shutdown.cancel();
 }
+
+/// A node fault inside `prepare` (one failed tree write) is not the votes'
+/// fault: they stay pending, sealing backs off, and the retry settles them.
+/// One fault only, so prepare's best-effort root reset still succeeds.
+#[tokio::test]
+async fn prepare_failure_keeps_the_votes_pending() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 700);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 701);
+    let vids = [v0.pkg.vote_id, v1.pkg.vote_id];
+    h.submit(v0).await.unwrap();
+    // The second vote fills the batch: its tick seals, and the first tree
+    // write inside prepare (a vote-id insert) fails.
+    db.fail_next_arbo_writes(1);
+    h.submit(v1).await.unwrap();
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0);
+    for vid in vids {
+        assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    }
+    assert_eq!(snap.pending, 2);
+    assert!(
+        snap.next_seal_not_before.unwrap() > s.chain.time(),
+        "the backoff does not show: {:?}",
+        snap.next_seal_not_before
+    );
+    wait_until("both settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(snap.root, genesis_root(&s.env.cfg).unwrap());
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}

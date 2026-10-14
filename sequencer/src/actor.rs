@@ -1372,8 +1372,9 @@ impl Actor {
             oldest + (self.batch_time as f64 * 0.9).ceil() as u64
         };
         let flush_at = self.end_time().saturating_sub(self.flush_horizon);
-        // Paused after failed L1 cycles: not before the pause ends.
-        let paused = self.failed_pause.map_or(0, |t| {
+        // Paused after failed L1 cycles, or cooling down after a transient
+        // failure: not before the pause ends.
+        let paused = self.failed_pause.max(self.prove_after).map_or(0, |t| {
             let left = t.saturating_duration_since(tokio::time::Instant::now());
             now.saturating_add(left.as_secs())
         });
@@ -2208,13 +2209,12 @@ impl Actor {
                 self.refresh_overflow();
                 return;
             }
+            // select_batch sized the batch, so this is a node fault (a tree
+            // write): the votes stay pending and the grace end closes them
+            // if it never clears.
             Err(e) => {
-                error!(pid = %hex::encode(self.pid31), %e, "prepare failed");
-                self.set_status(&vids, VoteStatus::Error, Some(&format!("prepare: {e}")));
-                if let Err(e) = self.deps.db.remove_pending(&self.pid, &vids) {
-                    error!(pid = %hex::encode(self.pid31), %e, "remove_pending");
-                }
-                self.drop_pending(&vids);
+                let secs = self.prove_backoff();
+                error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "prepare failed; votes stay pending");
                 return;
             }
         };
