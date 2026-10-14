@@ -254,6 +254,14 @@ pub fn parse_wei(s: &str) -> Result<u128, ConfigError> {
         .ok_or_else(bad)
 }
 
+/// A fee cap: a [`parse_wei`] amount above zero (zero would withhold every send).
+fn parse_fee_cap(s: &str) -> Result<u128, ConfigError> {
+    match parse_wei(s)? {
+        0 => Err(ConfigError::Invalid("fee cap", format!("{s}: must be > 0"))),
+        v => Ok(v),
+    }
+}
+
 /// The node's settings. Parse with [`Config::load`] or [`Config::parse_args`]:
 /// both resolve `--network` into `registry`, `rpc_url`, `blob_source`,
 /// `confirmations` and `start_block`, which a bare `try_parse_from` leaves
@@ -340,12 +348,12 @@ pub struct Config {
     pub l1_privkey_file: Option<PathBuf>,
     /// Most one blob post may cost at the fees it offers (`<wei>`, `<n>gwei`
     /// or `<n>eth`); above it the node waits for cheaper fees.
-    #[arg(long, env = "DAVINCI_L1_MAX_POST_FEE", default_value = "0.001eth", value_parser = parse_wei)]
+    #[arg(long, env = "DAVINCI_L1_MAX_POST_FEE", default_value = "0.001eth", value_parser = parse_fee_cap)]
     pub l1_max_post_fee: u128,
     /// Most one transaction on the registry chain may cost in execution gas,
     /// `gas limit × max fee per gas` (`<wei>`, `<n>gwei` or `<n>eth`); above
     /// it the send is withheld and retried later. OP's L1 data fee is apart.
-    #[arg(long, env = "DAVINCI_OP_MAX_TX_FEE", default_value = "0.002eth", value_parser = parse_wei)]
+    #[arg(long, env = "DAVINCI_OP_MAX_TX_FEE", default_value = "0.002eth", value_parser = parse_fee_cap)]
     pub op_max_tx_fee: u128,
     /// davinci-zkvm prover service.
     #[arg(long, env = "DAVINCI_PROVER_URL", default_value = "http://127.0.0.1:8080", value_parser = parse_http_url)]
@@ -1087,6 +1095,22 @@ mod tests {
         let mut args = with_rpc();
         args.extend(["--op-max-tx-fee", "lots"]);
         assert!(Config::parse_args(args).is_err());
+    }
+
+    // A zero cap would withhold every send or post: refused at boot.
+    #[test]
+    fn zero_fee_caps_are_refused() {
+        for flag in ["--op-max-tx-fee", "--l1-max-post-fee"] {
+            for zero in ["0", "0gwei", "0.0eth"] {
+                let mut args = with_rpc();
+                args.extend([flag, zero]);
+                let e = Config::parse_args(args).unwrap_err().to_string();
+                assert!(e.contains("> 0"), "{flag} {zero}: {e}");
+            }
+            let mut args = with_rpc();
+            args.extend([flag, "1"]);
+            assert!(Config::parse_args(args).is_ok(), "{flag} 1");
+        }
     }
 
     #[test]
