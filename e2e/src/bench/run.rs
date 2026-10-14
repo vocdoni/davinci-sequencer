@@ -359,8 +359,14 @@ pub fn kind_pid(k: &LogKind) -> Option<&str> {
         | K::RefreshOverflow { pid, .. }
         | K::FinalizeFailed { pid, .. }
         | K::ProverHold { pid }
-        | K::GuestRejected { pid, .. } => Some(pid),
-        K::Posted { .. } | K::RpcFailover { .. } | K::BeaconFailover => None,
+        | K::GuestRejected { pid, .. }
+        | K::SealPause { pid, .. }
+        | K::Transient { pid } => Some(pid),
+        K::Posted { .. }
+        | K::RpcFailover { .. }
+        | K::BeaconFailover
+        | K::PostOnRecord { .. }
+        | K::PostReplaced { .. } => None,
     }
 }
 
@@ -943,6 +949,26 @@ pub async fn finish_chaos(slot: &mut ChaosSlot, rig: &mut Rig, net: &Net) -> Res
     }
 }
 
+/// Undoes what the controller in `slot` injected, puts its rows in the
+/// report and empties the slot; every row goes in even when an undo fails.
+async fn close_chaos(
+    slot: &mut ChaosSlot,
+    rig: &mut Rig,
+    net: &Net,
+    report: &mut ScenarioReport,
+) -> Result<()> {
+    let Some((c, t0)) = slot.as_mut() else {
+        return Ok(());
+    };
+    let r = c.finish(rig, net, t0.elapsed()).await;
+    for row in c.rows() {
+        println!("chaos {}: {}", row.name, row.line());
+        report.chaos.insert(row.name.clone(), row.line());
+    }
+    *slot = None;
+    r
+}
+
 /// One chaos poll: the events since the last one, timed from the scenario's
 /// start.
 async fn chaos_step(
@@ -971,7 +997,11 @@ async fn chaos_step(
     let o = Observed {
         elapsed: t0.elapsed(),
         ended_for: first_end.map(|e| Duration::from_secs_f64((unix_now() - e).max(0.0))),
-        pending_nonce_gap: chaos::pending_gap(net).await.unwrap_or([false; 2]),
+        pending_nonce_gap: if c.wants_pending() {
+            chaos::pending_gap(net).await.unwrap_or([false; 2])
+        } else {
+            [false; 2]
+        },
         new_seals: seals,
     };
     c.step(rig, net, &o, &new).await
@@ -1391,29 +1421,108 @@ fn latency(
         .collect()
 }
 
-/// `/info` counters by name.
+/// `/info` counters by node name, summed over each node's incarnations.
 async fn info(rig: &Rig) -> BTreeMap<String, BTreeMap<String, u64>> {
     let mut out = BTreeMap::new();
     for (name, r) in [("a", Role::A), ("b", Role::B), ("o", Role::O)] {
-        let Ok(n) = rig.node(r) else { continue };
-        let Ok(i) = n.api.info().await else { continue };
-        out.insert(
-            name.to_string(),
-            [
-                ("settledBySelf", i.settled_by_self),
-                ("syncedFromOthers", i.synced_from_others),
-                ("lostRaces", i.lost_races),
-                ("bisections", i.bisections),
-                ("isolatedVotes", i.isolated_votes),
-                ("heldBatches", i.held_batches),
-                ("guestRejections", i.guest_rejections),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-        );
+        if let Some(c) = rig.counters(r).await {
+            out.insert(name.to_string(), c);
+        }
     }
     out
+}
+
+/// counters_ok's node part (spec §11), from deltas over the scenario summed
+/// over each node's incarnations: A's and B's `settledBySelf` against the
+/// transitions each sent, O's `syncedFromOthers` against all of them. A
+/// killed node's settlement can land while it is down, and its next
+/// incarnation counts that one as synced, so a restarted node may fall short
+/// by up to its restarts (noted). A node whose counters a kill could not
+/// read is not checked.
+fn counters_check(
+    settled: [Option<u64>; 2],
+    sent: [u64; 2],
+    restarts: [u32; 2],
+    unread: [bool; 3],
+    synced_o: Option<u64>,
+    n_tx: u64,
+    observer_incomplete: bool,
+) -> (bool, Vec<String>) {
+    let mut ok = true;
+    let mut notes = Vec::new();
+    for (i, n) in ["A", "B"].into_iter().enumerate() {
+        if unread[i] {
+            notes.push(format!(
+                "settledBySelf ({n}) not checked: a kill could not read its counters"
+            ));
+            continue;
+        }
+        match settled[i] {
+            Some(d) if d == sent[i] => {}
+            Some(d) if d < sent[i] && sent[i] - d <= u64::from(restarts[i]) => {
+                notes.push(format!(
+                    "settledBySelf ({n}) {d} of the {} transitions it sent, after {} restarts: a settlement that landed while it was down counts as synced",
+                    sent[i], restarts[i]
+                ))
+            }
+            d => {
+                ok = false;
+                notes.push(format!(
+                    "settledBySelf ({n}) {d:?} over the scenario, {} transitions sent by it",
+                    sent[i]
+                ));
+            }
+        }
+    }
+    if observer_incomplete {
+        notes.push("syncedFromOthers (O) not checked: observer incomplete".into());
+    } else if unread[2] {
+        notes.push("syncedFromOthers (O) not checked: a kill could not read its counters".into());
+    } else if synced_o != Some(n_tx) {
+        ok = false;
+        notes.push(format!(
+            "syncedFromOthers (O) {synced_o:?} over the scenario, {n_tx} transitions"
+        ));
+    }
+    (ok, notes)
+}
+
+/// The scenario's injections the rig can make. Live, an action naming a
+/// proxy the rig lacks is an error; on anvil (one RPC, no beacon) it is
+/// skipped and reported.
+fn usable_chaos(
+    name: &str,
+    sc: &Scenario,
+    have: &[[usize; 4]; 3],
+    live: bool,
+    report: &mut ScenarioReport,
+) -> Result<Vec<chaos::Chaos>> {
+    let mut out = Vec::new();
+    for c in &sc.chaos {
+        if chaos::references_exist(&c.action, have) {
+            if let chaos::Action::RpcDown { node, rpc, .. }
+            | chaos::Action::RpcFail { node, rpc, .. } = &c.action
+                && have[*node as usize][*rpc as usize] < 2
+            {
+                println!(
+                    "{name}: {}: the list has no other entry to fail over to",
+                    c.name
+                );
+            }
+            out.push(c.clone());
+            continue;
+        }
+        ensure!(
+            !live,
+            "{name}: {} names a proxy the rig does not have",
+            c.name
+        );
+        println!("{name}: {} skipped: no such proxy on anvil", c.name);
+        report
+            .chaos
+            .insert(c.name.clone(), "skipped: no such proxy on anvil".into());
+    }
+    Ok(out)
 }
 
 fn counter(m: &BTreeMap<String, BTreeMap<String, u64>>, node: &str, k: &str) -> Option<u64> {
@@ -1520,10 +1629,12 @@ pub async fn run_scenario_in(
             rig.restart_with(r, sc.knobs[i].clone()).await?;
         }
     }
-    // 4. Every election listed and served on A and B.
+    // 4. Every election listed and served on A and B, and the injections
+    // the rig can make.
     for (_, e) in &lanes {
         plan::wait_served(rig, e, &ctx.seed).await?;
     }
+    let injections = usable_chaos(&name, sc, &rig.url_counts(), ctx.net.live, &mut report)?;
     // 5. Ballots and their order.
     enum Sends {
         Plain(Vec<(Duration, BallotRecord)>),
@@ -1581,6 +1692,7 @@ pub async fn run_scenario_in(
     let org = Arc::new(ctx.net.organizer()?);
     let org_lock = Arc::new(tokio::sync::Mutex::new(()));
     let info0 = info(rig).await;
+    let kills0 = [Role::A, Role::B, Role::O].map(|r| (rig.kills(r), rig.unread_kills(r)));
     let bal0 = balances(&ctx.net).await?;
     let calls0 = [Role::A, Role::B].map(|r| rig.prove_calls(r).len());
     let t0 = Instant::now();
@@ -1597,8 +1709,8 @@ pub async fn run_scenario_in(
             .collect(),
     };
     std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(&meta)?)?;
-    if !sc.chaos.is_empty() {
-        *chaos = Some((Controller::new(sc.chaos.clone()), t0));
+    if !injections.is_empty() {
+        *chaos = Some((Controller::new(injections), t0));
     }
     let specs: Vec<ElectionSpec> = wave.elections.iter().map(|e| e.spec.clone()).collect();
     let fees_now = if ctx.net.live {
@@ -1787,6 +1899,13 @@ pub async fn run_scenario_in(
         for t in &timers {
             t.abort();
         }
+        // Killed nodes come back, so sends past their permit can answer.
+        if let Err(e) = close_chaos(chaos, rig, &ctx.net, &mut report).await {
+            println!(
+                "{name}: {}",
+                crate::redact_urls(&format!("chaos teardown at the stop: {e:#}"))
+            );
+        }
         for (l, e) in &lanes {
             if done.ended.contains_key(&l.tag) {
                 continue;
@@ -1874,13 +1993,12 @@ pub async fn run_scenario_in(
                 let pid = &e.snap.pid.0;
                 let r = org.results(pid).await.ok().flatten();
                 let mut all = r.is_some();
+                // A node chaos took down has no view yet.
                 for role in [Role::A, Role::B, Role::O] {
-                    all &= rig
-                        .node(role)?
-                        .api
-                        .process(pid)
-                        .await
-                        .is_ok_and(|v| v.result.is_some());
+                    all &= match rig.node(role) {
+                        Ok(n) => n.api.process(pid).await.is_ok_and(|v| v.result.is_some()),
+                        Err(_) => false,
+                    };
                 }
                 let due = org
                     .grace_end(pid)
@@ -1924,18 +2042,7 @@ pub async fn run_scenario_in(
         }
     }
     // Every injection is undone before the audit reads the nodes.
-    if let Some((c, _)) = chaos.as_ref() {
-        for r in c.rows() {
-            report.chaos.insert(
-                r.name.clone(),
-                format!(
-                    "applied {:.0} s undone {:?} recovery {:?} {:?}",
-                    r.applied_s, r.undone_s, r.recovery_s, r.effects
-                ),
-            );
-        }
-    }
-    finish_chaos(chaos, rig, &ctx.net).await?;
+    close_chaos(chaos, rig, &ctx.net, &mut report).await?;
 
     // 9. The audit.
     let entries = ledger.entries()?;
@@ -1975,35 +2082,40 @@ pub async fn run_scenario_in(
         merged.notes.push(format!("{t}: never ended ({e})"));
     }
     // The nodes' counters over the scenario: every transition is settled by
-    // exactly one of A and B and synced by O. They live in memory and reset
-    // when a node restarts, so a scenario that kills a node (Task 20) must
-    // add up per-incarnation deltas instead.
+    // the one of A and B that sent it and synced by O. They live in memory,
+    // so `info` sums each node's incarnations (a kill reads them first).
     let info1 = info(rig).await;
     let n_tx = rows.len() as u64;
     let delta = |node: &str, k: &str| -> Option<u64> {
         Some(counter(&info1, node, k)?.saturating_sub(counter(&info0, node, k)?))
     };
-    let settled = delta("a", "settledBySelf").zip(delta("b", "settledBySelf"));
-    match settled {
-        Some((a, b)) if a + b == n_tx => {}
-        s => {
-            merged.counters_ok = false;
-            merged.notes.push(format!(
-                "settledBySelf A+B {s:?} over the scenario, {n_tx} transitions"
-            ));
-        }
-    }
-    if merged.observer_incomplete {
-        merged
-            .notes
-            .push("syncedFromOthers (O) not checked: observer incomplete".into());
-    } else if delta("o", "syncedFromOthers") != Some(n_tx) {
-        merged.counters_ok = false;
-        merged.notes.push(format!(
-            "syncedFromOthers (O) {:?} over the scenario, {n_tx} transitions",
-            delta("o", "syncedFromOthers")
-        ));
-    }
+    let sent = [0, 1].map(|i| {
+        let a = ctx.net.sequencers.get(i).map(|s| s.1);
+        rows.iter()
+            .filter(|(_, r)| Some(alloy::primitives::Address::from(r.sender)) == a)
+            .count() as u64
+    });
+    let since = |i: usize, r: Role| {
+        (
+            rig.kills(r) - kills0[i].0,
+            rig.unread_kills(r) > kills0[i].1,
+        )
+    };
+    let (ok, notes) = counters_check(
+        [delta("a", "settledBySelf"), delta("b", "settledBySelf")],
+        sent,
+        [since(0, Role::A).0, since(1, Role::B).0],
+        [
+            since(0, Role::A).1,
+            since(1, Role::B).1,
+            since(2, Role::O).1,
+        ],
+        delta("o", "syncedFromOthers"),
+        n_tx,
+        merged.observer_incomplete,
+    );
+    merged.counters_ok &= ok;
+    merged.notes.extend(notes);
     println!(
         "audit {name}: no_vote_lost={} clean={} tally_ok={} results_ok={} counters_ok={}",
         merged.no_vote_lost, merged.clean, merged.tally_ok, merged.results_ok, merged.counters_ok
@@ -2465,6 +2577,39 @@ mod tests {
         ));
         assert_eq!(sealed_or_synced(&ev, Role::B, "p", 30.0), (0, true));
         assert_eq!(sealed_or_synced(&ev, Role::B, "p", 33.0), (0, false));
+    }
+
+    #[test]
+    fn counters_are_checked_per_node_and_incarnation() {
+        let ok = |s, r, u, o, inc| counters_check(s, [3, 2], r, u, o, 5, inc);
+        let none = [false; 3];
+        // Each node settled what it sent, O synced all.
+        assert_eq!(
+            ok([Some(3), Some(2)], [0, 0], none, Some(5), false),
+            (true, vec![])
+        );
+        // A sum that matches is not enough: A settled one of B's.
+        assert!(!ok([Some(4), Some(1)], [0, 0], none, Some(5), false).0);
+        // A restarted A may count one of its own as synced, noted.
+        let (pass, notes) = ok([Some(2), Some(2)], [1, 0], none, Some(5), false);
+        assert!(pass && notes.len() == 1 && notes[0].contains("restarts"));
+        // Not two short after one restart, nor one short without one.
+        assert!(!ok([Some(1), Some(2)], [1, 0], none, Some(5), false).0);
+        assert!(!ok([Some(3), Some(1)], [0, 0], none, Some(5), false).0);
+        // A node that never answered fails; an unread kill skips the node.
+        assert!(!ok([None, Some(2)], [0, 0], none, Some(5), false).0);
+        let (pass, notes) = ok(
+            [Some(0), Some(2)],
+            [1, 0],
+            [true, false, false],
+            Some(5),
+            false,
+        );
+        assert!(pass && notes[0].contains("not checked"));
+        // O: exact, unless the observer is incomplete.
+        assert!(!ok([Some(3), Some(2)], [0, 0], none, Some(4), false).0);
+        let (pass, notes) = ok([Some(3), Some(2)], [0, 0], none, Some(4), true);
+        assert!(pass && notes[0].contains("observer incomplete"));
     }
 
     #[test]

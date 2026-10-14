@@ -2,9 +2,10 @@
 //! observer O on fixed ports, every upstream behind its own loopback proxy
 //! so an outage or a restart never changes the URLs a node was given.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -102,6 +103,12 @@ pub struct ProveCall {
 
 pub struct Rig {
     nodes: [Option<Node>; 3],
+    /// Per node, the `/info` counters its killed incarnations ended with,
+    /// summed: they live in the node's memory and a restart zeroes them.
+    retired: [BTreeMap<String, u64>; 3],
+    /// Per node, kills, and kills that could not read the counters first.
+    kills: [u32; 3],
+    unread: [u32; 3],
     /// As `Net::node_config` made them; knobs are applied to a clone at
     /// every start so a later set can undo an earlier one.
     cfgs: [NodeConfig; 3],
@@ -176,6 +183,54 @@ pub fn wrap_list(list: &str, urls: &[String]) -> String {
         .join(",")
 }
 
+/// Proxies per role (A, B, O) and upstream list, in the order of
+/// [`crate::bench::chaos::Rpc`] (OP, L1, Send, Beacon): what a chaos action
+/// may reference. `op` is each role's OP list; the Ethereum lists and the
+/// beacons are the same for every node.
+pub fn url_counts(
+    op: [&str; 3],
+    l1: Option<&str>,
+    send: Option<&str>,
+    beacon: Option<&str>,
+) -> [[usize; 4]; 3] {
+    let n = |l: Option<&str>| l.map_or(0, |l| entries(l).len());
+    op.map(|o| [entries(o).len(), n(l1), n(send), n(beacon)])
+}
+
+/// On anvil each upstream list has one entry; two proxies in front of it
+/// let a node fail over (C6) on one chain.
+pub fn failover_pair(list: &str) -> String {
+    match entries(list)[..] {
+        [one] => format!("{one},{one}"),
+        _ => list.to_string(),
+    }
+}
+
+/// The `/info` counters a run compares, by name.
+pub fn counters_of(i: &davinci_client::api::Info) -> BTreeMap<String, u64> {
+    [
+        ("settledBySelf", i.settled_by_self),
+        ("syncedFromOthers", i.synced_from_others),
+        ("lostRaces", i.lost_races),
+        ("bisections", i.bisections),
+        ("isolatedVotes", i.isolated_votes),
+        ("heldBatches", i.held_batches),
+        ("guestRejections", i.guest_rejections),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+fn add_counters(into: &mut BTreeMap<String, u64>, from: &BTreeMap<String, u64>) {
+    for (k, v) in from {
+        *into.entry(k.clone()).or_default() += v;
+    }
+}
+
+/// How long a kill waits to read the node's counters first.
+const INFO_READ: Duration = Duration::from_secs(3);
+
 /// The base config with `k` applied.
 fn config_for(base: &NodeConfig, k: Option<&Knobs>) -> NodeConfig {
     let mut c = base.clone();
@@ -220,6 +275,10 @@ impl Rig {
             };
             let mut c = net.node_config(role.name(), seq, i, &prover_url, &census, &dir)?;
             c.start_block = Some(plan.start_block);
+            if !net.live {
+                c.rpc_url = failover_pair(&c.rpc_url);
+                c.l1_rpc_url = c.l1_rpc_url.map(|l| failover_pair(&l));
+            }
             px.op = proxy_list(&c.rpc_url).await?;
             c.rpc_url = wrap_list(&c.rpc_url, &urls(&px.op));
             if let Some(l) = c.l1_rpc_url.clone() {
@@ -240,6 +299,9 @@ impl Rig {
         let bin = sequencer_bin()?;
         let mut rig = Rig {
             nodes: [None, None, None],
+            retired: Default::default(),
+            kills: [0; 3],
+            unread: [0; 3],
             knobs: [
                 Some(spec.knobs[0].clone()),
                 Some(spec.knobs[1].clone()),
@@ -271,13 +333,49 @@ impl Rig {
         &self.proxies[r.idx()]
     }
 
-    /// Stops the node, releasing its datadir and port.
+    /// Stops the node, releasing its datadir and port. Its counters are
+    /// read first, so [`Rig::counters`] keeps them across the restart.
     pub async fn kill(&mut self, r: Role) -> Result<()> {
-        // Dropping a node kills and reaps its process.
-        if self.nodes[r.idx()].take().is_none() {
+        let i = r.idx();
+        let Some(n) = self.nodes[i].as_ref() else {
             bail!("node {} is not running", r.name());
+        };
+        match tokio::time::timeout(INFO_READ, n.api.info()).await {
+            Ok(Ok(info)) => add_counters(&mut self.retired[i], &counters_of(&info)),
+            _ => self.unread[i] += 1,
         }
+        self.kills[i] += 1;
+        // Dropping a node kills and reaps its process.
+        self.nodes[i] = None;
         Ok(())
+    }
+
+    /// The node's `/info` counters over all its incarnations: the running
+    /// one's plus what the killed ones ended with. `None` while it is down
+    /// or does not answer.
+    pub async fn counters(&self, r: Role) -> Option<BTreeMap<String, u64>> {
+        let info = self.nodes[r.idx()].as_ref()?.api.info().await.ok()?;
+        let mut c = counters_of(&info);
+        add_counters(&mut c, &self.retired[r.idx()]);
+        Some(c)
+    }
+
+    /// Kills of the node so far.
+    pub fn kills(&self, r: Role) -> u32 {
+        self.kills[r.idx()]
+    }
+
+    /// Kills that could not read the node's counters: [`Rig::counters`]
+    /// misses what those incarnations counted.
+    pub fn unread_kills(&self, r: Role) -> u32 {
+        self.unread[r.idx()]
+    }
+
+    /// Proxies per role and upstream list, as [`url_counts`] gives them.
+    pub fn url_counts(&self) -> [[usize; 4]; 3] {
+        self.proxies
+            .each_ref()
+            .map(|p| [p.op.len(), p.l1.len(), p.send.len(), p.beacon.len()])
     }
 
     /// Starts a stopped node on its port with its config, on its old datadir.
@@ -318,6 +416,26 @@ impl Rig {
 mod tests {
     use super::*;
     use crate::node::NodeConfig;
+
+    #[test]
+    fn url_layout() {
+        assert_eq!(failover_pair("http://a"), "http://a,http://a");
+        assert_eq!(failover_pair(" http://a, "), "http://a,http://a");
+        assert_eq!(failover_pair("http://a,http://b"), "http://a,http://b");
+        let c = url_counts(["a,b", "b,c", "c"], Some("l1,l2"), None, Some("x"));
+        assert_eq!(c, [[2, 2, 0, 1], [2, 2, 0, 1], [1, 2, 0, 1]]);
+    }
+
+    #[test]
+    fn counters_add_up_across_incarnations() {
+        let mut retired = BTreeMap::new();
+        let one = |n| BTreeMap::from([("settledBySelf".to_string(), n)]);
+        add_counters(&mut retired, &one(3));
+        add_counters(&mut retired, &one(2));
+        let mut now = one(4);
+        add_counters(&mut now, &retired);
+        assert_eq!(now["settledBySelf"], 9);
+    }
 
     #[test]
     fn wrap_list_keeps_order() {

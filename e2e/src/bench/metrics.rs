@@ -214,6 +214,24 @@ pub enum Kind {
         pid: String,
         mask: String,
     },
+    /// A started node found its earlier run's L1 post on record.
+    PostOnRecord {
+        nonce: u64,
+    },
+    /// An L1 post not mined in time, replaced at its nonce.
+    PostReplaced {
+        nonce: u64,
+    },
+    /// L1 cycles kept posting without landing: sealing paused.
+    SealPause {
+        pid: String,
+        secs: u64,
+        cycles: u64,
+    },
+    /// A settlement failed for now (a prover or RPC down): requeued.
+    Transient {
+        pid: String,
+    },
 }
 
 pub fn kind(e: &LogEvent) -> Option<Kind> {
@@ -302,6 +320,20 @@ pub fn kind(e: &LogEvent) -> Option<Kind> {
             }
         }
         "prover fails every batch; holding votes pending" => Kind::ProverHold { pid },
+        "L1 post of an earlier run on record; the next post replaces it if still pending" => {
+            Kind::PostOnRecord { nonce: n("nonce") }
+        }
+        "L1 post not mined; replacing it with doubled fees" => {
+            Kind::PostReplaced { nonce: n("nonce") }
+        }
+        "L1 cycles keep posting blobs without landing; pausing this process's sealing (votes stay pending)" => {
+            Kind::SealPause {
+                pid,
+                secs: n("pause_secs"),
+                cycles: n("failed_cycles"),
+            }
+        }
+        "transient settlement failure, requeueing" => Kind::Transient { pid },
         _ => return None,
     })
 }
@@ -546,6 +578,34 @@ mod tests {
         ));
         assert_eq!(k, Kind::ProverHold { pid: pid.into() });
         assert!(parse_line("not a log line").is_none());
+    }
+
+    #[test]
+    fn parses_chaos_lines() {
+        let pid = "f39f0000000000000000000000000000000000000000000000000000000000";
+        let (_, k) = ev(
+            "2026-10-13T18:00:00.000000Z  INFO L1 post of an earlier run on record; the next post replaces it if still pending nonce=7 tx=0xab",
+        );
+        assert_eq!(k, Kind::PostOnRecord { nonce: 7 });
+        let (_, k) = ev(
+            "2026-10-13T18:00:00.000000Z  WARN L1 post not mined; replacing it with doubled fees nonce=7 blocks=3",
+        );
+        assert_eq!(k, Kind::PostReplaced { nonce: 7 });
+        let (_, k) = ev(&format!(
+            "2026-10-13T18:00:00.000000Z ERROR L1 cycles keep posting blobs without landing; pausing this process's sealing (votes stay pending) pid={pid} pause_secs=600 failed_cycles=3 error=prover: connection refused"
+        ));
+        assert_eq!(
+            k,
+            Kind::SealPause {
+                pid: pid.into(),
+                secs: 600,
+                cycles: 3
+            }
+        );
+        let (_, k) = ev(&format!(
+            "2026-10-13T18:00:00.000000Z  WARN transient settlement failure, requeueing pid={pid} e=FeeCap attempts=2 retry_in=4"
+        ));
+        assert_eq!(k, Kind::Transient { pid: pid.into() });
     }
 
     #[test]
