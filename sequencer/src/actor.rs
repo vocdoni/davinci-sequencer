@@ -2807,8 +2807,11 @@ impl Actor {
                     self.requeue_flight(f);
                     return;
                 }
-                warn!(pid = %hex::encode(self.pid31), "window closed while the batch was in flight");
-                self.set_status(&vids, VoteStatus::Error, Some(&self.closed_reason()));
+                // The close-out errors what is left, once the tree is at the
+                // chain's root: a peer may have settled these votes.
+                warn!(pid = %hex::encode(self.pid31), "window closed while the batch was in flight; requeueing for the close-out");
+                self.requeue_flight(f);
+                return;
             }
             JobOutcome::Reverted(name) => {
                 self.rollback_flight(&f);

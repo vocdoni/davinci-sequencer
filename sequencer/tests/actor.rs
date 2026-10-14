@@ -6461,3 +6461,66 @@ async fn restart_backlog_of_extensions_does_not_rewind_the_end() {
     assert_eq!(end(&node.db), e0 + 1_000);
     shutdown.cancel();
 }
+
+/// A flight whose votes a peer settled (its event not routed yet) reverts
+/// on the closed window: the votes go back to the queue for the close-out,
+/// which reconciles first, so they settle from the sync instead of erroring.
+#[tokio::test]
+async fn time_revert_of_a_flight_a_peer_settled_does_not_error_it() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.advance_time(DURATION - 10);
+    beats().await;
+    let x = fake_vote(&s.env, 0, &[1, 2], 1_900);
+    let vid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.settle_externally(&foreign_batch_of(
+        &s,
+        &[x.clone(), fake_vote(&s.env, 3, &[2, 3], 71)],
+    ));
+    s.chain.pass_grace();
+    beats().await;
+    // The proof lands on a closed window: InvalidTimeBounds.
+    prover.release(10);
+    wait_until("flight resolved", async || {
+        !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    assert_ne!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Error),
+        "errored on the revert while a peer holds it"
+    );
+    s.chain.hide_block(None);
+    s.chain.set_results_externally(vec![3, 4]);
+    wait_until("followed to the final root", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.root == s.chain.root() && snap.synced
+    })
+    .await;
+    wait_until("settled from the sync", async || {
+        let st = vote_status(&h, vid).await;
+        assert_ne!(
+            st,
+            Some(VoteStatus::Error),
+            "errored while the chain holds it"
+        );
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    shutdown.cancel();
+}
