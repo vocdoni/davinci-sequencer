@@ -1507,8 +1507,9 @@ async fn replayed_events_do_not_abort_flights() {
 
 /// A commit-persist failure rolls the tree back before requeueing, so
 /// the follow-up resync from our own blobs applies and the votes settle.
-#[tokio::test]
-async fn commit_failure_rolls_back_and_resyncs() {
+/// With the rollback failing too (`faults == 2`) the actor reopens its
+/// state at the committed record, in-run.
+async fn commit_failure_rolls_back_and_resyncs_with(faults: u32) {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
@@ -1530,8 +1531,8 @@ async fn commit_failure_rolls_back_and_resyncs() {
     let vid = v.pkg.vote_id;
     h.submit(v).await.unwrap();
     wait_until("proof running", async || prover.calls() >= 1).await;
-    // The next arbo write is the commit's persist: it fails once.
-    db.fail_next_arbo_writes(1);
+    // The next arbo writes are the commit's persist, then the rollback.
+    db.fail_next_arbo_writes(faults);
     prover.release(1);
     wait_until("vote settled after resync", async || {
         vote_status(&h, vid).await == Some(VoteStatus::Settled)
@@ -1539,9 +1540,75 @@ async fn commit_failure_rolls_back_and_resyncs() {
     .await;
     let snap = h.snapshot().await.unwrap();
     assert_eq!(snap.root, s.chain.root());
+    let (p, root) = h.vote_id_proof(vid).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
     // The repair went through the blob-sync path.
     assert_eq!(node.metrics.synced_from_others.load(Ordering::SeqCst), 1);
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn commit_failure_rolls_back_and_resyncs() {
+    commit_failure_rolls_back_and_resyncs_with(1).await;
+}
+
+#[tokio::test]
+async fn commit_and_rollback_failure_reopens_and_resyncs() {
+    commit_failure_rolls_back_and_resyncs_with(2).await;
+}
+
+/// A peer sync whose tree writes fail part way: the first insert lands,
+/// the next one and apply's own reset fail, and with `faults == 3` the
+/// actor's reset too. The node points its tree back at the committed root
+/// (or reopens), so once the faults clear the resync applies, in-run.
+async fn partial_peer_sync_recovers_with(faults: u32) {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let peer = fake_vote(&s.env, 0, &[1, 2], 510);
+    db.fail_arbo_writes_after(1, faults);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&peer)));
+    wait_until("synced the peer", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let (p, root) = h.vote_id_proof(peer.pkg.vote_id).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
+    let v = fake_vote(&s.env, 1, &[1, 2], 511);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("ours settled on top", async || {
+        all_settled(&h, &[vid]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn partial_peer_sync_resets_the_tree() {
+    partial_peer_sync_recovers_with(2).await;
+}
+
+#[tokio::test]
+async fn partial_peer_sync_with_a_failed_reset_reopens() {
+    partial_peer_sync_recovers_with(3).await;
 }
 
 /// Restart with a sealed-but-unproved batch: recover() puts the aggregated

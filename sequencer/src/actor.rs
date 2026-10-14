@@ -2110,6 +2110,9 @@ impl Actor {
                 self.rollback_flight(&f);
                 self.requeue_flight(f);
             }
+            if self.state_lost {
+                return;
+            }
         }
         if let Some(t) = self.resync_after
             && tokio::time::Instant::now() < t
@@ -2897,9 +2900,12 @@ impl Actor {
         }
     }
 
+    /// A failed rollback leaves the tree at the prepared root: reopen at
+    /// the committed record before any more state work.
     fn rollback_flight(&mut self, f: &Flight) {
         if let Err(e) = self.state.rollback(&f.prepared) {
-            error!(pid = %hex::encode(self.pid31), %e, "rollback failed");
+            error!(pid = %hex::encode(self.pid31), %e, "rollback failed; reopening");
+            self.state_lost = true;
         }
     }
 
@@ -3822,6 +3828,11 @@ impl Actor {
         let before = self.state.committed();
         if let Err(e) = cpu(|| self.state.apply_synced(&td, new_root)) {
             error!(pid = %hex::encode(self.pid31), %e, "apply_synced failed");
+            // Its own reset of the root is best-effort.
+            if let Err(e) = self.state.reset_to_committed() {
+                error!(pid = %hex::encode(self.pid31), %e, "tree reset after a failed sync; reopening");
+                self.state_lost = true;
+            }
             return false;
         }
         let after = self.state.committed();
