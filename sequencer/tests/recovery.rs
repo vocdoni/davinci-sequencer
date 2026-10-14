@@ -1038,3 +1038,72 @@ async fn two_unrecorded_landings_are_repaired_in_order() {
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
     shutdown.cancel();
 }
+
+/// Our landing's record waits on its blobs (R4) when a peer lands on top:
+/// the peer's transition must not be recorded at our index ahead of it. The
+/// log repairs in block order once our blobs come: ours, then the peer's.
+#[tokio::test(start_paused = true)]
+async fn a_peer_landing_waits_for_our_pending_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 3100);
+    h.submit(v0.clone()).await.unwrap();
+    wait_secs("sealed", 600, async || prover.calls() >= 1).await;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_secs("ours in the tree", 600, async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let ours = s.chain.root();
+    s.chain.withhold_blobs(Some(s.chain.last_transition_tx()));
+    db.fail_next_writes(0);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(db.transitions(&pid_fr()).unwrap().is_empty());
+    let peer = fake_vote(&s.env, 5, &[2, 1], 3101);
+    s.chain
+        .settle_externally(&s.chain.peer_batch(&s, std::slice::from_ref(&peer)));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let ts = db.transitions(&pid_fr()).unwrap();
+    assert!(
+        ts.iter().all(|t| t.old_root != ours),
+        "the peer's transition was recorded ahead of ours"
+    );
+    s.chain.withhold_blobs(None);
+    wait_secs("both records", 300, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 2
+    })
+    .await;
+    let ts = db.transitions(&pid_fr()).unwrap();
+    assert_eq!(
+        ts.iter().map(|t| t.by_self).collect::<Vec<_>>(),
+        [true, false]
+    );
+    assert_eq!(ts[0].new_root, ours);
+    assert_eq!(ts[1].old_root, ours);
+    assert_eq!(db.blobs(&pid_fr(), 0).unwrap().len() as u64, ts[0].n_blobs);
+    wait_secs("on the chain's root", 300, async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(
+        vote_status(&h, v0.pkg.vote_id).await,
+        Some(VoteStatus::Settled)
+    );
+    shutdown.cancel();
+}

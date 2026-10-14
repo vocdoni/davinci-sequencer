@@ -3712,7 +3712,8 @@ impl Actor {
         self.record.onchain.state_root = new_root;
         self.follow_counts(voters, overwrites);
         self.put_record();
-        if old_root == committed {
+        // With a record missing, the gap replay keeps block order.
+        if old_root == committed && self.log_root == committed {
             self.apply_sync(block, tx_hash, sender, old_root, new_root, n_blobs, l1)
                 .await;
             return;
@@ -3891,9 +3892,17 @@ impl Actor {
                     l1,
                 )
                 .await;
+                // Still waiting (its blobs): later records keep block order.
+                if self.log_root != new_root {
+                    return;
+                }
                 continue;
             }
             if old_root == committed {
+                // Never record past a missing record.
+                if self.log_root != committed {
+                    return;
+                }
                 if !self
                     .apply_sync(
                         ev.block,
