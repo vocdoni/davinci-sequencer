@@ -2086,6 +2086,8 @@ impl Actor {
             Ok(s) => {
                 self.state = s;
                 self.state_lost = false;
+                // Events may have been dropped meanwhile: re-read the chain.
+                self.vote_at_stale = true;
                 true
             }
             Err(e) => {
@@ -3364,9 +3366,11 @@ impl Actor {
     }
 
     async fn on_event(&mut self, ev: RegistryEvent) {
-        // No tree to apply it to: the rebuild's resync replays transitions
-        // from the creation and its read merges the fields.
+        // No tree to apply it to: dropped, and the chain re-read once the
+        // state is back (the resync replays transitions, the read merges
+        // the fields).
         if !self.reopen_state() {
+            self.vote_at_stale = true;
             return;
         }
         // A backlog event older than a merged chain read would rewind the

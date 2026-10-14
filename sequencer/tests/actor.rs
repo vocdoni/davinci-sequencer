@@ -7371,3 +7371,68 @@ async fn results_reorged_out_after_finalize_are_resubmitted() {
 async fn results_reorged_out_after_finalize_are_resubmitted_after_a_restart() {
     results_reorged_out_after_finalize(true).await;
 }
+
+/// A pause during a proof, then the proof fails and so does the rollback:
+/// the state must be reopened. The resume arrives while the reopen still
+/// fails and is dropped; once storage recovers, the reopened actor re-reads
+/// the chain, sees the process Ready again and settles its votes, with no
+/// restart, no other event and no end.
+#[tokio::test]
+async fn resume_dropped_while_the_state_is_lost_is_read_back() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 0], 1330 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        h.submit(v.clone()).await.unwrap();
+    }
+    wait_until("proving", async || prover.calls() >= 1).await;
+    s.chain.set_status(ProcessStatus::Paused);
+    wait_until("actor sees the pause", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Paused
+    })
+    .await;
+    // The proof fails, and every tree write from here on: the rollback,
+    // then every reopen.
+    *prover.fail_batches.lock().unwrap() = 1;
+    db.fail_next_arbo_writes(u32::MAX);
+    prover.release(1);
+    wait_until("flight dropped", async || {
+        let snap = h.snapshot().await.unwrap();
+        !snap.in_flight && snap.pending == 2
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Ready);
+    let block = s.chain.head_block();
+    wait_until("the resume routed", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    h.snapshot().await.unwrap();
+    db.fail_next_arbo_writes(0);
+    prover.release(1);
+    wait_until("settled after the reopen", async || {
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().status, ProcessStatus::Ready);
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
