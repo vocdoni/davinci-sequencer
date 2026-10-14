@@ -185,8 +185,9 @@ On OP Mainnet:
   `send withheld` and `replacement withheld`. In L1-blob mode the node also checks it before
   posting a batch's blobs on Ethereum, for the smallest settlement (800k gas plus the margin,
   about 2.1 gwei at the default): if even that would be withheld, nothing is posted and no
-  Ethereum fee is spent. The proof still runs, and the votes go back to the queue unless OP's fee
-  falls before it is ready. A larger settlement can still pass this check and be withheld at its
+  Ethereum fee is spent. The post is retried like a fee-capped one while the proof runs and goes
+  out once OP's fee falls; if it is still over when the proof is ready, the votes go back to the
+  queue. A larger settlement can still pass this check and be withheld at its
   send. On another chain in blob mode (Ethereum, Gnosis), raise it to that chain's prices. Both
   caps must be above zero: `0` would withhold every send, so the node refuses it at boot.
 - Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the

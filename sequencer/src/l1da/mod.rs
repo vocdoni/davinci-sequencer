@@ -194,7 +194,7 @@ impl Retries {
             debug!(pid, chunk, checks = self.checks, error = %e, "L1 post failed again");
         }
         self.wait = match e {
-            PostError::FeeCap { .. } if !self.wait.is_zero() => {
+            PostError::FeeCap { .. } | PostError::OpFeeCap { .. } if !self.wait.is_zero() => {
                 self.wait.saturating_mul(2).min(FEE_CAP_BACKOFF.max(poll))
             }
             _ => poll,
@@ -256,10 +256,11 @@ pub enum Settled {
 }
 
 /// Posts `chunks` in order, one transaction at a time: each waits until the
-/// one before is mined (the window-1 poster); nothing when the settlement's
-/// OP fee is over its cap ([`L1Da::settle_fee_check`]). Fee-cap and L1 trouble are
-/// retried as [`Retries`] paces them; any other error, or the flight's end,
-/// stops the run. Returns the mined posts and the error that stopped it early.
+/// one before is mined (the window-1 poster), and only while OP's fee lets
+/// the settlement through ([`L1Da::settle_fee_check`]). Either fee cap (L1's
+/// or OP's) and L1 trouble are retried as [`Retries`] paces them; any other
+/// error, or the flight's end, stops the run. Returns the mined posts and the
+/// error that stopped it early.
 async fn post_chunks(
     da: &L1Da,
     job: &L1Job<'_>,
@@ -267,25 +268,29 @@ async fn post_chunks(
 ) -> (Vec<Posted>, Option<PostError>) {
     let pid = hex::encode(job.pid);
     let mut posts = Vec::with_capacity(chunks.len());
-    if let Err(e) = da.settle_fee_check().await {
-        return (posts, Some(e));
-    }
     let mut retries = Retries::default();
     for (i, c) in chunks.iter().enumerate() {
         loop {
-            match da
-                .poster
-                .post(&job.pid, &job.root_before, c, job.deadline)
-                .await
-            {
+            let res = match da.settle_fee_check().await {
+                Ok(()) => {
+                    da.poster
+                        .post(&job.pid, &job.root_before, c, job.deadline)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match res {
                 Ok(p) => {
                     retries.cleared(&pid, i);
                     posts.push(p);
                     job.posted.store(true, Ordering::Relaxed);
                     break;
                 }
-                // Fee cap, L1 trouble: wait and post again while the proof runs.
-                Err(e @ (PostError::FeeCap { .. } | PostError::L1(_))) => {
+                // Fee cap (L1's, or OP's settlement), L1 trouble: wait and
+                // post again while the proof runs.
+                Err(
+                    e @ (PostError::FeeCap { .. } | PostError::OpFeeCap { .. } | PostError::L1(_)),
+                ) => {
                     retries.failed(&pid, i, &e, da.poll);
                     // A fee spike between chunks must not hold the flight past
                     // the job's deadline; `settle` then posts the missing chunk,

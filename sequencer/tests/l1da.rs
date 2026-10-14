@@ -1346,9 +1346,9 @@ impl FeeGate for OpGate {
 }
 
 // An OP fee spike would withhold the settlement after the blobs were paid
-// for on Ethereum: nothing is posted while it lasts, and the job ends
-// transient, as a fee-capped send does. Under the cap the batch posts and
-// lands.
+// for on Ethereum: once the proof is ready, the settle posts nothing while
+// it lasts and the job ends transient, as a fee-capped send does. Under the
+// cap the batch posts and lands.
 #[tokio::test]
 async fn no_l1_post_while_the_op_settlement_would_be_withheld() {
     let mut r = rig();
@@ -1356,13 +1356,7 @@ async fn no_l1_post_while_the_op_settlement_would_be_withheld() {
     gate.over.store(true, Ordering::SeqCst);
     r.da.op_fees = Some(gate.clone());
     let job = r.job();
-    let (_, posting) = with_post(&r.da, &r.s.chain, &job, std::future::ready(())).await;
-    assert!(posting.posts.is_empty(), "{posting:?}");
-    assert!(
-        matches!(posting.error, Some(PostError::OpFeeCap { want: 2, cap: 1 })),
-        "{posting:?}"
-    );
-    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, Posting::default()).await;
     assert!(
         matches!(&out, Settled::Transient(e) if e.contains("--op-max-tx-fee")),
         "{out:?}"
@@ -1378,5 +1372,43 @@ async fn no_l1_post_while_the_op_settlement_would_be_withheld() {
     let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
     assert!(matches!(out, Settled::Landed(_)), "{out:?}");
     assert_eq!(r.l1.sends().len(), 1);
-    assert!(gate.checks.load(Ordering::SeqCst) >= 3);
+    // One before the settle's refused post, one before the post.
+    assert_eq!(gate.checks.load(Ordering::SeqCst), 2);
+}
+
+// An OP fee spike at seal time: the post waits as a fee-capped one does and
+// goes out once OP's fee falls, while the proof still runs, so the batch
+// keeps the overlap and lands.
+#[tokio::test(start_paused = true)]
+async fn an_op_fee_spike_at_seal_delays_the_post_within_the_proof() {
+    let poll = Duration::from_secs(1);
+    let mut r = rig_with(poll);
+    let l1 = Capped::new(r.l1.clone());
+    l1.spike.store(false, Ordering::SeqCst);
+    let (dir, db) = fresh_db();
+    r.da = L1Da::new(l1.clone(), db.clone(), u128::MAX, poll, TX_BLOB_CAP).unwrap();
+    (r.db, r._dir) = (db, dir);
+    let gate = Arc::new(OpGate::default());
+    gate.over.store(true, Ordering::SeqCst);
+    r.da.op_fees = Some(gate.clone());
+    let t0 = tokio::time::Instant::now();
+    let job = L1Job {
+        deadline: t0 + Duration::from_secs(600),
+        ..r.job()
+    };
+    let lift = async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        gate.over.store(false, Ordering::SeqCst);
+    };
+    let prove = tokio::time::sleep(Duration::from_secs(300));
+    let ((_, posting), ()) = tokio::join!(with_post(&r.da, &r.s.chain, &job, prove), lift);
+    assert_eq!(posting.posts.len(), 1, "{posting:?}");
+    let sent = l1.sent_at.lock().unwrap().expect("posted") - t0;
+    assert!(
+        sent >= Duration::from_secs(60) && sent <= Duration::from_secs(121),
+        "posted after {sent:?}"
+    );
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.l1.sends().len(), 1);
 }
