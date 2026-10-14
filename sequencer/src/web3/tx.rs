@@ -26,8 +26,8 @@ const ERROR_STRING: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
 const PANIC: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 /// Gas limit headroom over the estimate, in percent.
 const GAS_MARGIN: u64 = 20;
-/// `--op-max-tx-fee`'s default, 0.002 ETH: about 1 gwei on the largest
-/// settlement, far above OP's usual price.
+/// `--op-max-tx-fee`'s default, 0.002 ETH: about 0.57 gwei on the largest
+/// measured L1-blob settlement (3.5 M gas), far above OP's usual price.
 pub const DEFAULT_MAX_TX_FEE: u128 = 2_000_000_000_000_000;
 
 fn transition_call(pid: &[u8; 31], snark: &PlonkSnark, blobs: &TransitionBlobs) -> Bytes {

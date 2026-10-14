@@ -62,8 +62,8 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--l1-send-rpc-url` | `DAVINCI_L1_SEND_RPC_URL` | `--l1-rpc-url` | Endpoints that only receive the blob transactions. A 6-blob send is about 1.5 MB; many public RPCs refuse such bodies. |
 | `--l1-privkey-file` | `DAVINCI_L1_PRIVKEY_FILE` | unset | File with the hex key of the dedicated Ethereum account that posts blobs. A signing node in L1-blob mode needs it. |
 | (env only) | `DAVINCI_L1_PRIVKEY` | unset | The same key, from the environment. |
-| `--l1-max-post-fee` | `DAVINCI_L1_MAX_POST_FEE` | `0.001eth` | Most one blob post may cost at the fees it offers (`<wei>`, `<n>gwei`, `<n>eth`); above it the node waits for cheaper fees. |
-| `--op-max-tx-fee` | `DAVINCI_OP_MAX_TX_FEE` | `0.002eth` | Most one transaction on the registry chain may cost in execution gas, `gas limit × max fee per gas` (`<wei>`, `<n>gwei`, `<n>eth`); above it the send is withheld and retried later. |
+| `--l1-max-post-fee` | `DAVINCI_L1_MAX_POST_FEE` | `0.001eth` | Most one blob post may cost at the fees it offers (`<wei>`, `<n>gwei`, `<n>eth`); above it the node waits for cheaper fees. Must be above 0. |
+| `--op-max-tx-fee` | `DAVINCI_OP_MAX_TX_FEE` | `0.002eth` | Most one transaction on the registry chain may cost in execution gas, `gas limit × max fee per gas` (`<wei>`, `<n>gwei`, `<n>eth`); above it the send is withheld and retried later. Must be above 0. |
 | `--start-block` | `DAVINCI_START_BLOCK` | network | First block a fresh deployment scans for registry events. Ignored once the deployment has scanned. Progress is saved every 5,000 blocks. |
 | `--confirmations` | `DAVINCI_CONFIRMATIONS` | network, else `2` | Blocks behind head treated as final. Raise it with load-balanced RPCs whose backends lag. |
 | `--prover-url` | `DAVINCI_PROVER_URL` | `http://127.0.0.1:8080` | davinci-zkvm prover service. |
@@ -166,18 +166,29 @@ On OP Mainnet:
   The cost counts `21000 × max fee + blobs × 131072 × blob fee`, so at the default the gas term
   alone reaches the cap at an Ethereum base fee of about 24 gwei, whatever the blob fee; above it
   every post waits. Each replacement doubles every fee, so from a 1 gwei base fee about four
-  replacements fit under the default.
+  replacements fit under the default. A post over the cap is retried after one poll interval, then
+  after twice as long each time up to once a minute (fees move once per Ethereum block), never
+  past the batch deadline. The node logs `L1 post failed; retrying` at warn level when the
+  refusals start and `L1 post went through after failing` (with `after` and `checks`) when a post
+  clears them, at debug level in between. Ethereum RPC errors are logged the same way and retried
+  every poll interval.
 - `--op-max-tx-fee` bounds every transaction the node sends on the registry chain: transitions,
   results, the DKG and Council results calls, and `record()` in L1-blob mode. It counts
   `gas limit × max fee per gas` at the price the node would offer; OP's L1 data fee is charged
   apart and not counted, nor is the blob fee of a blob-mode transition. A
-  `submitStateTransitionL1` takes about 1.5 to 2.5 M gas, so the 0.002 ETH default admits about
-  1 gwei on the largest one, 20 to 100 times OP's usual price. Above it the send is refused before
+  `submitStateTransitionL1` took 0.8 to 3.5 M gas in measured runs, so the 0.002 ETH default
+  admits about 0.57 gwei on the largest one (about 0.48 gwei counting the 20 % margin on the gas
+  limit) and about 2 gwei on the smallest. Above it the send is refused before
   signing, logged at error level with the price and the cap, and the batch is retried under the
   usual backoff; a replacement whose bump would cross it is withheld and the transaction waits at
   its current price. Near the grace end the cap trades spend for liveness: watch for
-  `send withheld` and `replacement withheld`. On another chain in blob mode (Ethereum, Gnosis),
-  raise it to that chain's prices.
+  `send withheld` and `replacement withheld`. In L1-blob mode the node also checks it before
+  posting a batch's blobs on Ethereum, for the smallest settlement (800k gas plus the margin,
+  about 2.1 gwei at the default): if even that would be withheld, nothing is posted and no
+  Ethereum fee is spent. The proof still runs, and the votes go back to the queue unless OP's fee
+  falls before it is ready. A larger settlement can still pass this check and be withheld at its
+  send. On another chain in blob mode (Ethereum, Gnosis), raise it to that chain's prices. Both
+  caps must be above zero: `0` would withhold every send, so the node refuses it at boot.
 - Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the
   node logs why at debug level ("no time to land an L1-blob batch", "no batch fits", "the exposed set needs more blob
   transactions than the window fits").

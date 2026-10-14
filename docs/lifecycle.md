@@ -15,11 +15,15 @@ One loop polls the registry events up to `head − confirmations` and routes the
 - the on-chain root is the genesis root the node derives from the process configuration. A node
   that starts late requires the process's first transition to start from that root instead.
 
-Merkle censuses (origins 1 and 2) are downloaded and their root checked. For an on-chain census
-(origin 3) the node indexes the census contract and serves votes after the first sync. A process
-that fails a permanent check is marked `ignored` with the reason. Transient failures are retried
-from a persisted list, and the process is ignored after 10 attempts. A late bootstrap scans the
-registry logs from the process's creation block and replays every transition from its blobs.
+Merkle censuses (origins 1 and 2) are downloaded off the event loop, so a slow census server does
+not stall routing, and their root is checked. The process waits on the retry list until its census
+is stored, and a failed download costs one attempt. At most 8 downloads and 2 builds run at once;
+a download that brings less than 16 KiB in a 30 s window after its first byte is cut off and
+retried. For an on-chain census (origin 3) the node indexes the census contract and serves votes
+after the first sync. A process that fails a permanent check is marked `ignored` with the reason.
+Transient failures are retried from a persisted list, and the process is ignored after 10
+attempts. A late bootstrap scans the registry logs from the process's creation block and replays
+every transition from its blobs.
 
 ## Admission
 
@@ -146,7 +150,12 @@ Each batch:
    the base fee plus the tip, the blob fee twice the blob base fee.
    A transaction not mined after 3 Ethereum blocks is replaced at its nonce with every fee
    doubled. A post whose worst-case cost would pass `--l1-max-post-fee` (or that L1 refuses) is
-   retried while the proof runs, waiting for cheaper fees, up to the grace end.
+   retried while the proof runs, waiting for cheaper fees, up to the grace end: over the cap after
+   one poll interval, doubling to once a minute; after an L1 error, every poll interval. Before
+   posting, the node prices the smallest OP settlement (800k gas plus 20 %) at OP's current fee:
+   if `--op-max-tx-fee` would withhold it, nothing is posted, and once the proof is ready the votes
+   go back to the queue, as for a withheld send. A fee that falls during the proof lets the blobs
+   go out then.
 3. If OP's L1 origin (`L1Block.number()`) reaches the block of the last transaction before the
    proof is ready, the node calls `record()` on the verifier once, which stores that origin on OP.
 4. With the proof ready, waits until every blob transaction has one Ethereum block on top and
