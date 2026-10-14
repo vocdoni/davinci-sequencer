@@ -12,7 +12,7 @@ use alloy::primitives::{B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use anyhow::{Context, Result, anyhow, ensure};
 use davinci_client::SequencerClient;
-use davinci_client::api::{ProcessId, parse_vote_id, vote_id_hex};
+use davinci_client::api::{ProcessId, ProcessStatus, parse_vote_id, vote_id_hex};
 use davinci_client::organizer::Organizer;
 use davinci_zkvm_sdk::client::ProverClient;
 use serde::{Deserialize, Serialize};
@@ -2493,21 +2493,38 @@ pub async fn audit_run(ctx: &Ctx, rig: &Rig, run_dir: &Path) -> Result<AuditResu
     Ok(merged)
 }
 
-/// `audit --run`: an election ended since the run (by `davinci-bench end`)
-/// is still finishing; waits for its results on the registry and every node
-/// as the run does, by grace end + 15 min and at most an hour. READY, PAUSED
-/// and canceled elections have none to wait for.
+/// Whether the registry says `audit --run` should wait for an election's
+/// results. Only the registry's view counts, never a node's: a node that
+/// just started still reads READY. A READY election whose end (start +
+/// duration) has passed, or falls within the results wait, is ending (a
+/// shortened end leaves the status READY until the contract is touched
+/// again); one with a distant end, a PAUSED or a canceled one has no results
+/// coming.
+fn awaits_results(status: ProcessStatus, start: u64, duration: u64, now: u64) -> bool {
+    match status {
+        ProcessStatus::Canceled | ProcessStatus::Paused | ProcessStatus::Unknown => false,
+        ProcessStatus::Ready => start.saturating_add(duration) <= now + RESULTS_MAX.as_secs(),
+        ProcessStatus::Ended | ProcessStatus::Results => true,
+    }
+}
+
+/// `audit --run`: for an election that is ending or ended (by
+/// `davinci-bench end` or the run), waits for its results on the registry
+/// and every node, up to the registry's grace end + 15 min and at most an
+/// hour. The rig stays up meanwhile: only the key-holding node publishes a
+/// sequencer-key election's results.
 async fn wait_results_if_ended(ctx: &Ctx, rig: &Rig, e: &Election) -> Result<()> {
-    use davinci_client::api::ProcessStatus as S;
     let org = ctx.net.organizer()?;
     let (pid, tag) = (&e.snap.pid.0, &e.spec.tag);
-    if matches!(
-        org.process(pid).await?.status,
-        S::Ready | S::Paused | S::Canceled
-    ) {
+    let p = org.process(pid).await?;
+    if !awaits_results(p.status, p.start_time, p.duration, unix_now() as u64) {
         return Ok(());
     }
+    let end = p.start_time.saturating_add(p.duration);
+    let grace = u64::from(org.grace_params().await?.default_grace);
     let started = Instant::now();
+    let mut printed = Instant::now();
+    println!("{tag}: ending, waiting for its results");
     loop {
         let mut all = org.results(pid).await.ok().flatten().is_some();
         for role in [Role::A, Role::B, Role::O] {
@@ -2516,17 +2533,31 @@ async fn wait_results_if_ended(ctx: &Ctx, rig: &Rig, e: &Election) -> Result<()>
                 Err(_) => false,
             };
         }
+        // The registry's grace end once it has one; before the end lands,
+        // the end plus the default grace.
         let due = org
             .grace_end(pid)
             .await
-            .map_or(u64::MAX, |g| g.saturating_add(RESULTS_LATE));
+            .unwrap_or_else(|_| end.saturating_add(grace))
+            .saturating_add(RESULTS_LATE);
         if all {
-            println!("{tag}: results on the registry and every node");
+            println!(
+                "{tag}: results on the registry and every node after {:.0} s",
+                started.elapsed().as_secs_f64()
+            );
             return Ok(());
         }
         if unix_now() as u64 > due || started.elapsed() >= RESULTS_MAX {
             println!("{tag}: no results by grace end + 15 min");
             return Ok(());
+        }
+        if printed.elapsed() >= TICK {
+            println!(
+                "{tag}: waiting for results, {:.0} s, {} s to the deadline",
+                started.elapsed().as_secs_f64(),
+                due.saturating_sub(unix_now() as u64)
+            );
+            printed = Instant::now();
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -2536,6 +2567,21 @@ async fn wait_results_if_ended(ctx: &Ctx, rig: &Rig, e: &Election) -> Result<()>
 mod tests {
     use super::*;
     use crate::bench::ballots::fake_req;
+
+    #[test]
+    fn audit_waits_on_the_registrys_view() {
+        use davinci_client::api::ProcessStatus as S;
+        let day = 24 * 3600;
+        // Shortened to 75 s ahead, status still READY on the registry: wait.
+        assert!(awaits_results(S::Ready, 1000, 75, 1010));
+        // Ended long ago: wait (the grace window runs).
+        assert!(awaits_results(S::Ended, 1000, 75, 5000));
+        assert!(awaits_results(S::Results, 1000, 75, 5000));
+        // Three days left, paused, canceled: no results coming.
+        assert!(!awaits_results(S::Ready, 1000, 3 * day, 1010));
+        assert!(!awaits_results(S::Paused, 1000, 75, 5000));
+        assert!(!awaits_results(S::Canceled, 1000, 75, 5000));
+    }
     use crate::bench::schedule::{Gap, Phase, Schedule};
 
     fn rec(voter: u32, round: u8) -> BallotRecord {
