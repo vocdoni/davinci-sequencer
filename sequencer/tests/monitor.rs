@@ -20,6 +20,10 @@ struct Net {
     reorg_in_page: Arc<Mutex<Option<(u64, u64, u8)>>>,
     /// While set, every `block_hash` read fails (a rate-limited RPC).
     fail_hashes: Arc<AtomicBool>,
+    /// The next `n` process reads of the main process panic in the caller
+    /// (an actor bug unwinding its task); `reads` counts those reads.
+    panics: Arc<AtomicU64>,
+    reads: Arc<AtomicU64>,
 }
 
 impl Net {
@@ -31,12 +35,26 @@ impl Net {
             fork: Arc::new(Mutex::new((u64::MAX, 0))),
             reorg_in_page: Arc::default(),
             fail_hashes: Arc::default(),
+            panics: Arc::default(),
+            reads: Arc::default(),
         }
     }
 
     /// A reorg replaces every block from `from` on.
     fn reorg(&self, from: u64, tag: u8) {
         *self.fork.lock().unwrap() = (from, tag);
+    }
+
+    fn read_of(&self, pid: &[u8; 31]) {
+        if *pid != pid31() {
+            return;
+        }
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let armed = self
+            .panics
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        assert!(!armed, "scripted actor panic");
     }
 
     fn hash_of(&self, n: u64) -> [u8; 32] {
@@ -58,6 +76,7 @@ impl Chain for Net {
         self.chain.signer()
     }
     async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess, Web3Error> {
+        self.read_of(pid);
         let mut p = self.chain.process(pid).await?;
         if *pid == bad_pid31() {
             self.bad_reads.fetch_add(1, Ordering::SeqCst);
@@ -69,6 +88,7 @@ impl Chain for Net {
         if *pid == bad_pid31() {
             return self.process(pid).await;
         }
+        self.read_of(pid);
         self.chain.process_at(pid, block).await
     }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
@@ -1194,5 +1214,102 @@ async fn corrupt_retry_list_still_starts() {
     )
     .await;
     let _h = handle(&node).await;
+    sd.cancel();
+}
+
+// ---------------------------------------------------- dead actors respawn
+
+/// Waits for a live actor of `pid` in the map other than `old` (if given).
+async fn live_actor(node: &Node, pid: Fr) -> ActorHandle {
+    let mut out = None;
+    wait_until("live actor", async || {
+        let h = node.processes.read().await.get(&pid).cloned();
+        match h {
+            Some(h) if h.snapshot().await.is_ok() => {
+                out = Some(h);
+                true
+            }
+            _ => false,
+        }
+    })
+    .await;
+    out.unwrap()
+}
+
+/// A panic in one actor's task (the release profile unwinds, tokio drops
+/// the task) leaves that election without an actor: the monitor sees the
+/// closed handle, respawns it from its record, and the next vote settles.
+/// The other election's actor is untouched.
+#[tokio::test]
+async fn panicked_actor_is_respawned() {
+    let s = setup(2, 8, None);
+    bad_process_on_file(&s);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let h = live_actor(&node, pid_fr()).await;
+    let other = live_actor(&node, bad_pid_fr()).await;
+
+    // The read after the landing panics inside the actor's task.
+    net.panics.store(1, Ordering::SeqCst);
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    wait_until("the actor died", async || {
+        net.panics.load(Ordering::SeqCst) == 0 && h.snapshot().await.is_err()
+    })
+    .await;
+
+    let h2 = live_actor(&node, pid_fr()).await;
+    assert!(all_settled(&h2, &[vid0]).await, "the landed vote survived");
+    let v1 = fake_vote(&s.env, 1, &[2, 1], 6);
+    let vid1 = v1.pkg.vote_id;
+    h2.submit(v1).await.unwrap();
+    wait_until("settled after the respawn", async || {
+        all_settled(&h2, &[vid1]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    assert!(other.snapshot().await.is_ok(), "the other actor still runs");
+    assert_eq!(boot_attempts(&db, &pid31()), None, "retry entry dropped");
+    sd.cancel();
+}
+
+/// An actor that panics at every start is respawned with the retry
+/// backoff, not at every poll.
+#[tokio::test]
+async fn deterministic_actor_panic_backs_off() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let h = live_actor(&node, pid_fr()).await;
+    net.panics.store(u64::MAX, Ordering::SeqCst);
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    h.submit(v).await.unwrap();
+    wait_until("the actor died", async || h.snapshot().await.is_err()).await;
+    let before = net.reads.load(Ordering::SeqCst);
+    // 100 polls at 20 ms; the backoff doubles up to 32 polls.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let deaths = net.reads.load(Ordering::SeqCst) - before;
+    assert!((1..=10).contains(&deaths), "{deaths} respawns in 2 s");
     sd.cancel();
 }

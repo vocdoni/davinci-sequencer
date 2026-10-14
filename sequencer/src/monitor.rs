@@ -577,6 +577,8 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
         }
     };
     let mut hash_errors = 0u32;
+    // Actor task deaths per pid this run: each one doubles the respawn wait.
+    let mut deaths: HashMap<Fr, u32> = HashMap::new();
     let mut poll = tokio::time::interval(ctx.cfg.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     poll.reset(); // skip the immediate first tick
@@ -585,6 +587,10 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
             _ = shutdown.cancelled() => return,
             _ = poll.tick() => {}
         }
+        if shutdown.is_cancelled() {
+            return; // actors end at shutdown: nothing to reap
+        }
+        reap_dead_actors(&ctx, &mut retries, &mut deaths).await;
         // A reorg below the cursor may have replaced routed events: route
         // the range again (actors are replay-tolerant). A cursor without a
         // hash (a fail-open page, an older database) is armed here, so an
@@ -714,6 +720,47 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
             } => {}
         }
     }
+}
+
+/// Drops the handles of actors whose task ended (the release build unwinds,
+/// so a panic ends only its task) and queues their respawn on the retry
+/// list, where a stored record without an actor is respawned. Each death of
+/// a pid doubles its wait: a panic at every start respawns at the longest
+/// backoff, not every poll.
+async fn reap_dead_actors(ctx: &Ctx, retries: &mut Vec<BootRetry>, deaths: &mut HashMap<Fr, u32>) {
+    let dead: Vec<Fr> = ctx
+        .node
+        .processes
+        .read()
+        .await
+        .iter()
+        .filter(|(_, h)| h.is_closed())
+        .map(|(pid, _)| *pid)
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    let mut map = ctx.node.processes.write().await;
+    let now = tokio::time::Instant::now();
+    for pid in dead {
+        if !map.get(&pid).is_some_and(ActorHandle::is_closed) {
+            continue;
+        }
+        map.remove(&pid);
+        let n = deaths.entry(pid).or_default();
+        *n = n.saturating_add(1);
+        error!(pid = %pid_hex(&pid), deaths = *n, "actor task ended; respawning");
+        if !retries.iter().any(|r| r.pid == pid) {
+            retries.push(BootRetry {
+                pid,
+                pid31: pid31_of(&pid),
+                attempts: 0,
+                due: now + boot_backoff(ctx.cfg.poll_interval, *n),
+            });
+        }
+    }
+    drop(map);
+    save_retries(&ctx.deps.db, retries);
 }
 
 /// Persists the cursor and its block hash in one write.
