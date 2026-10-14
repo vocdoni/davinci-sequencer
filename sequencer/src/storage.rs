@@ -221,6 +221,9 @@ pub struct Db {
     /// Scripted failures of process-record reads (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     process_read_faults: Arc<std::sync::atomic::AtomicU32>,
+    /// While set, every transition-record write fails (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    transition_faults: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Db {
@@ -321,6 +324,8 @@ impl Db {
             write_faults: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             process_read_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            transition_faults: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -462,6 +467,14 @@ impl Db {
     pub fn fail_next_writes(&self, n: u32) {
         self.write_faults
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `on`, every transition-record write fails and every other write
+    /// goes through (a crash right before the record). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_transition_writes(&self, on: bool) {
+        self.transition_faults
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Makes the next `n` [`Db::process`] reads fail. Test hook.
@@ -760,6 +773,13 @@ impl Db {
         blobs: &[Blob],
         process: &ProcessRecord,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .transition_faults
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Db("scripted transition write failure".into()));
+        }
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;
             tx_remove(tx, pid, vids)?;

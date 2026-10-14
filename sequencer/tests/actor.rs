@@ -5376,6 +5376,8 @@ async fn hold_seals_only_exposed_votes(prover_hold: bool) {
         );
         assert_eq!(prover.sizes().last(), Some(&n_held));
     }
+    // The peer's batch carried a vote of ours: its slots joined the set.
+    let e0 = if clash.is_some() { exposed() } else { e0 };
     let fresh: Vec<usize> = (n_held..40)
         .filter(|i| !slots.contains(&fake_vote(&s.env, *i, &[1, 2], 1).slot))
         .take(3)

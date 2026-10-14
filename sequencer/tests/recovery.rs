@@ -1107,3 +1107,77 @@ async fn a_peer_landing_waits_for_our_pending_record() {
     );
     shutdown.cancel();
 }
+
+/// The crash window of `apply_sync_crash_window_reopens` with a populated
+/// election and one of our votes in the peer's batch: our revote waits here,
+/// a peer includes it with its refreshes, the sync commits the tree but not
+/// the record, and a reorg takes the peer transition before the restart. The
+/// rebuild re-seals the revote, and the re-seal covers every slot the peer's
+/// public batch changed (24 occupied slots: a batch refreshes a random 16).
+#[tokio::test(start_paused = true)]
+async fn synced_peer_batch_lost_at_a_crash_keeps_its_slots_covered() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 3200 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    // Our revote waits for company; a peer includes it first.
+    let x = fake_vote(&s.env, 3, &[2, 1], 3300);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    let b = peer_batch_of(&db, &s, std::slice::from_ref(&x));
+    let peer_slots: Vec<u64> = davinci_zkvm_sdk::blob::decode_blobs(&b.blobs.blobs, nf)
+        .unwrap()
+        .updates
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    db.fail_transition_writes(true);
+    let block = s.chain.settle_externally(&b);
+    wait_secs("synced in the tree", 600, async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    wait_secs("event routed", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    assert_eq!(db.transitions(&pid_fr()).unwrap().len(), 1);
+    shutdown.cancel();
+    drop((h, node, db));
+
+    s.chain.reorg_out_last_transition();
+    let db = reopen_db(dir.path()).await;
+    let shutdown = CancellationToken::new();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, FakeProver::open(), &shutdown).await;
+    wait_secs("rebuilt", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    s.chain.advance_time(400);
+    wait_secs("re-sealed on the chain", 600, async || {
+        all_settled(&h, &[xid]).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let (p, root) = h.vote_id_proof(xid).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
+    for slot in peer_slots {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out a slot the peer published"
+        );
+    }
+    shutdown.cancel();
+}

@@ -3787,6 +3787,38 @@ impl Actor {
                 return false;
             }
         };
+        // A public batch carrying votes of ours: should a reorg take it before
+        // its record is written, their re-seal must cover its slots. Durable
+        // before the transition becomes authoritative.
+        let ours: Vec<u64> = {
+            let mine: std::collections::HashSet<u64> = self
+                .pending
+                .iter()
+                .chain(self.in_flight.iter().flat_map(|f| f.votes.iter()))
+                .map(|v| v.pkg.vote_id)
+                .collect();
+            td.vote_ids
+                .iter()
+                .copied()
+                .filter(|v| mine.contains(v))
+                .collect()
+        };
+        if !ours.is_empty() {
+            let mut slots = self.exposed.clone();
+            slots.extend(td.updates.iter().map(|(s, _)| *s));
+            let mut vids = self.exposed_vids.clone();
+            vids.extend(ours);
+            let rec = crate::storage::ExposedRecord {
+                slots: slots.iter().copied().collect(),
+                vote_ids: vids.iter().copied().collect(),
+            };
+            if let Err(e) = self.deps.db.put_exposed(&self.pid, &rec) {
+                error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's exposed slots");
+                return false;
+            }
+            self.exposed = slots;
+            self.exposed_vids = vids;
+        }
         let before = self.state.committed();
         if let Err(e) = cpu(|| self.state.apply_synced(&td, new_root)) {
             error!(pid = %hex::encode(self.pid31), %e, "apply_synced failed");
