@@ -12,7 +12,7 @@ use davinci_zkvm_sdk::client::PlonkSnark;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::{L1Da, L1Job, PostError, Posted, Posting, Settled, chunks};
+use super::{L1Da, L1Job, PostError, Posted, Posting, Retries, Settled, chunks};
 use crate::actor::Chain;
 use crate::web3::l1proof::{L1ProofError, verify_local};
 use crate::web3::{L1Origin, RevertReason, Web3Error, revert_message};
@@ -175,6 +175,7 @@ pub async fn settle(
     let mut gone: Vec<Option<Instant>> = vec![None; chunks.len()];
     // Since when the proof of these posts fails to build or anchor.
     let mut proof_failing: Option<Instant> = None;
+    let mut post_retries = Retries::default();
     loop {
         if job.cancel.is_cancelled() {
             return Settled::Transient("flight aborted".into());
@@ -189,6 +190,7 @@ pub async fn settle(
                 .await
             {
                 Ok(p) => {
+                    post_retries.cleared(&pid, i);
                     posts[i] = Some(p);
                     job.posted.store(true, Ordering::Relaxed);
                     // A recorded origin below the new post anchors nothing.
@@ -198,10 +200,13 @@ pub async fn settle(
                 Err(e @ (PostError::Deadline | PostError::NoSigner | PostError::Storage(_))) => {
                     return Settled::Transient(e.to_string());
                 }
-                // Fee cap, L1 trouble: wait and post again within the deadline.
+                // Fee cap, L1 trouble: wait and post again within the deadline
+                // (the top of the loop reports it).
                 Err(e) => {
-                    warn!(%pid, chunk = i, error = %e, "L1 post failed; retrying");
-                    pause_or_abort!(da, job);
+                    post_retries.failed(&pid, i, &e, da.poll);
+                    if !post_retries.wait(da, job).await && job.cancel.is_cancelled() {
+                        return Settled::Transient("flight aborted".into());
+                    }
                 }
             }
             continue;

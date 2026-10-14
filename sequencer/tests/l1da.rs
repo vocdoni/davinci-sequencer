@@ -1126,3 +1126,202 @@ async fn a_single_chunk_repost_drops_the_recorded_origin() {
         vec![p[0].block, p[0].block, b1]
     );
 }
+
+/// An Ethereum whose fees are above any cap while `spike` is set. Counts
+/// the fee reads and notes when the first blob transaction went out.
+struct Capped {
+    inner: FakeL1,
+    spike: AtomicBool,
+    reads: AtomicU64,
+    sent_at: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Capped {
+    fn new(inner: FakeL1) -> Arc<Self> {
+        Arc::new(Capped {
+            inner,
+            spike: AtomicBool::new(true),
+            reads: AtomicU64::new(0),
+            sent_at: Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait]
+impl L1Chain for Capped {
+    fn sender(&self) -> Option<Address> {
+        self.inner.sender()
+    }
+    async fn head(&self) -> Result<u64, Web3Error> {
+        self.inner.head().await
+    }
+    async fn nonce(&self) -> Result<u64, Web3Error> {
+        self.inner.nonce().await
+    }
+    async fn fees(&self) -> Result<L1Market, Web3Error> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let mut m = self.inner.fees().await?;
+        if self.spike.load(Ordering::SeqCst) {
+            m.base_fee *= 1000;
+        }
+        Ok(m)
+    }
+    async fn sign_blob_tx(
+        &self,
+        nonce: u64,
+        fees: &L1Fees,
+        blobs: &TransitionBlobs,
+    ) -> Result<SignedBlobTx, Web3Error> {
+        self.inner.sign_blob_tx(nonce, fees, blobs).await
+    }
+    async fn send_blob_tx(&self, tx: &SignedBlobTx) -> Result<(), L1SendError> {
+        self.sent_at
+            .lock()
+            .unwrap()
+            .get_or_insert_with(tokio::time::Instant::now);
+        self.inner.send_blob_tx(tx).await
+    }
+    async fn receipt(&self, tx: B256) -> Result<Option<L1Receipt>, Web3Error> {
+        self.inner.receipt(tx).await
+    }
+    async fn tx_known(&self, tx: B256) -> Result<bool, Web3Error> {
+        self.inner.tx_known(tx).await
+    }
+    async fn build_proof(&self, txs: &[B256], top: u64) -> Result<L1BlobProof, Web3Error> {
+        self.inner.build_proof(txs, top).await
+    }
+}
+
+/// The events logged on this thread while the guard lives: (level, message).
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+impl Logs {
+    fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = Logs::default();
+        let sub = tracing_subscriber::registry().with(logs.clone());
+        (logs, tracing::subscriber::set_default(sub))
+    }
+
+    fn count(&self, level: tracing::Level, needle: &str) -> usize {
+        let l = self.0.lock().unwrap();
+        l.iter()
+            .filter(|(lv, m)| *lv == level && m.contains(needle))
+            .count()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logs {
+    fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Msg(String);
+        impl tracing::field::Visit for Msg {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "message" {
+                    self.0 = format!("{v:?}");
+                }
+            }
+        }
+        let mut m = Msg(String::new());
+        e.record(&mut m);
+        self.0.lock().unwrap().push((*e.metadata().level(), m.0));
+    }
+}
+
+// Chaos run C7: a post above the cap was retried every poll with a WARN
+// each, 802 lines in 13.5 min. Fees above the cap for ten minutes: the
+// retries back off to one a minute, the cap is logged at WARN when it
+// starts and when it clears, and the post goes out within a minute of the
+// fees falling. Both places that post: while proving and in the settle.
+#[tokio::test(start_paused = true)]
+async fn a_fee_capped_post_backs_off_and_warns_once() {
+    for in_settle in [false, true] {
+        let poll = Duration::from_secs(1);
+        let mut r = rig_with(poll);
+        let l1 = Capped::new(r.l1.clone());
+        let cap = L1Fees::offer(&r.l1.market()).cost(r.blobs.blobs.len()) * 3;
+        let (dir, db) = fresh_db();
+        r.da = L1Da::new(l1.clone(), db.clone(), cap, poll, TX_BLOB_CAP).unwrap();
+        (r.db, r._dir) = (db, dir);
+        let job = L1Job {
+            deadline: tokio::time::Instant::now() + Duration::from_secs(3600),
+            ..r.job()
+        };
+        let (logs, _g) = Logs::capture();
+        let t0 = tokio::time::Instant::now();
+        let spike = Duration::from_secs(600);
+        let lift = async {
+            tokio::time::sleep(spike).await;
+            l1.spike.store(false, Ordering::SeqCst);
+            l1.reads.load(Ordering::SeqCst)
+        };
+        let run = async {
+            let posting = match in_settle {
+                true => Posting::default(),
+                false => {
+                    let (_, p) = with_post(&r.da, &r.s.chain, &job, std::future::ready(())).await;
+                    assert_eq!(p.posts.len(), 1, "{p:?}");
+                    p
+                }
+            };
+            settle(&r.da, &r.s.chain, &job, &r.snark, posting).await
+        };
+        let (out, reads) = tokio::join!(run, lift);
+        assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+        // 1, 2, 4 .. 32 s, then one a minute: 15 in ten minutes (not 600).
+        assert!(
+            reads <= 20,
+            "in_settle {in_settle}: {reads} fee checks in {spike:?}"
+        );
+        let sent = l1.sent_at.lock().unwrap().expect("posted") - t0;
+        assert!(
+            sent >= spike && sent <= spike + Duration::from_secs(61),
+            "in_settle {in_settle}: posted after {sent:?}"
+        );
+        assert_eq!(r.l1.sends().len(), 1);
+        let warn = tracing::Level::WARN;
+        assert_eq!(
+            logs.count(warn, "L1 post failed"),
+            1,
+            "in_settle {in_settle}"
+        );
+        assert_eq!(
+            logs.count(warn, "L1 post went through"),
+            1,
+            "in_settle {in_settle}"
+        );
+    }
+}
+
+// The backoff never waits past the job's deadline.
+#[tokio::test(start_paused = true)]
+async fn the_fee_cap_backoff_stops_at_the_deadline() {
+    let poll = Duration::from_secs(1);
+    let mut r = rig_with(poll);
+    let l1 = Capped::new(r.l1.clone());
+    let cap = L1Fees::offer(&r.l1.market()).cost(r.blobs.blobs.len()) * 3;
+    let (dir, db) = fresh_db();
+    r.da = L1Da::new(l1.clone(), db.clone(), cap, poll, TX_BLOB_CAP).unwrap();
+    (r.db, r._dir) = (db, dir);
+    let t0 = tokio::time::Instant::now();
+    let job = L1Job {
+        deadline: t0 + Duration::from_secs(100),
+        ..r.job()
+    };
+    let (_, posting) = with_post(&r.da, &r.s.chain, &job, std::future::ready(())).await;
+    assert!(
+        matches!(posting.error, Some(PostError::Deadline)),
+        "{posting:?}"
+    );
+    let took = t0.elapsed();
+    assert!(
+        took >= Duration::from_secs(100) && took <= Duration::from_secs(101),
+        "{took:?}"
+    );
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("deadline")),
+        "{out:?}"
+    );
+    assert!(r.l1.sends().is_empty());
+}

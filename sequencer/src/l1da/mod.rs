@@ -13,7 +13,7 @@ use std::time::Duration;
 use davinci_zkvm_sdk::blob::TransitionBlobs;
 use davinci_zkvm_sdk::limits::{MAX_BLOBS, TX_BLOB_CAP};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::actor::Chain;
 use crate::storage::{Db, StorageError};
@@ -25,6 +25,10 @@ pub use settle::{
     MAX_PROOF_RETRIES, MAX_REPOSTS, PROOF_FAIL_FOR, REORG_MARGIN, TOP_ABOVE_ORIGIN, choose_anchor,
     settle,
 };
+
+/// Longest wait between fee-capped post attempts: fees move once per L1
+/// block (12 s) and a spike lasts minutes.
+pub const FEE_CAP_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Seconds each chunk after the first adds to the Ethereum leg: its post
 /// waits until the one before is mined (about two L1 blocks).
@@ -120,10 +124,63 @@ pub fn chunks(blobs: &TransitionBlobs, per_tx: usize) -> Vec<TransitionBlobs> {
 impl L1Da {
     /// Waits one poll; false once `cancel` fires.
     pub(crate) async fn pause(&self, cancel: &CancellationToken) -> bool {
+        self.pause_for(self.poll, cancel).await
+    }
+
+    /// Waits `d`; false once `cancel` fires.
+    pub(crate) async fn pause_for(&self, d: Duration, cancel: &CancellationToken) -> bool {
         tokio::select! {
             _ = cancel.cancelled() => false,
-            _ = tokio::time::sleep(self.poll) => true,
+            _ = tokio::time::sleep(d) => true,
         }
+    }
+}
+
+/// A run of failed posts (fee cap, L1 trouble) of one job: paces the
+/// retries and logs the run at WARN when it starts and when a post ends it,
+/// DEBUG in between. Fee-cap refusals wait one poll, doubling up to
+/// [`FEE_CAP_BACKOFF`]; L1 trouble keeps the poll.
+#[derive(Default)]
+pub(crate) struct Retries {
+    since: Option<tokio::time::Instant>,
+    checks: u32,
+    wait: Duration,
+}
+
+impl Retries {
+    /// Logs `e` and sets the wait before the next attempt.
+    pub(crate) fn failed(&mut self, pid: &str, chunk: usize, e: &PostError, poll: Duration) {
+        self.checks = self.checks.saturating_add(1);
+        if self.since.is_none() {
+            self.since = Some(tokio::time::Instant::now());
+            warn!(pid, chunk, error = %e, "L1 post failed; retrying (logged again once it goes through)");
+        } else {
+            debug!(pid, chunk, checks = self.checks, error = %e, "L1 post failed again");
+        }
+        self.wait = match e {
+            PostError::FeeCap { .. } if !self.wait.is_zero() => {
+                self.wait.saturating_mul(2).min(FEE_CAP_BACKOFF.max(poll))
+            }
+            _ => poll,
+        };
+    }
+
+    /// A post went through: logs the run it ended, if any, and resets.
+    pub(crate) fn cleared(&mut self, pid: &str, chunk: usize) {
+        if let Some(t) = self.since.take() {
+            warn!(pid, chunk, after = ?t.elapsed(), checks = self.checks,
+                "L1 post went through after failing");
+        }
+        *self = Retries::default();
+    }
+
+    /// Waits before the next attempt, never past `job`'s deadline: false
+    /// once the deadline passed or the flight ended.
+    pub(crate) async fn wait(&self, da: &L1Da, job: &L1Job<'_>) -> bool {
+        let left = job
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        !left.is_zero() && da.pause_for(self.wait.min(left), &job.cancel).await
     }
 }
 
@@ -164,15 +221,17 @@ pub enum Settled {
 
 /// Posts `chunks` in order, one transaction at a time: each waits until the
 /// one before is mined (the window-1 poster). Fee-cap and L1 trouble are
-/// retried each poll; any other error, or the flight's end, stops the run.
-/// Returns the mined posts and the error that stopped it early.
+/// retried as [`Retries`] paces them; any other error, or the flight's end,
+/// stops the run. Returns the mined posts and the error that stopped it early.
 async fn post_chunks(
     da: &L1Da,
     job: &L1Job<'_>,
     chunks: &[TransitionBlobs],
 ) -> (Vec<Posted>, Option<PostError>) {
+    let pid = hex::encode(job.pid);
     let mut posts = Vec::with_capacity(chunks.len());
-    for c in chunks {
+    let mut retries = Retries::default();
+    for (i, c) in chunks.iter().enumerate() {
         loop {
             match da
                 .poster
@@ -180,13 +239,14 @@ async fn post_chunks(
                 .await
             {
                 Ok(p) => {
+                    retries.cleared(&pid, i);
                     posts.push(p);
                     job.posted.store(true, Ordering::Relaxed);
                     break;
                 }
                 // Fee cap, L1 trouble: wait and post again while the proof runs.
                 Err(e @ (PostError::FeeCap { .. } | PostError::L1(_))) => {
-                    warn!(pid = %hex::encode(job.pid), error = %e, "L1 post failed; retrying");
+                    retries.failed(&pid, i, &e, da.poll);
                     // A fee spike between chunks must not hold the flight past
                     // the job's deadline; `settle` then posts the missing chunk,
                     // but its top-of-loop deadline check fires first and
@@ -194,8 +254,11 @@ async fn post_chunks(
                     if tokio::time::Instant::now() >= job.deadline {
                         return (posts, Some(PostError::Deadline));
                     }
-                    if !da.pause(&job.cancel).await {
-                        return (posts, Some(e));
+                    if !retries.wait(da, job).await {
+                        if job.cancel.is_cancelled() {
+                            return (posts, Some(e));
+                        }
+                        return (posts, Some(PostError::Deadline));
                     }
                 }
                 Err(e) => return (posts, Some(e)),
