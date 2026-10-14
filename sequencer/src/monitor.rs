@@ -586,6 +586,16 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
                 ctx.node.metrics.reorgs.fetch_add(1, Ordering::Relaxed);
                 (last, last_hash) = (to, None);
                 save_cursor(&ctx.deps.db, last, None);
+                // Every actor re-reads its process: one whose transitions the
+                // reorg took may have no event in the range to wake it. Off
+                // the loop, so a full mailbox cannot stall routing.
+                let handles: Vec<ActorHandle> =
+                    ctx.node.processes.read().await.values().cloned().collect();
+                ctx.deps.tasks.spawn(async move {
+                    for h in handles {
+                        h.reread().await;
+                    }
+                });
             }
             // The same block, or an endpoint behind the cursor.
             (Ok(_), _) => {}

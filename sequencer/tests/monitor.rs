@@ -858,3 +858,73 @@ async fn cursor_without_a_hash_is_armed_at_the_next_poll() {
     .await;
     sd.cancel();
 }
+
+/// A reorg at the cursor wakes every actor to re-read the chain. An idle
+/// process whose committed transition the reorg took, with none of its
+/// events in the rewound range, rebuilds about LANDED_EVENT_WAIT later
+/// without any vote to seal.
+#[tokio::test(start_paused = true)]
+async fn reorg_at_the_cursor_wakes_an_idle_process_to_rebuild() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 1600);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 1601);
+    h.submit(v0.clone()).await.unwrap();
+    wait_until("v0 settled", async || {
+        all_settled(&h, &[v0.pkg.vote_id]).await
+    })
+    .await;
+    // Far past the creation and the first landing: the rewind misses them.
+    s.chain.set_head_block(s.chain.head_block() + 300);
+    h.submit(v1.clone()).await.unwrap();
+    wait_until("v1 settled", async || {
+        all_settled(&h, &[v1.pkg.vote_id]).await
+    })
+    .await;
+    let landed = s.chain.head_block();
+    settled_at_head(&db, &net).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    s.chain.reorg_out_last_transition();
+    net.reorg(landed, 1);
+    wait_until("reorg seen", async || {
+        node.metrics.reorgs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let t0 = tokio::time::Instant::now();
+    for _ in 0..200 {
+        if node.metrics.rebuilds.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        node.metrics.rebuilds.load(Ordering::SeqCst),
+        1,
+        "never rebuilt"
+    );
+    assert!(
+        t0.elapsed() <= Duration::from_secs(95),
+        "{:?}",
+        t0.elapsed()
+    );
+    wait_until("v1 settled again on the chain's root", async || {
+        all_settled(&h, &[v1.pkg.vote_id]).await
+            && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    sd.cancel();
+}
