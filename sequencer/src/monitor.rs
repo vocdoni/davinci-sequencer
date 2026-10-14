@@ -152,14 +152,29 @@ pub async fn spawn_node(
     }
     drop(map);
     let tracker = ctx.deps.tasks.clone();
+    tracker.spawn(heartbeat_loop(
+        ctx.deps.contracts.clone(),
+        node.processes.clone(),
+        ctx.cfg.confirmations,
+        ctx.cfg.heartbeat(),
+        shutdown.clone(),
+    ));
     tracker.spawn(monitor_loop(ctx, shutdown));
     Ok(node)
 }
 
-/// Origin-2 census updates: pid -> (uri, newest root, state). A newer
-/// update replaces uri and root; a running fetch finishes first, so each
+/// Census downloads by pid: origin-2 updates and bootstrap censuses. A newer
+/// root replaces uri and root; a running fetch finishes first, so each
 /// process has at most one fetch in flight and one pending.
-type Updates = Arc<Mutex<HashMap<Fr, (String, Fr, Job)>>>;
+type Updates = Arc<Mutex<HashMap<Fr, Update>>>;
+
+struct Update {
+    uri: String,
+    root: Fr,
+    job: Job,
+    /// The last transient failure, until a bootstrap counts it.
+    failed: Option<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Job {
@@ -217,11 +232,44 @@ impl CensusQueue {
             error!(pid = %pid_hex(&pid), %e, "clear census failure");
         }
         if let Ok(mut q) = self.updates.lock() {
-            let e = q.entry(pid).or_insert((String::new(), root, Job::Queued));
-            (e.0, e.1) = (uri, root);
-            if e.2 == Job::Done {
-                e.2 = Job::Queued;
+            let e = q.entry(pid).or_insert(Update {
+                uri: String::new(),
+                root,
+                job: Job::Queued,
+                failed: None,
+            });
+            if e.root != root {
+                e.failed = None;
             }
+            (e.uri, e.root) = (uri, root);
+            if e.job == Job::Done {
+                e.job = Job::Queued;
+            }
+        }
+    }
+
+    /// Whether `pid`'s download is queued or running, with no failure to
+    /// report and its census not stored yet.
+    fn waiting(&self, pid: &Fr) -> bool {
+        let root = match self.updates.lock() {
+            Ok(q) => match q.get(pid) {
+                Some(e) if e.job != Job::Done && e.failed.is_none() => e.root,
+                _ => return false,
+            },
+            Err(_) => return false,
+        };
+        !self.store.has(&root).unwrap_or(true)
+    }
+
+    /// The transient failure of `pid`'s download since the last call.
+    fn take_failure(&self, pid: &Fr) -> Option<String> {
+        self.updates.lock().ok()?.get_mut(pid)?.failed.take()
+    }
+
+    /// Drops `pid`'s entry: its bootstrap ended.
+    fn forget(&self, pid: &Fr) {
+        if let Ok(mut q) = self.updates.lock() {
+            q.remove(pid);
         }
     }
 }
@@ -236,7 +284,7 @@ fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
 /// Roots of finished processes are kept, so their proofs stay servable.
 async fn prune_censuses(ctx: &Ctx) {
     let mut keep: HashSet<[u8; 32]> = match ctx.queue.updates.lock() {
-        Ok(q) => q.values().map(|e| fr_to_be(&e.1)).collect(),
+        Ok(q) => q.values().map(|e| fr_to_be(&e.root)).collect(),
         Err(_) => return,
     };
     match ctx.deps.db.processes() {
@@ -254,17 +302,17 @@ async fn prune_censuses(ctx: &Ctx) {
     }
 }
 
-/// Starts a fetch for every queued origin-2 census not already in flight.
-/// Off the monitor loop: `CensusStore::fetch` applies the usual SSRF, size
-/// and backoff rules, and a transient failure stays queued for the next tick.
+/// Starts a fetch for every queued census not already in flight. Off the
+/// monitor loop: `CensusStore::fetch` applies the usual SSRF, size and
+/// backoff rules, and a transient failure stays queued for the next tick.
 fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
     let jobs: Vec<(Fr, String, Fr)> = match ctx.queue.updates.lock() {
         Ok(mut q) => q
             .iter_mut()
-            .filter(|(_, e)| e.2 == Job::Queued)
+            .filter(|(_, e)| e.job == Job::Queued)
             .map(|(pid, e)| {
-                e.2 = Job::Running;
-                (*pid, e.0.clone(), e.1)
+                e.job = Job::Running;
+                (*pid, e.uri.clone(), e.root)
             })
             .collect(),
         Err(_) => return,
@@ -281,6 +329,7 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                 _ = sd.cancelled() => return,
                 r = census.fetch(&uri, &root) => r,
             };
+            let mut failed = None;
             let done = match res {
                 Ok(()) => {
                     prune.store(true, Ordering::Relaxed);
@@ -301,6 +350,7 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                 }
                 Err(e) => {
                     warn!(pid = %pid_hex(&pid), ?e, "census update fetch; retrying");
+                    failed = Some(e.to_string());
                     false
                 }
             };
@@ -308,7 +358,10 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
             if let Ok(mut q) = q.lock()
                 && let Some(e) = q.get_mut(&pid)
             {
-                e.2 = if done && e.1 == root {
+                if e.root == root && failed.is_some() {
+                    e.failed = failed;
+                }
+                e.job = if done && e.root == root {
                     Job::Done
                 } else {
                     Job::Queued
@@ -475,23 +528,12 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
         },
     };
     let mut retries = load_retries(&ctx.deps.db);
-    // Independent cadences: a due tick is never lost to the other branch.
     let mut poll = tokio::time::interval(ctx.cfg.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     poll.reset(); // skip the immediate first tick
-    let mut beat = tokio::time::interval(ctx.cfg.heartbeat());
-    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    beat.reset();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = beat.tick() => {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = heartbeat(&ctx) => {}
-                }
-                continue;
-            }
             _ = poll.tick() => {}
         }
         let head = tokio::select! {
@@ -561,13 +603,37 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
 }
 
 /// The heartbeat: actors seal, close out, resync and finalize on Head.
-/// The block is the confirmed head, so gap replays never apply a
-/// transition still shallow enough to reorg out.
-async fn heartbeat(ctx: &Ctx) {
-    if let Ok((block, time)) = ctx.deps.contracts.head().await {
-        let confirmed_block = block.saturating_sub(ctx.cfg.confirmations);
-        for h in ctx.node.processes.read().await.values() {
-            h.head(confirmed_block, time).await;
+/// Its own task, so a slow page or bootstrap never delays it. The block is
+/// the confirmed head, so gap replays never apply a transition still
+/// shallow enough to reorg out.
+async fn heartbeat_loop(
+    contracts: Arc<dyn crate::actor::Chain>,
+    processes: Arc<RwLock<HashMap<Fr, ActorHandle>>>,
+    confirmations: u64,
+    every: std::time::Duration,
+    shutdown: CancellationToken,
+) {
+    let mut beat = tokio::time::interval(every);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beat.reset();
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = beat.tick() => {}
+        }
+        let head = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            r = contracts.head() => r,
+        };
+        let Ok((block, time)) = head else { continue };
+        let confirmed_block = block.saturating_sub(confirmations);
+        // Not under the map lock: a full mailbox must not hold up a spawn.
+        let hs: Vec<ActorHandle> = processes.read().await.values().cloned().collect();
+        for h in hs {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = h.head(confirmed_block, time) => {}
+            }
         }
     }
 }
@@ -592,9 +658,14 @@ async fn route(
             return; // already queued for retry
         }
         if let Err(e) = bootstrap(ctx, pid, &pid31, shutdown).await {
-            warn!(pid = %hex::encode(pid31), %e, "bootstrap failed; queued for retry");
-            // A wait (a census still syncing) is not a failed attempt.
-            let attempts = u32::from(!matches!(e, NodeError::Census(CensusError::Backoff(_))));
+            // A wait (a census still loading) is not a failed attempt.
+            let wait = matches!(e, NodeError::Census(CensusError::Backoff(_)));
+            if wait {
+                info!(pid = %hex::encode(pid31), "bootstrap waits for its census");
+            } else {
+                warn!(pid = %hex::encode(pid31), %e, "bootstrap failed; queued for retry");
+            }
+            let attempts = u32::from(!wait);
             retries.push(BootRetry {
                 pid,
                 pid31,
@@ -692,6 +763,7 @@ async fn ignore_unbootstrapped(ctx: &Ctx, pid: Fr, pid31: &[u8; 31], note: &str)
     if let Err(e) = ignore(ctx, rec, &note) {
         error!(pid = %hex::encode(pid31), %e, "record ignored process");
     }
+    ctx.queue.forget(&pid);
 }
 
 /// Stand-in record for a process whose on-chain read never succeeded.
@@ -746,6 +818,12 @@ async fn bootstrap(
     if ctx.deps.db.process(&pid)?.is_some() || ctx.node.processes.read().await.contains_key(&pid) {
         return Ok(()); // seen before (respawned or ignored)
     }
+    // Its census is still downloading: nothing to re-read yet.
+    if ctx.queue.waiting(&pid) {
+        return Err(NodeError::Census(CensusError::Backoff(
+            ctx.cfg.poll_interval,
+        )));
+    }
     // A failed fetch is transient: the caller queues the pid for retry.
     let onchain = match ctx.deps.contracts.process(pid31).await {
         Ok(p) => p,
@@ -795,28 +873,34 @@ async fn bootstrap(
             }));
         }
     }
+    // Origins 1 and 2 download off the loop (the URI is the creator's: a
+    // slow server must not stall routing). The process waits on the retry
+    // list until the census is stored; a failed download costs an attempt.
     if matches!(
         pcfg.census_origin,
         CensusOrigin::MerkleStatic | CensusOrigin::MerkleOffchainDynamic
-    ) && let Err(e) = ctx
-        .node
-        .census
-        .fetch(&rec.onchain.census.uri, &pcfg.census_root)
-        .await
-    {
-        return match e {
-            // A broken document or a policy refusal can never validate:
-            // ignore for good.
-            CensusError::Format(_)
-            | CensusError::RootMismatch { .. }
-            | CensusError::Config(_)
-            | CensusError::Refused(_) => ignore(ctx, rec, &format!("census: {e}")),
-            // Network trouble (or the store's own backoff): the caller puts
-            // the process on the bootstrap retry list.
-            e => Err(NodeError::Census(e)),
-        };
+    ) {
+        // A broken document or a policy refusal can never validate: ignore
+        // for good, even if another process stored the root meanwhile.
+        if let Some(why) = ctx.node.census.bad_reason(&pid, &pcfg.census_root) {
+            ctx.queue.forget(&pid);
+            if let Err(e) = ctx.node.census.clear_bad(&pid) {
+                error!(pid = %pid_hex(&pid), %e, "clear census failure");
+            }
+            return ignore(ctx, rec, &format!("census: {why}"));
+        }
+        if !ctx.node.census.has(&pcfg.census_root)? {
+            if let Some(why) = ctx.queue.take_failure(&pid) {
+                return Err(NodeError::Census(CensusError::Fetch(why)));
+            }
+            queue_census(ctx, pid, rec.onchain.census.uri.clone(), pcfg.census_root);
+            return Err(NodeError::Census(CensusError::Backoff(
+                ctx.cfg.poll_interval,
+            )));
+        }
     }
     ctx.deps.db.put_process(&rec)?;
+    ctx.queue.forget(&pid);
     let chain_time = ctx.deps.contracts.head().await.map(|(_, t)| t).unwrap_or(0);
     let h = spawn_actor(
         &ctx.cfg,
