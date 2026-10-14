@@ -63,6 +63,7 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--l1-privkey-file` | `DAVINCI_L1_PRIVKEY_FILE` | unset | File with the hex key of the dedicated Ethereum account that posts blobs. A signing node in L1-blob mode needs it. |
 | (env only) | `DAVINCI_L1_PRIVKEY` | unset | The same key, from the environment. |
 | `--l1-max-post-fee` | `DAVINCI_L1_MAX_POST_FEE` | `0.001eth` | Most one blob post may cost at the fees it offers (`<wei>`, `<n>gwei`, `<n>eth`); above it the node waits for cheaper fees. |
+| `--op-max-tx-fee` | `DAVINCI_OP_MAX_TX_FEE` | `0.002eth` | Most one transaction on the registry chain may cost in execution gas, `gas limit × max fee per gas` (`<wei>`, `<n>gwei`, `<n>eth`); above it the send is withheld and retried later. |
 | `--start-block` | `DAVINCI_START_BLOCK` | network | First block a fresh deployment scans for registry events. Ignored once the deployment has scanned. Progress is saved every 5,000 blocks. |
 | `--confirmations` | `DAVINCI_CONFIRMATIONS` | network, else `2` | Blocks behind head treated as final. Raise it with load-balanced RPCs whose backends lag. |
 | `--prover-url` | `DAVINCI_PROVER_URL` | `http://127.0.0.1:8080` | davinci-zkvm prover service. |
@@ -166,6 +167,17 @@ On OP Mainnet:
   alone reaches the cap at an Ethereum base fee of about 24 gwei, whatever the blob fee; above it
   every post waits. Each replacement doubles every fee, so from a 1 gwei base fee about four
   replacements fit under the default.
+- `--op-max-tx-fee` bounds every transaction the node sends on the registry chain: transitions,
+  results, the DKG and Council results calls, and `record()` in L1-blob mode. It counts
+  `gas limit × max fee per gas` at the price the node would offer; OP's L1 data fee is charged
+  apart and not counted, nor is the blob fee of a blob-mode transition. A
+  `submitStateTransitionL1` takes about 1.5 to 2.5 M gas, so the 0.002 ETH default admits about
+  1 gwei on the largest one, 20 to 100 times OP's usual price. Above it the send is refused before
+  signing, logged at error level with the price and the cap, and the batch is retried under the
+  usual backoff; a replacement whose bump would cross it is withheld and the transaction waits at
+  its current price. Near the grace end the cap trades spend for liveness: watch for
+  `send withheld` and `replacement withheld`. On another chain in blob mode (Ethereum, Gnosis),
+  raise it to that chain's prices.
 - Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the
   node logs why at debug level ("no time to land an L1-blob batch", "no batch fits", "the exposed set needs more blob
   transactions than the window fits").

@@ -26,6 +26,9 @@ const ERROR_STRING: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
 const PANIC: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 /// Gas limit headroom over the estimate, in percent.
 const GAS_MARGIN: u64 = 20;
+/// `--op-max-tx-fee`'s default, 0.002 ETH: about 1 gwei on the largest
+/// settlement, far above OP's usual price.
+pub const DEFAULT_MAX_TX_FEE: u128 = 2_000_000_000_000_000;
 
 fn transition_call(pid: &[u8; 31], snark: &PlonkSnark, blobs: &TransitionBlobs) -> Bytes {
     PR::submitStateTransitionCall {
@@ -165,6 +168,15 @@ fn bumped(old: &Fees, now_max: u128, now_prio: u128, now_blob: u128) -> Fees {
         priority: up(old.priority).max(now_prio),
         blob_fee: old.blob_fee.saturating_mul(2).max(1).max(now_blob),
     }
+}
+
+// What a tx may cost in execution gas: `gas` (the limit) at `max_fee`.
+fn cost(gas: u64, max_fee: u128) -> u128 {
+    u128::from(gas).saturating_mul(max_fee)
+}
+
+fn fits_cap(gas: u64, fees: &Fees, cap: u128) -> bool {
+    cost(gas, fees.max_fee) <= cap
 }
 
 /// Whether a node refused a blob tx for its sidecar version (v0 vs v1).
@@ -487,126 +499,161 @@ impl Contracts {
             .block(alloy::eips::BlockId::latest())
             .await
             .map_err(|e| self.classify(&e))?;
-        tx.set_gas_limit(gas.saturating_add(gas / 100 * GAS_MARGIN));
+        let gas_limit = gas.saturating_add(gas / 100 * GAS_MARGIN);
+        tx.set_gas_limit(gas_limit);
+        let cap = self.max_tx_fee;
 
         let mut hashes: Vec<B256> = Vec::new();
         let mut version_retried = false;
         let mut v1 = self.cell_proofs();
         let mut attempt = 0;
         let mut rereads = 0;
+        // A replacement over the cap was withheld (logged once).
+        let mut capped = false;
         while attempt < MAX_ATTEMPTS {
             attempt += 1;
-            let mut req = tx.clone();
-            req.set_max_fee_per_gas(fees.max_fee);
-            req.set_max_priority_fee_per_gas(fees.priority);
-            if blobs.is_some() {
-                req.set_max_fee_per_blob_gas(fees.blob_fee);
+            let withheld = !fits_cap(gas_limit, &fees, cap);
+            if withheld {
+                let want = cost(gas_limit, fees.max_fee);
+                // A send of ours holds this nonce: wait for it at its price.
+                let Some(held) = state.stuck.filter(|_| !hashes.is_empty()) else {
+                    tracing::error!(
+                        nonce,
+                        want,
+                        cap,
+                        "send withheld: its fee is over --op-max-tx-fee"
+                    );
+                    return Err(Web3Error::FeeCap { want, cap });
+                };
+                if !capped {
+                    capped = true;
+                    tracing::error!(
+                        nonce,
+                        want,
+                        cap,
+                        "replacement withheld: its fee is over --op-max-tx-fee, waiting at the current price"
+                    );
+                }
+                fees = held;
             }
-            if let Some(sc) = &sidecar {
-                req.set_blob_sidecar(sc.clone());
-            }
-            // Signed here so the hash is known even if the send errors.
-            let env = req
-                .build(wallet)
-                .await
-                .map_err(|e| Web3Error::Rpc(format!("signing: {e}")))?;
-            let hash = *env.tx_hash();
             let mut gap = None;
-            match p.send_tx_envelope(env).await {
-                Ok(_) => {
-                    hashes.push(hash);
-                    // Whatever happens below (fees only go up between attempts).
-                    state.hold(fees, hash);
-                    if version_retried {
-                        // The other version was accepted: use it from now on.
-                        self.cell_proofs.store(v1, Ordering::Relaxed);
-                    }
+            if !withheld {
+                let mut req = tx.clone();
+                req.set_max_fee_per_gas(fees.max_fee);
+                req.set_max_priority_fee_per_gas(fees.priority);
+                if blobs.is_some() {
+                    req.set_max_fee_per_blob_gas(fees.blob_fee);
                 }
-                // No node answered, but the tx may be in: wait for it like
-                // an accepted one.
-                Err(e) if maybe_sent(&e) => {
-                    tracing::warn!(nonce, error = %e, "send unanswered, waiting for its receipt");
-                    hashes.push(hash);
-                    state.hold(fees, hash);
+                if let Some(sc) = &sidecar {
+                    req.set_blob_sidecar(sc.clone());
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if let Some(b) =
-                        blobs.filter(|_| !version_retried && sidecar_version_error(&msg))
-                    {
-                        version_retried = true;
-                        v1 = !v1;
-                        tracing::warn!(error = %msg, v1, "sidecar version refused, retrying with the other");
-                        sidecar = Some(self.sidecar(b, v1).await?);
-                        attempt -= 1;
-                        continue;
-                    }
-                    if underpriced(&msg) {
-                        if attempt == MAX_ATTEMPTS {
-                            // Something of ours holds this nonce at least this price.
-                            state.stuck = Some(fees);
-                            return Err(Web3Error::Underpriced(msg));
+                // Signed here so the hash is known even if the send errors.
+                let env = req
+                    .build(wallet)
+                    .await
+                    .map_err(|e| Web3Error::Rpc(format!("signing: {e}")))?;
+                let hash = *env.tx_hash();
+                match p.send_tx_envelope(env).await {
+                    Ok(_) => {
+                        hashes.push(hash);
+                        // Whatever happens below (fees only go up between attempts).
+                        state.hold(fees, hash);
+                        if version_retried {
+                            // The other version was accepted: use it from now on.
+                            self.cell_proofs.store(v1, Ordering::Relaxed);
                         }
-                        let (m, pr, bl) = self.fees_now(blobs.is_some()).await?;
-                        fees = bumped(&fees, m, pr, bl);
-                        continue;
                     }
-                    let raced = raced(&msg);
-                    // An endpoint holding this very tx took it, like an
-                    // acceptance (Nethermind's answer may outlive the pool
-                    // entry: then a receipt timeout and a replacement). After
-                    // an RPC failover the send may have reached the failed
-                    // endpoint too: it may be pooled or mined.
-                    let ours = known_tx(&msg)
-                        || raced && matches!(p.get_transaction_by_hash(hash).await, Ok(Some(_)));
-                    if ours {
+                    // No node answered, but the tx may be in: wait for it like
+                    // an accepted one.
+                    Err(e) if maybe_sent(&e) => {
+                        tracing::warn!(nonce, error = %e, "send unanswered, waiting for its receipt");
                         hashes.push(hash);
                         state.hold(fees, hash);
-                    } else if raced && hashes.is_empty() {
-                        // Nothing sent at this nonce in this call holds it.
-                        // It may be ours after all (an acceptance lost in
-                        // the broadcast), or an earlier send may be: wait a
-                        // few blocks for either before moving on.
-                        let mut ask = state.sent.clone();
-                        ask.push(hash);
-                        let wait = self.receipt_timeout.min(RACE_WAIT);
-                        if let Some(r) = self.wait_any(&ask, wait).await? {
-                            let this = ask[mine..].contains(&r.transaction_hash);
-                            state.unstick();
-                            state.mined = state.mined.max(Some(nonce));
-                            if !this {
-                                return Err(Web3Error::Rpc(format!(
-                                    "nonce {nonce} went to an earlier tx of ours, {}",
-                                    r.transaction_hash
-                                )));
-                            }
-                            drop(state);
-                            return self.finish(r, tx, ask.len() - mine).await;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if let Some(b) =
+                            blobs.filter(|_| !version_retried && sidecar_version_error(&msg))
+                        {
+                            version_retried = true;
+                            v1 = !v1;
+                            tracing::warn!(error = %msg, v1, "sidecar version refused, retrying with the other");
+                            sidecar = Some(self.sidecar(b, v1).await?);
+                            attempt -= 1;
+                            continue;
                         }
-                        if rereads == MAX_REREADS {
+                        if underpriced(&msg) {
+                            if attempt == MAX_ATTEMPTS {
+                                // Something of ours holds this nonce at least this price.
+                                state.stuck = Some(fees);
+                                return Err(Web3Error::Underpriced(msg));
+                            }
+                            let (m, pr, bl) = self.fees_now(blobs.is_some()).await?;
+                            fees = bumped(&fees, m, pr, bl);
+                            continue;
+                        }
+                        let raced = raced(&msg);
+                        // An endpoint holding this very tx took it, like an
+                        // acceptance (Nethermind's answer may outlive the pool
+                        // entry: then a receipt timeout and a replacement). After
+                        // an RPC failover the send may have reached the failed
+                        // endpoint too: it may be pooled or mined.
+                        let ours = known_tx(&msg)
+                            || raced
+                                && matches!(p.get_transaction_by_hash(hash).await, Ok(Some(_)));
+                        if ours {
+                            hashes.push(hash);
+                            state.hold(fees, hash);
+                        } else if raced && hashes.is_empty() {
+                            // Nothing sent at this nonce in this call holds it.
+                            // It may be ours after all (an acceptance lost in
+                            // the broadcast), or an earlier send may be: wait a
+                            // few blocks for either before moving on.
+                            let mut ask = state.sent.clone();
+                            ask.push(hash);
+                            let wait = self.receipt_timeout.min(RACE_WAIT);
+                            if let Some(r) = self.wait_any(&ask, wait).await? {
+                                let this = ask[mine..].contains(&r.transaction_hash);
+                                state.unstick();
+                                state.mined = state.mined.max(Some(nonce));
+                                if !this {
+                                    return Err(Web3Error::Rpc(format!(
+                                        "nonce {nonce} went to an earlier tx of ours, {}",
+                                        r.transaction_hash
+                                    )));
+                                }
+                                drop(state);
+                                return self.finish(r, tx, ask.len() - mine).await;
+                            }
+                            if rereads == MAX_REREADS {
+                                return Err(self.classify(&e));
+                            }
+                            // The nonce was read from a lagging endpoint and is
+                            // mined: the same tx goes out at the next one.
+                            rereads += 1;
+                            let named = named_count(&msg).and_then(|k| k.checked_sub(1));
+                            state.mined = state.mined.max(Some(nonce)).max(named);
+                            let next = self.nonce(from, &state).await?;
+                            tracing::warn!(
+                                nonce,
+                                next,
+                                "nonce too low, resending at a fresh nonce"
+                            );
+                            nonce = next;
+                            fees.nonce = next;
+                            tx.set_nonce(next);
+                            if state.stuck.is_some_and(|s| s.nonce != nonce) {
+                                state.stuck = None;
+                            }
+                            attempt -= 1;
+                            continue;
+                        } else if gapped(&msg) {
+                            gap = Some(e);
+                        } else if !raced || hashes.is_empty() {
                             return Err(self.classify(&e));
                         }
-                        // The nonce was read from a lagging endpoint and is
-                        // mined: the same tx goes out at the next one.
-                        rereads += 1;
-                        let named = named_count(&msg).and_then(|k| k.checked_sub(1));
-                        state.mined = state.mined.max(Some(nonce)).max(named);
-                        let next = self.nonce(from, &state).await?;
-                        tracing::warn!(nonce, next, "nonce too low, resending at a fresh nonce");
-                        nonce = next;
-                        fees.nonce = next;
-                        tx.set_nonce(next);
-                        if state.stuck.is_some_and(|s| s.nonce != nonce) {
-                            state.stuck = None;
-                        }
-                        attempt -= 1;
-                        continue;
-                    } else if gapped(&msg) {
-                        gap = Some(e);
-                    } else if !raced || hashes.is_empty() {
-                        return Err(self.classify(&e));
+                        // A send of ours at this nonce is in the pool or mined: keep waiting on it.
                     }
-                    // A send of ours at this nonce is in the pool or mined: keep waiting on it.
                 }
             }
             if gap.is_none()
@@ -1286,6 +1333,83 @@ mod tests {
         chain.lock().unwrap().known = true;
         c.send(call(&[3]), None).await.unwrap();
         assert_eq!(sent(&chain), [(5, vec![3])]);
+    }
+
+    // The stub's price for one call: the `FeeCap` a 1-wei cap returns.
+    async fn price(c: &mut Contracts) -> u128 {
+        c.max_tx_fee = 1;
+        let e = c.send(call(&[0]), None).await.unwrap_err();
+        let Web3Error::FeeCap { want, cap: 1 } = e else {
+            panic!("want FeeCap, got {e}")
+        };
+        want
+    }
+
+    // Over `--op-max-tx-fee` nothing is signed nor sent; at the cap it goes.
+    #[tokio::test]
+    async fn a_send_over_the_fee_cap_is_withheld() {
+        let (mut c, chain) = sender(5).await;
+        let want = price(&mut c).await;
+        assert!(sent(&chain).is_empty(), "nothing broadcast");
+        // Gas limit (21000 + 20%) times the stub's max fee.
+        assert!(want > 25_200 && want % 25_200 == 0, "{want}");
+        c.max_tx_fee = want - 1;
+        let e = c.send(call(&[1]), None).await.unwrap_err();
+        assert!(
+            matches!(e, Web3Error::FeeCap { cap, .. } if cap == want - 1),
+            "{e}"
+        );
+        assert!(sent(&chain).is_empty());
+        c.max_tx_fee = want;
+        let (r, _) = c.send(call(&[2]), None).await.unwrap();
+        assert_eq!(r.replacements, 0);
+        assert_eq!(sent(&chain), [(5, vec![2])]);
+    }
+
+    // A replacement whose bump crosses the cap is withheld: the tx waits at
+    // its price, and the next send, which would have to replace it, is
+    // refused before signing.
+    #[tokio::test]
+    async fn a_replacement_over_the_fee_cap_is_withheld() {
+        let (mut c, chain) = sender(5).await;
+        c.max_tx_fee = price(&mut c).await;
+        chain.lock().unwrap().hold = true;
+        let e = c.send(call(&[1]), None).await.unwrap_err();
+        assert!(matches!(e, Web3Error::Stuck { nonce: 5, .. }), "{e}");
+        assert_eq!(sent(&chain), [(5, vec![1])], "never replaced");
+        let e = c.send(call(&[2]), None).await.unwrap_err();
+        assert!(matches!(e, Web3Error::FeeCap { .. }), "{e}");
+        assert_eq!(sent(&chain).len(), 1);
+
+        // Mined at its price while the withheld replacement waits.
+        let (mut c, chain) = sender(5).await;
+        c.max_tx_fee = price(&mut c).await;
+        chain.lock().unwrap().hold = true;
+        let miner = chain.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut ch = miner.lock().unwrap();
+            ch.hold = false;
+            ch.mine();
+        });
+        let (r, _) = c.send(call(&[3]), None).await.unwrap();
+        assert_eq!(r.replacements, 0);
+        assert_eq!(sent(&chain), [(5, vec![3])]);
+    }
+
+    #[test]
+    fn fee_cap_bounds_gas_times_max_fee() {
+        let f = |max_fee| Fees {
+            nonce: 0,
+            max_fee,
+            priority: 1,
+            blob_fee: 0,
+        };
+        assert!(fits_cap(100, &f(10), 1_000));
+        assert!(!fits_cap(100, &f(11), 1_000));
+        // Saturates instead of wrapping into a small product.
+        assert!(!fits_cap(u64::MAX, &f(u128::MAX), u128::MAX - 1));
+        assert_eq!(cost(u64::MAX, u128::MAX), u128::MAX);
     }
 
     #[tokio::test]

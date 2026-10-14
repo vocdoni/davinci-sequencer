@@ -342,6 +342,11 @@ pub struct Config {
     /// or `<n>eth`); above it the node waits for cheaper fees.
     #[arg(long, env = "DAVINCI_L1_MAX_POST_FEE", default_value = "0.001eth", value_parser = parse_wei)]
     pub l1_max_post_fee: u128,
+    /// Most one transaction on the registry chain may cost in execution gas,
+    /// `gas limit × max fee per gas` (`<wei>`, `<n>gwei` or `<n>eth`); above
+    /// it the send is withheld and retried later. OP's L1 data fee is apart.
+    #[arg(long, env = "DAVINCI_OP_MAX_TX_FEE", default_value = "0.002eth", value_parser = parse_wei)]
+    pub op_max_tx_fee: u128,
     /// davinci-zkvm prover service.
     #[arg(long, env = "DAVINCI_PROVER_URL", default_value = "http://127.0.0.1:8080", value_parser = parse_http_url)]
     pub prover_url: Url,
@@ -485,6 +490,7 @@ impl fmt::Debug for Config {
             .field("l1_privkey", &self.l1_privkey)
             .field("l1_privkey_file", &self.l1_privkey_file)
             .field("l1_max_post_fee", &self.l1_max_post_fee)
+            .field("op_max_tx_fee", &self.op_max_tx_fee)
             .field("prover_url", &Hosts(std::slice::from_ref(&self.prover_url)))
             .field("batch_max", &self.batch_max)
             .field("max_blobs_per_tx", &self.max_blobs_per_tx)
@@ -1068,6 +1074,19 @@ mod tests {
         assert_eq!(two.to_string().parse::<BlobSourceKind>().unwrap(), two);
         assert!("beacon:http://a,ftp://b".parse::<BlobSourceKind>().is_err());
         assert!(parse_duration("2h").unwrap() == Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn op_max_tx_fee() {
+        let c = Config::parse_args(with_rpc()).unwrap();
+        assert_eq!(c.op_max_tx_fee, crate::web3::DEFAULT_MAX_TX_FEE);
+        assert_eq!(c.op_max_tx_fee, 2_000_000_000_000_000);
+        let mut args = with_rpc();
+        args.extend(["--op-max-tx-fee", "0.5gwei"]);
+        assert_eq!(Config::parse_args(args).unwrap().op_max_tx_fee, 500_000_000);
+        let mut args = with_rpc();
+        args.extend(["--op-max-tx-fee", "lots"]);
+        assert!(Config::parse_args(args).is_err());
     }
 
     #[test]

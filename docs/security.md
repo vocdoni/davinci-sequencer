@@ -111,3 +111,5 @@ a DKG mode when no single node should hold the key.
   512-bit reduction, which changes the batch circuit and its program key.
 - **Not supported:** key resharing across epochs, fees against pool draining, and the chained
   (folded) proof mode of davinci-zkvm with dynamic censuses or DKG keys.
+  `--op-max-tx-fee` bounds the node's own spend per transaction (execution gas, not OP's L1 data
+  fee), not the pool: a fee spike past it withholds settlement instead of draining the key.

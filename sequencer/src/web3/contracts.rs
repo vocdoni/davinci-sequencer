@@ -100,6 +100,8 @@ pub struct Contracts {
     pub(super) errors: Arc<HashMap<[u8; 4], String>>,
     pub(super) send_lock: Arc<tokio::sync::Mutex<SendState>>,
     pub(super) receipt_timeout: Duration,
+    /// Most one send may cost in execution gas (`gas limit × max fee`), wei.
+    pub(super) max_tx_fee: u128,
     /// `dkgAdapter()`, an immutable: read once, on first DKG use.
     pub(super) dkg_adapter: Arc<tokio::sync::OnceCell<Address>>,
     /// `councilAdapter()`, likewise.
@@ -618,13 +620,15 @@ impl Contracts {
     /// Connects with the node configuration. In L1-blob mode this chain
     /// never carries blobs, so its blob support is not probed.
     pub async fn connect(cfg: &Config) -> Result<Self> {
-        Self::open(
+        let mut c = Self::open(
             &cfg.rpc_url,
             cfg.registry,
             cfg.privkey.as_ref(),
             !cfg.l1_mode(),
         )
-        .await
+        .await?;
+        c.max_tx_fee = cfg.op_max_tx_fee;
+        Ok(c)
     }
 
     /// Connects to `rpcs` (in order of preference, with sticky failover).
@@ -680,6 +684,7 @@ impl Contracts {
             errors: Arc::new(error_names()?),
             send_lock: Arc::new(tokio::sync::Mutex::new(SendState::default())),
             receipt_timeout: Duration::from_secs(120),
+            max_tx_fee: super::tx::DEFAULT_MAX_TX_FEE,
             dkg_adapter: Arc::default(),
             council_adapter: Arc::default(),
             da: Arc::default(),
@@ -718,6 +723,11 @@ impl Contracts {
     /// higher fees.
     pub fn set_receipt_timeout(&mut self, d: Duration) {
         self.receipt_timeout = d;
+    }
+
+    /// Most one send may cost in execution gas, in wei (`--op-max-tx-fee`).
+    pub fn set_max_tx_fee(&mut self, cap: u128) {
+        self.max_tx_fee = cap;
     }
 
     /// `getProcess`; an unknown pid is an error.
@@ -990,6 +1000,7 @@ impl Contracts {
             errors: Arc::new(error_names().unwrap()),
             send_lock: Default::default(),
             receipt_timeout: Duration::from_secs(1),
+            max_tx_fee: super::tx::DEFAULT_MAX_TX_FEE,
             dkg_adapter: Default::default(),
             council_adapter: Default::default(),
             da: Default::default(),

@@ -32,6 +32,7 @@ pub use l1::{
 };
 pub use l1op::revert_message;
 pub use release::{DeployedRelease, Mismatch};
+pub use tx::DEFAULT_MAX_TX_FEE;
 
 /// `User-Agent` of every outgoing HTTP request: some public RPCs answer 403
 /// without one.
@@ -456,6 +457,10 @@ pub enum Web3Error {
     /// send replaces it at the same nonce.
     #[error("tx at nonce {nonce} not mined after {attempts} attempts")]
     Stuck { nonce: u64, attempts: u32 },
+    /// Withheld before signing: the tx would cost `want` wei in execution
+    /// gas, over `--op-max-tx-fee`. Nothing was sent; retry later.
+    #[error("fee {want} wei over the --op-max-tx-fee cap of {cap} wei: not sent")]
+    FeeCap { want: u128, cap: u128 },
     #[error("no signing key: the node is an observer")]
     NoSigner,
     #[error("unexpected chain data: {0}")]

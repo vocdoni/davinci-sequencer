@@ -601,6 +601,152 @@ async fn registry_on_anvil() {
     c.end_process(&pid2).await.unwrap();
 }
 
+// `--op-max-tx-fee` below a settlement's price: the node's transition is
+// withheld before signing, nothing reaches the chain, and the same call
+// lands under the default cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn op_max_tx_fee_withholds_a_settlement() {
+    use davinci_sequencer::config::Config;
+    use davinci_sequencer::web3::DEFAULT_MAX_TX_FEE;
+
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let me = key.address();
+    let secret = SecretString::new(hex::encode(key.to_bytes()));
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(BALLOT_VK_HASH),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    code.extend(ctor_tail(Address::ZERO));
+    let registry = deploy(&deployer, code).await;
+
+    // The node, from its configuration, capped at one wei.
+    let mut cfg = Config::parse_args([
+        "davinci-sequencer",
+        "--network",
+        "custom",
+        "--registry",
+        &registry.to_string(),
+        "--rpc-url",
+        url.as_str(),
+        "--blob-source",
+        "anvil",
+        "--op-max-tx-fee",
+        "1",
+    ])
+    .unwrap();
+    cfg.privkey = Some(secret);
+    let mut c = Contracts::connect(&cfg).await.unwrap();
+    assert_eq!(c.signer(), Some(me));
+
+    let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+    let mut census_root = [0u8; 32];
+    census_root[0] = 0x01;
+    let np = NewProcess {
+        status: ProcessStatus::Ready,
+        start_time: 0,
+        duration: 3600,
+        max_voters: 1000,
+        ballot_mode: BallotMode {
+            num_fields: NF,
+            group_size: 1,
+            unique_values: false,
+            cost_exponent: 1,
+            max_value: 5,
+            min_value: 0,
+            max_value_sum: 20,
+            min_value_sum: 0,
+        },
+        census: OnchainCensus {
+            origin: 1,
+            root: census_root,
+            uri: "file:///tmp/census.json".into(),
+            contract_address: [0u8; 20],
+        },
+        metadata: "ipfs://meta".into(),
+        metadata_hash: metadata_hash(META_DOC),
+        enc_key: pk,
+    };
+    let count = async || {
+        let latest = deployer.get_transaction_count(me).await.unwrap();
+        let pending = deployer.get_transaction_count(me).pending().await.unwrap();
+        (latest, pending)
+    };
+
+    // Any send: the process creation is withheld too.
+    let before = count().await;
+    let err = c.create_process(&np).await.err().unwrap();
+    assert!(matches!(err, Web3Error::FeeCap { cap: 1, .. }), "{err}");
+    assert_eq!(count().await, before, "nothing broadcast");
+    c.set_max_tx_fee(DEFAULT_MAX_TX_FEE);
+    let (pid, _) = c.create_process(&np).await.unwrap();
+    c.set_max_tx_fee(1);
+
+    let p = c.process(&pid).await.unwrap();
+    let t = TransitionData {
+        vote_ids: vec![VOTE_ID_MIN + 1],
+        updates: vec![(0x11, some_ballot(&pk, 1))],
+        num_fields: NF,
+    };
+    let blobs = build_blobs(&t, &pid_fr(&pid), &p.state_root).unwrap();
+    let snark = batch_snark(
+        &Batch {
+            before: p.state_root,
+            after: [0x91; 32],
+            voters: 1,
+            overwrites: 0,
+            occupied_before: 0,
+        },
+        &census_root,
+        &blobs,
+    );
+    c.simulate_transition(&pid, &snark, &blobs).await.unwrap();
+    let before = count().await;
+    let err = c
+        .submit_transition(&pid, &snark, &blobs)
+        .await
+        .err()
+        .unwrap();
+    let Web3Error::FeeCap { want, cap: 1 } = err else {
+        panic!("want FeeCap, got {err}")
+    };
+    assert_eq!(count().await, before, "nothing broadcast");
+    assert_eq!(c.process(&pid).await.unwrap().voters_count, 0);
+
+    // Under the default cap the same transition lands.
+    assert!(want <= DEFAULT_MAX_TX_FEE, "{want}");
+    c.set_max_tx_fee(DEFAULT_MAX_TX_FEE);
+    let r = c.submit_transition(&pid, &snark, &blobs).await.unwrap();
+    assert_eq!(r.replacements, 0);
+    assert_eq!(count().await, (before.0 + 1, before.1 + 1));
+    assert_eq!(c.process(&pid).await.unwrap().voters_count, 1);
+}
+
 // An organizer replaces the metadata: the node reads each value from
 // getProcess and as a typed event, creation first, in order.
 #[tokio::test(flavor = "multi_thread")]
