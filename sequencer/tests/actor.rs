@@ -6738,3 +6738,71 @@ async fn hold_without_pending_exposed_votes_still_probes() {
     .await;
     shutdown.cancel();
 }
+
+/// A transition the new branch of a reorg re-included in a higher block
+/// (the monitor routes it again) is the one in the log: a no-op. It must
+/// neither rewind the pin nor abort the batch in flight. The chain reads
+/// fail throughout, so nothing heals a rewound pin.
+async fn reincluded_transition_is_a_noop(flight: bool) {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 900 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        prover.release(1);
+        wait_until("settled", async || all_settled(&h, &vids).await).await;
+    }
+    if flight {
+        let v = fake_vote(&s.env, 2, &[1, 2], 902);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_until("third proof running", async || prover.calls() == 3).await;
+    }
+    s.chain.fail_process(u32::MAX);
+    let block = s.chain.reinclude_transition(0);
+    wait_until("the re-included event routed", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    let snap = h.snapshot().await.unwrap();
+    assert!(snap.synced, "the pin moved back to a root we passed");
+    assert_eq!(snap.in_flight, flight, "the batch in flight was dropped");
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 0);
+    prover.release(1);
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(
+        prover.calls(),
+        vids.len() as u64,
+        "a batch was proved again"
+    );
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    s.chain.fail_process(0);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn reincluded_transition_is_a_noop_while_idle() {
+    reincluded_transition_is_a_noop(false).await;
+}
+
+#[tokio::test]
+async fn reincluded_transition_does_not_abort_a_flight() {
+    reincluded_transition_is_a_noop(true).await;
+}

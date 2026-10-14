@@ -3360,7 +3360,7 @@ impl Actor {
             }
             return;
         }
-        if self.seen_tx(block, &tx_hash) {
+        if self.seen_tx(&old_root, &new_root) {
             return; // replayed event of a transition already in the log
         }
         // Our own in-flight batch landing: its receipt handler commits.
@@ -3395,13 +3395,18 @@ impl Actor {
         self.replay_gap(block).await;
     }
 
-    /// Whether this transition is already in the local log (a replay).
-    fn seen_tx(&self, block: u64, tx_hash: &[u8; 32]) -> bool {
-        if block > self.last_tx_block {
+    /// Whether this transition is already in the local log (a replay), by
+    /// its roots: a reorg branch can re-include the same transaction in a
+    /// later block. Roots never repeat, so one leaving the committed root
+    /// is new.
+    fn seen_tx(&self, old_root: &[u8; 32], new_root: &[u8; 32]) -> bool {
+        if *old_root == self.state.committed().root {
             return false;
         }
         match self.deps.db.transitions(&self.pid) {
-            Ok(ts) => ts.iter().any(|t| t.tx_hash == *tx_hash),
+            Ok(ts) => ts
+                .iter()
+                .any(|t| t.old_root == *old_root && t.new_root == *new_root),
             Err(e) => {
                 error!(pid = %hex::encode(self.pid31), %e, "transitions read");
                 false

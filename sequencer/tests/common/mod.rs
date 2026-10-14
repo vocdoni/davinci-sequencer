@@ -767,6 +767,23 @@ impl FakeChain {
         i.history.clear();
     }
 
+    /// The `n`-th transition event (from 0) again, in a new block: a reorg
+    /// branch that re-included the same transaction higher up.
+    pub fn reinclude_transition(&self, n: usize) -> u64 {
+        let mut i = self.inner.lock().unwrap();
+        let mut ev = i
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::StateTransitioned { .. }))
+            .nth(n)
+            .cloned()
+            .unwrap();
+        i.block += 1;
+        ev.block = i.block;
+        i.events.push(ev);
+        i.block
+    }
+
     pub fn fail_blobs(&self, n: u32) {
         self.inner.lock().unwrap().fail_blobs = n;
     }
