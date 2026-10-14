@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::actor::{ActorError, ActorHandle, Deps, spawn_actor};
+use crate::actor::{ActorError, ActorHandle, Deps, merge_onchain, pid31_of, spawn_actor};
 use crate::census::onchain::OnchainIndex;
 use crate::census::{CensusError, CensusOptions, CensusStore};
 use crate::config::Config;
@@ -24,7 +24,8 @@ use crate::metrics::Metrics;
 use crate::storage::{Db, LocalStatus, ProcessRecord, StorageError};
 use crate::web3::{EventKind, RegistryEvent};
 
-const LAST_BLOCK_KEY: &str = "monitor_last_block";
+/// The monitor's cursor: every event up to this block was routed.
+pub(crate) const LAST_BLOCK_KEY: &str = "monitor_last_block";
 const BOOT_RETRIES_KEY: &str = "monitor_boot_retries";
 /// Bootstrap attempts per process before it is recorded ignored.
 const BOOT_ATTEMPT_CAP: u32 = 10;
@@ -121,20 +122,35 @@ pub async fn spawn_node(
         deps,
         node: node.clone(),
         vk_hash,
-        updates: Arc::default(),
+        queue: CensusQueue {
+            store: node.census.clone(),
+            updates: Arc::default(),
+        },
         prune: Arc::default(),
     };
     // Respawn what a previous run served. A head read seeds each actor's
     // chain time so it does not accept votes into an already-ended window;
     // 0 means "unknown" and the actor refuses votes until the first Head.
-    let chain_time = ctx.deps.contracts.head().await.map(|(_, t)| t).unwrap_or(0);
+    let (head_block, chain_time) = ctx.deps.contracts.head().await.unwrap_or((0, 0));
+    // A read from an endpoint behind the routed events could rewind them.
+    let cursor = ctx.deps.db.meta_u64(LAST_BLOCK_KEY)?.unwrap_or(0);
+    let fresh = head_block >= cursor;
+    if !fresh {
+        warn!(
+            head_block,
+            cursor, "chain endpoint behind the event cursor; the actors refresh their records"
+        );
+    }
     let mut map = node.processes.write().await;
-    for rec in ctx.deps.db.processes()? {
+    for mut rec in ctx.deps.db.processes()? {
         // Finalized processes respawn too: their actor is read-only
         // (never accepts, seals or finalizes) but keeps serving tracker
         // proofs and stored ballots. Only Ignored records stay down.
         if rec.local == LocalStatus::Ignored {
             continue;
+        }
+        if fresh {
+            refresh_record(&ctx, &mut rec).await;
         }
         resume_census(&ctx, &rec).await;
         match respawn(&ctx, &rec, chain_time, &shutdown) {
@@ -167,9 +183,31 @@ struct Ctx {
     deps: Deps,
     node: Node,
     vk_hash: [u8; 32],
-    updates: Updates,
+    queue: CensusQueue,
     /// Set when an update loaded: the next tick drops unused censuses.
     prune: Arc<AtomicBool>,
+}
+
+/// Brings an active record up to the chain before its actor starts: events
+/// routed into a mailbox are lost at a crash and never routed again (the
+/// cursor moved past them). A failed read keeps the stored record; the
+/// actor's first tick reads again.
+async fn refresh_record(ctx: &Ctx, rec: &mut ProcessRecord) {
+    if rec.local != LocalStatus::Active {
+        return;
+    }
+    match ctx.deps.contracts.process(&pid31_of(&rec.pid)).await {
+        Ok(p) => {
+            let before = rec.onchain.clone();
+            merge_onchain(&mut rec.onchain, &p);
+            if rec.onchain != before
+                && let Err(e) = ctx.deps.db.put_process(rec)
+            {
+                error!(pid = %pid_hex(&rec.pid), %e, "persist the refreshed process");
+            }
+        }
+        Err(e) => warn!(pid = %pid_hex(&rec.pid), %e, "process read at boot; the actor retries"),
+    }
 }
 
 /// A respawned dynamic census: re-register an origin-3 contract, queue an
@@ -196,17 +234,32 @@ async fn resume_census(ctx: &Ctx, rec: &ProcessRecord) {
     }
 }
 
-fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
-    if let Err(e) = ctx.node.census.clear_bad(&pid) {
-        error!(pid = %pid_hex(&pid), %e, "clear census failure");
-    }
-    if let Ok(mut q) = ctx.updates.lock() {
-        let e = q.entry(pid).or_insert((String::new(), root, Job::Queued));
-        (e.0, e.1) = (uri, root);
-        if e.2 == Job::Done {
-            e.2 = Job::Queued;
+/// The origin-2 census downloads the monitor runs off its loop. Actors
+/// queue one too: a chain read can move a root whose event a crash lost.
+#[derive(Clone)]
+pub struct CensusQueue {
+    store: Arc<CensusStore>,
+    updates: Updates,
+}
+
+impl CensusQueue {
+    /// Queues `root` of `pid` for download; a newer root replaces it.
+    pub(crate) fn queue(&self, pid: Fr, uri: String, root: Fr) {
+        if let Err(e) = self.store.clear_bad(&pid) {
+            error!(pid = %pid_hex(&pid), %e, "clear census failure");
+        }
+        if let Ok(mut q) = self.updates.lock() {
+            let e = q.entry(pid).or_insert((String::new(), root, Job::Queued));
+            (e.0, e.1) = (uri, root);
+            if e.2 == Job::Done {
+                e.2 = Job::Queued;
+            }
         }
     }
+}
+
+fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
+    ctx.queue.queue(pid, uri, root);
 }
 
 /// Drops stored censuses no process uses any more: not the root of an
@@ -214,7 +267,7 @@ fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
 /// so it never races a bootstrap that stored a census before its record.
 /// Roots of finished processes are kept, so their proofs stay servable.
 async fn prune_censuses(ctx: &Ctx) {
-    let mut keep: HashSet<[u8; 32]> = match ctx.updates.lock() {
+    let mut keep: HashSet<[u8; 32]> = match ctx.queue.updates.lock() {
         Ok(q) => q.values().map(|e| fr_to_be(&e.1)).collect(),
         Err(_) => return,
     };
@@ -237,7 +290,7 @@ async fn prune_censuses(ctx: &Ctx) {
 /// Off the monitor loop: `CensusStore::fetch` applies the usual SSRF, size
 /// and backoff rules, and a transient failure stays queued for the next tick.
 fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
-    let jobs: Vec<(Fr, String, Fr)> = match ctx.updates.lock() {
+    let jobs: Vec<(Fr, String, Fr)> = match ctx.queue.updates.lock() {
         Ok(mut q) => q
             .iter_mut()
             .filter(|(_, e)| e.2 == Job::Queued)
@@ -251,7 +304,7 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
     for (pid, uri, root) in jobs {
         let (census, q, prune, sd) = (
             ctx.node.census.clone(),
-            ctx.updates.clone(),
+            ctx.queue.updates.clone(),
             ctx.prune.clone(),
             shutdown.clone(),
         );
@@ -318,6 +371,7 @@ fn census_access(ctx: &Ctx) -> crate::actor::CensusAccess {
     crate::actor::CensusAccess {
         store: ctx.node.census.clone(),
         onchain: ctx.node.onchain.clone(),
+        queue: ctx.queue.clone(),
     }
 }
 

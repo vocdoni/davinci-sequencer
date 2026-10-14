@@ -909,12 +909,7 @@ fn update_census(t: &Served, sub: &str, voters: &[usize], root: Fr) {
 }
 
 fn announce_census(t: &Served, uri: String, root: Fr) {
-    t.s.chain.advance_time(0);
-    t.s.chain.push_event(EventKind::CensusUpdated {
-        pid: pid31(),
-        root: fr_to_be(&root),
-        uri,
-    });
+    t.s.chain.set_census(fr_to_be(&root), uri);
 }
 
 async fn wait_served(t: &Served, voter: usize, root: Fr) {

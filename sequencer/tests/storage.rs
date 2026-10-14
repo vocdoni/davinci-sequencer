@@ -443,7 +443,10 @@ fn vote_lifecycle_is_atomic_and_durable() {
     let va = db.vote(&pid(1), a).unwrap().unwrap();
     assert_eq!((va.status, va.error), (VoteStatus::Pending, None));
 
-    db.settle(&pid(1), &[a, c], &transition(0), &[blob(1), blob(2)])
+    // The pinned root moves with the transition.
+    let mut rec = process(1);
+    rec.onchain.state_root = transition(0).new_root;
+    db.settle(&pid(1), &[a, c], &transition(0), &[blob(1), blob(2)], &rec)
         .unwrap();
     drop(db);
     let db = open(&dir);
@@ -453,14 +456,30 @@ fn vote_lifecycle_is_atomic_and_durable() {
     assert_eq!(status(&db, b), VoteStatus::Aggregated);
     assert_eq!(db.transitions(&pid(1)).unwrap(), vec![transition(0)]);
     assert_eq!(db.blobs(&pid(1), 0).unwrap(), vec![blob(1), blob(2)]);
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(rec.clone()));
 
-    // A failed settle leaves the transition out too.
+    // A failed settle leaves the transition and the record out too.
+    let mut next = rec.clone();
+    next.onchain.state_root = transition(1).new_root;
     assert!(
-        db.settle(&pid(1), &[base + 77], &transition(1), &[blob(5)])
+        db.settle(&pid(1), &[base + 77], &transition(1), &[blob(5)], &next)
             .is_err()
     );
     assert_eq!(db.transitions(&pid(1)).unwrap().len(), 1);
     assert!(db.blobs(&pid(1), 1).unwrap().is_empty());
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(rec.clone()));
+
+    // So does a write failing at commit: nothing of it persists.
+    db.fail_next_writes(1);
+    assert!(
+        db.settle(&pid(1), &[], &transition(1), &[blob(5)], &next)
+            .is_err()
+    );
+    assert_eq!(db.transitions(&pid(1)).unwrap().len(), 1);
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(rec));
+    db.settle(&pid(1), &[], &transition(1), &[blob(5)], &next)
+        .unwrap();
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(next));
 }
 
 #[test]
@@ -483,7 +502,7 @@ fn settled_vote_cannot_be_admitted_again() {
     db.admit_vote(&vote(1, a)).unwrap();
     db.admit_vote(&vote(1, b)).unwrap();
     db.seal_batch(&pid(1), &[a]).unwrap();
-    db.settle(&pid(1), &[a], &transition(0), &[blob(1)])
+    db.settle(&pid(1), &[a], &transition(0), &[blob(1)], &process(1))
         .unwrap();
     let mut again = vote(1, a);
     again.package = vec![9, 9, 9];
@@ -688,19 +707,21 @@ fn l1_posts_round_trip_by_nonce() {
 }
 
 #[test]
-fn a_schema_8_file_upgrades_in_place() {
-    let dir = tempfile::tempdir().unwrap();
-    {
+fn schema_8_and_9_files_upgrade_in_place() {
+    for old in [8, 9] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(&dir);
+            db.put_process(&process(3)).unwrap();
+            db.set_meta_u64(SCHEMA_VERSION_KEY, old).unwrap();
+        }
         let db = open(&dir);
-        db.put_process(&process(3)).unwrap();
-        db.set_meta_u64(SCHEMA_VERSION_KEY, 8).unwrap();
+        assert_eq!(db.meta_u64(SCHEMA_VERSION_KEY).unwrap(), Some(10));
+        assert_eq!(db.process(&pid(3)).unwrap(), Some(process(3)));
+        db.put_l1_post(&post(1, 1)).unwrap();
     }
-    let db = open(&dir);
-    assert_eq!(db.meta_u64(SCHEMA_VERSION_KEY).unwrap(), Some(9));
-    assert_eq!(db.process(&pid(3)).unwrap(), Some(process(3)));
-    db.put_l1_post(&post(1, 1)).unwrap();
-    drop(db);
     // Older versions are still refused.
+    let dir = tempfile::tempdir().unwrap();
     {
         let db = open(&dir);
         db.set_meta_u64(SCHEMA_VERSION_KEY, 7).unwrap();

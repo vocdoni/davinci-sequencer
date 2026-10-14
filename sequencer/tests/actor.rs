@@ -871,12 +871,7 @@ async fn metadata_update_reaches_the_record() {
     )
     .await;
     let _h = handle(&node).await;
-    s.chain.advance_time(0);
-    s.chain.push_event(EventKind::MetadataUpdated {
-        pid: pid31(),
-        uri: "ipfs://metadata-2".into(),
-        hash: [0x5a; 32],
-    });
+    s.chain.set_metadata("ipfs://metadata-2", [0x5a; 32]);
     wait_until("metadata stored", async || {
         node.db.process(&pid_fr()).unwrap().is_some_and(|r| {
             r.onchain.metadata_uri == "ipfs://metadata-2" && r.onchain.metadata_hash == [0x5a; 32]
@@ -2004,12 +1999,7 @@ fn update_census(s: &TestSetup, sub: &str, voters: &[usize]) -> Fr {
     let dir = s.census_dir.join(sub);
     std::fs::create_dir(&dir).unwrap();
     let uri = write_census_of(&dir, voters.iter().copied());
-    s.chain.advance_time(0);
-    s.chain.push_event(EventKind::CensusUpdated {
-        pid: pid31(),
-        root: fr_to_be(&root),
-        uri,
-    });
+    s.chain.set_census(fr_to_be(&root), uri);
     root
 }
 
@@ -5644,4 +5634,234 @@ async fn stale_stored_counts_heal_on_the_first_tick() {
     wait_until("healed", async || stored_counts(&node.db) == (2, 1)).await;
     assert_eq!(s.chain.submit_count(), submits);
     stop.cancel();
+}
+
+// ------------------------------------------------ events lost at a crash
+
+/// Events the monitor had routed into the actor's mailbox die with the
+/// process: here an extension of the voting window. The restart reads the
+/// process from the chain (at boot, or on the first tick when that read
+/// fails), so the pending vote settles inside the new window instead of
+/// being closed out at the old grace end.
+#[tokio::test]
+async fn restart_heals_a_stale_record_from_the_chain() {
+    for boot_read_fails in [false, true] {
+        let s = setup(2, 8, None);
+        let dir = TempDir::new().unwrap();
+        let shutdown = CancellationToken::new();
+        let (node, h) = batching_node(
+            Db::open_in(dir.path()).unwrap(),
+            dir.path(),
+            &s,
+            FakeProver::open(),
+            2,
+            &[],
+            shutdown.clone(),
+        )
+        .await;
+        let v = fake_vote(&s.env, 0, &[1, 2], 1_100);
+        let vid = v.pkg.vote_id;
+        h.submit(v).await.unwrap();
+        shutdown.cancel();
+        drop((h, node));
+
+        // While it is down the organizer extends the window, and the clock
+        // passes the old grace end; the event never reaches the actor.
+        s.chain.extend_duration(5_000);
+        s.chain.advance_time(DURATION + GRACE.default_grace + 10);
+        assert!(s.chain.time() < s.chain.end_time());
+        let db = reopen_db(dir.path()).await;
+        db.set_meta_u64("monitor_last_block", s.chain.head_block())
+            .unwrap();
+        if boot_read_fails {
+            s.chain.fail_process(1);
+        }
+        let shutdown = CancellationToken::new();
+        let prover = FakeProver::open();
+        let (node, h) =
+            batching_node(db, dir.path(), &s, prover.clone(), 2, &[], shutdown.clone()).await;
+        wait_until("vote settled in the extended window", async || {
+            let st = vote_status(&h, vid).await;
+            assert_ne!(
+                st,
+                Some(VoteStatus::Error),
+                "boot_read_fails={boot_read_fails}: closed at the old grace end"
+            );
+            st == Some(VoteStatus::Settled)
+        })
+        .await;
+        assert!(h.snapshot().await.unwrap().accepting);
+        let rec = node.db.process(&pid_fr()).unwrap().unwrap();
+        assert_eq!(rec.onchain.end_time(), s.chain.end_time());
+        shutdown.cancel();
+    }
+}
+
+/// A foreign transition whose event was lost (its block is never routed):
+/// the boot read shows an unknown root, so the node waits for the sync
+/// instead of sealing on the stale root and wasting a cycle on the revert.
+#[tokio::test]
+async fn restart_behind_an_unseen_transition_resyncs_before_sealing() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    shutdown.cancel();
+    drop((h, node));
+
+    let block = s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    s.chain.hide_block(Some(block));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 2, &[1, 0], 1_200);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    beats().await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0, "sealed on a root the chain has left");
+    assert!(!snap.synced);
+    assert_ne!(snap.root, s.chain.root());
+
+    s.chain.hide_block(None);
+    wait_until("vote settled after the sync", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Settled)
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(node.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 0);
+    assert_eq!(prover.calls(), 1);
+    shutdown.cancel();
+}
+
+/// Origin 2: a `CensusUpdated` lost at a crash. The restart's chain read
+/// (at boot, or on the first tick when that read fails) moves the census
+/// root and queues its download, so the votes seal at the root the
+/// contract now expects.
+#[tokio::test]
+async fn lost_census_update_loads_after_a_restart() {
+    for boot_read_fails in [false, true] {
+        let s = offchain_setup(4);
+        let dir = TempDir::new().unwrap();
+        let shutdown = CancellationToken::new();
+        let (node, h) = batching_node(
+            Db::open_in(dir.path()).unwrap(),
+            dir.path(),
+            &s,
+            FakeProver::open(),
+            2,
+            &[],
+            shutdown.clone(),
+        )
+        .await;
+        let v0 = fake_vote(&s.env, 0, &[1, 2], 1_300);
+        h.submit(v0.clone()).await.unwrap();
+        shutdown.cancel();
+        drop((h, node));
+
+        let root1 = update_census(&s, "v2", &[0, 1, 2, 3, 4]);
+        s.chain.set_census_root_check(Some(fr_to_le(&root1)));
+        let db = reopen_db(dir.path()).await;
+        db.set_meta_u64("monitor_last_block", s.chain.head_block())
+            .unwrap();
+        if boot_read_fails {
+            s.chain.fail_process(1);
+        }
+        let shutdown = CancellationToken::new();
+        let (_node, h) = batching_node(
+            db,
+            dir.path(),
+            &s,
+            FakeProver::open(),
+            2,
+            &[],
+            shutdown.clone(),
+        )
+        .await;
+        let v1 = fake_vote(&s.env, 1, &[2, 1], 1_301);
+        h.submit(v1.clone()).await.unwrap();
+        wait_until("settled at the new census root", async || {
+            all_settled(&h, &[v0.pkg.vote_id, v1.pkg.vote_id]).await
+        })
+        .await;
+        assert_eq!(
+            s.chain.last_census_root(),
+            Some(fr_to_le(&root1)),
+            "boot_read_fails={boot_read_fails}"
+        );
+        shutdown.cancel();
+    }
+}
+
+/// A chain read from an endpoint behind the events (its head below the
+/// newest block seen, or below the monitor's cursor at boot) is not merged:
+/// it would rewind the extension the events delivered.
+#[tokio::test]
+async fn lagging_read_does_not_rewind_the_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let end = s.chain.end_time();
+    s.chain.freeze_view(true);
+    s.chain.extend_duration(5_000);
+    // A landing makes the actor re-read the chain.
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    wait_until("synced", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    beats().await;
+    let stored = |db: &Db| db.process(&pid_fr()).unwrap().unwrap().onchain.end_time();
+    assert_eq!(stored(&node.db), end + 5_000, "rewound by a lagging read");
+    shutdown.cancel();
+    drop((h, node));
+
+    // At boot the cursor bounds the endpoint.
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    beats().await;
+    assert_eq!(stored(&node.db), end + 5_000, "rewound at boot");
+    s.chain.freeze_view(false);
+    beats().await;
+    assert!(h.snapshot().await.unwrap().synced);
+    assert_eq!(stored(&node.db), end + 5_000);
+    shutdown.cancel();
 }

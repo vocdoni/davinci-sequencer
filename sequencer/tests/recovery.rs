@@ -316,3 +316,156 @@ async fn shutdown_cuts_a_stalled_catch_up() {
         .await
         .expect("monitor still running 2s after shutdown");
 }
+
+/// Two votes for voters `a` and `b`, prepared by another sequencer on the
+/// genesis root.
+fn foreign_batch(s: &TestSetup, a: usize, b: usize) -> davinci_state::PreparedBatch {
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let theirs = [
+        fake_vote(&s.env, a, &[1, 2], 70),
+        fake_vote(&s.env, b, &[2, 3], 71),
+    ];
+    other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(7), &Default::default())
+        .unwrap()
+}
+
+/// Restarts a node on `dir` after the window was hit: the tree is at the
+/// chain root, the record writes after it never happened. The node must
+/// reopen, heal the pin, write the missing transition record and settle a
+/// new vote on the healed root.
+async fn restart_after_the_window(
+    s: &TestSetup,
+    dir: &Path,
+    by_self: bool,
+    settled: &[u64],
+    n_votes: u64,
+) {
+    let db = reopen_db(dir).await;
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db,
+        dir,
+        s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_until("settled after restart", async || {
+        all_settled(&h, settled).await
+    })
+    .await;
+    wait_until("pin healed", async || h.snapshot().await.unwrap().synced).await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    let pid = pid_fr();
+    wait_until("transition recorded", async || {
+        node.db.transitions(&pid).unwrap().len() == 1
+    })
+    .await;
+    let t = &node.db.transitions(&pid).unwrap()[0];
+    assert_eq!(
+        (t.index, t.new_root, t.by_self),
+        (0, s.chain.root(), by_self)
+    );
+    assert_eq!((t.n_votes, t.n_overwrites), (n_votes, 0));
+    assert!(!node.db.blobs(&pid, 0).unwrap().is_empty());
+    assert_eq!(
+        node.db.process(&pid).unwrap().unwrap().onchain.state_root,
+        s.chain.root()
+    );
+    // A new vote seals on the healed root and lands.
+    let v = fake_vote(&s.env, 5, &[0, 1], 1_005);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("new vote settled", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Settled)
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(node.db.transitions(&pid).unwrap().len(), 2);
+    shutdown.cancel();
+}
+
+/// Crash between the tree commit of our own landing and the record writes
+/// after it (votes, transition, pin): the restart reopens at the tree's
+/// record and repairs the rest.
+#[tokio::test]
+async fn crash_between_tree_commit_and_record_write_reopens() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1_000);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("batch sealed", async || prover.calls() >= 1).await;
+    // From here on no record write persists: the crash.
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_until("landed and committed in the tree", async || {
+        s.chain.voters() == 1 && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    // The monitor moved past the landing's event before the crash.
+    let head = s.chain.head_block();
+    wait_until("event routed", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(head)
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+    restart_after_the_window(&s, dir.path(), true, &[vid], 1).await;
+}
+
+/// The same window after a synced foreign transition (tree commit of
+/// `apply_synced`, then the transition and record writes).
+#[tokio::test]
+async fn apply_sync_crash_window_reopens() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    db.fail_next_writes(u32::MAX);
+    let block = s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    wait_until("synced in the tree", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    wait_until("event routed", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+    restart_after_the_window(&s, dir.path(), false, &[], 2).await;
+}

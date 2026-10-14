@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use davinci_state::{
-    CensusOrigin, Committed, Error as StateError, ProcessConfig, ProcessState, VerifiedVote,
-    VotePackage, genesis_root, vote_still_valid,
+    CensusOrigin, Error as StateError, ProcessConfig, ProcessState, VerifiedVote, VotePackage,
+    genesis_root, vote_still_valid,
 };
 use davinci_zkvm_sdk::ballot::Ballot;
 use davinci_zkvm_sdk::blob::{TransitionBlobs, decode_blobs};
@@ -203,6 +203,8 @@ pub struct CensusAccess {
     pub store: Arc<crate::census::CensusStore>,
     /// Origin-3 census contracts.
     pub onchain: Arc<crate::census::onchain::OnchainIndex>,
+    /// Origin-2 downloads (the monitor's queue).
+    pub queue: crate::monitor::CensusQueue,
 }
 
 /// Everything an actor talks to.
@@ -464,7 +466,7 @@ pub struct ProcessSnapshot {
     pub local: LocalStatus,
     /// Whether `submit` would be admitted right now.
     pub accepting: bool,
-    /// The committed root is the on-chain root.
+    /// The committed root is the on-chain root, and no newer one was seen.
     pub synced: bool,
 }
 
@@ -680,38 +682,6 @@ fn unpack_vote(bytes: &[u8]) -> Result<VerifiedVote, String> {
     })
 }
 
-/// `Committed` as the sequencer persists it (the arbo-side copy is not
-/// readable standalone; this one is written before create and after every
-/// commit/sync, so a restart can always `ProcessState::open`).
-#[derive(Serialize, Deserialize)]
-struct CommittedJson {
-    #[serde(with = "hex::serde")]
-    root: [u8; 32],
-    voters: u64,
-    overwrites: u64,
-    accumulator: Ballot,
-}
-
-fn committed_to_json(c: &Committed) -> Result<Vec<u8>, ActorError> {
-    serde_json::to_vec(&CommittedJson {
-        root: c.root,
-        voters: c.voters,
-        overwrites: c.overwrites,
-        accumulator: c.accumulator,
-    })
-    .map_err(|e| ActorError::Internal(e.to_string()))
-}
-
-fn committed_from_json(bytes: &[u8]) -> Result<Committed, String> {
-    let c: CommittedJson = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    Ok(Committed {
-        root: c.root,
-        voters: c.voters,
-        overwrites: c.overwrites,
-        accumulator: c.accumulator,
-    })
-}
-
 // ------------------------------------------------------------------- actor
 
 pub(crate) enum JobOutcome {
@@ -827,6 +797,13 @@ struct Actor {
     last_head_block: u64,
     /// Block of the newest applied transition; lower bound for gap replay.
     last_tx_block: u64,
+    /// Newest block a Head or an event showed: a chain read from an endpoint
+    /// behind it is not used.
+    seen_block: u64,
+    /// `new_root` of the newest transition record (genesis before the
+    /// first). Behind the committed root when a record write was lost; the
+    /// resync writes the missing records from the chain.
+    log_root: [u8; 32],
     in_flight: Option<Flight>,
     generation: u64,
     next_index: u64,
@@ -908,7 +885,7 @@ pub fn seal_jitter(rng: &mut impl rand::Rng) -> f64 {
     rng.gen_range(0.9..=1.1)
 }
 
-fn pid31_of(pid: &Fr) -> [u8; 31] {
+pub(crate) fn pid31_of(pid: &Fr) -> [u8; 31] {
     let be = fr_to_be(pid);
     let mut out = [0u8; 31];
     out.copy_from_slice(&be[1..]);
@@ -932,36 +909,45 @@ fn cpu<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Opens the process state: reopen from the persisted committed record, or
-/// create at genesis (persisting the record first, so a crash between the
-/// two is recoverable either way).
+/// Opens the process state at the committed record its tree storage holds
+/// (written with the slot store in one batch, so no crash can split them),
+/// or creates it at genesis on the first start.
 fn open_state(
     db: &Db,
     pid: &Fr,
     cfg: &ProcessConfig,
 ) -> Result<ProcessState<crate::storage::ArboStore>, ActorError> {
     let storage = db.arbo_storage(pid).map_err(ierr)?;
-    if let Some(bytes) = db.committed(pid).map_err(ierr)? {
-        let committed = committed_from_json(&bytes).map_err(ActorError::Internal)?;
-        match ProcessState::open(cfg.clone(), storage, &committed) {
-            Ok(s) => return Ok(s),
-            // Crashed after writing the record but before `create`.
-            Err(StateError::Invalid(m)) if m.contains("no process") => {
-                let storage = db.arbo_storage(pid).map_err(ierr)?;
-                return ProcessState::create(cfg.clone(), storage).map_err(ierr);
-            }
-            Err(e) => return Err(ierr(e)),
+    match ProcessState::open_stored(cfg.clone(), storage) {
+        Ok(s) => Ok(s),
+        Err(StateError::Invalid(m)) if m.contains("no process") => {
+            let storage = db.arbo_storage(pid).map_err(ierr)?;
+            ProcessState::create(cfg.clone(), storage).map_err(ierr)
         }
+        Err(e) => Err(ierr(e)),
     }
-    let genesis = Committed {
-        root: genesis_root(cfg).map_err(ierr)?,
-        voters: 0,
-        overwrites: 0,
-        accumulator: Ballot::identity(),
-    };
-    db.put_committed(pid, &committed_to_json(&genesis)?)
-        .map_err(ierr)?;
-    ProcessState::create(cfg.clone(), storage).map_err(ierr)
+}
+
+/// Copies a `getProcess` read over the stored record: every field the
+/// events move, except the pin (`state_root`, moved only by applied
+/// transitions) and the counters, which follow the chain only at the pin.
+/// `last_vote_at` only grows.
+pub(crate) fn merge_onchain(o: &mut OnchainProcess, p: &OnchainProcess) {
+    o.status = p.status;
+    o.duration = p.duration;
+    o.grace = p.grace;
+    o.max_voters = p.max_voters;
+    o.metadata_uri.clone_from(&p.metadata_uri);
+    o.metadata_hash = p.metadata_hash;
+    o.census.root = p.census.root;
+    o.census.uri.clone_from(&p.census.uri);
+    o.dkg = p.dkg;
+    o.results.clone_from(&p.results);
+    o.last_vote_at = o.last_vote_at.max(p.last_vote_at);
+    if p.state_root == o.state_root {
+        o.voters_count = p.voters_count;
+        o.overwritten_count = p.overwritten_count;
+    }
 }
 
 /// Spawns the actor of one process and returns its handle. `chain_time` is
@@ -989,6 +975,10 @@ pub(crate) fn spawn_actor(
     let transitions = deps.db.transitions(&pid).map_err(ierr)?;
     let next_index = transitions.last().map(|t| t.index + 1).unwrap_or(0);
     let last_tx_block = transitions.last().map(|t| t.block).unwrap_or(0);
+    let log_root = match transitions.last() {
+        Some(t) => t.new_root,
+        None => genesis_root(&pcfg).map_err(ierr)?,
+    };
     let (tx, rx) = mpsc::channel(1024);
     let mut actor = Actor {
         pid,
@@ -1015,6 +1005,14 @@ pub(crate) fn spawn_actor(
         chain_time,
         last_head_block: 0,
         last_tx_block,
+        // Events up to the monitor's cursor reached the previous run.
+        seen_block: deps
+            .db
+            .meta_u64(crate::monitor::LAST_BLOCK_KEY)
+            .map_err(ierr)?
+            .unwrap_or(0)
+            .max(last_tx_block),
+        log_root,
         in_flight: None,
         generation: 0,
         next_index,
@@ -1172,13 +1170,17 @@ impl Actor {
                     status: self.record.onchain.status,
                     local: self.record.local,
                     accepting: self.accepting(),
-                    synced: c.root == self.record.onchain.state_root,
+                    synced: c.root == self.record.onchain.state_root && !self.await_sync,
                 });
             }
-            Msg::Event(ev) => self.on_event(ev).await,
+            Msg::Event(ev) => {
+                self.seen_block = self.seen_block.max(ev.block);
+                self.on_event(ev).await
+            }
             Msg::Head { block, time } => {
                 self.chain_time = time;
                 self.last_head_block = block;
+                self.seen_block = self.seen_block.max(block);
                 self.end_moved = false;
             }
             Msg::JobProved { generation } => {
@@ -1514,33 +1516,15 @@ impl Actor {
         // Close-out and results wait on it, so a read that keeps failing
         // (or an endpoint stuck behind the events) is logged and counted.
         if self.vote_at_stale {
-            let why = match self.deps.contracts.process(&self.pid31).await {
+            let why = match self.fresh_read().await {
                 Ok(p) => {
-                    let pinned = p.state_root == self.record.onchain.state_root;
-                    let o = &mut self.record.onchain;
-                    let mut dirty = p.last_vote_at > o.last_vote_at;
-                    o.last_vote_at = o.last_vote_at.max(p.last_vote_at);
-                    // The chain at the pinned root is authoritative for the
-                    // counters: heals a stale bootstrap copy and a reorged-out
-                    // receipt landing.
-                    if pinned
-                        && (o.voters_count, o.overwritten_count)
-                            != (p.voters_count, p.overwritten_count)
-                    {
-                        o.voters_count = p.voters_count;
-                        o.overwritten_count = p.overwritten_count;
-                        dirty = true;
-                    }
-                    if dirty {
-                        self.put_record();
-                    }
-                    self.vote_at_stale = !pinned;
+                    self.vote_at_stale = !self.apply_read(&p);
                     format!(
-                        "chain root 0x{} behind the events",
+                        "chain root 0x{} is not the pinned one",
                         hex::encode(p.state_root)
                     )
                 }
-                Err(e) => e.to_string(),
+                Err(e) => e,
             };
             if self.vote_at_stale {
                 self.stale_ticks += 1;
@@ -1614,14 +1598,114 @@ impl Actor {
         self.maybe_finalize();
     }
 
-    /// Repairs falling behind the chain (lost race, failed blob sync): on
-    /// every heartbeat, if the committed root is not the on-chain root,
-    /// replay the gap, with capped exponential backoff between attempts.
-    /// The target root lives in `record.onchain.state_root` and is never
-    /// dropped on a failed attempt.
+    /// `getProcess`, from an endpoint whose head has every block this actor
+    /// acted on: a lagging one could rewind what the events moved.
+    async fn fresh_read(&self) -> Result<OnchainProcess, String> {
+        let (block, _) = self
+            .deps
+            .contracts
+            .head()
+            .await
+            .map_err(|e| e.to_string())?;
+        if block < self.seen_block {
+            return Err(format!(
+                "endpoint head {block} behind block {}",
+                self.seen_block
+            ));
+        }
+        self.deps
+            .contracts
+            .process(&self.pid31)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Applies a fresh chain read: heals a pin left behind the committed
+    /// tree, latches an unknown chain root, and merges every field the
+    /// events move, with their handlers' side effects (an event lost in the
+    /// mailbox at a crash is never routed again). Whether the read shows the
+    /// pinned root.
+    fn apply_read(&mut self, p: &OnchainProcess) -> bool {
+        let committed = self.state.committed().root;
+        let before = self.record.onchain.clone();
+        // The chain is at our tree's root and the pin is not: the record
+        // write after a commit was lost.
+        if p.state_root == committed && before.state_root != committed {
+            warn!(pid = %hex::encode(self.pid31), "pin behind the committed tree; re-pinning at the chain root");
+            self.record.onchain.state_root = committed;
+        }
+        let pinned = p.state_root == self.record.onchain.state_root;
+        // A root that is not ours, not one we passed and not our flight's:
+        // the chain went ahead with a transition the events have not shown
+        // (or lost). Sync before sealing on a root that can only revert.
+        if !pinned
+            && p.state_root != committed
+            && !self.await_sync
+            && self
+                .in_flight
+                .as_ref()
+                .is_none_or(|f| f.prepared.new_root != p.state_root)
+            && !self.passed_root(&p.state_root)
+        {
+            info!(pid = %hex::encode(self.pid31), root = %format!("0x{}", hex::encode(p.state_root)), "chain at an unknown root; syncing before the next seal");
+            self.await_sync = true;
+        }
+        merge_onchain(&mut self.record.onchain, p);
+        let o = self.record.onchain.clone();
+        if o == before {
+            return pinned;
+        }
+        if o.duration != before.duration {
+            self.end_moved = true;
+        }
+        if o.max_voters != before.max_voters {
+            self.error_new_slots_if_full();
+        }
+        if o.census.root != before.census.root {
+            self.census_moved();
+            // Its event, which queues the download, may be lost.
+            if self.state.config().census_origin == CensusOrigin::MerkleOffchainDynamic
+                && let Ok(root) = fr_from_be(&o.census.root)
+            {
+                self.census
+                    .queue
+                    .queue(self.pid, o.census.uri.clone(), root);
+            }
+        }
+        if o.status != before.status {
+            self.status_moved(o.status);
+            // RESULTS comes with ResultsSet in one transaction.
+            if o.status == ProcessStatus::Results {
+                let reason = self.closed_reason();
+                self.close_out(&reason);
+            }
+        }
+        self.put_record();
+        pinned
+    }
+
+    /// Whether `root` is the old root of a transition in our log: a chain
+    /// read showing it lags. A failed read counts as not passed.
+    fn passed_root(&self, root: &[u8; 32]) -> bool {
+        match self.deps.db.transitions(&self.pid) {
+            Ok(ts) => ts.iter().any(|t| t.old_root == *root),
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "transitions read");
+                false
+            }
+        }
+    }
+
+    /// Repairs falling behind the chain (lost race, failed blob sync, a lost
+    /// transition record): on every heartbeat, if the committed root is not
+    /// the on-chain root or the log is behind the tree, replay the gap, with
+    /// capped exponential backoff between attempts. The target root lives in
+    /// `record.onchain.state_root` and is never dropped on a failed attempt.
     async fn maybe_resync(&mut self) {
-        let behind =
-            |a: &Self| a.await_sync || a.state.committed().root != a.record.onchain.state_root;
+        let behind = |a: &Self| {
+            let root = a.state.committed().root;
+            a.await_sync || root != a.record.onchain.state_root || a.log_root != root
+        };
         if !behind(self) {
             self.resync_after = None;
             self.resync_backoff_ms = 0;
@@ -2492,17 +2576,6 @@ impl Actor {
         self.drop_pending(&full);
     }
 
-    fn persist_committed(&self) {
-        match committed_to_json(&self.state.committed()) {
-            Ok(b) => {
-                if let Err(e) = self.deps.db.put_committed(&self.pid, &b) {
-                    error!(pid = %hex::encode(self.pid31), %e, "put_committed");
-                }
-            }
-            Err(e) => error!(pid = %hex::encode(self.pid31), %e, "encode committed"),
-        }
-    }
-
     async fn on_job_done(&mut self, generation: u64, outcome: JobOutcome, posted: bool) {
         let Some(mut f) = self.in_flight.take_if(|f| f.generation == generation) else {
             return; // a stale job of an aborted flight
@@ -2710,6 +2783,8 @@ impl Actor {
     }
 
     fn commit_flight(&mut self, f: Flight, tx_hash: [u8; 32], block: u64) {
+        // A read from below the landing's block could not show it.
+        self.seen_block = self.seen_block.max(block);
         // The registry's counters after this landing, from the publics it
         // checked: occupied_before is its votersCount and an overwrite is
         // no new voter. The landing's event raises them again (idempotent).
@@ -2740,7 +2815,6 @@ impl Actor {
             return;
         }
         let p = &f.prepared;
-        self.persist_committed();
         let rec = crate::storage::TransitionRecord {
             index: self.next_index,
             old_root: p.old_root,
@@ -2758,18 +2832,10 @@ impl Actor {
             n_blobs: p.blobs.blobs.len() as u64,
             by_self: true,
         };
-        if let Err(e) = self
-            .deps
-            .db
-            .settle(&self.pid, &p.vote_ids, &rec, &p.blobs.blobs)
-        {
-            error!(pid = %hex::encode(self.pid31), %e, "settle");
-        }
-        self.next_index += 1;
-        self.last_tx_block = self.last_tx_block.max(block);
+        // Votes, transition, pin and counts in one write after the tree's.
         self.record.onchain.state_root = p.new_root;
+        self.write_transition(&p.vote_ids, &rec, &p.blobs.blobs);
         self.vote_at_stale = true;
-        self.put_record();
         self.await_sync = false;
         self.failed_cycles = 0;
         self.failed_pause = None;
@@ -2790,16 +2856,7 @@ impl Actor {
         match ev.kind {
             EventKind::ProcessCreated { .. } => {}
             EventKind::StatusChanged { new, .. } => {
-                self.record.onchain.status = new;
-                self.pause_hold = None;
-                // Ended flushes through the grace; the tick closes out at its end.
-                if new == ProcessStatus::Canceled {
-                    let reason = self.closed_reason();
-                    self.close_out(&reason);
-                }
-                if new == ProcessStatus::Results {
-                    self.mark_finalized();
-                }
+                self.status_moved(new);
                 self.put_record();
             }
             // Shortened or extended: admission, flush mode, the budget and
@@ -2878,20 +2935,41 @@ impl Actor {
                 self.record.onchain.census.root = root;
                 self.record.onchain.census.uri = uri;
                 self.put_record();
-                if self.state.config().census_origin == CensusOrigin::MerkleOffchainDynamic && moved
-                {
-                    // A flight built on the old root can only revert; taking
-                    // it also stales its JobDone via the generation guard.
-                    if let Some(f) = self.in_flight.take() {
-                        warn!(pid = %hex::encode(self.pid31), "census re-rooted under a flight; requeueing");
-                        self.rollback_flight(&f);
-                        self.requeue_flight(f);
-                    }
-                    // Pending votes are re-checked once the new tree loads.
-                    self.census_recheck = true;
+                if moved {
+                    self.census_moved();
                 }
             }
         }
+    }
+
+    /// The process status moved (its event, or a chain read showing it).
+    fn status_moved(&mut self, new: ProcessStatus) {
+        self.record.onchain.status = new;
+        self.pause_hold = None;
+        // Ended flushes through the grace; the tick closes out at its end.
+        if new == ProcessStatus::Canceled {
+            let reason = self.closed_reason();
+            self.close_out(&reason);
+        }
+        if new == ProcessStatus::Results {
+            self.mark_finalized();
+        }
+    }
+
+    /// The census root moved (its event, or a chain read showing it).
+    fn census_moved(&mut self) {
+        if self.state.config().census_origin != CensusOrigin::MerkleOffchainDynamic {
+            return;
+        }
+        // A flight built on the old root can only revert; taking it also
+        // stales its JobDone via the generation guard.
+        if let Some(f) = self.in_flight.take() {
+            warn!(pid = %hex::encode(self.pid31), "census re-rooted under a flight; requeueing");
+            self.rollback_flight(&f);
+            self.requeue_flight(f);
+        }
+        // Pending votes are re-checked once the new tree loads.
+        self.census_recheck = true;
     }
 
     /// Raises the stored registry counters to a landing's totals. Both only
@@ -2908,6 +2986,104 @@ impl Actor {
         if let Err(e) = self.deps.db.put_process(&self.record) {
             error!(pid = %hex::encode(self.pid31), %e, "put_process");
         }
+    }
+
+    /// Records a transition the tree just applied: its settled votes, the
+    /// record with its blobs, and the process record (pin, counts), in one
+    /// write. A failure leaves the log behind the tree; the resync writes
+    /// the record again from the chain.
+    fn write_transition(
+        &mut self,
+        vids: &[u64],
+        rec: &crate::storage::TransitionRecord,
+        blobs: &[davinci_zkvm_sdk::blob::Blob],
+    ) {
+        match self
+            .deps
+            .db
+            .settle(&self.pid, vids, rec, blobs, &self.record)
+        {
+            Ok(()) => {
+                self.next_index = rec.index + 1;
+                self.last_tx_block = self.last_tx_block.max(rec.block);
+                self.log_root = rec.new_root;
+            }
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "transition write failed; resyncing the log")
+            }
+        }
+    }
+
+    /// The record of a transition the tree applied but whose record write
+    /// was lost (a crash between the two, or a failed write): the next one
+    /// after the log, met again as its event or in a gap replay. Its blobs
+    /// are fetched best-effort, its counts come from the event's totals, and
+    /// batch votes the lost write left unsettled settle with it.
+    #[allow(clippy::too_many_arguments)] // the event's fields, as routed
+    async fn record_missing(
+        &mut self,
+        block: u64,
+        tx_hash: [u8; 32],
+        sender: Address,
+        old_root: [u8; 32],
+        new_root: [u8; 32],
+        (voters, overwrites): (u64, u64),
+        n_blobs: u64,
+        l1: Option<L1Blobs>,
+    ) {
+        let fetched = match &l1 {
+            None => {
+                self.deps
+                    .blobs
+                    .blobs_for_tx(alloy::primitives::B256::from(tx_hash), block, n_blobs)
+                    .await
+            }
+            Some(l) => self.deps.blobs.blobs_for_l1(&l.blocks, &l.vhs).await,
+        };
+        let blobs = fetched.unwrap_or_else(|e| {
+            warn!(pid = %hex::encode(self.pid31), ?e, "blobs of an unrecorded transition unavailable; recording it without them");
+            Vec::new()
+        });
+        let (log, vids) = match (
+            self.deps.db.transitions(&self.pid),
+            self.deps
+                .db
+                .vote_ids_with_status(&self.pid, &[VoteStatus::Aggregated, VoteStatus::Processed]),
+        ) {
+            (Ok(log), Ok(vids)) => (log, vids),
+            (Err(e), _) | (_, Err(e)) => {
+                error!(pid = %hex::encode(self.pid31), %e, "log repair read");
+                return;
+            }
+        };
+        // Callers hold no flight, so every vote id in the tree is settled.
+        let vids: Vec<u64> = vids
+            .into_iter()
+            .filter(|v| matches!(self.state.has_vote_id(*v), Ok(true)))
+            .collect();
+        // The log's totals before it: distinct voters and overwrites.
+        let (n_before, w_before) = log.iter().fold((0u64, 0u64), |(n, w), t| {
+            (
+                n.saturating_add(t.n_votes.saturating_sub(t.n_overwrites)),
+                w.saturating_add(t.n_overwrites),
+            )
+        });
+        let n_overwrites = overwrites.saturating_sub(w_before);
+        let rec = crate::storage::TransitionRecord {
+            index: self.next_index,
+            old_root,
+            new_root,
+            tx_hash,
+            block,
+            sender: sender.into_array(),
+            n_votes: voters.saturating_sub(n_before).saturating_add(n_overwrites),
+            n_overwrites,
+            // The registry's count, whether or not the blobs were fetched.
+            n_blobs,
+            by_self: self.deps.contracts.signer() == Some(sender),
+        };
+        warn!(pid = %hex::encode(self.pid31), index = rec.index, "writing a transition record lost at a crash");
+        self.write_transition(&vids, &rec, &blobs);
     }
 
     /// A finalize attempt that failed for good (a failed results proof or
@@ -2975,6 +3151,20 @@ impl Actor {
             // event must not unblock sealing while we are still behind.
             if self.record.onchain.state_root == new_root {
                 self.await_sync = false;
+            }
+            // Its record was lost at a crash: write it now.
+            if self.log_root == old_root && self.in_flight.is_none() {
+                self.record_missing(
+                    block,
+                    tx_hash,
+                    sender,
+                    old_root,
+                    new_root,
+                    (voters, overwrites),
+                    n_blobs,
+                    l1,
+                )
+                .await;
             }
             return;
         }
@@ -3072,7 +3262,6 @@ impl Actor {
             error!(pid = %hex::encode(self.pid31), %e, "apply_synced failed");
             return false;
         }
-        self.persist_committed();
         let after = self.state.committed();
         let rec = crate::storage::TransitionRecord {
             index: self.next_index,
@@ -3086,17 +3275,12 @@ impl Actor {
             n_blobs: blobs.len() as u64,
             by_self: false,
         };
-        if let Err(e) = self.deps.db.put_transition(&self.pid, &rec, &blobs) {
-            error!(pid = %hex::encode(self.pid31), %e, "put_transition");
-        }
-        self.next_index += 1;
-        self.last_tx_block = self.last_tx_block.max(block);
         if self.record.onchain.state_root == old_root {
             // We were at the tip: advance it. A gap replay keeps the newer
             // target the events already told us about.
             self.record.onchain.state_root = new_root;
         }
-        self.put_record();
+        self.write_transition(&[], &rec, &blobs);
         self.metrics
             .synced_from_others
             .fetch_add(1, Ordering::SeqCst);
@@ -3155,7 +3339,24 @@ impl Actor {
             if self.follow_counts(voters, overwrites) {
                 self.put_record();
             }
-            if old_root == self.state.committed().root
+            let committed = self.state.committed().root;
+            // The log first catches up with the tree (records lost at a
+            // crash), then the tree with the chain.
+            if old_root == self.log_root && self.log_root != committed {
+                self.record_missing(
+                    ev.block,
+                    ev.tx_hash.0,
+                    sender,
+                    old_root,
+                    new_root,
+                    (voters, overwrites),
+                    n_blobs,
+                    l1,
+                )
+                .await;
+                continue;
+            }
+            if old_root == committed
                 && !self
                     .apply_sync(
                         ev.block,

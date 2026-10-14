@@ -277,6 +277,9 @@ pub struct Inner {
     /// Next N `process()` calls show a root behind the events (a lagging
     /// endpoint).
     lag_process: u32,
+    /// While set, `head()` and `process()` answer from this snapshot of
+    /// `(proc, block, time)`: an endpoint stuck behind the events.
+    frozen: Option<(OnchainProcess, u64, u64)>,
     /// Next N blob fetches fail.
     fail_blobs: u32,
     /// Next N `submit_transition` calls fail without landing.
@@ -406,6 +409,7 @@ impl FakeChain {
             submits: 0,
             fail_process: 0,
             lag_process: 0,
+            frozen: None,
             fail_blobs: 0,
             fail_submits: 0,
             timeout_submits: 0,
@@ -567,6 +571,45 @@ impl FakeChain {
         });
     }
 
+    /// The census moves (`CensusUpdated`), in getProcess too.
+    pub fn set_census(&self, root: [u8; 32], uri: String) {
+        let mut i = self.inner.lock().unwrap();
+        i.proc.census.root = root;
+        i.proc.census.uri.clone_from(&uri);
+        i.block += 1;
+        let block = i.block;
+        let log_index = i.events.len() as u64;
+        i.events.push(RegistryEvent {
+            block,
+            tx_hash: B256::with_last_byte(7),
+            log_index,
+            kind: EventKind::CensusUpdated {
+                pid: pid31(),
+                root,
+                uri,
+            },
+        });
+    }
+
+    /// The organizer updates the metadata (`ProcessMetadataUpdated`).
+    pub fn set_metadata(&self, uri: &str, hash: [u8; 32]) {
+        let mut i = self.inner.lock().unwrap();
+        i.proc.metadata_uri = uri.into();
+        i.proc.metadata_hash = hash;
+        i.block += 1;
+        let block = i.block;
+        i.events.push(RegistryEvent {
+            block,
+            tx_hash: B256::with_last_byte(8),
+            log_index: 0,
+            kind: EventKind::MetadataUpdated {
+                pid: pid31(),
+                uri: uri.into(),
+                hash,
+            },
+        });
+    }
+
     pub fn grace_params(&self) -> GraceParams {
         self.inner.lock().unwrap().grace
     }
@@ -673,6 +716,13 @@ impl FakeChain {
 
     pub fn lag_process(&self, n: u32) {
         self.inner.lock().unwrap().lag_process = n;
+    }
+
+    /// From now on `head()` and `process()` answer as of this moment, until
+    /// called with false.
+    pub fn freeze_view(&self, on: bool) {
+        let mut i = self.inner.lock().unwrap();
+        i.frozen = on.then(|| (i.proc.clone(), i.block, i.time));
     }
 
     pub fn fail_blobs(&self, n: u32) {
@@ -1213,6 +1263,9 @@ impl Chain for FakeChain {
             i.fail_process -= 1;
             return Err(Web3Error::Rpc("scripted process failure".into()));
         }
+        if let Some((p, _, _)) = &i.frozen {
+            return Ok(p.clone());
+        }
         if i.lag_process > 0 {
             i.lag_process -= 1;
             let mut p = i.proc.clone();
@@ -1260,6 +1313,9 @@ impl Chain for FakeChain {
 
     async fn head(&self) -> Result<(u64, u64), Web3Error> {
         let i = self.inner.lock().unwrap();
+        if let Some((_, block, time)) = i.frozen {
+            return Ok((block, time));
+        }
         Ok((i.block, i.time))
     }
 

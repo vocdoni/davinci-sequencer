@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::web3::OnchainProcess;
 
 /// Bump on any incompatible change to a table layout or record encoding.
-pub const SCHEMA_VERSION: u64 = 9;
+pub const SCHEMA_VERSION: u64 = 10;
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The database file inside its directory.
 pub const DB_FILE: &str = "sequencer.redb";
@@ -42,8 +42,6 @@ const PENDING: Bytes = TableDefinition::new("pending");
 // pid‖vid -> seq: makes pushes idempotent and removals direct.
 const PENDING_IDX: Bytes = TableDefinition::new("pending_idx");
 const TRANSITIONS: Bytes = TableDefinition::new("transitions");
-// pid -> the actor's committed-state record (JSON, actor-owned format).
-const COMMITTED: Bytes = TableDefinition::new("committed");
 const BLOBS: Bytes = TableDefinition::new("blobs");
 // One row: the master secret election keys are derived from (`keys.rs`).
 const ENC_KEYS: Bytes = TableDefinition::new("enc_keys");
@@ -58,8 +56,9 @@ const EXPOSED: Bytes = TableDefinition::new("exposed");
 // nonce (BE8) -> `L1PostRecord`: blob transactions of the node's Ethereum
 // account not yet seen mined (L1-blob mode).
 const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
-/// The last schema this build upgrades in place: 9 only added `l1_posts`.
-const UPGRADES_FROM: u64 = 8;
+/// Schemas this build upgrades in place: 9 only added `l1_posts`, 10 stopped
+/// using the `committed` table (the tree's own record is authoritative).
+const UPGRADES_FROM: [u64; 2] = [8, 9];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -214,6 +213,9 @@ pub struct Db {
     /// Every arbo handle handed out, so tests can see open snapshots.
     #[cfg(any(test, feature = "test-hooks"))]
     arbo_handles: Arc<std::sync::Mutex<Vec<arbo::RedbStorage>>>,
+    /// Scripted failures of the node's own write transactions (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    write_faults: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for Db {
@@ -309,6 +311,8 @@ impl Db {
             arbo_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(any(test, feature = "test-hooks"))]
             arbo_handles: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            write_faults: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -366,8 +370,8 @@ impl Db {
                         .map_err(db_err)?;
                 }
                 Some(v) if v == SCHEMA_VERSION => {}
-                // Additive: the new table is opened below.
-                Some(UPGRADES_FROM) => {
+                // Nothing to rewrite: new tables are opened below.
+                Some(v) if UPGRADES_FROM.contains(&v) => {
                     meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)
                         .map_err(db_err)?;
                 }
@@ -384,7 +388,6 @@ impl Db {
                 PENDING,
                 PENDING_IDX,
                 TRANSITIONS,
-                COMMITTED,
                 BLOBS,
                 ENC_KEYS,
                 CENSUS,
@@ -435,6 +438,15 @@ impl Db {
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Makes the next `n` record writes (processes, votes, queue,
+    /// transitions) fail while arbo writes go through; `u32::MAX` stands for
+    /// a crash right after a tree commit. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_writes(&self, n: u32) {
+        self.write_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Arbo handles (any process) holding an open read snapshot. Test hook.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn arbo_snapshots_open(&self) -> usize {
@@ -460,12 +472,11 @@ impl Db {
     }
 
     fn put(&self, table: Bytes, key: &[u8], value: &[u8]) -> Result<()> {
-        let tx = self.db.begin_write().map_err(db_err)?;
-        {
+        self.write(|tx| {
             let mut t = tx.open_table(table).map_err(db_err)?;
             t.insert(key, value).map_err(db_err)?;
-        }
-        tx.commit().map_err(db_err)
+            Ok(())
+        })
     }
 
     // Rows whose key starts with `prefix`, all keys `len` bytes long.
@@ -482,7 +493,7 @@ impl Db {
     }
 
     pub fn put_process(&self, p: &ProcessRecord) -> Result<()> {
-        self.put(PROCESSES, &pid_key(&p.pid), &encode(p)?)
+        self.write(|tx| tx_put_process(tx, p))
     }
 
     pub fn process(&self, pid: &Fr) -> Result<Option<ProcessRecord>> {
@@ -540,15 +551,6 @@ impl Db {
             }
         }
         Ok(out)
-    }
-
-    /// Stores the actor's committed-state record for a process.
-    pub fn put_committed(&self, pid: &Fr, v: &[u8]) -> Result<()> {
-        self.put(COMMITTED, &pid_key(pid), v)
-    }
-
-    pub fn committed(&self, pid: &Fr) -> Result<Option<Vec<u8>>> {
-        self.get(COMMITTED, &pid_key(pid))
     }
 
     /// Persists the exposed set before a batch can broadcast. One
@@ -616,6 +618,18 @@ impl Db {
     // One write transaction: `f` runs inside it, the commit happens only if
     // it succeeds (dropping an uncommitted transaction aborts it).
     fn write(&self, f: impl FnOnce(&WriteTransaction) -> Result<()>) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .write_faults
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(StorageError::Db("scripted write failure".into()));
+        }
         let tx = self.db.begin_write().map_err(db_err)?;
         f(&tx)?;
         tx.commit().map_err(db_err)
@@ -699,19 +713,22 @@ impl Db {
         })
     }
 
-    /// A transition landed: its votes are `settled` and leave the queue, and
-    /// the transition and its blobs are stored, all in one commit.
+    /// A transition landed (ours or synced): its votes, if any, are `settled`
+    /// and leave the queue, and the transition, its blobs and the process
+    /// record (pin and counts) are stored, all in one commit.
     pub fn settle(
         &self,
         pid: &Fr,
         vids: &[u64],
         t: &TransitionRecord,
         blobs: &[Blob],
+        process: &ProcessRecord,
     ) -> Result<()> {
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;
             tx_remove(tx, pid, vids)?;
-            tx_put_transition(tx, pid, t, blobs)
+            tx_put_transition(tx, pid, t, blobs)?;
+            tx_put_process(tx, process)
         })
     }
 
@@ -965,7 +982,7 @@ fn adopt_flat(datadir: &Path, dir: &Path, chain_id: u64, registry: &[u8; 20]) ->
         "its deployment is unknown (no process to tell it by)"
     } else if prefixes.iter().any(|p| Some(*p) != ours) {
         "it belongs to another deployment"
-    } else if !matches!(schema, Some(SCHEMA_VERSION | UPGRADES_FROM)) {
+    } else if !schema.is_some_and(|v| v == SCHEMA_VERSION || UPGRADES_FROM.contains(&v)) {
         "its schema version is not this build's"
     } else {
         ""
@@ -1112,6 +1129,14 @@ fn tx_status(
         t.insert(key.as_slice(), encode(&v)?.as_slice())
             .map_err(db_err)?;
     }
+    Ok(())
+}
+
+fn tx_put_process(tx: &WriteTransaction, p: &ProcessRecord) -> Result<()> {
+    tx.open_table(PROCESSES)
+        .map_err(db_err)?
+        .insert(pid_key(&p.pid).as_slice(), encode(p)?.as_slice())
+        .map_err(db_err)?;
     Ok(())
 }
 
