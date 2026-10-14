@@ -808,6 +808,9 @@ struct Actor {
     /// Newest block a Head or an event showed: a chain read from an endpoint
     /// behind it is not used.
     seen_block: u64,
+    /// Block of the newest merged chain read: what a field event at or
+    /// below it sets is already in the record, with its effects.
+    read_block: u64,
     /// `new_root` of the newest transition record (genesis before the
     /// first). Behind the committed root when a record write was lost; the
     /// resync writes the missing records from the chain.
@@ -1024,6 +1027,7 @@ pub(crate) fn spawn_actor(
             .map_err(ierr)?
             .unwrap_or(0)
             .max(last_tx_block),
+        read_block: 0,
         log_root,
         in_flight: None,
         generation: 0,
@@ -1551,8 +1555,8 @@ impl Actor {
         // (or an endpoint stuck behind the events) is logged and counted.
         if self.vote_at_stale {
             let why = match self.fresh_read().await {
-                Ok((_, p)) => {
-                    self.vote_at_stale = !self.apply_read(&p);
+                Ok((block, _, p)) => {
+                    self.vote_at_stale = !self.apply_read(&p, block);
                     format!(
                         "chain root 0x{} is not the pinned one",
                         hex::encode(p.state_root)
@@ -1640,11 +1644,11 @@ impl Actor {
         self.maybe_finalize();
     }
 
-    /// The head time and `getProcess` at that head, which has every block
+    /// The head block and time, and `getProcess` at that head, which has every block
     /// this actor acted on: a lagging endpoint could rewind what the events
     /// moved, and pinning the read to the head keeps a backend behind it (a
     /// load-balanced URL) from answering.
-    async fn fresh_read(&self) -> Result<(u64, OnchainProcess), String> {
+    async fn fresh_read(&self) -> Result<(u64, u64, OnchainProcess), String> {
         let (block, time) = self
             .deps
             .contracts
@@ -1663,7 +1667,7 @@ impl Actor {
             .process_at(&self.pid31, block)
             .await
             .map_err(|e| e.to_string())?;
-        Ok((time, p))
+        Ok((block, time, p))
     }
 
     /// Applies a fresh chain read: heals a pin left behind the committed
@@ -1671,7 +1675,8 @@ impl Actor {
     /// events move, with their handlers' side effects (an event lost in the
     /// mailbox at a crash is never routed again). Whether the read shows the
     /// pinned root.
-    fn apply_read(&mut self, p: &OnchainProcess) -> bool {
+    fn apply_read(&mut self, p: &OnchainProcess, block: u64) -> bool {
+        self.read_block = self.read_block.max(block);
         let committed = self.state.committed().root;
         let before = self.record.onchain.clone();
         // The chain is at our tree's root and the pin is not: the record
@@ -1828,7 +1833,7 @@ impl Actor {
         {
             return;
         }
-        let (time, p) = match self.fresh_read().await {
+        let (block, time, p) = match self.fresh_read().await {
             Ok(r) => r,
             Err(e) => {
                 debug!(pid = %hex::encode(self.pid31), %e, "close-out read; retrying");
@@ -1837,7 +1842,7 @@ impl Actor {
         };
         // The read is also the refresh: a moved grace end, status or root
         // lands in the record (and latches a sync) before the decision.
-        self.vote_at_stale = !self.apply_read(&p);
+        self.vote_at_stale = !self.apply_read(&p, block);
         if p.state_root != committed
             || self.await_sync
             || committed != self.record.onchain.state_root
@@ -2964,6 +2969,12 @@ impl Actor {
     }
 
     async fn on_event(&mut self, ev: RegistryEvent) {
+        // A backlog event older than a merged chain read would rewind the
+        // record (an older duration closing the window early). Transitions
+        // still apply: the read does not move the tree.
+        if ev.block <= self.read_block && !matches!(ev.kind, EventKind::StateTransitioned { .. }) {
+            return;
+        }
         match ev.kind {
             EventKind::ProcessCreated { .. } => {}
             EventKind::StatusChanged { new, .. } => {

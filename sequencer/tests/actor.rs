@@ -6387,3 +6387,77 @@ async fn log_repair_moves_the_pin_without_a_chain_read() {
     assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
     shutdown.cancel();
 }
+
+/// Two extensions past the cursor at a restart, the second not routed yet:
+/// the first chain read merges the newest end, and the older event routed
+/// after it must not rewind the record (admission closing early, a
+/// close-out at the old grace end). The vote waits and flushes.
+#[tokio::test]
+async fn restart_backlog_of_extensions_does_not_rewind_the_end() {
+    const WAITS: &[&str] = &["--solo-wait", "48h"];
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        WAITS,
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1_800);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    beats().await;
+    shutdown.cancel();
+    drop((h, node));
+
+    let e0 = s.chain.end_time();
+    s.chain.extend_duration(500);
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.extend_duration(500);
+    let last = s.chain.head_block();
+    // Past the first extension's end, inside its grace.
+    s.chain.advance_time(DURATION + 550);
+    // The first chain read comes before the backlog is paged.
+    s.chain.events_delay(Duration::from_millis(300));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        WAITS,
+        shutdown.clone(),
+    )
+    .await;
+    wait_until("backlog routed", async || {
+        node.db.meta_u64("monitor_last_block").unwrap().unwrap_or(0) >= last
+    })
+    .await;
+    beats().await;
+    let end = |db: &Db| db.process(&pid_fr()).unwrap().unwrap().onchain.end_time();
+    assert_eq!(end(&node.db), e0 + 1_000, "rewound by an older event");
+    assert!(h.snapshot().await.unwrap().accepting);
+    assert_eq!(prover.calls(), 0, "flushed at an older end");
+    // Past the first extension's grace end: still open on-chain.
+    s.chain.advance_time(150);
+    beats().await;
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    // Within the flush horizon of the real end.
+    prover.release(10);
+    s.chain.advance_time(200);
+    wait_until("flushed", async || {
+        let st = vote_status(&h, vid).await;
+        assert_ne!(st, Some(VoteStatus::Error), "closed at an older end");
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    assert_eq!(end(&node.db), e0 + 1_000);
+    shutdown.cancel();
+}
