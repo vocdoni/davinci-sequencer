@@ -218,6 +218,9 @@ pub struct Db {
     /// Scripted failures of the node's own write transactions (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     write_faults: Arc<std::sync::atomic::AtomicU32>,
+    /// Scripted failures of process-record reads (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    process_read_faults: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for Db {
@@ -316,6 +319,8 @@ impl Db {
             arbo_handles: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             write_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            process_read_faults: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -459,6 +464,13 @@ impl Db {
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Makes the next `n` [`Db::process`] reads fail. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_process_reads(&self, n: u32) {
+        self.process_read_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Arbo handles (any process) holding an open read snapshot. Test hook.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn arbo_snapshots_open(&self) -> usize {
@@ -509,6 +521,18 @@ impl Db {
     }
 
     pub fn process(&self, pid: &Fr) -> Result<Option<ProcessRecord>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .process_read_faults
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(StorageError::Db("scripted read failure".into()));
+        }
         self.get(PROCESSES, &pid_key(pid))?
             .map(|v| decode("processes", &v))
             .transpose()

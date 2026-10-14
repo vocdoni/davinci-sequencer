@@ -1043,3 +1043,43 @@ async fn stored_process_is_not_ignored_at_the_attempt_cap() {
     let _h = handle(&node).await;
     sd.cancel();
 }
+
+/// At the cap attempt the record read fails too (storage trouble is what
+/// keeps a spawn failing): the pid must keep retrying, not be recorded
+/// ignored over its live record.
+#[tokio::test]
+async fn record_read_failure_at_the_cap_does_not_ignore() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    db.fail_next_arbo_writes(u32::MAX);
+    let sd = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        sd.clone(),
+    )
+    .await;
+    wait_until("one attempt short of the cap", async || {
+        boot_attempts(&db, &pid31()) == Some(9)
+    })
+    .await;
+    db.fail_next_process_reads(u32::MAX);
+    wait_until("cap attempt made", async || {
+        boot_attempts(&db, &pid31()) != Some(9)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    db.fail_next_process_reads(0);
+    let rec = db.process(&pid_fr()).unwrap().unwrap();
+    assert_eq!(rec.local, LocalStatus::Active, "{:?}", rec.note);
+    assert_eq!(boot_attempts(&db, &pid31()), Some(10));
+    db.fail_next_arbo_writes(0);
+    let _h = handle(&node).await;
+    sd.cancel();
+}

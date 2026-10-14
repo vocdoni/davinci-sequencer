@@ -854,7 +854,8 @@ async fn run_boot_retries(ctx: &Ctx, retries: &mut Vec<BootRetry>, shutdown: &Ca
             Err(e) => {
                 changed = true;
                 retries[i].attempts += 1;
-                let stored = matches!(ctx.deps.db.process(&pid), Ok(Some(_)));
+                // Fail closed: a read error may hide a live record.
+                let stored = !matches!(ctx.deps.db.process(&pid), Ok(None));
                 if retries[i].attempts >= BOOT_ATTEMPT_CAP && stored {
                     // A process with state is never given up: retry at the
                     // longest backoff and keep saying so.
