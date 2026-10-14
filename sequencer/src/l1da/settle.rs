@@ -184,6 +184,10 @@ pub async fn settle(
             return Settled::Transient("L1 settlement past the batch deadline".into());
         }
         if let Some(i) = posts.iter().position(Option::is_none) {
+            // The settlement would be withheld: a post would only spend.
+            if let Err(e) = da.settle_fee_check().await {
+                return Settled::Transient(e.to_string());
+            }
             match da
                 .poster
                 .post(&job.pid, &job.root_before, &chunks[i], job.deadline)

@@ -372,6 +372,21 @@ impl Contracts {
         Ok(self.send(tx, None).await?.0)
     }
 
+    /// `FeeCap` when a send estimated at `gas` would be withheld by
+    /// `--op-max-tx-fee` at the current fees: the check `send` makes, with
+    /// the same gas margin.
+    pub async fn check_fee_cap(&self, gas: u64) -> Result<()> {
+        let (max_fee, _, _) = self.fees_now(false).await?;
+        let want = cost(gas.saturating_add(gas / 100 * GAS_MARGIN), max_fee);
+        if want > self.max_tx_fee {
+            return Err(Web3Error::FeeCap {
+                want,
+                cap: self.max_tx_fee,
+            });
+        }
+        Ok(())
+    }
+
     // Longest a send queues behind others before giving up with `Busy`.
     fn busy_timeout(&self) -> Duration {
         self.receipt_timeout
@@ -747,6 +762,13 @@ impl Contracts {
             res = replay(alloy::eips::BlockId::latest()).await;
         }
         replay_verdict(res, tx_hash, block)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::l1da::FeeGate for Contracts {
+    async fn check(&self, gas: u64) -> Result<()> {
+        self.check_fee_cap(gas).await
     }
 }
 
@@ -1431,6 +1453,23 @@ mod tests {
         c.send(call(&[3]), None).await.unwrap();
         let next = bumped(&held, market, 0, 0).max_fee;
         assert_eq!(prices(&chain), [market, next]);
+    }
+
+    // The check before an L1 post prices a send as `send` does (gas margin
+    // included): withheld above the cap, through at it, nothing sent.
+    #[tokio::test]
+    async fn the_fee_check_prices_as_the_send_does() {
+        let (mut c, chain) = sender(5).await;
+        let want = price(&mut c).await;
+        c.max_tx_fee = want - 1;
+        let e = c.check_fee_cap(21_000).await.unwrap_err();
+        assert!(
+            matches!(e, Web3Error::FeeCap { want: w, cap } if w == want && cap == want - 1),
+            "{e}"
+        );
+        c.max_tx_fee = want;
+        c.check_fee_cap(21_000).await.unwrap();
+        assert!(sent(&chain).is_empty());
     }
 
     #[test]

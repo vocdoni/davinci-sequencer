@@ -5,8 +5,8 @@ mod common;
 
 use common::*;
 use davinci_sequencer::l1da::{
-    GONE_FOR, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, PROOF_FAIL_FOR, PostError, Posted,
-    Poster, Posting, Settled, chunks, settle, with_post,
+    FeeGate, GONE_FOR, L1Da, L1Job, MAX_PROOF_RETRIES, MAX_REPOSTS, MIN_SETTLE_GAS, PROOF_FAIL_FOR,
+    PostError, Posted, Poster, Posting, Settled, chunks, settle, with_post,
 };
 use davinci_sequencer::storage::L1PostRecord;
 use davinci_sequencer::web3::L1Chain;
@@ -1324,4 +1324,59 @@ async fn the_fee_cap_backoff_stops_at_the_deadline() {
         "{out:?}"
     );
     assert!(r.l1.sends().is_empty());
+}
+
+/// The registry chain's fee check, scripted: withheld while `over`.
+#[derive(Default)]
+struct OpGate {
+    over: AtomicBool,
+    checks: AtomicU64,
+}
+
+#[async_trait]
+impl FeeGate for OpGate {
+    async fn check(&self, gas: u64) -> Result<(), Web3Error> {
+        assert_eq!(gas, MIN_SETTLE_GAS);
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        match self.over.load(Ordering::SeqCst) {
+            true => Err(Web3Error::FeeCap { want: 2, cap: 1 }),
+            false => Ok(()),
+        }
+    }
+}
+
+// An OP fee spike would withhold the settlement after the blobs were paid
+// for on Ethereum: nothing is posted while it lasts, and the job ends
+// transient, as a fee-capped send does. Under the cap the batch posts and
+// lands.
+#[tokio::test]
+async fn no_l1_post_while_the_op_settlement_would_be_withheld() {
+    let mut r = rig();
+    let gate = Arc::new(OpGate::default());
+    gate.over.store(true, Ordering::SeqCst);
+    r.da.op_fees = Some(gate.clone());
+    let job = r.job();
+    let (_, posting) = with_post(&r.da, &r.s.chain, &job, std::future::ready(())).await;
+    assert!(posting.posts.is_empty(), "{posting:?}");
+    assert!(
+        matches!(posting.error, Some(PostError::OpFeeCap { want: 2, cap: 1 })),
+        "{posting:?}"
+    );
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(
+        matches!(&out, Settled::Transient(e) if e.contains("--op-max-tx-fee")),
+        "{out:?}"
+    );
+    assert!(r.l1.sends().is_empty(), "posted above the OP cap");
+    assert!(!job.posted.load(Ordering::SeqCst));
+    assert_eq!(r.s.chain.l1_simulates(), 0);
+
+    gate.over.store(false, Ordering::SeqCst);
+    let job = r.job();
+    let posting = r.posting(&job).await;
+    assert_eq!(posting.posts.len(), 1, "{posting:?}");
+    let out = settle(&r.da, &r.s.chain, &job, &r.snark, posting).await;
+    assert!(matches!(out, Settled::Landed(_)), "{out:?}");
+    assert_eq!(r.l1.sends().len(), 1);
+    assert!(gate.checks.load(Ordering::SeqCst) >= 3);
 }

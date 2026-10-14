@@ -35,6 +35,10 @@ pub enum PostError {
     NoSigner,
     #[error("an L1 post would cost up to {want} wei, above the cap of {cap} wei")]
     FeeCap { want: u128, cap: u128 },
+    #[error(
+        "not posting: the OP settlement would cost up to {want} wei, above --op-max-tx-fee {cap} wei"
+    )]
+    OpFeeCap { want: u128, cap: u128 },
     #[error("the L1 post was not mined before the batch deadline")]
     Deadline,
     #[error("L1: {0}")]

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use davinci_zkvm_sdk::blob::TransitionBlobs;
 use davinci_zkvm_sdk::limits::{MAX_BLOBS, TX_BLOB_CAP};
 use tokio_util::sync::CancellationToken;
@@ -17,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::actor::Chain;
 use crate::storage::{Db, StorageError};
-use crate::web3::{L1Chain, L1Origin, TxReceipt};
+use crate::web3::{L1Chain, L1Origin, TxReceipt, Web3Error};
 
 pub use post::{PostError, Posted, Poster, REPLACE_AFTER};
 pub use settle::{
@@ -29,6 +30,21 @@ pub use settle::{
 /// Longest wait between fee-capped post attempts: fees move once per L1
 /// block (12 s) and a spike lasts minutes.
 pub const FEE_CAP_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Least gas a `submitStateTransitionL1` takes: one blob transaction and a
+/// 3-header L1 proof measured 800-860k on OP (docs/benchmarks.md). The
+/// check before a post prices this much, so it holds back only posts whose
+/// settlement `--op-max-tx-fee` is sure to withhold; a bigger one may still
+/// be withheld at its send.
+pub const MIN_SETTLE_GAS: u64 = 800_000;
+
+/// The registry chain's fee check before an L1 post.
+#[async_trait]
+pub trait FeeGate: Send + Sync {
+    /// `Web3Error::FeeCap` when a send estimated at `gas` would be withheld
+    /// by `--op-max-tx-fee` at the current fees.
+    async fn check(&self, gas: u64) -> Result<(), Web3Error>;
+}
 
 /// Seconds each chunk after the first adds to the Ethereum leg: its post
 /// waits until the one before is mined (about two L1 blocks).
@@ -62,6 +78,8 @@ pub struct L1Da {
     /// Most blobs one Ethereum transaction carries (the per-transaction
     /// cap): a transition goes out in chunks of this many.
     pub chunk: usize,
+    /// The registry's fee check before a post; `None` posts unchecked.
+    pub op_fees: Option<Arc<dyn FeeGate>>,
 }
 
 impl L1Da {
@@ -79,6 +97,7 @@ impl L1Da {
             l1,
             poll,
             chunk: chunk.max(1),
+            op_fees: None,
         })
     }
 }
@@ -125,6 +144,23 @@ impl L1Da {
     /// Waits one poll; false once `cancel` fires.
     pub(crate) async fn pause(&self, cancel: &CancellationToken) -> bool {
         self.pause_for(self.poll, cancel).await
+    }
+
+    /// Before a post: `OpFeeCap` when `--op-max-tx-fee` would withhold the
+    /// settlement at the current OP fees, so the post would only spend. A
+    /// failed fee read lets the post go: the send checks again.
+    pub(crate) async fn settle_fee_check(&self) -> Result<(), PostError> {
+        let Some(g) = &self.op_fees else {
+            return Ok(());
+        };
+        match g.check(MIN_SETTLE_GAS).await {
+            Err(Web3Error::FeeCap { want, cap }) => Err(PostError::OpFeeCap { want, cap }),
+            Err(e) => {
+                debug!(error = %e, "OP fee read failed; posting unchecked");
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
 
     /// Waits `d`; false once `cancel` fires.
@@ -220,7 +256,8 @@ pub enum Settled {
 }
 
 /// Posts `chunks` in order, one transaction at a time: each waits until the
-/// one before is mined (the window-1 poster). Fee-cap and L1 trouble are
+/// one before is mined (the window-1 poster); nothing when the settlement's
+/// OP fee is over its cap ([`L1Da::settle_fee_check`]). Fee-cap and L1 trouble are
 /// retried as [`Retries`] paces them; any other error, or the flight's end,
 /// stops the run. Returns the mined posts and the error that stopped it early.
 async fn post_chunks(
@@ -230,6 +267,9 @@ async fn post_chunks(
 ) -> (Vec<Posted>, Option<PostError>) {
     let pid = hex::encode(job.pid);
     let mut posts = Vec::with_capacity(chunks.len());
+    if let Err(e) = da.settle_fee_check().await {
+        return (posts, Some(e));
+    }
     let mut retries = Retries::default();
     for (i, c) in chunks.iter().enumerate() {
         loop {
