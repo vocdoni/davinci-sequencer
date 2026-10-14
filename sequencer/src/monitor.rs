@@ -137,6 +137,8 @@ pub async fn spawn_node(
         },
         prune: Arc::default(),
     };
+    // Before anything spawns: an unreadable list fails startup.
+    let mut retries = load_retries(&ctx.deps.db)?;
     // Respawn what a previous run served. A head read seeds each actor's
     // chain time so it does not accept votes into an already-ended window;
     // 0 means "unknown" and the actor refuses votes until the first Head.
@@ -167,7 +169,6 @@ pub async fn spawn_node(
     // The monitor retries them (bootstrap starts a stored record's actor).
     // The list goes to the monitor in memory: a failed persist (the same
     // outage) must not lose a pid whose creation is behind the cursor.
-    let mut retries = load_retries(&ctx.deps.db);
     if !failed.is_empty() {
         for pid in failed {
             if !retries.iter().any(|r| r.pid == pid) {
@@ -492,24 +493,29 @@ fn boot_backoff(poll: std::time::Duration, attempts: u32) -> std::time::Duration
     poll * 2u32.pow(attempts.saturating_sub(1).min(5))
 }
 
-fn load_retries(db: &Db) -> Vec<BootRetry> {
+/// The persisted retry list. A storage error fails startup (a restart
+/// retries): starting empty would drop pids whose creation is behind the
+/// cursor for good. A corrupt list is logged and dropped, since failing on
+/// it would wedge the node.
+fn load_retries(db: &Db) -> Result<Vec<BootRetry>, NodeError> {
     let bytes = match db.meta_bytes(BOOT_RETRIES_KEY) {
         Ok(Some(b)) => b,
-        Ok(None) => return Vec::new(),
+        Ok(None) => return Ok(Vec::new()),
         Err(e) => {
-            error!(%e, "bootstrap retry list unreadable; starting empty");
-            return Vec::new();
+            error!(%e, "bootstrap retry list unreadable; refusing to start");
+            return Err(e.into());
         }
     };
     let list: Vec<(String, u32)> = match serde_json::from_slice(&bytes) {
         Ok(l) => l,
         Err(e) => {
             error!(%e, "bootstrap retry list corrupt; starting empty");
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
     let now = tokio::time::Instant::now();
-    list.iter()
+    Ok(list
+        .iter()
         .filter_map(|(h, attempts)| {
             let mut pid31 = [0u8; 31];
             let pid = hex::decode_to_slice(h, &mut pid31)
@@ -530,7 +536,7 @@ fn load_retries(db: &Db) -> Vec<BootRetry> {
                 due: now,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn save_retries(db: &Db, retries: &[BootRetry]) {

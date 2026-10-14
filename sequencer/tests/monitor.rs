@@ -167,13 +167,13 @@ impl Clock for ChainClock {
     }
 }
 
-async fn start(
+async fn try_start(
     db: Db,
     net: &Net,
     prover: Arc<FakeProver>,
     cfg: Config,
     sd: &CancellationToken,
-) -> Node {
+) -> Result<Node, davinci_sequencer::monitor::NodeError> {
     let deps = Deps {
         db,
         contracts: Arc::new(net.clone()),
@@ -184,7 +184,17 @@ async fn start(
         tasks: tokio_util::task::TaskTracker::new(),
         l1: None,
     };
-    spawn_node(cfg, deps, sd.clone()).await.unwrap()
+    spawn_node(cfg, deps, sd.clone()).await
+}
+
+async fn start(
+    db: Db,
+    net: &Net,
+    prover: Arc<FakeProver>,
+    cfg: Config,
+    sd: &CancellationToken,
+) -> Node {
+    try_start(db, net, prover, cfg, sd).await.unwrap()
 }
 
 /// Serves `body` at `/census.json` once `gate` gives a permit, or never.
@@ -1128,5 +1138,61 @@ async fn boot_retry_survives_a_failed_persist() {
     let vid = v.pkg.vote_id;
     h.submit(v).await.unwrap();
     wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    sd.cancel();
+}
+
+/// The persisted retry list cannot be read at boot (a storage error): the
+/// node refuses to start rather than drop entries whose creation is behind
+/// the cursor; once storage answers, a restart bootstraps them.
+#[tokio::test]
+async fn unreadable_retry_list_fails_startup() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    // A pid waiting on the retry list, no record, its creation behind the
+    // cursor.
+    let list = serde_json::to_vec(&vec![(hex::encode(pid31()), 1u32)]).unwrap();
+    db.set_meta_bytes("monitor_boot_retries", &list).unwrap();
+    db.set_meta_u64("monitor_last_block", s.chain.head_block())
+        .unwrap();
+    db.fail_meta_reads(Some("monitor_boot_retries"));
+    let net = Net::new(s.chain.clone());
+    let sd = CancellationToken::new();
+    let cfg = || cfg(dir.path(), &s.census_dir, 1);
+    let r = try_start(db.clone(), &net, FakeProver::open(), cfg(), &sd).await;
+    assert!(r.is_err(), "started without its retry list");
+    sd.cancel();
+
+    db.fail_meta_reads(None);
+    let sd = CancellationToken::new();
+    let node = start(db.clone(), &net, FakeProver::open(), cfg(), &sd).await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    sd.cancel();
+}
+
+/// A corrupt retry list (bad data, not a storage error) is dropped with an
+/// error log; failing on it would keep the node down for good.
+#[tokio::test]
+async fn corrupt_retry_list_still_starts() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    db.set_meta_bytes("monitor_boot_retries", b"not json")
+        .unwrap();
+    let net = Net::new(s.chain.clone());
+    let sd = CancellationToken::new();
+    let node = start(
+        db,
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
     sd.cancel();
 }

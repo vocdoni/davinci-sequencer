@@ -221,6 +221,9 @@ pub struct Db {
     /// Scripted failures of process-record reads (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     process_read_faults: Arc<std::sync::atomic::AtomicU32>,
+    /// While set, reads of this `meta_bytes` key fail (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    meta_read_fault: Arc<std::sync::Mutex<Option<String>>>,
     /// While set, every transition-record write fails (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     transition_faults: Arc<std::sync::atomic::AtomicBool>,
@@ -324,6 +327,8 @@ impl Db {
             write_faults: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             process_read_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            meta_read_fault: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             transition_faults: Default::default(),
         };
@@ -482,6 +487,15 @@ impl Db {
     pub fn fail_next_process_reads(&self, n: u32) {
         self.process_read_faults
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `Some(k)`, every [`Db::meta_bytes`] read of `k` fails. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_meta_reads(&self, k: Option<&str>) {
+        *self
+            .meta_read_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = k.map(str::to_string);
     }
 
     /// Arbo handles (any process) holding an open read snapshot. Test hook.
@@ -855,6 +869,16 @@ impl Db {
     }
 
     pub fn meta_bytes(&self, k: &str) -> Result<Option<Vec<u8>>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .meta_read_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            == Some(k)
+        {
+            return Err(StorageError::Db("scripted read failure".into()));
+        }
         self.get(META_BYTES, k.as_bytes())
     }
 
