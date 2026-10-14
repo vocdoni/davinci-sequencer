@@ -854,3 +854,87 @@ async fn crash_window_landing_reorged_out_rebuilds() {
     }
     shutdown.cancel();
 }
+
+/// The same crash window, but before the restart a peer lands on the new
+/// branch from the orphan's old root (the log's last root). That transition
+/// is not our missing record (it does not reach our tree's root): the node
+/// rebuilds from the log's last root, syncs the peer and re-seals the
+/// orphan's vote, covering every slot the orphan batch published.
+#[tokio::test(start_paused = true)]
+async fn crash_window_peer_forks_from_the_orphan_root_rebuilds() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 2900 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    let v = fake_vote(&s.env, 24, &[2, 1], 2924);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("sealed", 600, async || prover.calls() >= 2).await;
+    let exposed = db.exposed(&pid_fr()).unwrap().unwrap().slots;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_secs("landed in the tree", 600, async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let head = s.chain.head_block();
+    wait_secs("event routed", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(head)
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+
+    s.chain.reorg_out_last_transition();
+    let db = reopen_db(dir.path()).await;
+    // A peer lands on the new branch, from the orphan's old root.
+    let peer = fake_vote(&s.env, 25, &[1, 2], 2925);
+    let pvid = peer.pkg.vote_id;
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&peer)));
+    let shutdown = CancellationToken::new();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, FakeProver::open(), &shutdown).await;
+    wait_secs("rebuilt", 300, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    s.chain.advance_time(400);
+    wait_secs("re-sealed on the chain", 600, async || {
+        all_settled(&h, &[vid]).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 26);
+    // The peer's vote was never ours: no local record, but in the tree.
+    for id in [vid, pvid] {
+        let (p, root) = h.vote_id_proof(id).await.unwrap();
+        assert!(p.exists);
+        assert_eq!(root, s.chain.root());
+    }
+    let ts = db.transitions(&pid_fr()).unwrap();
+    assert_eq!(
+        ts.iter().map(|t| t.by_self).collect::<Vec<_>>(),
+        [false, false, true],
+        "the log is the chain's: ours replayed, the peer's, our re-seal"
+    );
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, vid));
+    for slot in exposed {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out an exposed slot"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
