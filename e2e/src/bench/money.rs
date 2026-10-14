@@ -153,6 +153,38 @@ impl Budget {
         }
     }
 
+    /// What each sequencer key (A, B) may still spend on Ethereum.
+    pub fn room_l1(&self, now: &Balances) -> [U256; 2] {
+        self.spent(now)
+            .l1
+            .map(|s| self.caps.l1_per_key.saturating_sub(s))
+    }
+
+    /// Sets the caps given (ETH, decimal; empty keeps the cap): the owner's
+    /// figures at `run`, over what the first `gate` wrote. Returns whether
+    /// one changed.
+    pub fn set_caps(
+        &mut self,
+        l1: Option<&str>,
+        op: Option<&str>,
+        org: Option<&str>,
+    ) -> Result<bool> {
+        let mut changed = false;
+        for (k, v, cap) in [
+            ("L1 cap", l1, &mut self.caps.l1_per_key),
+            ("OP cap", op, &mut self.caps.op_per_key),
+            ("organizer cap", org, &mut self.caps.organizer_op),
+        ] {
+            let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            let new = parse_ether(v).with_context(|| format!("{k} {v:?}"))?;
+            changed |= new != *cap;
+            *cap = new;
+        }
+        Ok(changed)
+    }
+
     /// Fails, naming the account, when one has spent its cap.
     pub fn check(&self, now: &Balances) -> Result<(), String> {
         let s = self.spent(now);
@@ -699,6 +731,40 @@ mod tests {
             "{err}"
         );
         assert!(Budget::new(b.start.clone(), b.caps.clone()).is_ok());
+    }
+
+    #[test]
+    fn caps_are_the_owners() {
+        let e = |x: u64| U256::from(x);
+        let mut b = Budget {
+            inflows: Balances::default(),
+            start: Balances {
+                l1: [e(10u64.pow(15)), e(10u64.pow(15))],
+                ..Balances::default()
+            },
+            caps: Caps {
+                l1_per_key: parse_ether("0.005").unwrap(),
+                op_per_key: parse_ether("0.0005").unwrap(),
+                organizer_op: parse_ether("0.002").unwrap(),
+            },
+        };
+        assert!(!b.set_caps(None, Some(""), None).unwrap());
+        assert!(
+            b.set_caps(Some("0.0009"), Some("0.00015"), Some("0.0003"))
+                .unwrap()
+        );
+        assert_eq!(b.caps.l1_per_key, e(900_000_000_000_000));
+        assert_eq!(b.caps.op_per_key, e(150_000_000_000_000));
+        assert_eq!(b.caps.organizer_op, e(300_000_000_000_000));
+        assert!(!b.set_caps(Some("0.0009"), None, None).unwrap());
+        assert!(b.set_caps(Some("lots"), None, None).is_err());
+        // Room: the cap less what the key spent since the start.
+        let mut now = b.start.clone();
+        now.l1[1] -= e(850_000_000_000_000);
+        assert_eq!(
+            b.room_l1(&now),
+            [e(900_000_000_000_000), e(50_000_000_000_000)]
+        );
     }
 
     #[test]

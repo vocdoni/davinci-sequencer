@@ -399,6 +399,10 @@ pub struct Controller {
     done: Vec<ChaosRow>,
     /// Anvil only: mining is paused so a post stays pending.
     paused: bool,
+    /// Failed [`pending_gap`] reads, and the last error (redacted): an
+    /// `L1Pending` entry that never fired may never have been able to.
+    pending_errors: u64,
+    last_pending_error: Option<String>,
 }
 
 impl Controller {
@@ -409,7 +413,46 @@ impl Controller {
             recovering: Vec::new(),
             done: Vec::new(),
             paused: false,
+            pending_errors: 0,
+            last_pending_error: None,
         }
+    }
+
+    /// The entries that have not fired.
+    pub fn pending(&self) -> &[Chaos] {
+        &self.waiting
+    }
+
+    /// Records a failed pending-nonce read (`e` already redacted); returns
+    /// whether to log it: the first, then every 60th.
+    pub fn pending_error(&mut self, e: &str) -> bool {
+        self.pending_errors += 1;
+        self.last_pending_error = Some(e.to_string());
+        self.pending_errors % 60 == 1
+    }
+
+    /// How many pending-nonce reads failed.
+    pub fn pending_errors(&self) -> u64 {
+        self.pending_errors
+    }
+
+    /// A `(name, line)` report row per entry that never fired, so a fault
+    /// that did not happen is not read as one the nodes survived.
+    pub fn unfired(&self) -> Vec<(String, String)> {
+        self.waiting
+            .iter()
+            .map(|c| {
+                let mut l = format!("never triggered ({:?})", c.trigger);
+                if matches!(c.trigger, Trigger::L1Pending(_)) && self.pending_errors > 0 {
+                    l.push_str(&format!(
+                        "; pending-nonce reads failed {} times, last: {}",
+                        self.pending_errors,
+                        self.last_pending_error.as_deref().unwrap_or("")
+                    ));
+                }
+                (c.name.clone(), l)
+            })
+            .collect()
     }
 
     /// Whether an injection waits on a pending Ethereum post: only then is
@@ -774,6 +817,33 @@ mod tests {
         assert_eq!(rows[0].recovery_s, Some(22.0));
         assert_eq!(rows[0].effects, ["post x1", "post on record x1"]);
         assert!(c.recovering.is_empty());
+    }
+
+    #[test]
+    fn an_unfired_entry_gets_a_row() {
+        let kill = |name: &str, trigger| Chaos {
+            name: name.into(),
+            trigger,
+            action: Action::Kill {
+                node: Role::A,
+                down: Duration::from_secs(30),
+            },
+        };
+        let mut c = Controller::new(vec![
+            kill("kill A at pending", Trigger::L1Pending(NodeId::A)),
+            kill("kill A after a seal", Trigger::Sealed(NodeId::A)),
+        ]);
+        assert_eq!(c.pending().len(), 2);
+        // The first failed read is logged, the next 59 are not.
+        assert!(c.pending_error("rpc: timed out"));
+        assert!(!c.pending_error("rpc: 503"));
+        let rows = c.unfired();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "kill A at pending");
+        assert!(rows[0].1.starts_with("never triggered (L1Pending(A))"));
+        assert!(rows[0].1.contains("failed 2 times, last: rpc: 503"));
+        assert_eq!(rows[1].1, "never triggered (Sealed(A))");
+        assert!(Controller::new(vec![]).unfired().is_empty());
     }
 
     #[test]
