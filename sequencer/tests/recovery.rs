@@ -536,16 +536,16 @@ async fn results_lost_at_a_crash_finalize_locally() {
 
 /// A crash part way through the genesis of a new process (its tree written,
 /// no committed record yet): the restart re-creates it and the process
-/// spawns and settles. (Whether the bootstrap retry spawns it before the
-/// restart is the monitor's business.)
+/// spawns and settles.
 #[tokio::test]
 async fn crash_inside_genesis_creation_respawns() {
     for skip in [2, 4] {
         let s = setup(2, 8, None);
         let dir = TempDir::new().unwrap();
         let db = Db::open_in(dir.path()).unwrap();
-        // The params write and `skip - 1` genesis leaves go through.
-        db.fail_arbo_writes_after(skip, 1);
+        // The params write and `skip - 1` genesis leaves go through, then
+        // no tree write does (the crash): the bootstrap retry cannot spawn.
+        db.fail_arbo_writes_after(skip, u32::MAX);
         let shutdown = CancellationToken::new();
         let node = start_node(
             db.clone(),
@@ -563,6 +563,10 @@ async fn crash_inside_genesis_creation_respawns() {
         })
         .await;
         tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !node.processes.read().await.contains_key(&pid_fr()),
+            "the cut genesis spawned"
+        );
         shutdown.cancel();
         drop((node, db));
 
@@ -772,6 +776,76 @@ async fn repair_waits_for_the_blobs_and_keeps_the_exposed_set() {
     })
     .await;
     let reseal = updated_slots(&db, nf, transition_of(&db, nf, rvid));
+    for slot in exposed {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out an exposed slot"
+        );
+    }
+    shutdown.cancel();
+}
+
+/// The crash window of `crash_between_tree_commit_and_record_write_reopens`
+/// (the tree committed the landing, its record never written), and a reorg
+/// takes that landing before the restart. The tree is one transition ahead
+/// of the log, and the chain sits at the log's last root: the node rebuilds
+/// from there, re-seals the vote on the chain and covers every slot the
+/// orphaned batch published (kept in its exposed set: it has no record).
+#[tokio::test(start_paused = true)]
+async fn crash_window_landing_reorged_out_rebuilds() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1900 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    let v = fake_vote(&s.env, 24, &[2, 1], 1924);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("sealed", 600, async || prover.calls() >= 2).await;
+    let exposed = db.exposed(&pid_fr()).unwrap().unwrap().slots;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_secs("landed in the tree", 600, async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let head = s.chain.head_block();
+    wait_secs("event routed", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(head)
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+
+    s.chain.reorg_out_last_transition();
+    let db = reopen_db(dir.path()).await;
+    let shutdown = CancellationToken::new();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, FakeProver::open(), &shutdown).await;
+    wait_secs("rebuilt", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    s.chain.advance_time(400);
+    wait_secs("re-sealed on the chain", 600, async || {
+        all_settled(&h, &[vid]).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 25);
+    let (p, root) = h.vote_id_proof(vid).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, vid));
     for slot in exposed {
         assert!(
             reseal.contains(&slot),

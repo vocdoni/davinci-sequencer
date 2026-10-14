@@ -1819,8 +1819,13 @@ impl Actor {
 
     /// The index of the transition in our log leaving `root`, a root we
     /// passed: a chain read showing it lags or lost our later transitions.
-    /// A failed read counts as not passed.
+    /// The log's last root counts too while the tree is past it (a landing
+    /// whose record was never written): index `next_index`. A failed read
+    /// counts as not passed.
     fn passed_index(&self, root: &[u8; 32]) -> Option<u64> {
+        if *root == self.log_root && self.state.committed().root != self.log_root {
+            return Some(self.next_index);
+        }
         match self.deps.db.transitions(&self.pid) {
             Ok(ts) => ts.iter().find(|t| t.old_root == *root).map(|t| t.index),
             Err(e) => {
@@ -1920,7 +1925,12 @@ impl Actor {
                 return;
             }
         };
-        let Some(fork) = log.iter().find(|t| t.index == d).map(|t| t.old_root) else {
+        // Past the log's end: the tree's unrecorded landing left its last root.
+        let fork = match d == self.next_index {
+            true => Some(self.log_root),
+            false => log.iter().find(|t| t.index == d).map(|t| t.old_root),
+        };
+        let Some(fork) = fork else {
             error!(%pid, d, "rebuild: no transition at the divergence");
             self.diverged = None;
             return;
@@ -1986,7 +1996,8 @@ impl Actor {
             slots: slots.iter().copied().collect(),
             vote_ids: vids.iter().copied().collect(),
         };
-        let depth = lost.count();
+        // The tree's unrecorded landing is lost too.
+        let depth = lost.count() + usize::from(self.state.committed().root != self.log_root);
         let mut record = self.record.clone();
         record.onchain.state_root = p.state_root;
         record.onchain.voters_count = p.voters_count;
