@@ -284,6 +284,9 @@ pub struct Inner {
     /// while `head()` moves on: a backend behind the head. `process_at` a
     /// later block fails there.
     split: Option<(OnchainProcess, u64)>,
+    /// `(block, proc)` snapshots from `checkpoint`: `process_at` a block
+    /// below the head answers the newest one at or below it.
+    history: Vec<(u64, OnchainProcess)>,
     /// Next N blob fetches fail.
     fail_blobs: u32,
     /// Next N `submit_transition` calls fail without landing.
@@ -418,6 +421,7 @@ impl FakeChain {
             lag_process: 0,
             frozen: None,
             split: None,
+            history: Vec::new(),
             fail_blobs: 0,
             fail_submits: 0,
             timeout_submits: 0,
@@ -744,6 +748,23 @@ impl FakeChain {
     pub fn split_view(&self, on: bool) {
         let mut i = self.inner.lock().unwrap();
         i.split = on.then(|| (i.proc.clone(), i.block));
+    }
+
+    /// Records the process as of the current block, for `process_at` reads
+    /// of later blocks that stay below the head.
+    pub fn checkpoint(&self) {
+        let mut i = self.inner.lock().unwrap();
+        let snap = (i.block, i.proc.clone());
+        i.history.push(snap);
+    }
+
+    /// The block carrying the results reorged out: the process is Ended
+    /// again with no results, and their events never route.
+    pub fn reorg_results(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.proc.status = ProcessStatus::Ended;
+        i.proc.results = Vec::new();
+        i.history.clear();
     }
 
     pub fn fail_blobs(&self, n: u32) {
@@ -1314,14 +1335,20 @@ impl Chain for FakeChain {
     }
 
     async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error> {
-        if *pid == pid31()
-            && let Some((p, at)) = &self.inner.lock().unwrap().split
-        {
-            return if block <= *at {
-                Ok(p.clone())
-            } else {
-                Err(Web3Error::Rpc(format!("header not found: {block}")))
-            };
+        if *pid == pid31() {
+            let i = self.inner.lock().unwrap();
+            if let Some((p, at)) = &i.split {
+                return if block <= *at {
+                    Ok(p.clone())
+                } else {
+                    Err(Web3Error::Rpc(format!("header not found: {block}")))
+                };
+            }
+            if block < i.block
+                && let Some((_, p)) = i.history.iter().rev().find(|(b, _)| *b <= block)
+            {
+                return Ok(p.clone());
+            }
         }
         self.process(pid).await
     }
@@ -2084,6 +2111,11 @@ pub fn test_config_with(
     } else {
         &["--batch-time", "1h"]
     };
+    let conf: &[&str] = if extra.contains(&"--confirmations") {
+        &[]
+    } else {
+        &["--confirmations", "0"]
+    };
     let base = [
         "davinci-sequencer",
         "--datadir",
@@ -2098,8 +2130,6 @@ pub fn test_config_with(
         &bm,
         "--poll-interval",
         "20ms",
-        "--confirmations",
-        "0",
         "--settle-margin",
         margin,
         "--census-dir",
@@ -2109,7 +2139,15 @@ pub fn test_config_with(
         "--census-sync-every",
         "0s",
     ];
-    Config::parse_args(base.iter().chain(rpc).chain(bt).chain(extra).copied()).unwrap()
+    Config::parse_args(
+        base.iter()
+            .chain(rpc)
+            .chain(bt)
+            .chain(conf)
+            .chain(extra)
+            .copied(),
+    )
+    .unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]

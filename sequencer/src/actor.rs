@@ -795,6 +795,8 @@ struct Actor {
     flush_horizon: u64,
     /// Landing margin reserved after proving.
     settle_margin: u64,
+    /// `--confirmations`: depth of the head a results read is confirmed at.
+    confirmations: u64,
     /// L1-blob mode: the Ethereum leg, which runs during the proof.
     l1_settle_lag: u64,
     slot_depth: usize,
@@ -1016,6 +1018,7 @@ pub(crate) fn spawn_actor(
         solo_wait: cfg.solo_wait.as_secs(),
         flush_horizon: cfg.flush_horizon.as_secs(),
         settle_margin: cfg.settle_margin.as_secs(),
+        confirmations: cfg.confirmations,
         l1_settle_lag: cfg.l1_settle_lag.as_secs(),
         slot_depth: cfg.slot_depth as usize,
         prove_base: cfg.prove_base.as_secs_f64(),
@@ -1589,10 +1592,13 @@ impl Actor {
         }
         if results_due && !self.vote_at_stale {
             self.results_sent = None;
-            if self.record.local == LocalStatus::Active {
+            if self.record.local == LocalStatus::Active
+                && self.record.onchain.status != ProcessStatus::Results
+            {
                 warn!(pid = %hex::encode(self.pid31), "results transaction never confirmed; resubmitting");
             }
         }
+        self.confirm_results().await;
         // Landed-but-unconfirmed flight: if the chain never showed our root
         // by the deadline (the tx reorged out), roll back and requeue.
         if self.in_flight.as_ref().is_some_and(|f| {
@@ -1642,6 +1648,7 @@ impl Actor {
         // settled must never be errored.
         self.maybe_resync().await;
         self.maybe_close_out().await;
+        self.confirm_results().await;
         if self.record.local != LocalStatus::Active {
             return;
         }
@@ -1742,7 +1749,13 @@ impl Actor {
             }
         }
         if o.status != before.status {
-            self.status_moved(o.status);
+            if o.status == ProcessStatus::Results && self.record.local == LocalStatus::Active {
+                // A read is at the head, depth 0: finalize only once the
+                // confirmed head shows the results (confirm_results).
+                self.pause_hold = None;
+            } else {
+                self.status_moved(o.status);
+            }
         }
         self.put_record();
         pinned
@@ -1811,6 +1824,29 @@ impl Actor {
         } else {
             self.resync_after = None;
             self.resync_backoff_ms = 0;
+        }
+    }
+
+    /// Results a head read showed (not yet an event): finalize once the
+    /// confirmed head shows them too. Until then the results deadline is
+    /// armed, so a reorg that drops them is re-read and resubmitted.
+    async fn confirm_results(&mut self) {
+        if self.record.local != LocalStatus::Active
+            || self.record.onchain.status != ProcessStatus::Results
+        {
+            return;
+        }
+        if self.results_sent.is_none() {
+            self.results_sent = Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+        }
+        let confirmed = match self.deps.contracts.confirmed_head(self.confirmations).await {
+            Ok(block) => self.deps.contracts.process_at(&self.pid31, block).await,
+            Err(e) => Err(e),
+        };
+        match confirmed {
+            Ok(p) if p.status == ProcessStatus::Results => self.mark_finalized(),
+            Ok(_) => {}
+            Err(e) => debug!(pid = %hex::encode(self.pid31), %e, "results confirmation read"),
         }
     }
 

@@ -6524,3 +6524,86 @@ async fn time_revert_of_a_flight_a_peer_settled_does_not_error_it() {
     .await;
     shutdown.cancel();
 }
+
+/// RESULTS seen by a read at the head is depth 0: the node does not
+/// finalize on it until the confirmed head shows them. When the block
+/// carrying them reorgs out, the deadline re-reads the chain and the key
+/// holder submits its own results, finalizing at their event.
+#[tokio::test(start_paused = true)]
+async fn results_read_at_the_head_does_not_finalize_until_confirmed() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 41);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    shutdown.cancel();
+    drop((h, node));
+
+    // A peer's results land in the newest block, not confirmed yet; their
+    // events are not routed.
+    s.chain.pass_grace();
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.set_results_externally(vec![3, 4]);
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        1,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        reopen_db(dir.path()).await,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_until("the head read merged the results", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Results
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        h.snapshot().await.unwrap().local,
+        LocalStatus::Active,
+        "finalized on a depth-0 read"
+    );
+    // That block reorgs out: Ended again, no results, no event ever.
+    s.chain.reorg_results();
+    wait_long("our results on chain", async || {
+        s.chain.results_submits() == 1 && !s.chain.results().is_empty()
+    })
+    .await;
+    let mut want = vec![0u64; 16];
+    want[0] = 1;
+    want[1] = 2;
+    assert_eq!(s.chain.results(), want);
+    // A new block confirms the results event.
+    s.chain.advance_time(1);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results_submits(), 1);
+    shutdown.cancel();
+}
