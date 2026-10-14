@@ -44,7 +44,7 @@ const BUILD_PERMITS: usize = 2;
 /// Concurrent census downloads: apart from the builds, so a few slow
 /// servers (any organizer picks the URI) cannot hold up every bootstrap.
 /// Each holds at most `max_bytes` until it gets a build permit.
-const DOWNLOAD_PERMITS: usize = 8;
+const DOWNLOAD_PERMITS: usize = 4;
 /// From the first body byte, a download bringing fewer than this many
 /// bytes in a window is cut off (transient): a trickle that stays inside
 /// the read timeout would hold its permit for the whole 300 s.

@@ -31,7 +31,7 @@ Downloads are restricted, because the URI comes from on-chain data:
 
 - only `http(s)` by default, to public hosts only, with no redirects, no proxy and a 256 MiB cap;
 - a download that brings less than 16 KiB in a 30 s window after its first byte is cut off and
-  retried later. At most 8 downloads and 2 tree builds run at once, so slow servers cannot hold
+  retried later. At most 4 downloads and 2 tree builds run at once, so slow servers cannot hold
   up every other census;
 - loopback and private hosts need `--census-allow-private`;
 - `file://` needs `--census-dir`, and the path must resolve to a regular file under that
