@@ -3535,8 +3535,8 @@ impl Actor {
         n_blobs: u64,
         l1: Option<L1Blobs>,
     ) {
-        // Not ours: it does not reach the tree's root.
-        if new_root != self.state.committed().root {
+        // Not ours: our tree never reached its root.
+        if !matches!(self.state.has_root(&new_root), Ok(true)) {
             return;
         }
         let fetched = match &l1 {
@@ -3871,12 +3871,12 @@ impl Actor {
             }
             let committed = self.state.committed().root;
             // The log first catches up with the tree (records lost at a
-            // crash), then the tree with the chain. Only the transition that
-            // reaches our tree's root is our missing record; another one
-            // leaving the log's last root forks from it (ours was reorged
+            // crash), then the tree with the chain. A transition leaving the
+            // log's last root for a root our tree reached is a missing
+            // record; for any other root it forks there (ours was reorged
             // out): rebuild from there.
             if old_root == self.log_root && self.log_root != committed {
-                if new_root != committed {
+                if !matches!(self.state.has_root(&new_root), Ok(true)) {
                     self.diverge(self.next_index, false);
                     continue;
                 }

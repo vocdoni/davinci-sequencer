@@ -938,3 +938,103 @@ async fn crash_window_peer_forks_from_the_orphan_root_rebuilds() {
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
     shutdown.cancel();
 }
+
+/// Our landing and then a peer's, both in the tree and neither recorded:
+/// what an earlier build left after its record writes failed (this one no
+/// longer applies past a missing record). At the restart the log is
+/// repaired in order: each transition leaving the log's last root reaches a
+/// root our tree holds, so it is ours to record, not a fork. Nothing
+/// rebuilds, and the next vote seals and settles.
+#[tokio::test(start_paused = true)]
+async fn two_unrecorded_landings_are_repaired_in_order() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 3000);
+    h.submit(v0.clone()).await.unwrap();
+    wait_secs("sealed", 600, async || prover.calls() >= 1).await;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_secs("ours in the tree", 600, async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let peer = fake_vote(&s.env, 5, &[2, 1], 3001);
+    let b = s.chain.peer_batch(&s, std::slice::from_ref(&peer));
+    s.chain.settle_externally(&b);
+    let head = s.chain.head_block();
+    wait_secs("the peer's event routed", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(head)
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+    // The earlier build applied the peer's transition too.
+    let db = reopen_db(dir.path()).await;
+    {
+        let mut st = davinci_state::ProcessState::open_stored(
+            s.env.cfg.clone(),
+            db.arbo_storage(&pid_fr()).unwrap(),
+        )
+        .unwrap();
+        let nf = s.env.cfg.ballot_mode.num_fields;
+        let td = davinci_zkvm_sdk::blob::decode_blobs(&b.blobs.blobs, nf).unwrap();
+        st.apply_synced(&td, b.new_root).unwrap();
+    }
+    assert!(db.transitions(&pid_fr()).unwrap().is_empty());
+
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_secs("both records", 300, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 2
+    })
+    .await;
+    let ts = db.transitions(&pid_fr()).unwrap();
+    assert_eq!(
+        ts.iter().map(|t| t.by_self).collect::<Vec<_>>(),
+        [true, false]
+    );
+    assert_eq!(ts[1].old_root, ts[0].new_root);
+    assert_eq!(ts[1].new_root, s.chain.root());
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(
+        vote_status(&h, v0.pkg.vote_id).await,
+        Some(VoteStatus::Settled)
+    );
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 3002);
+    h.submit(v1.clone()).await.unwrap();
+    wait_secs("the next vote settled", 300, async || {
+        all_settled(&h, &[v1.pkg.vote_id]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 3);
+    tokio::time::sleep(Duration::from_secs(200)).await;
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}

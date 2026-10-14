@@ -448,6 +448,12 @@ impl<S: Storage> ProcessState<S> {
         Ok(())
     }
 
+    /// Whether this storage holds tree root `root`: one our tree reached at
+    /// some point (nodes are keyed by hash and never deleted).
+    pub fn has_root(&self, root: &[u8; 32]) -> Result<bool, Error> {
+        Ok(*root == arbo::EMPTY_HASH || self.db.get(root)?.is_some())
+    }
+
     /// Points the tree back at the committed root, after a failed prepare
     /// whose own reset failed. The committed record is authoritative.
     pub fn reset_to_committed(&mut self) -> Result<(), Error> {

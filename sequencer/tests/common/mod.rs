@@ -291,6 +291,8 @@ pub struct Inner {
     process_at_calls: u64,
     /// Next N blob fetches fail.
     fail_blobs: u32,
+    /// Fetches of this transaction's blobs fail while set.
+    withheld: Option<B256>,
     /// Next N `submit_transition` calls fail without landing.
     fail_submits: u32,
     /// Next N `submit_transition` calls land but report a receipt timeout.
@@ -426,6 +428,7 @@ impl FakeChain {
             history: Vec::new(),
             process_at_calls: 0,
             fail_blobs: 0,
+            withheld: None,
             fail_submits: 0,
             timeout_submits: 0,
             hide_block: None,
@@ -847,6 +850,59 @@ impl FakeChain {
 
     pub fn fail_blobs(&self, n: u32) {
         self.inner.lock().unwrap().fail_blobs = n;
+    }
+
+    /// Fetches of `tx`'s blobs fail until called with `None`.
+    pub fn withhold_blobs(&self, tx: Option<B256>) {
+        self.inner.lock().unwrap().withheld = tx;
+    }
+
+    /// The transaction of the newest transition event.
+    pub fn last_transition_tx(&self) -> B256 {
+        let i = self.inner.lock().unwrap();
+        i.events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, EventKind::StateTransitioned { .. }))
+            .unwrap()
+            .tx_hash
+    }
+
+    /// Another sequencer's batch of `votes` on the chain's current root,
+    /// replayed from the chain's own transition events and blobs (blob
+    /// mode; each foreign landing overwrites the last one's blobs).
+    pub fn peer_batch(
+        &self,
+        s: &TestSetup,
+        votes: &[VerifiedVote],
+    ) -> davinci_state::PreparedBatch {
+        let mut st =
+            davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new())
+                .unwrap();
+        let nf = s.env.cfg.ballot_mode.num_fields;
+        let i = self.inner.lock().unwrap();
+        for e in &i.events {
+            let EventKind::StateTransitioned {
+                old_root,
+                new_root,
+                n_blobs,
+                ..
+            } = e.kind
+            else {
+                continue;
+            };
+            if old_root != st.committed().root {
+                continue;
+            }
+            let mut b = i.blobs[&e.tx_hash].clone();
+            b.truncate(n_blobs as usize);
+            let td = davinci_zkvm_sdk::blob::decode_blobs(&b, nf).unwrap();
+            st.apply_synced(&td, new_root).unwrap();
+        }
+        assert_eq!(st.committed().root, i.proc.state_root);
+        drop(i);
+        st.prepare(votes, &mut StdRng::seed_from_u64(11), &Default::default())
+            .unwrap()
     }
 
     pub fn fail_blobs_left(&self) -> u32 {
@@ -1849,6 +1905,9 @@ impl BlobSource for FakeBlobs {
         if i.fail_blobs > 0 {
             i.fail_blobs -= 1;
             return Err(Web3Error::Blob("scripted blob failure".into()));
+        }
+        if i.withheld == Some(tx) {
+            return Err(Web3Error::Blob("scripted withheld blobs".into()));
         }
         let mut b = i
             .blobs
