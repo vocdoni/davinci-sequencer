@@ -102,10 +102,22 @@ a DKG mode when no single node should hold the key.
   rebuild that election. Nodes archive and serve the blobs they saw, but no node fetches from
   another node's archive yet. Keep a node, or a blob archiver, running for the whole election.
 - **Reorgs.** Other sequencers' transitions are applied only once they are `--confirmations`
-  blocks deep, but the node's own commits follow the transaction receipt. An own transaction
-  whose event never confirms is rolled back after 90 s and its votes requeued. If a fully
-  committed own transition is reorged out, the node's copy of that process stays ahead of the
-  chain and stops following it.
+  blocks deep (1 on OP Mainnet), but in blob mode the node's own commits follow the transaction
+  receipt. Deeper reorgs are detected and recovered (see
+  [lifecycle.md](lifecycle.md#reorgs)):
+  - the monitor compares the hash of the block at its event cursor each poll, and on a mismatch
+    rewinds 128 blocks and routes them again. After 5 failed block reads in a row it routes on
+    without the check until a read succeeds, so a reorg in that window goes unseen until then;
+  - an own transaction whose event never confirms is rolled back after 90 s and its votes
+    requeued;
+  - a process left ahead of the chain (a read at a root its log passed, or a transition forking
+    from one, for 90 s) is rebuilt from the chain: the lost transitions' votes go back to the
+    queue and re-seal on the chain's root. The rebuild replays the process from its blobs, so it
+    needs them (see Blob retention), and it starts at the process's next chain read, which an
+    idle process makes only when it next has work.
+
+  Results already finalized are not undone by a reorg that drops them, and a reorg deeper than
+  the 128-block rewind can leave events of the dropped range unrouted.
 - **Scalar bias.** Re-encryption scalars are SHA-256 digests reduced modulo the BN254 scalar
   field, which leaves them 2^-7.6 from uniform modulo the subgroup order. Closing the gap needs a
   512-bit reduction, which changes the batch circuit and its program key.

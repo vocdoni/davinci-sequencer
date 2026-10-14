@@ -17,7 +17,7 @@ One loop polls the registry events up to `head − confirmations` and routes the
 
 Merkle censuses (origins 1 and 2) are downloaded off the event loop, so a slow census server does
 not stall routing, and their root is checked. The process waits on the retry list until its census
-is stored, and a failed download costs one attempt. At most 8 downloads and 2 builds run at once;
+is stored, and a failed download costs one attempt. At most 4 downloads and 2 builds run at once;
 a download that brings less than 16 KiB in a 30 s window after its first byte is cut off and
 retried. For an on-chain census (origin 3) the node indexes the census contract and serves votes
 after the first sync. A process that fails a permanent check is marked `ignored` with the reason.
@@ -90,7 +90,9 @@ blobs go to Ethereum instead, see [L1-blob mode](#l1-blob-mode-op-stack). A node
 one batch in flight per process; processes run in parallel.
 
 Transient prover errors back off (up to about 5 minutes) with the votes still pending, and end
-in `error` only if the election closes first. Other failures:
+in `error` only if the election closes first. So does a node fault while the batch is built (a
+failed write to the state tree): its votes are never errored for it. `nextSealNotBefore` shows
+the backoff. Other failures:
 
 - A job the prover fails for good (a `failed` job, a refused input, outputs it cannot decode)
   puts the votes back in the queue and retries the batch once at full size. Each further failure
@@ -130,6 +132,33 @@ accumulator from the ballots it already holds (the blobs do not carry it), appli
 committed root, and requires the result to equal the event's `newRoot`. Queued votes whose
 id is now in the tree become `settled`. Gaps are replayed from the registry logs. Every node
 stores the transitions and blobs it sees and serves them under `/processes/{pid}/transitions`.
+
+### Reorgs
+
+Each poll the monitor reads the hash of the block at its event cursor and compares it with the
+hash it stored with the cursor. A different hash is a reorg: the node logs an error, rewinds the
+cursor 128 blocks and routes that range again. Routing an event twice changes nothing, and a
+transition the new branch re-included in a later block is recognised by its old and new roots.
+After 5 failed block reads in a row the monitor routes on without the check, and re-arms it at
+the first read that succeeds.
+
+A reorg deeper than `--confirmations` can take a transition the node already committed: its own
+(committed at the receipt in blob mode, at the event in L1-blob mode) or one it synced. The node
+is then ahead of the chain: a chain read shows a root its transition log has passed, or an event
+shows a transition leaving such a root for another one. From then on it seals nothing and
+proves no results. If the chain does not come back within 90 s, the node rebuilds the process:
+
+1. One write drops the state tree, the transition log and the stored blobs, puts the votes the
+   lost transitions settled back in the queue, widens the exposed set by every slot of the lost
+   batches that carried them, and pins the chain's root.
+2. The node re-creates the genesis and replays every transition the chain has from its blobs,
+   as a late bootstrap does.
+3. The votes re-seal on the chain's root, or settle from the replay if the chain kept them in
+   another transition; once the window has closed, the close-out errors what is left.
+
+The rebuild logs an error with its depth and leaves a note in the process record. The node
+notices a divergence at its next chain read (after a landing, an event, a lost race or a results
+attempt), so an idle process rebuilds when it next has work.
 
 ## L1-blob mode (OP Stack)
 
@@ -376,6 +405,11 @@ crash between the two reopens at it: the batch's votes settle from the tree, the
 follows the chain once a read shows the tree's root there, and the missing transition record is
 rewritten from its event and blobs (which moves the pinned root too). The node seals nothing
 until the record is back, so the next landing cannot take its index.
+
+A process's genesis is written leaf by leaf with its record last, so a crash in between leaves a
+tree without a record: the next start writes the genesis again. A crash between a rebuild's
+write and its new genesis (see [Reorgs](#reorgs)) reopens the same way, at genesis with an empty
+log, and the replay goes on.
 
 Events the monitor routed into an actor's queue die with the process, and the event cursor has
 already moved past them. At boot, and whenever a landing makes the actor re-read the process,
