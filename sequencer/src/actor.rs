@@ -2695,6 +2695,18 @@ impl Actor {
     }
 
     fn commit_flight(&mut self, f: Flight, tx_hash: [u8; 32], block: u64) {
+        // The registry's counters after this landing, from the publics it
+        // checked: occupied_before is its votersCount and an overwrite is
+        // no new voter. The landing's event raises them again (idempotent).
+        let e = &f.prepared.expected;
+        let voters =
+            u64::from(e.occupied_before) + u64::from(e.voters.saturating_sub(e.overwrites));
+        let overwrites = self
+            .record
+            .onchain
+            .overwritten_count
+            .saturating_add(u64::from(e.overwrites));
+        self.follow_counts(voters, overwrites);
         if let Err(e) = self.state.commit(&f.prepared) {
             // The transition IS on-chain; record the target root so resync
             // repairs the local state from our own blobs, and requeue the
@@ -2828,6 +2840,8 @@ impl Actor {
                 sender,
                 old_root,
                 new_root,
+                voters,
+                overwrites,
                 n_blobs,
                 l1,
                 ..
@@ -2838,6 +2852,7 @@ impl Actor {
                     sender,
                     old_root,
                     new_root,
+                    (voters, overwrites),
                     n_blobs,
                     l1,
                 )
@@ -2862,6 +2877,16 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// Raises the stored registry counters to a landing's totals. Both only
+    /// grow on-chain, so a replayed older event cannot rewind them.
+    fn follow_counts(&mut self, voters: u64, overwrites: u64) -> bool {
+        let o = &mut self.record.onchain;
+        let moved = voters > o.voters_count || overwrites > o.overwritten_count;
+        o.voters_count = o.voters_count.max(voters);
+        o.overwritten_count = o.overwritten_count.max(overwrites);
+        moved
     }
 
     fn put_record(&self) {
@@ -2912,6 +2937,7 @@ impl Actor {
         sender: Address,
         old_root: [u8; 32],
         new_root: [u8; 32],
+        (voters, overwrites): (u64, u64),
         n_blobs: u64,
         l1: Option<L1Blobs>,
     ) {
@@ -2923,8 +2949,11 @@ impl Actor {
         if new_root == committed {
             // Already applied (our own settled transition echoing back).
             // Forward-only pin: never let a replayed event rewind the target.
+            let moved = self.follow_counts(voters, overwrites);
             if self.record.onchain.state_root == old_root {
                 self.record.onchain.state_root = new_root;
+                self.put_record();
+            } else if moved {
                 self.put_record();
             }
             // Clear the sync latch only at the pinned tip: a replayed old
@@ -2942,6 +2971,9 @@ impl Actor {
             if f.prepared.new_root == new_root {
                 let f = self.in_flight.take().unwrap();
                 self.commit_flight(f, tx_hash, block);
+                if self.follow_counts(voters, overwrites) {
+                    self.put_record();
+                }
                 return;
             }
             // A foreign transition while ours is in flight: we lost.
@@ -2955,6 +2987,7 @@ impl Actor {
         // The chain tip moved: pin the target root now (and persist it),
         // so a failed sync below is retried instead of forgotten.
         self.record.onchain.state_root = new_root;
+        self.follow_counts(voters, overwrites);
         self.put_record();
         if old_root == committed {
             self.apply_sync(block, tx_hash, sender, old_root, new_root, n_blobs, l1)
@@ -3091,15 +3124,23 @@ impl Actor {
             if *ev.kind.pid() != self.pid31 {
                 continue;
             }
-            if let EventKind::StateTransitioned {
+            let EventKind::StateTransitioned {
                 sender,
                 old_root,
                 new_root,
+                voters,
+                overwrites,
                 n_blobs,
                 l1,
                 ..
             } = ev.kind
-                && old_root == self.state.committed().root
+            else {
+                continue;
+            };
+            if self.follow_counts(voters, overwrites) {
+                self.put_record();
+            }
+            if old_root == self.state.committed().root
                 && !self
                     .apply_sync(
                         ev.block,

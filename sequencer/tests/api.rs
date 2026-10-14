@@ -1030,3 +1030,43 @@ async fn offchain_census_update_that_cannot_load_is_refused() {
     wait_served(&t, 4, root).await;
     t.shutdown.cancel();
 }
+
+/// `votersCount` and `overwrittenVotesCount` follow a synced transition
+/// and two own landings, overwrites included.
+#[tokio::test]
+async fn process_view_counts_follow_settled_transitions() {
+    let t = serve(FakeProver::open(), 2).await;
+    let h = handle(&t.node).await;
+    let counts = async || {
+        let p = t.client.process(&pid31()).await.unwrap();
+        (p.voters_count, p.overwritten_votes_count)
+    };
+    assert_eq!(counts().await, (0, 0));
+
+    // Another sequencer lands voters 0 and 1.
+    let mut other =
+        davinci_state::ProcessState::create(t.s.env.cfg.clone(), arbo::MemoryStorage::new())
+            .unwrap();
+    let theirs = [
+        fake_vote(&t.s.env, 0, &[1, 2], 30),
+        fake_vote(&t.s.env, 1, &[1, 2], 31),
+    ];
+    let b = other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(4), &Default::default())
+        .unwrap();
+    t.s.chain.settle_externally(&b);
+    wait_until("synced", async || counts().await == (2, 0)).await;
+
+    // Own landings: an overwrite and a new voter each.
+    for (i, k) in [(0, 32), (2, 33)] {
+        h.submit(fake_vote(&t.s.env, i, &[2, 1], k)).await.unwrap();
+    }
+    wait_until("own landing 1", async || counts().await == (3, 1)).await;
+    for (i, k) in [(1, 34), (3, 35)] {
+        h.submit(fake_vote(&t.s.env, i, &[2, 2], k)).await.unwrap();
+    }
+    wait_until("own landing 2", async || counts().await == (4, 2)).await;
+    assert_eq!(t.s.chain.voters(), 4);
+    assert_eq!(t.client.info().await.unwrap().settled_by_self, 2);
+    t.shutdown.cancel();
+}

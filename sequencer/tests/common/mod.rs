@@ -913,7 +913,8 @@ fn settle_foreign(i: &mut Inner, b: &davinci_state::PreparedBatch) -> u64 {
     assert_eq!(b.old_root, i.proc.state_root);
     i.proc.state_root = b.new_root;
     i.proc.last_vote_at = i.time;
-    i.proc.voters_count += b.expected.voters as u64;
+    // The registry: votersCount counts distinct slots, so overwrites are not new voters.
+    i.proc.voters_count += (b.expected.voters - b.expected.overwrites) as u64;
     i.proc.overwritten_count += b.expected.overwrites as u64;
     i.proc.batch_number += 1;
     i.block += 1;
@@ -963,7 +964,7 @@ fn land(
     i.last_census_root = Some(p.census_root);
     i.proc.state_root = p.root_after;
     i.proc.last_vote_at = i.time;
-    i.proc.voters_count += p.voters as u64;
+    i.proc.voters_count += (p.voters - p.overwrites) as u64;
     i.proc.overwritten_count += p.overwrites as u64;
     i.proc.batch_number += 1;
     i.block += 1;

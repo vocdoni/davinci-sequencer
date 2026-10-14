@@ -5433,3 +5433,98 @@ async fn cancel_under_a_prover_hold_names_the_hold() {
     }
     shutdown.cancel();
 }
+
+// The node's stored (votersCount, overwrittenVotesCount), as the API serves them.
+fn stored_counts(db: &Db) -> (u64, u64) {
+    let r = db.process(&pid_fr()).unwrap().unwrap();
+    (r.onchain.voters_count, r.onchain.overwritten_count)
+}
+
+/// The registry counters follow two own landings and one synced transition,
+/// overwrites included, without re-reading getProcess; a node bootstrapped
+/// mid-election and a restarted one report them too.
+#[tokio::test]
+async fn onchain_counts_follow_own_and_synced_transitions() {
+    let s = setup(2, 8, None);
+    let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (stop_a, stop_b) = (CancellationToken::new(), CancellationToken::new());
+    let node_a = start_node(
+        Db::open_in(dir_a.path()).unwrap(),
+        dir_a.path(),
+        &s,
+        s.chain.with_signer(0xa1),
+        FakeProver::open(),
+        2,
+        "0s",
+        stop_a.clone(),
+    )
+    .await;
+    let ha = handle(&node_a).await;
+    assert_eq!(stored_counts(&node_a.db), (0, 0));
+    // From here the counters come from the landings alone.
+    s.chain.fail_process(u32::MAX);
+
+    // Own landing 1: two new voters, its event hidden, so the receipt alone counts.
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    for (i, k) in [(0, 10), (1, 11)] {
+        ha.submit(fake_vote(&s.env, i, &[1, 2], k)).await.unwrap();
+    }
+    wait_until("own landing 1", async || {
+        stored_counts(&node_a.db) == (2, 0)
+    })
+    .await;
+    s.chain.hide_block(None);
+    // Own landing 2: voter 0 overwrites, voter 2 is new.
+    for (i, k) in [(0, 12), (2, 13)] {
+        ha.submit(fake_vote(&s.env, i, &[2, 1], k)).await.unwrap();
+    }
+    wait_until("own landing 2", async || {
+        stored_counts(&node_a.db) == (3, 1)
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 3);
+
+    // B bootstraps mid-election and replays both landings from blobs.
+    s.chain.fail_process(0);
+    let node_b = start_node(
+        Db::open_in(dir_b.path()).unwrap(),
+        dir_b.path(),
+        &s,
+        s.chain.with_signer(0xb2),
+        FakeProver::open(),
+        2,
+        "0s",
+        stop_b.clone(),
+    )
+    .await;
+    let hb = handle(&node_b).await;
+    wait_until("B synced", async || {
+        hb.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(stored_counts(&node_b.db), (3, 1));
+    s.chain.fail_process(u32::MAX);
+
+    // B lands voter 1's overwrite and new voter 3; A syncs it.
+    for (i, k) in [(1, 14), (3, 15)] {
+        hb.submit(fake_vote(&s.env, i, &[1, 1], k)).await.unwrap();
+    }
+    wait_until("synced landing", async || {
+        stored_counts(&node_a.db) == (4, 2) && stored_counts(&node_b.db) == (4, 2)
+    })
+    .await;
+    assert_eq!(node_a.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    assert_eq!(node_a.metrics.settled_by_self.load(Ordering::SeqCst), 2);
+    assert_eq!(node_b.metrics.settled_by_self.load(Ordering::SeqCst), 1);
+    s.chain.fail_process(0);
+    let chain = s.chain.process(&pid31()).await.unwrap();
+    assert_eq!((chain.voters_count, chain.overwritten_count), (4, 2));
+
+    // A restart keeps them.
+    stop_a.cancel();
+    drop(ha);
+    drop(node_a);
+    let db = reopen_db(dir_a.path()).await;
+    assert_eq!(stored_counts(&db), (4, 2));
+    stop_b.cancel();
+}
