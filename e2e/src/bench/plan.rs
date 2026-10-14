@@ -901,6 +901,26 @@ pub async fn cancel_candidates(
     }
 }
 
+/// The processes of wave `wave` named by `tags`, in order. Refuses an empty
+/// list, a repeated tag, and a tag that is not in that wave's `plan.json`
+/// (another wave's included), so `end` cannot touch an election by mistake.
+pub fn tagged_pids(plan: &Plan, wave: u32, tags: &[String]) -> Result<Vec<(String, ProcessId)>> {
+    ensure!(!tags.is_empty(), "no tags given");
+    let w = plan.wave(wave)?;
+    let mut seen = std::collections::HashSet::new();
+    tags.iter()
+        .map(|t| {
+            ensure!(seen.insert(t.as_str()), "tag {t:?} given twice");
+            let e = w
+                .elections
+                .iter()
+                .find(|e| &e.spec.tag == t)
+                .ok_or_else(|| anyhow!("tag {t:?} is not in wave {wave} of plan.json"))?;
+            Ok((t.clone(), e.snap.pid))
+        })
+        .collect()
+}
+
 /// Cancels each READY or PAUSED process of `pids`, printing one line per
 /// process. Tries them all, then fails with the errors; returns how many it
 /// canceled.
@@ -1122,6 +1142,28 @@ mod tests {
             hex(&crate::chain::ballot_vk_hash().unwrap())
         );
         assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn tagged_pids_refuse_unknown_foreign_and_empty() {
+        let s = seed(8);
+        let mut plan =
+            Plan::stand_in(&s, 1, &[spec("A", 2, 1, 3, 1, 0), spec("B", 2, 1, 3, 1, 0)]).unwrap();
+        plan.waves.extend(
+            Plan::stand_in(&s, 2, &[spec("C", 2, 1, 3, 1, 0)])
+                .unwrap()
+                .waves,
+        );
+        let t = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let ok = tagged_pids(&plan, 1, &t(&["B", "A"])).unwrap();
+        assert_eq!(ok[0].0, "B");
+        assert_eq!(ok[0].1, plan.wave(1).unwrap().elections[1].snap.pid);
+        assert!(tagged_pids(&plan, 1, &t(&["Z"])).is_err());
+        assert!(tagged_pids(&plan, 1, &t(&["A", "C"])).is_err());
+        assert!(tagged_pids(&plan, 2, &t(&["A"])).is_err());
+        assert!(tagged_pids(&plan, 1, &[]).is_err());
+        assert!(tagged_pids(&plan, 1, &t(&["A", "A"])).is_err());
+        assert!(tagged_pids(&plan, 3, &t(&["A"])).is_err());
     }
 
     #[test]
