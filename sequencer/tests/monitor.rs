@@ -805,3 +805,50 @@ async fn failing_block_hash_reads_do_not_stall_routing() {
     assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 0);
     sd.cancel();
 }
+
+/// A cursor routed without a hash (block reads failing) is armed at the
+/// first poll whose read answers, with no new page: a reorg at the cursor
+/// height on an idle chain is still caught.
+#[tokio::test]
+async fn cursor_without_a_hash_is_armed_at_the_next_poll() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    settled_at_head(&db, &net).await;
+
+    // Five failed reads, then routing goes on without a hash.
+    net.fail_hashes.store(true, Ordering::SeqCst);
+    bad_process_on_file(&s);
+    s.chain.advance_time(0);
+    s.chain.push_event(EventKind::ProcessCreated {
+        pid: bad_pid31(),
+        creator: Address::ZERO,
+    });
+    wait_until("creation routed without hashes", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    assert_eq!(cursor(&db), Some(s.chain.head_block()));
+    assert_eq!(db.meta_bytes(HASH_KEY).unwrap(), None);
+
+    // Reads recover; no new block, so no page stores a hash.
+    net.fail_hashes.store(false, Ordering::SeqCst);
+    settled_at_head(&db, &net).await;
+    net.reorg(s.chain.head_block(), 1);
+    wait_until("same-height reorg seen", async || {
+        node.metrics.reorgs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    sd.cancel();
+}

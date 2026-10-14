@@ -560,34 +560,42 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
             _ = poll.tick() => {}
         }
         // A reorg below the cursor may have replaced routed events: route
-        // the range again (actors are replay-tolerant).
-        if let Some(want) = last_hash {
-            let got = tokio::select! {
-                _ = shutdown.cancelled() => return,
-                r = ctx.deps.contracts.block_hash(last) => r,
-            };
-            if got.is_ok() {
-                hash_errors = 0;
+        // the range again (actors are replay-tolerant). A cursor without a
+        // hash (a fail-open page, an older database) is armed here, so an
+        // idle chain is checked too.
+        let got = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            r = ctx.deps.contracts.block_hash(last) => r,
+        };
+        if got.is_ok() {
+            hash_errors = 0;
+        }
+        match (got, last_hash) {
+            (Ok(Some(h)), None) => {
+                last_hash = Some(h);
+                save_cursor(&ctx.deps.db, last, last_hash);
             }
-            match got {
-                Ok(Some(h)) if h != want => {
-                    let to = last.saturating_sub(REORG_REWIND);
-                    error!(
-                        depth = last - to,
-                        cursor = last,
-                        to,
-                        "registry reorg below the event cursor; routing the range again"
-                    );
-                    ctx.node.metrics.reorgs.fetch_add(1, Ordering::Relaxed);
-                    (last, last_hash) = (to, None);
-                    save_cursor(&ctx.deps.db, last, None);
-                }
-                // The same block, or an endpoint behind the cursor.
-                Ok(_) => {}
-                Err(e) => {
-                    if !hash_failed(&mut hash_errors, &e, last) {
-                        continue;
-                    }
+            (Ok(Some(h)), Some(want)) if h != want => {
+                let to = last.saturating_sub(REORG_REWIND);
+                error!(
+                    depth = last - to,
+                    cursor = last,
+                    to,
+                    "registry reorg below the event cursor; routing the range again"
+                );
+                ctx.node.metrics.reorgs.fetch_add(1, Ordering::Relaxed);
+                (last, last_hash) = (to, None);
+                save_cursor(&ctx.deps.db, last, None);
+            }
+            // The same block, or an endpoint behind the cursor.
+            (Ok(_), _) => {}
+            // Nothing to check yet: route on.
+            (Err(e), None) => {
+                hash_failed(&mut hash_errors, &e, last);
+            }
+            (Err(e), Some(_)) => {
+                if !hash_failed(&mut hash_errors, &e, last) {
+                    continue;
                 }
             }
         }
