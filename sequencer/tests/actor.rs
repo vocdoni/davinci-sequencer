@@ -7611,3 +7611,56 @@ async fn panicking_results_task_is_retried() {
     assert!(prover.results_calls() >= 2);
     shutdown.cancel();
 }
+
+/// The coverage of a peer batch carrying our vote is written, but the sync
+/// never commits (every tree write fails) and the peer transition is
+/// reorged out meanwhile: no rebuild is needed (our tree never left the
+/// chain), the stale coverage row is harmless, and our vote seals and lands,
+/// whose record drops the row.
+#[tokio::test(start_paused = true)]
+async fn uncommitted_sync_whose_transition_vanishes_needs_no_rebuild() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let x = fake_vote(&s.env, 0, &[1, 2], 1640);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    db.fail_next_arbo_writes(u32::MAX);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&x)));
+    wait_long("coverage kept, sync not applied", async || {
+        db.sync_coverage(&pid_fr()).unwrap().is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        h.snapshot().await.unwrap().root,
+        genesis_root(&s.env.cfg).unwrap()
+    );
+    s.chain.reorg_out_last_transition();
+    db.fail_next_arbo_writes(0);
+    wait_long("back in sync", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Pending));
+    s.chain.advance_time(400);
+    wait_long("ours landed", async || all_settled(&h, &[xid]).await).await;
+    assert_eq!(s.chain.voters(), 1);
+    assert!(db.sync_coverage(&pid_fr()).unwrap().is_none());
+    tokio::time::sleep(Duration::from_secs(200)).await;
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}

@@ -2153,6 +2153,10 @@ impl Actor {
             self.await_sync = false;
         }
         if behind(self) {
+            // Re-read the chain too: the target may be gone (a pinned
+            // transition reorged out before it applied), which only a read
+            // shows and heals.
+            self.vote_at_stale = true;
             let ms = (self.resync_backoff_ms * 2).clamp(100, 60_000);
             self.resync_backoff_ms = ms;
             self.resync_after =
