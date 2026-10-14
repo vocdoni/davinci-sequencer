@@ -406,7 +406,10 @@ transition record and the process record together. The tree's record is authorit
 crash between the two reopens at it: the batch's votes settle from the tree, the pinned root
 follows the chain once a read shows the tree's root there, and the missing transition record is
 rewritten from its event and blobs (which moves the pinned root too). The node seals nothing
-until the record is back, so the next landing cannot take its index.
+until the record is back, so the next landing cannot take its index. The repair waits for the
+blobs: until then the process applies no later transition and closes nothing out, so it stays
+frozen until the blob source serves them again or the operator removes the process's state;
+another node that archived the blobs keeps serving the election meanwhile.
 
 A process's genesis is written leaf by leaf with its record last, so a crash in between leaves a
 tree without a record: the next start writes the genesis again. A crash between a rebuild's
