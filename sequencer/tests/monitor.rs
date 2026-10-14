@@ -15,8 +15,11 @@ struct Net {
     bad_reads: Arc<AtomicU64>,
     /// Blocks from `.0` on hash with fork tag `.1` (a reorg replaced them).
     fork: Arc<Mutex<(u64, u8)>>,
-    /// The `safe` head; `None` fails the read.
-    safe: Arc<Mutex<Option<u64>>>,
+    /// `(to, from, tag)`: the `events()` call ending at `to` reorgs blocks
+    /// from `from` on first (a reorg between the page hash and the page).
+    reorg_in_page: Arc<Mutex<Option<(u64, u64, u8)>>>,
+    /// While set, every `block_hash` read fails (a rate-limited RPC).
+    fail_hashes: Arc<AtomicBool>,
 }
 
 impl Net {
@@ -26,7 +29,8 @@ impl Net {
             blobs: Arc::default(),
             bad_reads: Arc::default(),
             fork: Arc::new(Mutex::new((u64::MAX, 0))),
-            safe: Arc::default(),
+            reorg_in_page: Arc::default(),
+            fail_hashes: Arc::default(),
         }
     }
 
@@ -62,6 +66,10 @@ impl Chain for Net {
         Ok(p)
     }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
+        let armed = self.reorg_in_page.lock().unwrap().take_if(|r| r.0 == to);
+        if let Some((_, fork, tag)) = armed {
+            self.reorg(fork, tag);
+        }
         self.chain.events(from, to).await
     }
     async fn head(&self) -> Result<(u64, u64), Web3Error> {
@@ -71,11 +79,10 @@ impl Chain for Net {
         self.chain.confirmed_head(confirmations).await
     }
     async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>, Web3Error> {
+        if self.fail_hashes.load(Ordering::SeqCst) {
+            return Err(Web3Error::Rpc("scripted block read failure".into()));
+        }
         Ok((n <= self.chain.head_block()).then(|| self.hash_of(n)))
-    }
-    async fn safe_head(&self) -> Result<u64, Web3Error> {
-        let safe = *self.safe.lock().unwrap();
-        safe.ok_or_else(|| Web3Error::Rpc("scripted safe-head failure".into()))
     }
     async fn simulate_transition(
         &self,
@@ -599,7 +606,7 @@ async fn reorg_at_the_cursor_reroutes_the_replaced_range() {
     })
     .await;
     assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
-    // No safe head: the rewind floor is 128 blocks, here block 0.
+    // The rewind goes back 128 blocks, here to block 0.
     assert_eq!(s.chain.event_calls()[calls].0, 1);
     settled_at_head(&db, &net).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -607,9 +614,9 @@ async fn reorg_at_the_cursor_reroutes_the_replaced_range() {
     sd.cancel();
 }
 
-/// The rewind goes back to the safe head, at most 128 blocks.
+/// The rewind goes back 128 blocks, wherever the fork is.
 #[tokio::test]
-async fn reorg_rewinds_to_the_safe_head_at_most_128_blocks() {
+async fn reorg_rewinds_128_blocks() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
@@ -626,14 +633,9 @@ async fn reorg_rewinds_to_the_safe_head_at_most_128_blocks() {
     let _h = handle(&node).await;
     s.chain.set_head_block(500);
     settled_at_head(&db, &net).await;
-    // (safe head, fork block, first block scanned again)
-    let cases = [
-        (Some(450), 480, 451),
-        (Some(10), 400, 373),
-        (None, 300, 373),
-    ];
-    for (i, (safe, from, rescan)) in cases.into_iter().enumerate() {
-        *net.safe.lock().unwrap() = safe;
+    // (fork block, first block scanned again)
+    let cases = [(499, 373), (400, 373)];
+    for (i, (from, rescan)) in cases.into_iter().enumerate() {
         let calls = s.chain.event_calls().len();
         net.reorg(from, i as u8 + 1);
         let n = i as u64 + 1;
@@ -692,5 +694,114 @@ async fn reorg_while_down_is_caught_after_a_restart() {
     })
     .await;
     assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
+    sd.cancel();
+}
+
+/// On OP the derivation behind an unsafe-head reorg makes the new branch
+/// safe at once, so the safe head read after it can sit above the fork
+/// (490 here, written RED against a safe-head floor): the rewind goes the
+/// full 128 blocks.
+#[tokio::test]
+async fn reorg_rewind_reaches_below_a_fork_the_safe_head_passed() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    s.chain.set_head_block(500);
+    settled_at_head(&db, &net).await;
+
+    // The new branch from 480 on carries a process creation at 485.
+    bad_process_on_file(&s);
+    s.chain.set_head_block(485);
+    s.chain.push_event(EventKind::ProcessCreated {
+        pid: bad_pid31(),
+        creator: Address::ZERO,
+    });
+    s.chain.set_head_block(500);
+    net.reorg(480, 1);
+    wait_until("creation at 485 routed", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
+    sd.cancel();
+}
+
+/// The page's end hash is read before its events: a reorg between the two
+/// leaves the old branch's hash, which the next poll catches.
+#[tokio::test]
+async fn reorg_between_page_hash_and_events_is_caught() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    settled_at_head(&db, &net).await;
+    let next = s.chain.head_block() + 1;
+    *net.reorg_in_page.lock().unwrap() = Some((next, next, 1));
+    s.chain.advance_time(0);
+    wait_until("reorg seen at the next poll", async || {
+        node.metrics.reorgs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    settled_at_head(&db, &net).await;
+    sd.cancel();
+}
+
+/// Block reads failing while the rest of the RPC answers (rate limits)
+/// must not stall routing: after a few failed polls the monitor routes
+/// without the check, and resumes it once the reads answer.
+#[tokio::test]
+async fn failing_block_hash_reads_do_not_stall_routing() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    settled_at_head(&db, &net).await;
+
+    net.fail_hashes.store(true, Ordering::SeqCst);
+    bad_process_on_file(&s);
+    s.chain.advance_time(0);
+    s.chain.push_event(EventKind::ProcessCreated {
+        pid: bad_pid31(),
+        creator: Address::ZERO,
+    });
+    wait_until("creation routed without hashes", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    net.fail_hashes.store(false, Ordering::SeqCst);
+    s.chain.advance_time(0);
+    settled_at_head(&db, &net).await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 0);
     sd.cancel();
 }

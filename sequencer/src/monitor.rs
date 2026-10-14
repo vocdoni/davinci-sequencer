@@ -28,8 +28,13 @@ use crate::web3::{EventKind, RegistryEvent};
 pub(crate) const LAST_BLOCK_KEY: &str = "monitor_last_block";
 /// Hash of the cursor block, written with it: a change means a reorg.
 const LAST_HASH_KEY: &str = "monitor_last_hash";
-/// Deepest rewind on a reorg at the cursor, in blocks.
+/// Rewind on a reorg at the cursor, in blocks. Not floored at the safe
+/// head: on OP the derivation behind an unsafe reorg makes the new branch
+/// safe at once, above the fork.
 const REORG_REWIND: u64 = 128;
+/// Consecutive failed block-hash reads before routing goes on unchecked: a
+/// rate-limited block read must not stall every election.
+const HASH_TRIES: u32 = 5;
 const BOOT_RETRIES_KEY: &str = "monitor_boot_retries";
 /// Bootstrap attempts per process before it is recorded ignored.
 const BOOT_ATTEMPT_CAP: u32 = 10;
@@ -544,6 +549,7 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
             None
         }
     };
+    let mut hash_errors = 0u32;
     let mut retries = load_retries(&ctx.deps.db);
     let mut poll = tokio::time::interval(ctx.cfg.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -560,13 +566,12 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
                 _ = shutdown.cancelled() => return,
                 r = ctx.deps.contracts.block_hash(last) => r,
             };
+            if got.is_ok() {
+                hash_errors = 0;
+            }
             match got {
                 Ok(Some(h)) if h != want => {
-                    let safe = tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        r = ctx.deps.contracts.safe_head() => r,
-                    };
-                    let to = rewind_target(last, safe.ok());
+                    let to = last.saturating_sub(REORG_REWIND);
                     error!(
                         depth = last - to,
                         cursor = last,
@@ -580,8 +585,9 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
                 // The same block, or an endpoint behind the cursor.
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(%e, "cursor block hash");
-                    continue;
+                    if !hash_failed(&mut hash_errors, &e, last) {
+                        continue;
+                    }
                 }
             }
         }
@@ -608,9 +614,12 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
                 r = ctx.deps.contracts.block_hash(to) => r,
             };
             let hash = match hash {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(%e, block = to, "page end block hash");
+                Ok(h) => {
+                    hash_errors = 0;
+                    h
+                }
+                Err(e) if hash_failed(&mut hash_errors, &e, to) => None,
+                Err(_) => {
                     failed = true;
                     break;
                 }
@@ -671,12 +680,18 @@ fn save_cursor(db: &Db, last: u64, hash: Option<[u8; 32]>) {
     }
 }
 
-/// Where a reorg at the cursor `last` rewinds to: the safe head, but at
-/// most [`REORG_REWIND`] blocks back, and at least the cursor block itself.
-fn rewind_target(last: u64, safe: Option<u64>) -> u64 {
-    safe.unwrap_or(0)
-        .max(last.saturating_sub(REORG_REWIND))
-        .min(last.saturating_sub(1))
+/// Counts a failed block-hash read; true once [`HASH_TRIES`] failed in a
+/// row: go on without the reorg check rather than stall routing.
+fn hash_failed(errors: &mut u32, e: &crate::web3::Web3Error, block: u64) -> bool {
+    *errors = errors.saturating_add(1);
+    match (*errors).cmp(&HASH_TRIES) {
+        std::cmp::Ordering::Less => warn!(%e, block, "block hash read"),
+        std::cmp::Ordering::Equal => {
+            warn!(%e, block, "block hash reads keep failing; routing without the reorg check")
+        }
+        std::cmp::Ordering::Greater => {}
+    }
+    *errors >= HASH_TRIES
 }
 
 /// The heartbeat: actors seal, close out, resync and finalize on Head.
@@ -1037,20 +1052,4 @@ fn ignore(ctx: &Ctx, mut rec: ProcessRecord, note: &str) -> Result<(), NodeError
     rec.note = Some(note.to_string());
     ctx.deps.db.put_process(&rec)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rewind_target;
-
-    #[test]
-    fn rewind_target_bounds() {
-        assert_eq!(rewind_target(500, Some(450)), 450);
-        assert_eq!(rewind_target(500, Some(10)), 372);
-        assert_eq!(rewind_target(500, None), 372);
-        assert_eq!(rewind_target(5, None), 0);
-        // A changed hash at or below the safe head still re-routes its block.
-        assert_eq!(rewind_target(500, Some(600)), 499);
-        assert_eq!(rewind_target(0, Some(9)), 0);
-    }
 }
