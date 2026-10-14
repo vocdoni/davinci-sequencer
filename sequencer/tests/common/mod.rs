@@ -301,6 +301,9 @@ pub struct Inner {
     revert_results: Option<String>,
     /// How many times `submit_results` was called (landed or not).
     results_submits: u64,
+    /// The next valid `submit_results` returns a receipt but changes
+    /// nothing and emits nothing: an OP reorg took it.
+    vanish_results: bool,
     /// Every `events()` range asked for, in order.
     event_calls: Vec<(u64, u64)>,
     /// DKG modes: the committee's plaintexts, once it combined them all.
@@ -420,6 +423,7 @@ impl FakeChain {
             last_census_root: None,
             revert_results: None,
             results_submits: 0,
+            vanish_results: false,
             event_calls: Vec::new(),
             dkg_plaintexts: None,
             dkg_requests: 0,
@@ -523,6 +527,11 @@ impl FakeChain {
     /// Script the next `submit_results` to revert with `name`.
     pub fn revert_results_once(&self, name: &str) {
         self.inner.lock().unwrap().revert_results = Some(name.to_string());
+    }
+
+    /// The next valid `submit_results` returns a receipt but never lands.
+    pub fn vanish_next_results(&self) {
+        self.inner.lock().unwrap().vanish_results = true;
     }
 
     /// How many times any node called `submit_results` on this chain.
@@ -1419,6 +1428,14 @@ impl Chain for FakeChain {
         }
         if p.state_root != i.proc.state_root {
             return Err(Web3Error::Revert(revert("InvalidStateRoot")));
+        }
+        if std::mem::take(&mut i.vanish_results) {
+            return Ok(TxReceipt {
+                tx_hash: B256::repeat_byte(0x33),
+                block: i.block,
+                gas_used: 0,
+                replacements: 0,
+            });
         }
         i.proc.results = p.results.to_vec();
         i.proc.status = ProcessStatus::Results;

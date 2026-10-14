@@ -832,6 +832,10 @@ struct Actor {
     eager: bool,
     /// Eager results: the checked snark and the root it proves.
     held: Option<([u8; 32], Box<PlonkSnark>)>,
+    /// Our results transaction has a receipt, which may be depth 0: no new
+    /// attempt before its event, and past this instant a chain read decides
+    /// (RESULTS finalizes, anything else resubmits).
+    results_sent: Option<tokio::time::Instant>,
     /// A transition landed since `last_vote_at` was last read from the chain;
     /// the grace end may have moved, so nothing closes on it until re-read.
     vote_at_stale: bool,
@@ -1029,6 +1033,7 @@ pub(crate) fn spawn_actor(
         finalize_after: None,
         eager: cfg.eager_results,
         held: None,
+        results_sent: None,
         // The record may predate the last landing: re-read before closing.
         vote_at_stale: true,
         stale_ticks: 0,
@@ -1232,7 +1237,16 @@ impl Actor {
                     self.put_record();
                 }
                 match result {
-                    Ok(()) => self.mark_finalized(),
+                    // Commit at the event, like an L1 landing: the receipt
+                    // may be depth 0 and reorg out.
+                    Ok(()) => {
+                        self.finalize_attempts = 0;
+                        self.results_failures = 0;
+                        if self.record.local == LocalStatus::Active {
+                            self.results_sent =
+                                Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+                        }
+                    }
                     Err(f) if f.permanent => self.results_failed(&f.msg),
                     Err(f) if f.gate => {
                         // A Council ceremony opens decryption on its own
@@ -1516,6 +1530,13 @@ impl Actor {
         if self.record.local == LocalStatus::Ignored {
             return;
         }
+        // Our results receipt saw no event in time: a chain read decides.
+        let results_due = self
+            .results_sent
+            .is_some_and(|t| tokio::time::Instant::now() >= t);
+        if results_due {
+            self.vote_at_stale = true;
+        }
         // Events carry no block time: read the landing time the grace end
         // runs from. Stale until the read shows the tip the events reached.
         // Close-out and results wait on it, so a read that keeps failing
@@ -1544,6 +1565,12 @@ impl Actor {
                 }
             } else {
                 self.stale_ticks = 0;
+            }
+        }
+        if results_due && !self.vote_at_stale {
+            self.results_sent = None;
+            if self.record.local == LocalStatus::Active {
+                warn!(pid = %hex::encode(self.pid31), "results transaction never confirmed; resubmitting");
             }
         }
         // Landed-but-unconfirmed flight: if the chain never showed our root
@@ -3186,6 +3213,7 @@ impl Actor {
         }
         self.record.local = LocalStatus::Finalized;
         self.held = None;
+        self.results_sent = None;
         self.put_record();
         info!(pid = %hex::encode(self.pid31), "process finalized");
     }
@@ -3446,6 +3474,8 @@ impl Actor {
 
     fn maybe_finalize(&mut self) {
         if self.finalizing
+            // Our results transaction awaits its event.
+            || self.results_sent.is_some()
             || self.in_flight.is_some()
             || self.record.local != LocalStatus::Active
             // Observers never settle, even when they hold the election key.

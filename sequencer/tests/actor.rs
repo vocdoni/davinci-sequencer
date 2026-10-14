@@ -6179,3 +6179,54 @@ async fn finalized_actor_keeps_following_the_chain() {
     assert_eq!(prover.calls(), 0);
     shutdown.cancel();
 }
+
+/// A results receipt is not a landing: an OP reorg can drop it. The node
+/// stays Active until the results event; when none comes within the
+/// landing wait it resubmits the held proof (no re-proof), and finalizes
+/// at the event.
+#[tokio::test(start_paused = true)]
+async fn results_receipt_without_event_is_resubmitted() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 40);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    // Eager results: proved in the grace and held.
+    s.chain.advance_time(DURATION + 1);
+    wait_until("eager proof", async || prover.results_calls() == 1).await;
+    s.chain.vanish_next_results();
+    s.chain.pass_grace();
+    wait_until("first submit", async || s.chain.results_submits() == 1).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(s.chain.results_submits(), 1, "resubmitted before the wait");
+    assert_eq!(
+        h.snapshot().await.unwrap().local,
+        LocalStatus::Active,
+        "finalized on a receipt"
+    );
+    wait_long("results on chain", async || !s.chain.results().is_empty()).await;
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results_submits(), 2);
+    assert_eq!(prover.results_calls(), 1, "the held proof was not reused");
+    shutdown.cancel();
+}
