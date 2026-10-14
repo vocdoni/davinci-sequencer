@@ -590,6 +590,11 @@ impl ActorHandle {
         let _ = self.tx.send(Msg::Reread).await;
     }
 
+    /// Whether the actor's task ended (a panic unwinds only its task).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Test hook: runs the refresh-overflow path directly.
     #[doc(hidden)]
     pub async fn force_refresh_overflow(&self) {
@@ -3807,22 +3812,17 @@ impl Actor {
                 return false;
             }
         };
-        // A public batch carrying votes of ours: should a reorg take it before
-        // its record is written, their re-seal must cover its slots. Durable
-        // before the transition becomes authoritative, and kept apart from
-        // the live exposed set (only a rebuild reads it).
-        let ours: Vec<u64> = {
-            let mine: std::collections::HashSet<u64> = self
-                .pending
-                .iter()
-                .chain(self.in_flight.iter().flat_map(|f| f.votes.iter()))
-                .map(|v| v.pkg.vote_id)
-                .collect();
-            td.vote_ids
-                .iter()
-                .copied()
-                .filter(|v| mine.contains(v))
-                .collect()
+        // A public batch carrying votes we store (settled ones too: a later
+        // rebuild can requeue them): should a reorg take it before its record
+        // is written, their re-seal must cover its slots. Durable before the
+        // transition becomes authoritative, and kept apart from the live
+        // exposed set (only a rebuild reads it).
+        let ours = match self.deps.db.stored_vote_ids(&self.pid, &td.vote_ids) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "stored votes read");
+                return false;
+            }
         };
         if !ours.is_empty() {
             let stored = self.deps.db.sync_coverage(&self.pid).and_then(|old| {

@@ -227,9 +227,12 @@ pub struct Db {
     /// While set, reads of this `meta_bytes` key fail (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     meta_read_fault: Arc<std::sync::Mutex<Option<String>>>,
-    /// While set, every transition-record write fails (tests only).
+    /// While set, transition-record writes fail after `transition_skip`
+    /// more go through (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     transition_faults: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    transition_skip: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for Db {
@@ -334,6 +337,8 @@ impl Db {
             meta_read_fault: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             transition_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            transition_skip: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -482,8 +487,18 @@ impl Db {
     /// goes through (a crash right before the record). Test hook.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_transition_writes(&self, on: bool) {
+        self.fail_transition_writes_after(0);
         self.transition_faults
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lets the next `skip` transition-record writes through, then fails
+    /// every one. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_transition_writes_after(&self, skip: u32) {
+        use std::sync::atomic::Ordering;
+        self.transition_skip.store(skip, Ordering::SeqCst);
+        self.transition_faults.store(true, Ordering::SeqCst);
     }
 
     /// Makes the next `n` [`Db::process`] reads fail. Test hook.
@@ -596,6 +611,23 @@ impl Db {
             .iter()
             .map(|(_, v)| decode("votes", v))
             .collect()
+    }
+
+    /// Which of `vids` this process has a stored vote for (any status),
+    /// one key lookup each in one read transaction; no record is decoded.
+    pub fn stored_vote_ids(&self, pid: &Fr, vids: &[u64]) -> Result<Vec<u64>> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let t = tx.open_table(VOTES).map_err(db_err)?;
+        let mut out = Vec::new();
+        for vid in vids {
+            if t.get(key_u64(pid, *vid).as_slice())
+                .map_err(db_err)?
+                .is_some()
+            {
+                out.push(*vid);
+            }
+        }
+        Ok(out)
     }
 
     /// Ids of a process's votes in one of `statuses`, without loading the
@@ -805,11 +837,16 @@ impl Db {
         process: &ProcessRecord,
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
-        if self
-            .transition_faults
-            .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(StorageError::Db("scripted transition write failure".into()));
+            use std::sync::atomic::Ordering;
+            if self.transition_faults.load(Ordering::SeqCst)
+                && self
+                    .transition_skip
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_err()
+            {
+                return Err(StorageError::Db("scripted transition write failure".into()));
+            }
         }
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;

@@ -778,12 +778,14 @@ impl FakeChain {
         i.history.clear();
     }
 
-    /// A reorg takes the newest transition: its event is gone and the root,
+    /// A reorg takes the transition at the tip: its event is gone and the root,
     /// counters and batch number are back where it found them. Returns the
     /// event, for `restore_transition`.
     pub fn reorg_out_last_transition(&self) -> RegistryEvent {
         let mut i = self.inner.lock().unwrap();
-        let is_t = |e: &RegistryEvent| matches!(e.kind, EventKind::StateTransitioned { .. });
+        // The transition that reached the tip (not a re-included copy).
+        let tip = i.proc.state_root;
+        let is_t = |e: &RegistryEvent| matches!(e.kind, EventKind::StateTransitioned { new_root, .. } if new_root == tip);
         let at = i.events.iter().rposition(is_t).unwrap();
         let ev = i.events.remove(at);
         let EventKind::StateTransitioned { old_root, .. } = ev.kind else {
