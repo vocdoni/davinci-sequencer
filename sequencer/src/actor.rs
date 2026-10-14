@@ -79,6 +79,15 @@ pub trait Chain: Send + Sync {
     /// `(block, timestamp)` of the head.
     async fn head(&self) -> Result<(u64, u64), Web3Error>;
     async fn confirmed_head(&self, confirmations: u64) -> Result<u64, Web3Error>;
+    /// Hash of block `n`; `None` when unknown (past the endpoint's head, or
+    /// a test double without blocks: the monitor then skips reorg checks).
+    async fn block_hash(&self, _n: u64) -> Result<Option<[u8; 32]>, Web3Error> {
+        Ok(None)
+    }
+    /// Number of the `safe` block.
+    async fn safe_head(&self) -> Result<u64, Web3Error> {
+        Err(Web3Error::Rpc("no safe head".into()))
+    }
     async fn simulate_transition(
         &self,
         pid: &[u8; 31],
@@ -251,6 +260,13 @@ impl Chain for crate::web3::Contracts {
     }
     async fn confirmed_head(&self, confirmations: u64) -> Result<u64, Web3Error> {
         crate::web3::Contracts::confirmed_head(self, confirmations).await
+    }
+    async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>, Web3Error> {
+        crate::web3::Contracts::block_hash(self, n).await
+    }
+    async fn safe_head(&self) -> Result<u64, Web3Error> {
+        let safe = alloy::eips::BlockNumberOrTag::Safe;
+        Ok(crate::web3::Contracts::head_at(self, safe).await?.0)
     }
     async fn simulate_transition(
         &self,

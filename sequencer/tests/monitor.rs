@@ -1,4 +1,5 @@
-//! Monitor loop: census downloads off the loop and the heartbeat task.
+//! Monitor loop: census downloads off the loop, the heartbeat task and
+//! reorg detection at the event cursor.
 
 mod common;
 
@@ -12,6 +13,35 @@ struct Net {
     blobs: Arc<Mutex<HashMap<B256, Vec<Blob>>>>,
     /// `process()` reads of the bad process.
     bad_reads: Arc<AtomicU64>,
+    /// Blocks from `.0` on hash with fork tag `.1` (a reorg replaced them).
+    fork: Arc<Mutex<(u64, u8)>>,
+    /// The `safe` head; `None` fails the read.
+    safe: Arc<Mutex<Option<u64>>>,
+}
+
+impl Net {
+    fn new(chain: FakeChain) -> Net {
+        Net {
+            chain,
+            blobs: Arc::default(),
+            bad_reads: Arc::default(),
+            fork: Arc::new(Mutex::new((u64::MAX, 0))),
+            safe: Arc::default(),
+        }
+    }
+
+    /// A reorg replaces every block from `from` on.
+    fn reorg(&self, from: u64, tag: u8) {
+        *self.fork.lock().unwrap() = (from, tag);
+    }
+
+    fn hash_of(&self, n: u64) -> [u8; 32] {
+        let (from, tag) = *self.fork.lock().unwrap();
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_be_bytes());
+        h[31] = if n >= from { tag } else { 0 };
+        h
+    }
 }
 
 fn bad_census_root() -> Fr {
@@ -39,6 +69,13 @@ impl Chain for Net {
     }
     async fn confirmed_head(&self, confirmations: u64) -> Result<u64, Web3Error> {
         self.chain.confirmed_head(confirmations).await
+    }
+    async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>, Web3Error> {
+        Ok((n <= self.chain.head_block()).then(|| self.hash_of(n)))
+    }
+    async fn safe_head(&self) -> Result<u64, Web3Error> {
+        let safe = *self.safe.lock().unwrap();
+        safe.ok_or_else(|| Web3Error::Rpc("scripted safe-head failure".into()))
     }
     async fn simulate_transition(
         &self,
@@ -199,14 +236,12 @@ async fn slow_census_does_not_stall_the_heartbeat() {
     let sd = CancellationToken::new();
     let blobs = Arc::new(Mutex::new(HashMap::new()));
     let net_a = Net {
-        chain: s.chain.with_signer(0xa1),
         blobs: blobs.clone(),
-        bad_reads: Arc::default(),
+        ..Net::new(s.chain.with_signer(0xa1))
     };
     let net_b = Net {
-        chain: s.chain.with_signer(0xb2),
         blobs,
-        bad_reads: Arc::default(),
+        ..Net::new(s.chain.with_signer(0xb2))
     };
     let (prover_a, prover_b) = (FakeProver::open(), FakeProver::open());
     let cfg_a = cfg(dir_a.path(), &s.census_dir, 10);
@@ -296,11 +331,7 @@ async fn bootstrap_with_a_queued_census_spawns_when_it_loads() {
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
     let sd = CancellationToken::new();
-    let net = Net {
-        chain: chain.clone(),
-        blobs: Arc::default(),
-        bad_reads: Arc::default(),
-    };
+    let net = Net::new(chain.clone());
     let node = start(
         db.clone(),
         &net,
@@ -358,11 +389,7 @@ async fn failed_bootstrap_download_costs_one_attempt() {
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
     let sd = CancellationToken::new();
-    let net = Net {
-        chain,
-        blobs: Arc::default(),
-        bad_reads: Arc::default(),
-    };
+    let net = Net::new(chain);
     let node = start(
         db.clone(),
         &net,
@@ -431,11 +458,7 @@ async fn refused_bootstrap_census_is_ignored_and_forgotten() {
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
     let sd = CancellationToken::new();
-    let net = Net {
-        chain: s.chain.clone(),
-        blobs: Arc::default(),
-        bad_reads: Arc::default(),
-    };
+    let net = Net::new(s.chain.clone());
     let node = start(
         db.clone(),
         &net,
@@ -505,5 +528,169 @@ async fn shared_root_stored_mid_download_leaves_no_failure_mark() {
     assert_eq!(node.census.bad_reason(&bad_pid_fr(), &root), None);
     let rec = node.db.process(&bad_pid_fr()).unwrap().unwrap();
     assert_eq!(rec.local, LocalStatus::Active);
+    sd.cancel();
+}
+
+// ------------------------------------------------- reorgs at the cursor
+
+const HASH_KEY: &str = "monitor_last_hash";
+
+fn cursor(db: &Db) -> Option<u64> {
+    db.meta_u64("monitor_last_block").unwrap()
+}
+
+/// The bad process on its own census (voter 7) in `census_dir/bad`.
+fn bad_process_on_file(s: &TestSetup) {
+    let d = s.census_dir.join("bad");
+    std::fs::create_dir_all(&d).unwrap();
+    let uri = write_census_of(&d, [7]);
+    let mut bad = s.env.cfg.clone();
+    bad.process_id = bad_pid_fr();
+    bad.census_root = bad_census_root();
+    s.chain.add_bad_process(BadKind::CensusUri {
+        uri,
+        state_root: genesis_root(&bad).unwrap(),
+    });
+}
+
+/// Waits until the cursor is at the chain head with that block's hash.
+async fn settled_at_head(db: &Db, net: &Net) {
+    let head = net.chain.head_block();
+    wait_until("cursor at head with its hash", async || {
+        cursor(db) == Some(head)
+            && db.meta_bytes(HASH_KEY).unwrap() == Some(net.hash_of(head).to_vec())
+    })
+    .await;
+}
+
+/// A reorg below the cursor brings in an event the old branch did not
+/// have: the monitor sees the cursor block's hash change, rewinds and
+/// routes the range again (the event bootstraps a process). Stable hashes
+/// never rewind.
+#[tokio::test]
+async fn reorg_at_the_cursor_reroutes_the_replaced_range() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    for _ in 0..3 {
+        s.chain.advance_time(0);
+    }
+    settled_at_head(&db, &net).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 0);
+
+    // The new branch from block 2 on carries a process creation.
+    bad_process_on_file(&s);
+    let calls = s.chain.event_calls().len();
+    net.reorg(2, 1);
+    wait_until("process of the new branch spawned", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
+    // No safe head: the rewind floor is 128 blocks, here block 0.
+    assert_eq!(s.chain.event_calls()[calls].0, 1);
+    settled_at_head(&db, &net).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
+    sd.cancel();
+}
+
+/// The rewind goes back to the safe head, at most 128 blocks.
+#[tokio::test]
+async fn reorg_rewinds_to_the_safe_head_at_most_128_blocks() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    s.chain.set_head_block(500);
+    settled_at_head(&db, &net).await;
+    // (safe head, fork block, first block scanned again)
+    let cases = [
+        (Some(450), 480, 451),
+        (Some(10), 400, 373),
+        (None, 300, 373),
+    ];
+    for (i, (safe, from, rescan)) in cases.into_iter().enumerate() {
+        *net.safe.lock().unwrap() = safe;
+        let calls = s.chain.event_calls().len();
+        net.reorg(from, i as u8 + 1);
+        let n = i as u64 + 1;
+        wait_until("reorg seen", async || {
+            node.metrics.reorgs.load(Ordering::SeqCst) == n
+        })
+        .await;
+        settled_at_head(&db, &net).await;
+        let after = &s.chain.event_calls()[calls..];
+        assert_eq!(
+            after.first().map(|c| c.0),
+            Some(rescan),
+            "case {i}: {after:?}"
+        );
+    }
+    sd.cancel();
+}
+
+/// The cursor's hash is persisted with it: a reorg while the node is down
+/// is caught at the first poll after the restart.
+#[tokio::test]
+async fn reorg_while_down_is_caught_after_a_restart() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let db = Db::open_in(dir.path()).unwrap();
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    s.chain.advance_time(0);
+    settled_at_head(&db, &net).await;
+    sd.cancel();
+    drop((_h, node, db));
+
+    bad_process_on_file(&s);
+    net.reorg(2, 1);
+    let db = reopen_db(dir.path()).await;
+    let sd = CancellationToken::new();
+    let node = start(
+        db,
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    wait_until("process of the new branch spawned", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
     sd.cancel();
 }

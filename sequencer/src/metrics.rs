@@ -25,6 +25,8 @@ pub struct Metrics {
     pub held_batches: AtomicU64,
     /// Batches the guest rejected (fail mask); their votes are errored.
     pub guest_rejections: AtomicU64,
+    /// Reorgs seen at the monitor's event cursor (events re-routed).
+    pub reorgs: AtomicU64,
     /// Proving-time model the batch budget sizes against.
     pub prove: ProveModel,
 }

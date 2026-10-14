@@ -26,6 +26,10 @@ use crate::web3::{EventKind, RegistryEvent};
 
 /// The monitor's cursor: every event up to this block was routed.
 pub(crate) const LAST_BLOCK_KEY: &str = "monitor_last_block";
+/// Hash of the cursor block, written with it: a change means a reorg.
+const LAST_HASH_KEY: &str = "monitor_last_hash";
+/// Deepest rewind on a reorg at the cursor, in blocks.
+const REORG_REWIND: u64 = 128;
 const BOOT_RETRIES_KEY: &str = "monitor_boot_retries";
 /// Bootstrap attempts per process before it is recorded ignored.
 const BOOT_ATTEMPT_CAP: u32 = 10;
@@ -533,6 +537,13 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
             }
         },
     };
+    let mut last_hash = match ctx.deps.db.meta_bytes(LAST_HASH_KEY) {
+        Ok(b) => b.and_then(|b| <[u8; 32]>::try_from(b).ok()),
+        Err(e) => {
+            error!(%e, "cursor hash unreadable; reorg check resumes at the next page");
+            None
+        }
+    };
     let mut retries = load_retries(&ctx.deps.db);
     let mut poll = tokio::time::interval(ctx.cfg.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -541,6 +552,38 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = poll.tick() => {}
+        }
+        // A reorg below the cursor may have replaced routed events: route
+        // the range again (actors are replay-tolerant).
+        if let Some(want) = last_hash {
+            let got = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                r = ctx.deps.contracts.block_hash(last) => r,
+            };
+            match got {
+                Ok(Some(h)) if h != want => {
+                    let safe = tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        r = ctx.deps.contracts.safe_head() => r,
+                    };
+                    let to = rewind_target(last, safe.ok());
+                    error!(
+                        depth = last - to,
+                        cursor = last,
+                        to,
+                        "registry reorg below the event cursor; routing the range again"
+                    );
+                    ctx.node.metrics.reorgs.fetch_add(1, Ordering::Relaxed);
+                    (last, last_hash) = (to, None);
+                    save_cursor(&ctx.deps.db, last, None);
+                }
+                // The same block, or an endpoint behind the cursor.
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(%e, "cursor block hash");
+                    continue;
+                }
+            }
         }
         let head = tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -558,6 +601,20 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
         let mut failed = false;
         while last < confirmed {
             let to = confirmed.min(last.saturating_add(crate::web3::MAX_LOG_RANGE));
+            // Read before the page: a reorg in between leaves the old hash,
+            // which the next poll catches.
+            let hash = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                r = ctx.deps.contracts.block_hash(to) => r,
+            };
+            let hash = match hash {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(%e, block = to, "page end block hash");
+                    failed = true;
+                    break;
+                }
+            };
             let page = tokio::select! {
                 _ = shutdown.cancelled() => return,
                 r = ctx.deps.contracts.events(last + 1, to) => r,
@@ -579,10 +636,8 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
             // last always advances: one unservable process must not stall
             // event routing for every other election. Failed bootstraps
             // live in the retry list instead.
-            last = to;
-            if let Err(e) = ctx.deps.db.set_meta_u64(LAST_BLOCK_KEY, last) {
-                error!(%e, "persist last block");
-            }
+            (last, last_hash) = (to, hash);
+            save_cursor(&ctx.deps.db, last, hash);
         }
         if failed {
             continue;
@@ -606,6 +661,22 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
             } => {}
         }
     }
+}
+
+/// Persists the cursor and its block hash in one write.
+fn save_cursor(db: &Db, last: u64, hash: Option<[u8; 32]>) {
+    let hash = hash.as_ref().map(|h| &h[..]);
+    if let Err(e) = db.set_meta_u64_and_bytes(LAST_BLOCK_KEY, last, LAST_HASH_KEY, hash) {
+        error!(%e, "persist last block");
+    }
+}
+
+/// Where a reorg at the cursor `last` rewinds to: the safe head, but at
+/// most [`REORG_REWIND`] blocks back, and at least the cursor block itself.
+fn rewind_target(last: u64, safe: Option<u64>) -> u64 {
+    safe.unwrap_or(0)
+        .max(last.saturating_sub(REORG_REWIND))
+        .min(last.saturating_sub(1))
 }
 
 /// The heartbeat: actors seal, close out, resync and finalize on Head.
@@ -966,4 +1037,20 @@ fn ignore(ctx: &Ctx, mut rec: ProcessRecord, note: &str) -> Result<(), NodeError
     rec.note = Some(note.to_string());
     ctx.deps.db.put_process(&rec)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewind_target;
+
+    #[test]
+    fn rewind_target_bounds() {
+        assert_eq!(rewind_target(500, Some(450)), 450);
+        assert_eq!(rewind_target(500, Some(10)), 372);
+        assert_eq!(rewind_target(500, None), 372);
+        assert_eq!(rewind_target(5, None), 0);
+        // A changed hash at or below the safe head still re-routes its block.
+        assert_eq!(rewind_target(500, Some(600)), 499);
+        assert_eq!(rewind_target(0, Some(9)), 0);
+    }
 }

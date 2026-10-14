@@ -870,6 +870,16 @@ impl Contracts {
         Ok((b.header.number, b.header.timestamp))
     }
 
+    /// Hash of block `n`; `None` past the endpoint's head.
+    pub async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>> {
+        let b = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(n))
+            .await
+            .map_err(rpc_err)?;
+        Ok(b.map(|b| b.header.hash.0))
+    }
+
     /// The highest block `confirmations` behind head.
     pub async fn confirmed_head(&self, confirmations: u64) -> Result<u64> {
         Ok(self.head().await?.0.saturating_sub(confirmations))

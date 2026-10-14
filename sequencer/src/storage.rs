@@ -785,6 +785,28 @@ impl Db {
         tx.commit().map_err(db_err)
     }
 
+    /// Sets `k` and, in the same transaction, the bytes under `kb` (`None`
+    /// removes them), so the two never disagree after a crash.
+    pub fn set_meta_u64_and_bytes(
+        &self,
+        k: &str,
+        v: u64,
+        kb: &str,
+        vb: Option<&[u8]>,
+    ) -> Result<()> {
+        let tx = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut t = tx.open_table(META).map_err(db_err)?;
+            t.insert(k, v).map_err(db_err)?;
+            let mut b = tx.open_table(META_BYTES).map_err(db_err)?;
+            match vb {
+                Some(vb) => drop(b.insert(kb.as_bytes(), vb).map_err(db_err)?),
+                None => drop(b.remove(kb.as_bytes()).map_err(db_err)?),
+            }
+        }
+        tx.commit().map_err(db_err)
+    }
+
     /// The node master secret behind every election key, drawn with `draw`
     /// and stored on first use (one write transaction, so it is set once).
     pub(crate) fn master_secret(&self, draw: impl FnOnce() -> [u8; 32]) -> Result<[u8; 32]> {
