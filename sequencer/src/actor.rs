@@ -855,6 +855,8 @@ struct Actor {
     /// attempt before its event, and past this instant a chain read decides
     /// (RESULTS finalizes, anything else resubmits).
     results_sent: Option<tokio::time::Instant>,
+    /// The Head block of the last results confirmation read.
+    confirm_block: Option<u64>,
     /// A transition landed since `last_vote_at` was last read from the chain;
     /// the grace end may have moved, so nothing closes on it until re-read.
     vote_at_stale: bool,
@@ -1055,6 +1057,7 @@ pub(crate) fn spawn_actor(
         eager: cfg.eager_results,
         held: None,
         results_sent: None,
+        confirm_block: None,
         // The record may predate the last landing: re-read before closing.
         vote_at_stale: true,
         stale_ticks: 0,
@@ -1614,7 +1617,6 @@ impl Actor {
                 warn!(pid = %hex::encode(self.pid31), "results transaction never confirmed; resubmitting");
             }
         }
-        self.confirm_results().await;
         // Landed-but-unconfirmed flight: if the chain never showed our root
         // by the deadline (the tx reorged out), roll back and requeue.
         if self.in_flight.as_ref().is_some_and(|f| {
@@ -1855,6 +1857,11 @@ impl Actor {
         if self.results_sent.is_none() {
             self.results_sent = Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
         }
+        // The confirmed head moves only with a Head: one try per Head block.
+        if self.confirm_block == Some(self.last_head_block) {
+            return;
+        }
+        self.confirm_block = Some(self.last_head_block);
         let confirmed = match self.deps.contracts.confirmed_head(self.confirmations).await {
             Ok(block) => self.deps.contracts.process_at(&self.pid31, block).await,
             Err(e) => Err(e),

@@ -6627,6 +6627,17 @@ async fn results_read_at_the_head_does_not_finalize_until_confirmed() {
         LocalStatus::Active,
         "finalized on a depth-0 read"
     );
+    // The confirmed head moves only with a head: voter polls (each runs a
+    // tick) add no confirmation reads.
+    let reads = s.chain.process_at_calls();
+    for _ in 0..20 {
+        h.status(vid).await.unwrap();
+    }
+    assert!(
+        s.chain.process_at_calls() <= reads + 1,
+        "{} confirmation reads for 20 polls",
+        s.chain.process_at_calls() - reads
+    );
     // That block reorgs out: Ended again, no results, no event ever.
     s.chain.reorg_results();
     wait_long("our results on chain", async || {

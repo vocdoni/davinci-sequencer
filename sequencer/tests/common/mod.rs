@@ -287,6 +287,8 @@ pub struct Inner {
     /// `(block, proc)` snapshots from `checkpoint`: `process_at` a block
     /// below the head answers the newest one at or below it.
     history: Vec<(u64, OnchainProcess)>,
+    /// `process_at` reads of the process.
+    process_at_calls: u64,
     /// Next N blob fetches fail.
     fail_blobs: u32,
     /// Next N `submit_transition` calls fail without landing.
@@ -422,6 +424,7 @@ impl FakeChain {
             frozen: None,
             split: None,
             history: Vec::new(),
+            process_at_calls: 0,
             fail_blobs: 0,
             fail_submits: 0,
             timeout_submits: 0,
@@ -756,6 +759,11 @@ impl FakeChain {
         let mut i = self.inner.lock().unwrap();
         let snap = (i.block, i.proc.clone());
         i.history.push(snap);
+    }
+
+    /// How many times any node read the process with `process_at`.
+    pub fn process_at_calls(&self) -> u64 {
+        self.inner.lock().unwrap().process_at_calls
     }
 
     /// The block carrying the results reorged out: the process is Ended
@@ -1353,7 +1361,8 @@ impl Chain for FakeChain {
 
     async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error> {
         if *pid == pid31() {
-            let i = self.inner.lock().unwrap();
+            let mut i = self.inner.lock().unwrap();
+            i.process_at_calls += 1;
             if let Some((p, at)) = &i.split {
                 return if block <= *at {
                     Ok(p.clone())
