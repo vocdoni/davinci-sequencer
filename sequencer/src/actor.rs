@@ -70,11 +70,9 @@ pub trait Chain: Send + Sync {
         0
     }
     async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess, Web3Error>;
-    /// `getProcess` at `block`. Test doubles without block history answer
-    /// at their latest state.
-    async fn process_at(&self, pid: &[u8; 31], _block: u64) -> Result<OnchainProcess, Web3Error> {
-        self.process(pid).await
-    }
+    /// `getProcess` at `block`. Required, so a wrapper cannot fall back to
+    /// the unpinned read.
+    async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error>;
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error>;
     /// `(block, timestamp)` of the head.
     async fn head(&self) -> Result<(u64, u64), Web3Error>;

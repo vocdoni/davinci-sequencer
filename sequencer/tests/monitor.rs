@@ -65,6 +65,12 @@ impl Chain for Net {
         }
         Ok(p)
     }
+    async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error> {
+        if *pid == bad_pid31() {
+            return self.process(pid).await;
+        }
+        self.chain.process_at(pid, block).await
+    }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
         let armed = self.reorg_in_page.lock().unwrap().take_if(|r| r.0 == to);
         if let Some((_, fork, tag)) = armed {
