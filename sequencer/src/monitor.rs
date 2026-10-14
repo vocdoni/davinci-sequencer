@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::actor::{ActorError, ActorHandle, Deps, spawn_actor};
+use crate::actor::{ActorError, ActorHandle, Deps, pid31_of, spawn_actor};
 use crate::census::onchain::OnchainIndex;
 use crate::census::{CensusError, CensusOptions, CensusStore};
 use crate::config::Config;
@@ -144,6 +144,7 @@ pub async fn spawn_node(
     // actor's first tick re-reads its process and applies what moved.
     let (_, chain_time) = ctx.deps.contracts.head().await.unwrap_or((0, 0));
     let mut map = node.processes.write().await;
+    let mut failed = Vec::new();
     for rec in ctx.deps.db.processes()? {
         // Finalized processes respawn too: their actor is read-only
         // (never accepts, seals or finalizes) but keeps serving tracker
@@ -156,10 +157,28 @@ pub async fn spawn_node(
             Ok(h) => {
                 map.insert(rec.pid, h);
             }
-            Err(e) => error!(pid = %pid_hex(&rec.pid), %e, "respawn failed"),
+            Err(e) => {
+                error!(pid = %pid_hex(&rec.pid), %e, "respawn failed; retrying");
+                failed.push(rec.pid);
+            }
         }
     }
     drop(map);
+    // The monitor retries them (bootstrap starts a stored record's actor).
+    if !failed.is_empty() {
+        let mut retries = load_retries(&ctx.deps.db);
+        for pid in failed {
+            if !retries.iter().any(|r| r.pid == pid) {
+                retries.push(BootRetry {
+                    pid,
+                    pid31: pid31_of(&pid),
+                    attempts: 1,
+                    due: tokio::time::Instant::now(),
+                });
+            }
+        }
+        save_retries(&ctx.deps.db, &retries);
+    }
     let tracker = ctx.deps.tasks.clone();
     tracker.spawn(heartbeat_loop(
         ctx.deps.contracts.clone(),
@@ -835,7 +854,15 @@ async fn run_boot_retries(ctx: &Ctx, retries: &mut Vec<BootRetry>, shutdown: &Ca
             Err(e) => {
                 changed = true;
                 retries[i].attempts += 1;
-                if retries[i].attempts >= BOOT_ATTEMPT_CAP {
+                let stored = matches!(ctx.deps.db.process(&pid), Ok(Some(_)));
+                if retries[i].attempts >= BOOT_ATTEMPT_CAP && stored {
+                    // A process with state is never given up: retry at the
+                    // longest backoff and keep saying so.
+                    error!(pid = %hex::encode(pid31), %e, "actor still fails to start; retrying");
+                    retries[i].attempts = BOOT_ATTEMPT_CAP;
+                    retries[i].due = now + boot_backoff(ctx.cfg.poll_interval, BOOT_ATTEMPT_CAP);
+                    i += 1;
+                } else if retries[i].attempts >= BOOT_ATTEMPT_CAP {
                     ignore_unbootstrapped(ctx, pid, &pid31, &e.to_string()).await;
                     retries.remove(i);
                 } else {
@@ -925,8 +952,20 @@ async fn bootstrap(
     pid31: &[u8; 31],
     shutdown: &CancellationToken,
 ) -> Result<(), NodeError> {
-    if ctx.deps.db.process(&pid)?.is_some() || ctx.node.processes.read().await.contains_key(&pid) {
-        return Ok(()); // seen before (respawned or ignored)
+    if ctx.node.processes.read().await.contains_key(&pid) {
+        return Ok(()); // running
+    }
+    if let Some(rec) = ctx.deps.db.process(&pid)? {
+        // Ignored stays down. A stored record without an actor (its spawn
+        // failed here or at boot) starts now; an error keeps the retry.
+        if rec.local == LocalStatus::Ignored {
+            return Ok(());
+        }
+        let chain_time = ctx.deps.contracts.head().await.map(|(_, t)| t).unwrap_or(0);
+        let h = respawn(ctx, &rec, chain_time, shutdown)?;
+        ctx.node.processes.write().await.insert(pid, h);
+        info!(pid = %hex::encode(pid31), "process actor started on retry");
+        return Ok(());
     }
     // Its census is still downloading: nothing to re-read yet.
     if ctx.queue.waiting(&pid) {

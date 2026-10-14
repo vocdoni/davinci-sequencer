@@ -495,6 +495,14 @@ async fn refused_bootstrap_census_is_ignored_and_forgotten() {
             .is_none()
     );
     assert_eq!(boot_attempts(&db, &bad_pid31()), None);
+    // Routed again (a reorg at the cursor), the ignored process stays down.
+    net.reorg(2, 1);
+    wait_until("re-routed", async || {
+        node.metrics.reorgs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    settled_at_head(&db, &net).await;
+    assert!(!node.processes.read().await.contains_key(&bad_pid_fr()));
     sd.cancel();
 }
 
@@ -926,5 +934,112 @@ async fn reorg_at_the_cursor_wakes_an_idle_process_to_rebuild() {
     })
     .await;
     assert_eq!(s.chain.voters(), 2);
+    sd.cancel();
+}
+
+// ------------------------------------------------ spawn failures retried
+
+/// The genesis write fails once when the new process's actor spawns: the
+/// record is already stored, and the retry must still start the actor (no
+/// restart) and settle votes.
+#[tokio::test]
+async fn failed_spawn_at_bootstrap_is_retried() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    db.fail_next_arbo_writes(1);
+    let sd = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        sd.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    assert_eq!(boot_attempts(&db, &pid31()), None, "retry entry dropped");
+    sd.cancel();
+}
+
+/// A stored record whose actor fails to start at boot (its genesis write
+/// fails once) goes on the retry list instead of staying down until the
+/// next restart.
+#[tokio::test]
+async fn failed_respawn_at_boot_is_retried() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    // A record without its tree: a crash between the two at bootstrap.
+    let rec = davinci_sequencer::storage::ProcessRecord {
+        pid: pid_fr(),
+        onchain: s.chain.process(&pid31()).await.unwrap(),
+        local: LocalStatus::Active,
+        note: None,
+    };
+    db.put_process(&rec).unwrap();
+    // Past the creation: only the retry list can start it.
+    db.set_meta_u64("monitor_last_block", s.chain.head_block())
+        .unwrap();
+    db.fail_next_arbo_writes(1);
+    let sd = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        sd.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    assert_eq!(boot_attempts(&db, &pid31()), None, "retry entry dropped");
+    sd.cancel();
+}
+
+/// A stored process whose actor keeps failing to start is never given up
+/// (recorded ignored) at the attempt cap: it stays Active and on the retry
+/// list, and starts once the fault clears.
+#[tokio::test]
+async fn stored_process_is_not_ignored_at_the_attempt_cap() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    db.fail_next_arbo_writes(u32::MAX);
+    let sd = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        sd.clone(),
+    )
+    .await;
+    wait_until("attempt cap reached", async || {
+        boot_attempts(&db, &pid31()) == Some(10)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let rec = db.process(&pid_fr()).unwrap().unwrap();
+    assert_eq!(rec.local, LocalStatus::Active);
+    assert_eq!(boot_attempts(&db, &pid31()), Some(10));
+    db.fail_next_arbo_writes(0);
+    let _h = handle(&node).await;
     sd.cancel();
 }
