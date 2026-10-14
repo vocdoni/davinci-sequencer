@@ -102,9 +102,10 @@ a DKG mode when no single node should hold the key.
   rebuild that election. Nodes archive and serve the blobs they saw, but no node fetches from
   another node's archive yet. Keep a node, or a blob archiver, running for the whole election.
   A node whose transition record was lost at a crash waits for that transition's blobs to write
-  it again: until then the process applies no later transition and closes nothing out, frozen
-  until the blobs are served again or the operator removes the process's state, while another
-  node with the archive keeps serving the election.
+  it again: until then the process seals nothing and applies no later transition, until the
+  blobs are served again or the operator removes the process's state, while another node with
+  the archive keeps serving the election. The close-out and the results still run once the tree
+  is at the chain's root.
 - **Reorgs.** Other sequencers' transitions are applied only once they are `--confirmations`
   blocks deep (1 on OP Mainnet), but in blob mode the node's own commits follow the transaction
   receipt. Deeper reorgs are detected and recovered (see
