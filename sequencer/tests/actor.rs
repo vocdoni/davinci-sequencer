@@ -5393,3 +5393,43 @@ async fn held_process_seals_only_its_exposed_votes() {
 async fn prover_hold_seals_only_its_exposed_votes() {
     hold_seals_only_exposed_votes(true).await;
 }
+
+/// Votes closed under a prover hold name it: the close reason carries the
+/// prover's error, not the plain `process closed` of an expected close.
+#[tokio::test(start_paused = true)]
+async fn cancel_under_a_prover_hold_names_the_hold() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        5,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, &s, 5, 1200).await;
+    s.chain.advance_time(400);
+    wait_long("holding, nothing in flight", async || {
+        node.metrics.isolated_votes.load(Ordering::SeqCst) == 3
+            && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Canceled);
+    for vid in &vids[3..] {
+        wait_long("errored", async || {
+            vote_status(&h, *vid).await == Some(VoteStatus::Error)
+        })
+        .await;
+        let e = vote_error(&h, *vid).await;
+        assert!(e.starts_with("process closed (held: prover: "), "{e}");
+        assert!(e.contains("bad input"), "{e}");
+    }
+    shutdown.cancel();
+}

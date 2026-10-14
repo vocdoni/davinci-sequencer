@@ -894,7 +894,8 @@ struct Actor {
     /// nothing about our prover.
     isolated: u32,
     /// The prover fails every input: retry full batches, error nothing.
-    prover_hold: bool,
+    /// Holds the prover's latest reason, which the close reason names.
+    prover_hold: Option<String>,
     /// The last node-side check failure that held votes pending, named in
     /// their close reason. Our landing clears it.
     held_reason: Option<String>,
@@ -1044,7 +1045,7 @@ pub(crate) fn spawn_actor(
         end_moved: false,
         bisect: None,
         isolated: 0,
-        prover_hold: false,
+        prover_hold: None,
         held_reason: None,
         tx: tx.clone(),
     };
@@ -1353,11 +1354,11 @@ impl Actor {
     fn seal_max(&self) -> usize {
         let mut max = self.batch_max;
         if let Some(b) = &self.bisect
-            && !self.prover_hold
+            && self.prover_hold.is_none()
         {
             max = max.min(b.cap);
         }
-        if self.prover_hold || self.held_reason.is_some() {
+        if self.prover_hold.is_some() || self.held_reason.is_some() {
             let exposed = self
                 .pending
                 .iter()
@@ -1643,9 +1644,10 @@ impl Actor {
         }
     }
 
-    /// The close reason of a pending vote: held votes name why.
+    /// The close reason of a pending vote: held votes name why (a node-side
+    /// check, else the prover's reason under a hold).
     fn closed_reason(&self) -> String {
-        match &self.held_reason {
+        match self.held_reason.as_ref().or(self.prover_hold.as_ref()) {
             Some(m) => format!("process closed (held: {m})"),
             None => "process closed".into(),
         }
@@ -1855,7 +1857,8 @@ impl Actor {
         // (which rides every re-attempt) needs; the proof gets what the leg
         // leaves: base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
         let spv = self.metrics.prove.spv(nf);
-        let proof_first = self.deps.l1.is_some() && (self.bisect.is_some() || self.prover_hold);
+        let proof_first =
+            self.deps.l1.is_some() && (self.bisect.is_some() || self.prover_hold.is_some());
         let (max_blobs, leg) = match &self.deps.l1 {
             Some(l1) => {
                 let window = deadline.saturating_sub(now);
@@ -2366,7 +2369,7 @@ impl Actor {
         let vids: BTreeSet<u64> = f.prepared.vote_ids.iter().copied().collect();
         self.metrics.bisections.fetch_add(1, Ordering::SeqCst);
         let secs = self.prove_backoff_upto(BISECT_BACKOFF_MAX);
-        if self.prover_hold {
+        if self.prover_hold.is_some() {
             error!(
                 pid = %hex::encode(self.pid31),
                 votes = n,
@@ -2374,6 +2377,7 @@ impl Actor {
                 %reason,
                 "batch proof failed; holding its votes pending"
             );
+            self.prover_hold = Some(reason);
             self.requeue_flight(f);
             return;
         }
@@ -2402,7 +2406,7 @@ impl Actor {
             self.isolated += 1;
             self.metrics.isolated_votes.fetch_add(1, Ordering::SeqCst);
             if self.isolated >= ISOLATED_BEFORE_HOLD {
-                self.prover_hold = true;
+                self.prover_hold = Some(b.reason.clone());
                 error!(pid = %hex::encode(self.pid31), "prover fails every batch; holding votes pending");
             }
         } else {
@@ -2426,7 +2430,7 @@ impl Actor {
     fn bisect_landed(&mut self, own: bool) {
         if own {
             self.isolated = 0;
-            self.prover_hold = false;
+            self.prover_hold = None;
         }
         let Some(b) = self.bisect.as_mut() else {
             return;

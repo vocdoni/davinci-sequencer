@@ -87,7 +87,7 @@ the one that settles last stands. Clients should send all of one voter's ballots
 A batch that loses a race goes back to `pending`, and so does one the settlement refuses because
 the organizer paused the process. Votes still queued when the grace window closes, or when the
 process is canceled, end in `process closed`, or `process closed (held: <reason>)` when a check of
-the node's own (such as a program key pin) held them. A node that never stored a vote still answers
+the node's own (such as a program key pin) or a prover failing every batch held them. A node that never stored a vote still answers
 `settled` when its id is in the tree, and 404 otherwise.
 
 Once a vote is settled, `GET /votes/{pid}/voteId/{voteId}/proof` returns a tracker proof, and

@@ -93,7 +93,8 @@ in `error` only if the election closes first. Other failures:
   halves the next batch, until a single vote fails: that vote alone ends in `error`, with the
   prover's reason and `(isolated by bisection)`. Retries back off up to 30 s. After three such
   votes in a row the node takes the prover to fail every input: it stops erroring and keeps
-  retrying full batches. A landing (the node's own or a synced one) ends the bisection once its
+  retrying full batches; votes still held at the close end in `process closed (held: prover:
+  <reason>)`. A landing (the node's own or a synced one) ends the bisection once its
   votes are settled, and so do the close and a restart (the state is in memory). The count and
   the hold end only at the node's own landing or a restart: another sequencer's landing says
   nothing about this node's prover. While it holds, a batch carries only the held votes, so
