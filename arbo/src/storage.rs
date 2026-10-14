@@ -37,6 +37,8 @@ pub trait Storage: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
     /// Apply the batch atomically.
     fn write(&self, batch: WriteBatch) -> Result<(), Error>;
+    /// Drops any cached read snapshot, so it stops pinning old pages.
+    fn release_snapshot(&self) {}
 }
 
 /// In-memory storage backed by a shared hash map.
@@ -127,6 +129,15 @@ mod redb_storage {
             Self::new(Arc::new(db), table)
         }
 
+        /// Whether a cached read snapshot is open (it pins the database
+        /// version it saw until released).
+        pub fn snapshot_open(&self) -> bool {
+            self.snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        }
+
         /// Trade commit durability for speed (`Durability::None` keeps the
         /// file consistent but may lose the latest commits on crash).
         pub fn set_durability(&mut self, durability: Durability) {
@@ -205,6 +216,12 @@ mod redb_storage {
                 .lock()
                 .map_err(|_| Error::Storage("poisoned snapshot lock".into()))? = None;
             Ok(())
+        }
+
+        // redb frees no page a live reader can see: an idle handle's snapshot
+        // would keep every later commit's copy-on-write pages in the file.
+        fn release_snapshot(&self) {
+            *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 }

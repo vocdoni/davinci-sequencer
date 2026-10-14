@@ -50,6 +50,9 @@ impl<S: Storage> Storage for Shared<S> {
     fn write(&self, batch: WriteBatch) -> Result<(), arbo::Error> {
         self.0.write(batch)
     }
+    fn release_snapshot(&self) {
+        self.0.release_snapshot()
+    }
 }
 
 /// The last proven-and-accepted state.
@@ -255,6 +258,12 @@ impl<S: Storage> ProcessState<S> {
 
     pub fn committed(&self) -> Committed {
         self.committed.clone()
+    }
+
+    /// Drops the storage's cached read snapshot. Call when idle: an open
+    /// snapshot keeps the database from reusing pages freed after it.
+    pub fn release_reads(&self) {
+        self.db.release_snapshot();
     }
 
     /// Number of occupied ballot slots.

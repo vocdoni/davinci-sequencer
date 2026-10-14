@@ -1124,6 +1124,9 @@ impl Actor {
 
     async fn run(&mut self, mut rx: mpsc::Receiver<Msg>, shutdown: CancellationToken) {
         loop {
+            // No tree snapshot outlives a message: an idle actor's would pin
+            // every later commit's pages in the shared file.
+            self.state.release_reads();
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 msg = rx.recv() => match msg {

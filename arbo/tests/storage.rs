@@ -54,3 +54,28 @@ fn second_redb_handle_metadata_never_stale() {
     assert_eq!(t2.root(), t1.root(), "second handle opened at stale root");
     assert_eq!(t2.n_leafs().unwrap(), 19, "stale nleafs");
 }
+
+#[test]
+fn released_snapshot_frees_pages_and_reads_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let db = Arc::new(redb::Database::create(&path).unwrap());
+    let reader = RedbStorage::new(db.clone(), "idle").unwrap();
+    let mut idle = Tree::new(reader.clone(), 64, Sha256).unwrap();
+    idle.add(&1u64.to_le_bytes(), &[1u8; 32]).unwrap();
+    assert!(reader.get(&idle.root()).unwrap().is_some());
+    assert!(reader.snapshot_open());
+    reader.release_snapshot();
+    assert!(!reader.snapshot_open());
+
+    // Commits elsewhere while the idle handle holds no snapshot reuse the
+    // freed pages instead of growing the file.
+    let mut busy = Tree::new(RedbStorage::new(db, "busy").unwrap(), 64, Sha256).unwrap();
+    for i in 0..400u64 {
+        busy.add(&i.to_le_bytes(), &[i as u8; 32]).unwrap();
+    }
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert!(len < 4 << 20, "file grew to {len} B");
+    // The released handle reads on (a fresh snapshot opens on demand).
+    assert!(reader.get(&idle.root()).unwrap().is_some());
+}

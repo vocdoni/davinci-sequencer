@@ -211,6 +211,9 @@ pub struct Db {
     arbo_faults: Arc<std::sync::atomic::AtomicU32>,
     /// Arbo reads (any process), counted in test builds only.
     arbo_reads: Arc<std::sync::atomic::AtomicU64>,
+    /// Every arbo handle handed out, so tests can see open snapshots.
+    #[cfg(any(test, feature = "test-hooks"))]
+    arbo_handles: Arc<std::sync::Mutex<Vec<arbo::RedbStorage>>>,
 }
 
 impl std::fmt::Debug for Db {
@@ -304,6 +307,8 @@ impl Db {
             db: Arc::new(db),
             arbo_faults: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             arbo_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-hooks"))]
+            arbo_handles: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -409,6 +414,11 @@ impl Db {
     pub fn arbo_storage(&self, pid: &Fr) -> Result<ArboStore> {
         let inner =
             arbo::RedbStorage::new(self.db.clone(), &Self::arbo_table(pid)).map_err(db_err)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.arbo_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(inner.clone());
         Ok(ArboStore {
             inner,
             faults: self.arbo_faults.clone(),
@@ -423,6 +433,17 @@ impl Db {
     pub fn fail_next_arbo_writes(&self, n: u32) {
         self.arbo_faults
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Arbo handles (any process) holding an open read snapshot. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn arbo_snapshots_open(&self) -> usize {
+        self.arbo_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|h| h.snapshot_open())
+            .count()
     }
 
     /// Arbo tree and slot-store reads so far (any process). Test hook.
@@ -1125,6 +1146,10 @@ impl arbo::Storage for ArboStore {
             return Err(arbo::Error::Storage("scripted write failure".into()));
         }
         arbo::Storage::write(&self.inner, batch)
+    }
+
+    fn release_snapshot(&self) {
+        arbo::Storage::release_snapshot(&self.inner)
     }
 }
 
