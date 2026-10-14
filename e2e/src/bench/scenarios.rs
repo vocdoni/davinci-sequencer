@@ -113,6 +113,10 @@ const X23_ROUNDS: usize = 5;
 const SKEW: Duration = Duration::from_secs(150);
 /// X3's loser runs this many OP blocks (about 5 min) behind on events.
 const LAG: u64 = 150;
+/// The same 5 min on a dry's anvil (1 s blocks): at 150 blocks the loser's
+/// held proof ends only seconds before it sees the winner, so the revert
+/// path would turn into the event path.
+const LAG_DRY: u64 = 300;
 /// X4's two AGM ends are this far apart, so their flushes do not share a
 /// node's Ethereum window.
 const X4_STAGGER: u64 = 360;
@@ -587,7 +591,8 @@ fn wave2_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
             k,
             rounds: race_rounds(rounds, scale),
             skew: skew.map(|n| (n, SKEW)),
-            lag_confirmations: lag.then_some(LAG),
+            // Below scale 1 is a dry, on anvil.
+            lag_confirmations: lag.then_some(if scale < 1.0 { LAG_DRY } else { LAG }),
         };
         let mut knobs = [race_knobs(k), race_knobs(k)];
         // The lag holds for the whole scenario rather than a restart per
@@ -1188,6 +1193,10 @@ mod tests {
         );
         assert!(x5.allowed.is_empty());
         assert!(all.iter().all(|s| s.wave == 2 && s.chaos.is_empty()));
+        // A dry keeps X3's lag at about 5 min on anvil's 1 s blocks.
+        let dry = scenarios(2, 0.3);
+        let x3 = dry.iter().find(|s| s.name == "X3").unwrap();
+        assert_eq!(race_of(x3).lag_confirmations, Some(300));
     }
 
     /// The live URL layout (spec §6): each node's OP list as the preset
