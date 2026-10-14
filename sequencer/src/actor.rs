@@ -1901,6 +1901,10 @@ impl Actor {
             None => d,
         };
         self.rebuild_from_chain(d, &p);
+        // Failed (storage): wait as long again before the next try.
+        if let Some((d, _)) = self.diverged {
+            self.diverged = Some((d, tokio::time::Instant::now()));
+        }
     }
 
     /// Settled votes whose id is not in the tree at `root`: those the
@@ -2575,9 +2579,7 @@ impl Actor {
                 cap = max_blobs,
                 "prepared batch exceeds the blob cap; not sealing"
             );
-            if let Err(e) = self.state.rollback(&prepared) {
-                error!(pid = %hex::encode(self.pid31), %e, "rollback");
-            }
+            self.rollback_prepared(&prepared);
             return;
         }
         // Persist the widened exposed set before the batch can reach
@@ -2591,19 +2593,17 @@ impl Actor {
             vote_ids: evids.iter().copied().collect(),
         };
         if let Err(e) = self.deps.db.put_exposed(&self.pid, &rec) {
-            error!(pid = %hex::encode(self.pid31), %e, "persist exposed set");
-            if let Err(e) = self.state.rollback(&prepared) {
-                error!(pid = %hex::encode(self.pid31), %e, "rollback");
-            }
+            let secs = self.prove_backoff();
+            error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "persist exposed set");
+            self.rollback_prepared(&prepared);
             return;
         }
         self.exposed = slots;
         self.exposed_vids = evids;
         if let Err(e) = self.deps.db.seal_batch(&self.pid, &vids) {
-            error!(pid = %hex::encode(self.pid31), %e, "seal_batch");
-            if let Err(e) = self.state.rollback(&prepared) {
-                error!(pid = %hex::encode(self.pid31), %e, "rollback");
-            }
+            let secs = self.prove_backoff();
+            error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "seal_batch");
+            self.rollback_prepared(&prepared);
             return;
         }
         let at: std::collections::HashMap<u64, u64> = self
@@ -2917,10 +2917,14 @@ impl Actor {
         }
     }
 
+    fn rollback_flight(&mut self, f: &Flight) {
+        self.rollback_prepared(&f.prepared);
+    }
+
     /// A failed rollback leaves the tree at the prepared root: reopen at
     /// the committed record before any more state work.
-    fn rollback_flight(&mut self, f: &Flight) {
-        if let Err(e) = self.state.rollback(&f.prepared) {
+    fn rollback_prepared(&mut self, p: &davinci_state::PreparedBatch) {
+        if let Err(e) = self.state.rollback(p) {
             error!(pid = %hex::encode(self.pid31), %e, "rollback failed; reopening");
             self.state_lost = true;
         }
@@ -4062,14 +4066,18 @@ impl Actor {
             self.finalizing = true;
             self.finalize_after = None;
             info!(pid = %hex::encode(self.pid31), "finalizing: submitting held results");
-            tokio::spawn(crate::finalize::run_submit_held(
-                self.deps.contracts.clone(),
-                self.pid31,
-                snark,
-                self.deps.grace.grace_max_total,
-                self.generation,
+            spawn_finalize(
                 self.tx.clone(),
-            ));
+                self.generation,
+                crate::finalize::run_submit_held(
+                    self.deps.contracts.clone(),
+                    self.pid31,
+                    snark,
+                    self.deps.grace.grace_max_total,
+                    self.generation,
+                    self.tx.clone(),
+                ),
+            );
             return;
         }
         // Proved at a root that has moved since: prove again.
@@ -4094,18 +4102,22 @@ impl Actor {
         self.finalizing = true;
         self.finalize_after = None;
         info!(pid = %hex::encode(self.pid31), hold, "finalizing: proving results");
-        tokio::spawn(crate::finalize::run_finalize(
-            self.deps.prover.clone(),
-            self.deps.contracts.clone(),
-            self.pid31,
-            request,
-            root,
-            tally,
-            self.deps.grace.grace_max_total,
-            hold,
-            self.generation,
+        spawn_finalize(
             self.tx.clone(),
-        ));
+            self.generation,
+            crate::finalize::run_finalize(
+                self.deps.prover.clone(),
+                self.deps.contracts.clone(),
+                self.pid31,
+                request,
+                root,
+                tally,
+                self.deps.grace.grace_max_total,
+                hold,
+                self.generation,
+                self.tx.clone(),
+            ),
+        );
     }
 
     /// DKG modes: nobody holds the key. Any signing node binds the committed
@@ -4136,15 +4148,19 @@ impl Actor {
         self.generation += 1;
         self.finalizing = true;
         self.finalize_after = None;
-        tokio::spawn(crate::finalize::run_finalize_dkg(
-            self.deps.contracts.clone(),
-            self.pid31,
-            inputs,
-            self.state.committed().root,
-            self.deps.grace.grace_max_total,
-            self.generation,
+        spawn_finalize(
             self.tx.clone(),
-        ));
+            self.generation,
+            crate::finalize::run_finalize_dkg(
+                self.deps.contracts.clone(),
+                self.pid31,
+                inputs,
+                self.state.committed().root,
+                self.deps.grace.grace_max_total,
+                self.generation,
+                self.tx.clone(),
+            ),
+        );
     }
 }
 
@@ -4175,10 +4191,60 @@ struct JobInput {
     cancel: CancellationToken,
 }
 
+/// Sends `msg` to the actor when dropped still armed: a task that ends
+/// without its own report (a panic, which tokio swallows) does not strand
+/// the flight or the finalize waiting on it.
+struct ReportOnDrop {
+    tx: mpsc::Sender<Msg>,
+    msg: Option<Msg>,
+}
+
+impl Drop for ReportOnDrop {
+    fn drop(&mut self) {
+        if let Some(m) = self.msg.take() {
+            let _ = self.tx.try_send(m);
+        }
+    }
+}
+
+/// Spawns a finalize task that reports a transient failure if it dies.
+fn spawn_finalize(
+    tx: mpsc::Sender<Msg>,
+    generation: u64,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let mut guard = ReportOnDrop {
+            tx,
+            msg: Some(Msg::FinalizeDone {
+                generation,
+                result: Err(FinalizeFail {
+                    permanent: false,
+                    wait: false,
+                    gate: false,
+                    msg: "finalize task ended without a result".into(),
+                    dkg_requested: None,
+                }),
+            }),
+        };
+        task.await;
+        guard.msg = None;
+    });
+}
+
 async fn run_job(job: JobInput) {
     let generation = job.generation;
     let tx = job.tx.clone();
+    let mut guard = ReportOnDrop {
+        tx: tx.clone(),
+        msg: Some(Msg::JobDone {
+            generation,
+            outcome: JobOutcome::Transient("job task ended without a result".into()),
+            posted: false,
+        }),
+    };
     let (outcome, posted) = job_inner(job).await;
+    guard.msg = None;
     let _ = tx
         .send(Msg::JobDone {
             generation,

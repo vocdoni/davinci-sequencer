@@ -528,6 +528,12 @@ impl Db {
             .count()
     }
 
+    /// Scripted record-write failures not yet used. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn write_faults_left(&self) -> u32 {
+        self.write_faults.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Arbo tree and slot-store reads so far (any process). Test hook.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn arbo_reads(&self) -> u64 {

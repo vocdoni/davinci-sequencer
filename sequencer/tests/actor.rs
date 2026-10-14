@@ -7436,3 +7436,178 @@ async fn resume_dropped_while_the_state_is_lost_is_read_back() {
     assert_eq!(s.chain.voters(), 2);
     shutdown.cancel();
 }
+
+// ---------------------------------------------- stranded or hot retries
+
+/// The seal's exposed-set write fails: the prepared batch is dropped and
+/// sealing backs off instead of preparing again on every message; once the
+/// write works the seal lands.
+#[tokio::test(start_paused = true)]
+async fn failed_exposed_write_backs_off_the_seal() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1600);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    db.fail_next_writes(u32::MAX);
+    // Solo-due at the next head: it prepares, and its exposed write fails.
+    s.chain.advance_time(400);
+    wait_long("a seal attempt", async || {
+        db.arbo_reads() > 0 && {
+            let r0 = db.arbo_reads();
+            h.snapshot().await.unwrap();
+            db.arbo_reads() > r0 || h.snapshot().await.unwrap().next_seal_not_before.is_some()
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let reads = db.arbo_reads();
+    for _ in 0..20 {
+        h.status(vid).await.unwrap();
+    }
+    assert_eq!(db.arbo_reads(), reads, "prepared again on every message");
+    assert!(
+        h.snapshot().await.unwrap().next_seal_not_before.unwrap() > s.chain.time(),
+        "the backoff does not show"
+    );
+    assert_eq!(prover.calls(), 0);
+    db.fail_next_writes(0);
+    wait_long("settled", async || all_settled(&h, &[vid]).await).await;
+    shutdown.cancel();
+}
+
+/// A rebuild whose write keeps failing waits before trying again, instead of
+/// a chain read and a write on every message; once storage recovers, the
+/// rebuild lands.
+#[tokio::test(start_paused = true)]
+async fn failed_rebuild_backs_off() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1610 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    s.chain.reorg_out_last_transition();
+    let block = s.chain.reinclude_transition(0);
+    wait_long("rerouted", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    // The rebuild's write (and every other) fails from before its wait ends.
+    db.fail_next_writes(1000);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    assert!(
+        db.write_faults_left() >= 998,
+        "{} rebuild attempts in 30 s",
+        1000 - db.write_faults_left()
+    );
+    db.fail_next_writes(0);
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("all settled on the chain's root", async || {
+        all_settled(&h, &vids).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// A batch job that panics (tokio swallows it) reports anyway: the flight is
+/// rolled back, its votes requeued, and the next cycle settles them.
+#[tokio::test]
+async fn panicking_job_requeues_its_votes() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.panic_batches.lock().unwrap() = 1;
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1620);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled after the panic", async || {
+        all_settled(&h, &[vid]).await
+    })
+    .await;
+    assert_eq!(prover.calls(), 2);
+    shutdown.cancel();
+}
+
+/// A results task that panics reports anyway: finalization retries and the
+/// results land.
+#[tokio::test]
+async fn panicking_results_task_is_retried() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.panic_results.lock().unwrap() = 1;
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1630);
+    h.submit(v.clone()).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[v.pkg.vote_id]).await).await;
+    s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
+    wait_until("finalized after the panic", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert!(prover.results_calls() >= 2);
+    shutdown.cancel();
+}

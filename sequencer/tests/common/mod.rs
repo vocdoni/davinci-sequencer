@@ -2022,6 +2022,9 @@ pub struct FakeProver {
     pub fail_batches: Mutex<u32>,
     /// Next N batch proofs fail permanently (the prover refused the input).
     pub fail_batches_permanent: Mutex<u32>,
+    /// Next N batch (results) proofs panic inside the job task.
+    pub panic_batches: Mutex<u32>,
+    pub panic_results: Mutex<u32>,
     /// Every batch proof holding this vote id fails permanently.
     pub fail_vid: Mutex<Option<u64>>,
     /// While set, every batch snark carries a zeroed program vk.
@@ -2051,6 +2054,8 @@ impl FakeProver {
             fail_results: Mutex::new(0),
             fail_batches: Mutex::new(0),
             fail_batches_permanent: Mutex::new(0),
+            panic_batches: Mutex::new(0),
+            panic_results: Mutex::new(0),
             fail_vid: Mutex::new(None),
             wrong_vk: Mutex::new(false),
             fail_results_permanent: Mutex::new(0),
@@ -2109,6 +2114,9 @@ impl Prover for FakeProver {
         if self.gated {
             self.hold.acquire().await.unwrap().forget();
         }
+        if take_one(&self.panic_batches) {
+            panic!("scripted panic in a batch proof");
+        }
         {
             let mut n = self.fail_batches.lock().unwrap();
             if *n > 0 {
@@ -2157,6 +2165,9 @@ impl Prover for FakeProver {
         if self.gate_results.load(Ordering::SeqCst) {
             self.hold_results.acquire().await.unwrap().forget();
         }
+        if take_one(&self.panic_results) {
+            panic!("scripted panic in a results proof");
+        }
         {
             let mut n = self.fail_results.lock().unwrap();
             if *n > 0 {
@@ -2193,6 +2204,14 @@ impl Prover for FakeProver {
             },
         ))
     }
+}
+
+// Takes one from a scripted count; whether there was one.
+fn take_one(n: &Mutex<u32>) -> bool {
+    let mut n = n.lock().unwrap();
+    let hit = *n > 0;
+    *n = n.saturating_sub(1);
+    hit
 }
 
 /// Another sequencer's batch of `votes`, built on the genesis root.
