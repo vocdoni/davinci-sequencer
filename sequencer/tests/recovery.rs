@@ -533,3 +533,63 @@ async fn results_lost_at_a_crash_finalize_locally() {
         shutdown.cancel();
     }
 }
+
+/// A crash part way through the genesis of a new process (its tree written,
+/// no committed record yet): the restart re-creates it and the process
+/// spawns and settles.
+#[tokio::test]
+async fn crash_inside_genesis_creation_respawns() {
+    for skip in [2, 4] {
+        let s = setup(2, 8, None);
+        let dir = TempDir::new().unwrap();
+        let db = Db::open_in(dir.path()).unwrap();
+        // The params write and `skip - 1` genesis leaves go through.
+        db.fail_arbo_writes_after(skip, 1);
+        let shutdown = CancellationToken::new();
+        let node = start_node(
+            db.clone(),
+            dir.path(),
+            &s,
+            s.chain.clone(),
+            FakeProver::open(),
+            1,
+            "0s",
+            shutdown.clone(),
+        )
+        .await;
+        wait_until("bootstrap stored the record", async || {
+            db.process(&pid_fr()).unwrap().is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !node.processes.read().await.contains_key(&pid_fr()),
+            "the cut genesis spawned"
+        );
+        shutdown.cancel();
+        drop((node, db));
+
+        let shutdown = CancellationToken::new();
+        let node = start_node(
+            reopen_db(dir.path()).await,
+            dir.path(),
+            &s,
+            s.chain.clone(),
+            FakeProver::open(),
+            1,
+            "0s",
+            shutdown.clone(),
+        )
+        .await;
+        let h = handle(&node).await;
+        assert_eq!(
+            h.snapshot().await.unwrap().root,
+            genesis_root(&s.env.cfg).unwrap()
+        );
+        let v = fake_vote(&s.env, 0, &[1, 2], 1_100);
+        let vid = v.pkg.vote_id;
+        h.submit(v).await.unwrap();
+        wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+        shutdown.cancel();
+    }
+}

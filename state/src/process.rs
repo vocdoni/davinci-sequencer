@@ -156,7 +156,10 @@ fn load_vk(cfg: &ProcessConfig) -> Result<SnarkJsVk, Error> {
 }
 
 impl<S: Storage> ProcessState<S> {
-    /// Creates the genesis state in an empty `storage`.
+    /// Creates the genesis state in a `storage` holding no process. The
+    /// committed record is written last, so a tree without one is a genesis
+    /// a crash cut short: it starts over from the empty root (no slot was
+    /// ever written without the record).
     pub fn create(cfg: ProcessConfig, storage: S) -> Result<Self, Error> {
         let db = Shared(Arc::new(storage));
         if db.get(KEY_COMMITTED)?.is_some() {
@@ -165,7 +168,7 @@ impl<S: Storage> ProcessState<S> {
         let vk = load_vk(&cfg)?;
         let mut tree = Tree::new(db.clone(), SMT_LEVELS, Sha256)?;
         if tree.root() != arbo::EMPTY_HASH {
-            return Err(Error::Invalid("storage already holds a tree".into()));
+            tree.set_root(&arbo::EMPTY_HASH)?;
         }
         for (k, v) in genesis_leaves(&cfg)? {
             tree.add(&key_bytes(k), &v)?;

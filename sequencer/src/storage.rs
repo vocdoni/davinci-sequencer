@@ -206,8 +206,10 @@ pub struct L1PostRecord {
 #[derive(Clone)]
 pub struct Db {
     db: Arc<Database>,
-    /// Scripted arbo write failures (tests only; always 0 in production).
+    /// Scripted arbo write failures (tests only; always 0 in production),
+    /// after skipping `arbo_skip` writes.
     arbo_faults: Arc<std::sync::atomic::AtomicU32>,
+    arbo_skip: Arc<std::sync::atomic::AtomicU32>,
     /// Arbo reads (any process), counted in test builds only.
     arbo_reads: Arc<std::sync::atomic::AtomicU64>,
     /// Every arbo handle handed out, so tests can see open snapshots.
@@ -308,6 +310,7 @@ impl Db {
         let this = Db {
             db: Arc::new(db),
             arbo_faults: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            arbo_skip: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             arbo_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(any(test, feature = "test-hooks"))]
             arbo_handles: Default::default(),
@@ -425,6 +428,7 @@ impl Db {
         Ok(ArboStore {
             inner,
             faults: self.arbo_faults.clone(),
+            skip: self.arbo_skip.clone(),
             reads: self.arbo_reads.clone(),
         })
     }
@@ -434,8 +438,16 @@ impl Db {
     /// Compiled only for tests (`test-hooks` covers integration tests).
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_arbo_writes(&self, n: u32) {
-        self.arbo_faults
-            .store(n, std::sync::atomic::Ordering::SeqCst);
+        self.fail_arbo_writes_after(0, n);
+    }
+
+    /// Lets the next `skip` arbo writes through, then fails `n` (a crash
+    /// part way through a run of writes). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_arbo_writes_after(&self, skip: u32, n: u32) {
+        use std::sync::atomic::Ordering;
+        self.arbo_skip.store(skip, Ordering::SeqCst);
+        self.arbo_faults.store(n, Ordering::SeqCst);
     }
 
     /// Makes the next `n` record writes (processes, votes, queue,
@@ -1192,6 +1204,7 @@ fn tx_put_transition(
 pub struct ArboStore {
     inner: arbo::RedbStorage,
     faults: Arc<std::sync::atomic::AtomicU32>,
+    skip: Arc<std::sync::atomic::AtomicU32>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     reads: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -1206,12 +1219,11 @@ impl arbo::Storage for ArboStore {
 
     fn write(&self, batch: arbo::WriteBatch) -> Result<(), arbo::Error> {
         use std::sync::atomic::Ordering;
-        if self.faults.load(Ordering::SeqCst) > 0
-            && self
-                .faults
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        let take = |c: &std::sync::atomic::AtomicU32| {
+            c.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
-        {
+        };
+        if self.faults.load(Ordering::SeqCst) > 0 && !take(&self.skip) && take(&self.faults) {
             return Err(arbo::Error::Storage("scripted write failure".into()));
         }
         arbo::Storage::write(&self.inner, batch)

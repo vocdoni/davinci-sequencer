@@ -258,6 +258,58 @@ fn open_stored_reopens_at_the_stored_record() {
     ProcessState::open(env.cfg.clone(), store, &committed).unwrap();
 }
 
+/// Shared storage whose `n`-th write from now fails (a crash there).
+#[derive(Clone)]
+struct CrashAt {
+    inner: arbo::MemoryStorage,
+    left: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl arbo::Storage for CrashAt {
+    fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, arbo::Error> {
+        self.inner.get(k)
+    }
+    fn write(&self, b: arbo::WriteBatch) -> Result<(), arbo::Error> {
+        if self.left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(arbo::Error::Storage("crash".into()));
+        }
+        self.inner.write(b)
+    }
+    fn release_snapshot(&self) {}
+}
+
+/// A crash at any write of `create` (the genesis leaves go in one by one,
+/// the record last) leaves a storage the next `create` finishes.
+#[test]
+fn create_recovers_from_a_crash_mid_genesis() {
+    let env = env(2, 8);
+    let genesis = genesis_root(&env.cfg).unwrap();
+    for at in 0..10 {
+        let s = CrashAt {
+            inner: arbo::MemoryStorage::new(),
+            left: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(at)),
+        };
+        let crashed = ProcessState::create(env.cfg.clone(), s.clone()).is_err();
+        let st = match ProcessState::open_stored(env.cfg.clone(), s.clone()) {
+            Ok(st) => {
+                assert!(!crashed, "crash at write {at} left a record");
+                st
+            }
+            Err(_) => ProcessState::create(env.cfg.clone(), s.clone())
+                .unwrap_or_else(|e| panic!("crash at write {at}: {e}")),
+        };
+        assert_eq!(st.root(), genesis, "crash at write {at}");
+        assert_eq!(st.committed().root, genesis);
+        drop(st);
+        assert_eq!(
+            ProcessState::open_stored(env.cfg.clone(), s)
+                .unwrap()
+                .root(),
+            genesis
+        );
+    }
+}
+
 #[test]
 fn check_publics_bites_on_tampering() {
     let env = env(2, 4);
