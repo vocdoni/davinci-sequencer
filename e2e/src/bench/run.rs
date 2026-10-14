@@ -506,6 +506,42 @@ async fn close_with_retries(
     Err(last)
 }
 
+/// `davinci-bench end`: closes each of `pids` (tag, id) as the run's lanes
+/// do, a shortened end through `close_with_retries`, printing one line per
+/// tag. Tries them all, then fails if any failed; returns how many it ended
+/// (a process already closed counts as none).
+pub async fn end_tagged(org: &Organizer, pids: &[(String, ProcessId)]) -> Result<usize> {
+    use davinci_client::api::ProcessStatus as S;
+    let lock = tokio::sync::Mutex::new(());
+    let how = Close::End(End::Shorten {
+        after: Duration::ZERO,
+        notice: super::scenarios::NOTICE,
+    });
+    let (mut done, mut failed) = (0, 0);
+    for (tag, pid) in pids {
+        let open = org
+            .process(&pid.0)
+            .await
+            .map(|p| matches!(p.status, S::Ready | S::Paused));
+        if open.as_ref().is_ok_and(|o| !*o) {
+            println!("{tag}: already closed");
+            continue;
+        }
+        match close_with_retries(org, &lock, pid, &how).await {
+            Ok(()) => {
+                println!("{tag}: ended");
+                done += 1;
+            }
+            Err(e) => {
+                println!("{tag}: failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+    ensure!(failed == 0, "{failed} of {} ends failed", pids.len());
+    Ok(done)
+}
+
 /// `AfterSettled`: until the registry counts every vote the ledger accepted
 /// for `pid` and neither node has one pending, or nothing is pending and
 /// nothing landed for `SETTLED_STABLE` (an errored vote never settles).
@@ -2405,6 +2441,7 @@ pub async fn audit_run(ctx: &Ctx, rig: &Rig, run_dir: &Path) -> Result<AuditResu
             .iter()
             .find(|e| &e.spec.tag == tag)
             .with_context(|| format!("{tag} is not in plan.json"))?;
+        wait_results_if_ended(ctx, rig, e).await?;
         let recs = load_ballots(&ctx.campaign, meta.wave, e)?;
         // A crash cuts the schedule: votes with no line never left the
         // harness, and every send that started has a line (`uncertain` when
@@ -2454,6 +2491,45 @@ pub async fn audit_run(ctx: &Ctx, rig: &Rig, run_dir: &Path) -> Result<AuditResu
         }))?,
     )?;
     Ok(merged)
+}
+
+/// `audit --run`: an election ended since the run (by `davinci-bench end`)
+/// is still finishing; waits for its results on the registry and every node
+/// as the run does, by grace end + 15 min and at most an hour. READY, PAUSED
+/// and canceled elections have none to wait for.
+async fn wait_results_if_ended(ctx: &Ctx, rig: &Rig, e: &Election) -> Result<()> {
+    use davinci_client::api::ProcessStatus as S;
+    let org = ctx.net.organizer()?;
+    let (pid, tag) = (&e.snap.pid.0, &e.spec.tag);
+    if matches!(
+        org.process(pid).await?.status,
+        S::Ready | S::Paused | S::Canceled
+    ) {
+        return Ok(());
+    }
+    let started = Instant::now();
+    loop {
+        let mut all = org.results(pid).await.ok().flatten().is_some();
+        for role in [Role::A, Role::B, Role::O] {
+            all &= match rig.node(role) {
+                Ok(n) => n.api.process(pid).await.is_ok_and(|v| v.result.is_some()),
+                Err(_) => false,
+            };
+        }
+        let due = org
+            .grace_end(pid)
+            .await
+            .map_or(u64::MAX, |g| g.saturating_add(RESULTS_LATE));
+        if all {
+            println!("{tag}: results on the registry and every node");
+            return Ok(());
+        }
+        if unix_now() as u64 > due || started.elapsed() >= RESULTS_MAX {
+            println!("{tag}: no results by grace end + 15 min");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 #[cfg(test)]

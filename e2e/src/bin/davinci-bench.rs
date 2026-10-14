@@ -1,5 +1,5 @@
 //! The live benchmark's controller: `keygen`, `fund`, `gate`, `plan`,
-//! `gen`, `merge`, `run`, `audit`, `serve`, `cancel` and `dry`. Keys come
+//! `gen`, `merge`, `run`, `audit`, `serve`, `cancel`, `end` and `dry`. Keys come
 //! from files (`DAVINCI_E2E_ORGANIZER_KEY` names one) and are never printed.
 //!
 //! A step that brings the rig up (`plan`, `run`, `audit`, `serve`, `dry`)
@@ -23,6 +23,7 @@ use davinci_e2e::bench::merge::{Verify, check_snapshots, merge_wave};
 use davinci_e2e::bench::money;
 use davinci_e2e::bench::plan::{
     self, CancelScope, ElectionSpec, NodeId, Plan, Seed, cancel_candidates, cancel_open,
+    tagged_pids,
 };
 use davinci_e2e::bench::rig::{Knobs, Rig, RigSpec, Role};
 use davinci_e2e::bench::run::{self as bench_run, ChaosSlot, Ctx};
@@ -176,6 +177,17 @@ enum Cmd {
         wave: Option<u32>,
         #[arg(long)]
         all: bool,
+    },
+    /// End the chosen elections of a wave (`plan.json`), live, as a run's
+    /// lanes do; their results follow, and `audit --run` waits for them.
+    End {
+        #[arg(long, env = "DAVINCI_BENCH_DIR")]
+        campaign: PathBuf,
+        #[arg(long)]
+        wave: u32,
+        /// The elections' tags, each one named: there is no `--all`.
+        #[arg(long, value_delimiter = ',', required = true)]
+        tags: Vec<String>,
     },
     /// A scaled-down run of some scenarios on two anvils: plan, gen (this
     /// host alone), merge and run.
@@ -782,6 +794,27 @@ async fn real_main() -> Result<ExitCode> {
             let pids = cancel_candidates(&plan, &rpc, org.address(), scope).await?;
             let n = cancel_open(&org, &pids).await?;
             println!("canceled {n} of {} processes", pids.len());
+        }
+        Cmd::End {
+            campaign,
+            wave,
+            tags,
+        } => {
+            let plan = Plan::load(&campaign)?;
+            let pids = tagged_pids(&plan, wave, &tags)?;
+            let (rpc, ..) = net::live_target()?;
+            let key = std::env::var_os("DAVINCI_E2E_ORGANIZER_KEY")
+                .context("DAVINCI_E2E_ORGANIZER_KEY (a key file)")?;
+            let org = Organizer::connect(&rpc, net::read_key(Path::new(&key))?, plan.registry)?
+                .with_receipt_timeout(net::scaled(Duration::from_secs(180)));
+            let chain_id = org.provider().get_chain_id().await.context("chain id")?;
+            ensure!(
+                chain_id == plan.chain_id,
+                "the RPC is on chain {chain_id}, the plan on {}",
+                plan.chain_id
+            );
+            let n = bench_run::end_tagged(&org, &pids).await?;
+            println!("ended {n} of {} elections", pids.len());
         }
         Cmd::Dry {
             scenario,
