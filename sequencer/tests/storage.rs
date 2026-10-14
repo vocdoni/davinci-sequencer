@@ -711,3 +711,15 @@ fn a_schema_8_file_upgrades_in_place() {
         "{err}"
     );
 }
+
+#[test]
+fn dropped_arbo_handle_releases_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let store = db.arbo_storage(&pid(1)).unwrap();
+    // A node-key read opens the cached snapshot, hit or miss.
+    arbo::Storage::get(&store, &[7u8; 32]).unwrap();
+    assert_eq!(db.arbo_snapshots_open(), 1);
+    drop(store);
+    assert_eq!(db.arbo_snapshots_open(), 0);
+}

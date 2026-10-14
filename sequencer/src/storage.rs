@@ -1175,6 +1175,14 @@ impl arbo::Storage for ArboStore {
     }
 }
 
+// The snapshot is shared with the handle's clones (the test-hooks registry
+// keeps one): an actor dropped mid-message must not leave it pinned.
+impl Drop for ArboStore {
+    fn drop(&mut self) {
+        arbo::Storage::release_snapshot(&self.inner)
+    }
+}
+
 /// Fr as `0x` + BE32 hex; decoding rejects values `>= p`.
 pub(crate) mod fr_hex {
     use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be};

@@ -39,6 +39,9 @@ impl Storage for FlakyStorage {
         }
         self.inner.write(b)
     }
+    fn release_snapshot(&self) {
+        self.inner.release_snapshot()
+    }
 }
 
 #[test]

@@ -38,7 +38,8 @@ pub trait Storage: Send + Sync {
     /// Apply the batch atomically.
     fn write(&self, batch: WriteBatch) -> Result<(), Error>;
     /// Drops any cached read snapshot, so it stops pinning old pages.
-    fn release_snapshot(&self) {}
+    /// Required: a wrapper that forgot to forward it would pin silently.
+    fn release_snapshot(&self);
 }
 
 /// In-memory storage backed by a shared hash map.
@@ -69,6 +70,9 @@ impl Storage for MemoryStorage {
         }
         Ok(())
     }
+
+    // No snapshots: reads see the map.
+    fn release_snapshot(&self) {}
 }
 
 #[cfg(feature = "redb")]
