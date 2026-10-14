@@ -117,8 +117,10 @@ a DKG mode when no single node should hold the key.
     noticed only at the process's next chain read, which an idle process makes when it next has
     work.
 
-  Results already finalized are not undone by a reorg that drops them, and a reorg deeper than
-  the 128-block rewind can leave events of the dropped range unrouted.
+  Results a reorg drops after the node finalized are submitted again once a chain read shows
+  them gone (the cursor check's re-read, a transition event, or the first read after a restart);
+  a reorg in the cursor check's fail-open window is seen only at the process's next read. A reorg
+  deeper than the 128-block rewind can leave events of the dropped range unrouted.
 - **Scalar bias.** Re-encryption scalars are SHA-256 digests reduced modulo the BN254 scalar
   field, which leaves them 2^-7.6 from uniform modulo the subgroup order. Closing the gap needs a
   512-bit reduction, which changes the batch circuit and its program key.

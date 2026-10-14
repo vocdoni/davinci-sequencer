@@ -287,7 +287,8 @@ root has not moved, and proves again otherwise.
 A results receipt may be shallow enough to reorg out, so the node marks the process finalized only
 at its `ProcessResultsSet` event (or a read showing it), in every key mode. If 90 s pass without
 it, the node reads the process: results there finalize it; otherwise it logs a warning and submits
-again, reusing the held proof when it has one.
+again, reusing the held proof when it has one. A finalized process whose results a deeper reorg
+dropped is active again at the next read that shows them gone, and the results go in again.
 
 An attempt that fails for good (a failed proving job, a proof that fails the checks, a revert the
 node does not expect) is retried, never abandoned: after 2 s, then 4 s, and from the third failure

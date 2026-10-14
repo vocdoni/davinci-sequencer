@@ -1782,9 +1782,24 @@ impl Actor {
             info!(pid = %hex::encode(self.pid31), root = %format!("0x{}", hex::encode(p.state_root)), "chain at an unknown root; syncing before the next seal");
             self.await_sync = true;
         }
+        // Finalized, and a fresh read at the head shows no results (nor a
+        // cancel): a reorg took them. Active again, so the results go in
+        // again, or confirm_results finalizes their re-inclusion.
+        let reopened = self.record.local == LocalStatus::Finalized
+            && !matches!(p.status, ProcessStatus::Results | ProcessStatus::Canceled);
+        if reopened {
+            warn!(pid = %hex::encode(self.pid31), status = ?p.status, "results gone from the chain; finalizing again");
+            self.record.local = LocalStatus::Active;
+            self.held = None;
+            self.results_sent = None;
+            self.confirm_block = None;
+        }
         merge_onchain(&mut self.record.onchain, p);
         let o = self.record.onchain.clone();
         if o == before {
+            if reopened {
+                self.put_record();
+            }
             return pinned;
         }
         if o.duration != before.duration {

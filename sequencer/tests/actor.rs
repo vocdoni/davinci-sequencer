@@ -7207,3 +7207,95 @@ async fn prepare_faults_then_a_peer_landing_syncs() {
     assert_eq!(s.chain.voters(), 3);
     shutdown.cancel();
 }
+
+/// The key holder's results land and confirm (Finalized), then a reorg
+/// takes the block carrying them while the ballot root stays. A fresh read
+/// showing the process without them (here after the monitor routes an old
+/// transition again, as its rewind does; or the first read after a restart)
+/// makes it Active again: it proves and submits again and finalizes at the
+/// new event.
+async fn results_reorged_out_after_finalize(restart: bool) {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    // One block on top of the creation: it routes at one confirmation.
+    s.chain.advance_time(0);
+    let cfg = || {
+        test_config_with(
+            dir.path(),
+            &s.census_dir,
+            1,
+            "0s",
+            &["--confirmations", "1"],
+        )
+    };
+    let shutdown = CancellationToken::new();
+    let node = start_node_cfg(
+        db,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg(),
+        shutdown.clone(),
+    )
+    .await;
+    let mut h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1950);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_long("settled", async || {
+        s.chain.advance_time(1);
+        all_settled(&h, &[vid]).await
+    })
+    .await;
+    s.chain.pass_grace();
+    wait_long("finalized", async || {
+        s.chain.advance_time(0);
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    let results = s.chain.results();
+    assert_eq!(s.chain.results_submits(), 1);
+    s.chain.reorg_results();
+    let _node;
+    if restart {
+        shutdown.cancel();
+        drop((h, node));
+        let shutdown = CancellationToken::new();
+        _node = start_node_cfg(
+            reopen_db(dir.path()).await,
+            s.chain.clone(),
+            FakeProver::open(),
+            cfg(),
+            shutdown.clone(),
+        )
+        .await;
+        h = handle(&_node).await;
+    } else {
+        _node = node;
+        s.chain.reinclude_transition(0);
+    }
+    wait_long("our results again", async || {
+        s.chain.advance_time(0);
+        s.chain.results_submits() == 2 && !s.chain.results().is_empty()
+    })
+    .await;
+    assert_eq!(s.chain.results(), results);
+    wait_long("finalized again", async || {
+        s.chain.advance_time(0);
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results_submits(), 2);
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_reorged_out_after_finalize_are_resubmitted() {
+    results_reorged_out_after_finalize(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_reorged_out_after_finalize_are_resubmitted_after_a_restart() {
+    results_reorged_out_after_finalize(true).await;
+}
