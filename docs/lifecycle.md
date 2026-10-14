@@ -206,8 +206,11 @@ by round, and `graceMaxTotal` caps the extension.
 
 - The node is in flush mode from `--flush-horizon` before the end until the grace end, while the
   process is ready, ended, or paused past its end. A process paused before its end seals nothing.
-- At the grace end the node errors whatever is still queued (`process closed`). A cancel closes
-  out at once.
+- At the grace end the node errors whatever is still queued (`process closed`), once its tree is
+  at the on-chain root, nothing is in flight, and a fresh read (the head first, then the process)
+  confirms the window closed. A landing the events have not shown yet moves the grace end in that
+  read, and a vote another sequencer settled settles from the sync instead of erroring. A cancel
+  or the results close out the same way, without waiting for the grace end.
 - A settlement that reverts `InvalidStatus` or `InvalidTimeBounds` while the window is open puts
   its votes back to pending.
 - The node reads the grace parameters from the registry at boot, and re-reads the process after
@@ -241,6 +244,11 @@ For a sequencer-key process, only the node holding the election key finalizes. I
 With `--eager-results` (the default) steps 1 to 3 run during the grace window, once nothing is
 queued or in flight. The node submits the proof on the first heartbeat after the grace end if the
 root has not moved, and proves again otherwise.
+
+A results receipt may be shallow enough to reorg out, so the node marks the process finalized only
+at its `ProcessResultsSet` event (or a read showing it), in every key mode. If 90 s pass without
+it, the node reads the process: results there finalize it; otherwise it logs a warning and submits
+again, reusing the held proof when it has one.
 
 An attempt that fails for good (a failed proving job, a proof that fails the checks, a revert the
 node does not expect) is retried, never abandoned: after 2 s, then 4 s, and from the third failure
@@ -357,14 +365,23 @@ A landing is two writes: the state tree with its committed record, then the vote
 transition record and the process record together. The tree's record is authoritative, so a
 crash between the two reopens at it: the batch's votes settle from the tree, the pinned root
 follows the chain once a read shows the tree's root there, and the missing transition record is
-rewritten from its event and blobs.
+rewritten from its event and blobs (which moves the pinned root too). The node seals nothing
+until the record is back, so the next landing cannot take its index.
 
 Events the monitor routed into an actor's queue die with the process, and the event cursor has
 already moved past them. At boot, and whenever a landing makes the actor re-read the process,
 the node therefore merges `getProcess` into its record: status, duration, grace, max voters,
 census, metadata, the DKG request and results, with the same effects as their events. A read
-whose chain head is behind the newest block the node has seen (the cursor, at boot) is not used.
-A chain root the node has not seen makes it sync before it seals again.
+whose chain head is behind the newest block the node has seen (the cursor, at boot) is not used,
+and the process is read at that head's block, so a backend behind it (a load-balanced URL) fails
+the read instead of answering from an older state. An event from a block the read already covers
+(a backlog routed after it) changes nothing, so an older end cannot replace a newer one. A chain
+root the node has not seen makes it sync before it seals again.
+
+A canceled or finalized process keeps following the chain: a read after the cancel or the
+results makes the process's final root the target, and the node replays the transitions it
+missed until its tree is there, without sealing. A finalized process does not report itself
+synced until a read has confirmed that root.
 
 In L1-blob mode the node records each Ethereum blob transaction, with the sending account, before
 sending it and drops the record once it is mined. After a restart the batch is proved again (its
