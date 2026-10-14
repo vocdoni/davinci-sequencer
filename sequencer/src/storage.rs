@@ -520,6 +520,28 @@ impl Db {
             .collect()
     }
 
+    /// Ids of a process's votes in one of `statuses`, without loading the
+    /// rest: only the id and status of each record are decoded.
+    pub fn vote_ids_with_status(&self, pid: &Fr, statuses: &[VoteStatus]) -> Result<Vec<u64>> {
+        #[derive(Deserialize)]
+        struct Head {
+            vote_id: u64,
+            status: VoteStatus,
+        }
+        let (lo, hi) = prefix_range(&pid_key(pid), 40);
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let t = tx.open_table(VOTES).map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in t.range(lo.as_slice()..=hi.as_slice()).map_err(db_err)? {
+            let (_, v) = row.map_err(db_err)?;
+            let h: Head = decode("votes", v.value())?;
+            if statuses.contains(&h.status) {
+                out.push(h.vote_id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Stores the actor's committed-state record for a process.
     pub fn put_committed(&self, pid: &Fr, v: &[u8]) -> Result<()> {
         self.put(COMMITTED, &pid_key(pid), v)

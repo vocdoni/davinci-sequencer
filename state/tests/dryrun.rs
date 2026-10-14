@@ -349,7 +349,7 @@ fn csp_batch_accepted() {
 fn assert_blob_count_bound(b: &davinci_state::PreparedBatch) {
     let n = b.request.kzg.as_ref().unwrap().commitments.len();
     for want in [n - 1, n + 1].into_iter().filter(|w| *w > 0) {
-        let mut bad = b.request.clone();
+        let mut bad = (*b.request).clone();
         let c = &mut bad.kzg.as_mut().unwrap().commitments;
         let last = c[n - 1].clone();
         c.resize(want, last);
@@ -492,7 +492,7 @@ fn guest_rejects_tampered_requests() {
         .unwrap();
 
     // Byte-order confusion: old_state_root shipped BE instead of arbo-LE.
-    let mut bad = b.request.clone();
+    let mut bad = (*b.request).clone();
     {
         let s = bad.state.as_mut().unwrap();
         let mut r = hex::decode(s.old_state_root.trim_start_matches("0x")).unwrap();
@@ -503,7 +503,7 @@ fn guest_rejects_tampered_requests() {
     assert!(!got.ok || got.fail_mask != 0, "BE root accepted");
 
     // Swapped ballot chain entries: the SMT chain no longer links.
-    let mut bad = b.request.clone();
+    let mut bad = (*b.request).clone();
     bad.state.as_mut().unwrap().ballot_smt.swap(0, 1);
     let got = run_guest(&bad);
     assert!(!got.ok || got.fail_mask != 0, "swapped slots accepted");

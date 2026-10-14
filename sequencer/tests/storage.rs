@@ -266,6 +266,22 @@ fn status_transition() {
         db.vote(&pid(1), base).unwrap().unwrap().status,
         VoteStatus::Aggregated
     );
+    // The restart scan finds the in-flight votes of this process only.
+    db.put_vote(&vote(2, base + 9)).unwrap();
+    db.set_status(&pid(2), &[base + 9], VoteStatus::Processed, None)
+        .unwrap();
+    db.set_status(&pid(1), &[base + 1], VoteStatus::Processed, None)
+        .unwrap();
+    let in_flight = [VoteStatus::Aggregated, VoteStatus::Processed];
+    assert_eq!(
+        db.vote_ids_with_status(&pid(1), &in_flight).unwrap(),
+        [base, base + 1]
+    );
+    assert_eq!(
+        db.vote_ids_with_status(&pid(1), &[VoteStatus::Pending])
+            .unwrap(),
+        [base + 2]
+    );
     // Wire strings are davinci-node's.
     assert_eq!(
         serde_json::to_string(&VoteStatus::Aggregated).unwrap(),

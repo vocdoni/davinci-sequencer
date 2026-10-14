@@ -1068,13 +1068,9 @@ impl Actor {
             self.exposed = r.slots.iter().copied().collect();
             self.exposed_vids = r.vote_ids.iter().copied().collect();
         }
-        let stale: Vec<u64> = db
-            .votes(&self.pid)
-            .map_err(ierr)?
-            .iter()
-            .filter(|v| matches!(v.status, VoteStatus::Aggregated | VoteStatus::Processed))
-            .map(|v| v.vote_id)
-            .collect();
+        let stale = db
+            .vote_ids_with_status(&self.pid, &[VoteStatus::Aggregated, VoteStatus::Processed])
+            .map_err(ierr)?;
         if !stale.is_empty() {
             db.requeue(&self.pid, &stale).map_err(ierr)?;
         }
@@ -2029,7 +2025,7 @@ impl Actor {
         let job = JobInput {
             generation: self.generation,
             pid31: self.pid31,
-            request: prepared.request.clone(),
+            request: Arc::clone(&prepared.request),
             expected: prepared.expected,
             blobs: prepared.blobs.clone(),
             prover: self.deps.prover.clone(),
@@ -3272,7 +3268,7 @@ impl Actor {
 struct JobInput {
     generation: u64,
     pid31: [u8; 31],
-    request: ProveRequest,
+    request: Arc<ProveRequest>,
     expected: BatchPublics,
     blobs: TransitionBlobs,
     prover: Arc<dyn Prover>,
