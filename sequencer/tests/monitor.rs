@@ -1083,3 +1083,50 @@ async fn record_read_failure_at_the_cap_does_not_ignore() {
     let _h = handle(&node).await;
     sd.cancel();
 }
+
+/// A storage outage at boot fails both the respawn and the retry list's
+/// persist: the list is handed to the monitor in memory, so once storage
+/// recovers the actor starts without a restart.
+#[tokio::test]
+async fn boot_retry_survives_a_failed_persist() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    // A record without its tree, its creation behind the cursor.
+    let rec = davinci_sequencer::storage::ProcessRecord {
+        pid: pid_fr(),
+        onchain: s.chain.process(&pid31()).await.unwrap(),
+        local: LocalStatus::Active,
+        note: None,
+    };
+    db.put_process(&rec).unwrap();
+    db.set_meta_u64("monitor_last_block", s.chain.head_block())
+        .unwrap();
+    // The outage: tree writes and record/meta writes fail.
+    db.fail_next_arbo_writes(u32::MAX);
+    db.fail_next_writes(u32::MAX);
+    let sd = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        sd.clone(),
+    )
+    .await;
+    assert_eq!(boot_attempts(&db, &pid31()), None, "the persist failed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(node.processes.read().await.is_empty());
+    // Storage recovers; no restart.
+    db.fail_next_arbo_writes(0);
+    db.fail_next_writes(0);
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 5);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    sd.cancel();
+}

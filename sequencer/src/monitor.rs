@@ -165,8 +165,10 @@ pub async fn spawn_node(
     }
     drop(map);
     // The monitor retries them (bootstrap starts a stored record's actor).
+    // The list goes to the monitor in memory: a failed persist (the same
+    // outage) must not lose a pid whose creation is behind the cursor.
+    let mut retries = load_retries(&ctx.deps.db);
     if !failed.is_empty() {
-        let mut retries = load_retries(&ctx.deps.db);
         for pid in failed {
             if !retries.iter().any(|r| r.pid == pid) {
                 retries.push(BootRetry {
@@ -187,7 +189,7 @@ pub async fn spawn_node(
         ctx.cfg.heartbeat(),
         shutdown.clone(),
     ));
-    tracker.spawn(monitor_loop(ctx, shutdown));
+    tracker.spawn(monitor_loop(ctx, shutdown, retries));
     Ok(node)
 }
 
@@ -546,7 +548,7 @@ fn save_retries(db: &Db, retries: &[BootRetry]) {
     }
 }
 
-async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
+async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<BootRetry>) {
     // The last scanned block; the start block only seeds a fresh database.
     let mut last = match ctx.deps.db.meta_u64(LAST_BLOCK_KEY).ok().flatten() {
         Some(b) => b,
@@ -569,7 +571,6 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
         }
     };
     let mut hash_errors = 0u32;
-    let mut retries = load_retries(&ctx.deps.db);
     let mut poll = tokio::time::interval(ctx.cfg.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     poll.reset(); // skip the immediate first tick
