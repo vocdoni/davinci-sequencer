@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::actor::{ActorError, ActorHandle, Deps, merge_onchain, pid31_of, spawn_actor};
+use crate::actor::{ActorError, ActorHandle, Deps, spawn_actor};
 use crate::census::onchain::OnchainIndex;
 use crate::census::{CensusError, CensusOptions, CensusStore};
 use crate::config::Config;
@@ -131,26 +131,16 @@ pub async fn spawn_node(
     // Respawn what a previous run served. A head read seeds each actor's
     // chain time so it does not accept votes into an already-ended window;
     // 0 means "unknown" and the actor refuses votes until the first Head.
-    let (head_block, chain_time) = ctx.deps.contracts.head().await.unwrap_or((0, 0));
-    // A read from an endpoint behind the routed events could rewind them.
-    let cursor = ctx.deps.db.meta_u64(LAST_BLOCK_KEY)?.unwrap_or(0);
-    let fresh = head_block >= cursor;
-    if !fresh {
-        warn!(
-            head_block,
-            cursor, "chain endpoint behind the event cursor; the actors refresh their records"
-        );
-    }
+    // Events lost in mailboxes at a crash are not routed again: each
+    // actor's first tick re-reads its process and applies what moved.
+    let (_, chain_time) = ctx.deps.contracts.head().await.unwrap_or((0, 0));
     let mut map = node.processes.write().await;
-    for mut rec in ctx.deps.db.processes()? {
+    for rec in ctx.deps.db.processes()? {
         // Finalized processes respawn too: their actor is read-only
         // (never accepts, seals or finalizes) but keeps serving tracker
         // proofs and stored ballots. Only Ignored records stay down.
         if rec.local == LocalStatus::Ignored {
             continue;
-        }
-        if fresh {
-            refresh_record(&ctx, &mut rec).await;
         }
         resume_census(&ctx, &rec).await;
         match respawn(&ctx, &rec, chain_time, &shutdown) {
@@ -186,28 +176,6 @@ struct Ctx {
     queue: CensusQueue,
     /// Set when an update loaded: the next tick drops unused censuses.
     prune: Arc<AtomicBool>,
-}
-
-/// Brings an active record up to the chain before its actor starts: events
-/// routed into a mailbox are lost at a crash and never routed again (the
-/// cursor moved past them). A failed read keeps the stored record; the
-/// actor's first tick reads again.
-async fn refresh_record(ctx: &Ctx, rec: &mut ProcessRecord) {
-    if rec.local != LocalStatus::Active {
-        return;
-    }
-    match ctx.deps.contracts.process(&pid31_of(&rec.pid)).await {
-        Ok(p) => {
-            let before = rec.onchain.clone();
-            merge_onchain(&mut rec.onchain, &p);
-            if rec.onchain != before
-                && let Err(e) = ctx.deps.db.put_process(rec)
-            {
-                error!(pid = %pid_hex(&rec.pid), %e, "persist the refreshed process");
-            }
-        }
-        Err(e) => warn!(pid = %pid_hex(&rec.pid), %e, "process read at boot; the actor retries"),
-    }
 }
 
 /// A respawned dynamic census: re-register an origin-3 contract, queue an

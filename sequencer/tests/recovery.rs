@@ -469,3 +469,67 @@ async fn apply_sync_crash_window_reopens() {
     drop((h, node, db));
     restart_after_the_window(&s, dir.path(), false, &[], 2).await;
 }
+
+/// Results set on-chain while the node was down, their events lost (the
+/// cursor already past them): the actor's first read finalizes the process
+/// locally, whether or not the first chain read after the restart fails.
+#[tokio::test]
+async fn results_lost_at_a_crash_finalize_locally() {
+    for boot_read_fails in [false, true] {
+        let s = setup(2, 8, None);
+        let dir = TempDir::new().unwrap();
+        let shutdown = CancellationToken::new();
+        let node = start_node(
+            Db::open_in(dir.path()).unwrap(),
+            dir.path(),
+            &s,
+            s.chain.clone(),
+            FakeProver::open(),
+            1,
+            "0s",
+            shutdown.clone(),
+        )
+        .await;
+        let h = handle(&node).await;
+        let v = fake_vote(&s.env, 0, &[1, 2], 1_000);
+        let vid = v.pkg.vote_id;
+        h.submit(v).await.unwrap();
+        wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+        shutdown.cancel();
+        drop((h, node));
+
+        s.chain.set_status(ProcessStatus::Ended);
+        s.chain.pass_grace();
+        s.chain.set_results_externally(vec![1, 2]);
+        let db = reopen_db(dir.path()).await;
+        db.set_meta_u64("monitor_last_block", s.chain.head_block())
+            .unwrap();
+        if boot_read_fails {
+            s.chain.fail_process(1);
+        }
+        let shutdown = CancellationToken::new();
+        let node = start_node(
+            db,
+            dir.path(),
+            &s,
+            s.chain.clone(),
+            FakeProver::open(),
+            1,
+            "0s",
+            shutdown.clone(),
+        )
+        .await;
+        let h = handle(&node).await;
+        wait_until("finalized locally", async || {
+            h.snapshot().await.unwrap().local == LocalStatus::Finalized
+        })
+        .await;
+        let rec = node.db.process(&pid_fr()).unwrap().unwrap();
+        let ctx = format!("boot_read_fails={boot_read_fails}");
+        assert_eq!(rec.onchain.status, ProcessStatus::Results, "{ctx}");
+        assert_eq!(rec.local, LocalStatus::Finalized, "{ctx}");
+        assert_eq!(rec.onchain.results, vec![1, 2], "{ctx}");
+        assert!(all_settled(&h, &[vid]).await, "{ctx}");
+        shutdown.cancel();
+    }
+}
