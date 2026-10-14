@@ -38,6 +38,7 @@ a skip line and pass, so check the output before assuming they ran.
 | `CIRCOM_ARTIFACTS=<dir> cargo test -p davinci-client --test prover` | circom artifacts | The ballot prover. |
 | `cargo test -p arbo --features sdk-poseidon` | nothing extra | arbo's circom Poseidon vectors. |
 | `ARBO_BENCH_1M=1 cargo bench -p arbo` | nothing extra | arbo benchmarks with the 1M-leaf rows. |
+| `MEMSOAK=1 cargo test -p davinci-sequencer --test memory memsoak -- --nocapture` | nothing extra (about 3 min, 1-2 GB of disk under `target/tmp` or `MEMSOAK_DIR`) | The L1-blob pipeline on fakes and jemalloc, 40 batches of 512 votes at 16 fields (`MEMSOAK_BATCHES`, `MEMSOAK_NF`): RSS within 600 MB of the live heap, the live heap within 300 MB of the redb cache, and the file within 48 MB a batch. |
 
 `--test l1da` (poster and settle loop) and `--test actor_l1` (the actor in L1-blob mode) run on scripted fakes with no gate.
 

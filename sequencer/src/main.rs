@@ -8,6 +8,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+// glibc malloc keeps every thread arena's peak after the per-batch
+// temporaries are freed; jemalloc purges dirty pages from background
+// threads (decay set in `.cargo/config.toml`).
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> anyhow::Result<()> {
     let cfg = davinci_sequencer::config::Config::load()?;
     // RUST_LOG wins; --log-level / DAVINCI_LOG_LEVEL is the fallback.

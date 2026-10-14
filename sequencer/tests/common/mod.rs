@@ -2067,7 +2067,7 @@ pub async fn start_l1_node_cfg(
     db: Db,
     chain: FakeChain,
     l1: FakeL1,
-    prover: Arc<FakeProver>,
+    prover: Arc<dyn Prover>,
     cfg: Config,
     shutdown: CancellationToken,
 ) -> Node {

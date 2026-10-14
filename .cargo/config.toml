@@ -1,0 +1,4 @@
+[env]
+# Baked into the node's jemalloc (`sequencer/src/main.rs`): return freed pages
+# within about a second. `_RJEM_MALLOC_CONF` overrides it at run time.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "dirty_decay_ms:1000,muzzy_decay_ms:0"

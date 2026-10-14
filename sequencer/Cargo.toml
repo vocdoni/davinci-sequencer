@@ -36,6 +36,9 @@ sha2.workspace = true
 num-bigint.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 tower = { workspace = true }
+# The node binary's allocator (`main.rs`): glibc keeps each thread arena's
+# high-water mark, jemalloc returns freed pages from background threads.
+tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 alloy = { workspace = true, features = [
     "std",
     "trie",
@@ -73,3 +76,5 @@ tracing-subscriber.workspace = true
 alloy = { workspace = true, features = ["node-bindings"] }
 # The `--db-cache-mb` test reads the page cache size.
 redb = { workspace = true, features = ["cache_metrics"] }
+# The memory soak reads the allocator's live bytes.
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
