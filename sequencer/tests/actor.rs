@@ -6230,3 +6230,160 @@ async fn results_receipt_without_event_is_resubmitted() {
     assert_eq!(prover.results_calls(), 1, "the held proof was not reused");
     shutdown.cancel();
 }
+
+/// A landing whose record write failed in-run (the tree committed it), then
+/// a new vote: the log catches up before the next seal, so both transitions
+/// are recorded and the first vote settles in the db.
+#[tokio::test]
+async fn failed_settle_then_new_landing_keeps_the_first_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 1_000);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    wait_until("batch sealed", async || prover.calls() >= 1).await;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_until("landed and committed in the tree", async || {
+        s.chain.voters() == 1 && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    // The echo arrives and the repair attempts fail; the backoff grows.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    db.fail_next_writes(0);
+    let v1 = fake_vote(&s.env, 1, &[2, 1], 1_001);
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v1).await.unwrap();
+    wait_until("second batch sealed", async || prover.calls() >= 2).await;
+    prover.release(1);
+    wait_until("both settled", async || {
+        all_settled(&h, &[vid0, vid1]).await
+    })
+    .await;
+    let ts = node.db.transitions(&pid_fr()).unwrap();
+    assert_eq!(ts.len(), 2, "the first transition was never recorded");
+    assert_eq!(ts.iter().map(|t| t.index).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(ts[0].old_root, genesis_root(&s.env.cfg).unwrap());
+    assert_eq!(ts[0].new_root, ts[1].old_root);
+    assert_eq!(ts[1].new_root, s.chain.root());
+    assert!(h.snapshot().await.unwrap().synced);
+    shutdown.cancel();
+}
+
+/// The refresh read is pinned to the head it read first: a backend whose
+/// `getProcess` lags the head (a load-balanced URL) cannot rewind what the
+/// events moved; the read fails there and is retried.
+#[tokio::test]
+async fn process_read_behind_the_head_does_not_rewind_the_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    beats().await;
+    let end = s.chain.end_time();
+    s.chain.split_view(true);
+    s.chain.extend_duration(5_000);
+    // A landing makes the actor re-read the chain.
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    wait_until("synced", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    beats().await;
+    let stored = |db: &Db| db.process(&pid_fr()).unwrap().unwrap().onchain.end_time();
+    assert_eq!(stored(&node.db), end + 5_000, "rewound by a lagging read");
+    s.chain.split_view(false);
+    beats().await;
+    assert!(h.snapshot().await.unwrap().synced);
+    assert_eq!(stored(&node.db), end + 5_000);
+    shutdown.cancel();
+}
+
+/// A landing whose record write was lost at a crash, restarted while every
+/// `getProcess` fails: the log repair moves the pin with the record (as a
+/// sync does), so sealing resumes without waiting for a chain read.
+#[tokio::test]
+async fn log_repair_moves_the_pin_without_a_chain_read() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 1_700);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    wait_until("batch sealed", async || prover.calls() >= 1).await;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_until("committed in the tree", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+
+    // The echo was routed before the crash: only the gap replay finds it.
+    let db = reopen_db(dir.path()).await;
+    db.set_meta_u64("monitor_last_block", s.chain.head_block())
+        .unwrap();
+    s.chain.fail_process(u32::MAX);
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v1 = fake_vote(&s.env, 1, &[2, 1], 1_701);
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v1).await.unwrap();
+    wait_until("both settled", async || {
+        all_settled(&h, &[vid0, vid1]).await
+    })
+    .await;
+    assert_eq!(node.db.transitions(&pid_fr()).unwrap().len(), 2);
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}

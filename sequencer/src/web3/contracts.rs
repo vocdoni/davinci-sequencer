@@ -378,6 +378,17 @@ fn mode_from_abi(m: &T::BallotMode) -> Result<BallotMode> {
     })
 }
 
+// A `getProcess` answer: an unknown process reads as all zeros.
+fn process_checked(p: &T::Process, pid: &[u8; 31]) -> Result<OnchainProcess> {
+    if p.organizationId == Address::ZERO {
+        return Err(Web3Error::Data(format!(
+            "unknown process 0x{}",
+            hex::encode(pid)
+        )));
+    }
+    process_from_abi(p)
+}
+
 fn process_from_abi(p: &T::Process) -> Result<OnchainProcess> {
     let enc_key = Point::from_be(
         &p.encryptionKey.x.to_be_bytes(),
@@ -735,14 +746,27 @@ impl Contracts {
         let call = PR::getProcessCall {
             processId: FixedBytes(*pid),
         };
-        let p = self.view(self.registry, call).await?;
-        if p.organizationId == Address::ZERO {
-            return Err(Web3Error::Data(format!(
-                "unknown process 0x{}",
-                hex::encode(pid)
-            )));
-        }
-        process_from_abi(&p)
+        process_checked(&self.view(self.registry, call).await?, pid)
+    }
+
+    /// `getProcess` at `block` (a head read just before): a backend below
+    /// that block fails the call instead of answering from an older state.
+    pub async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess> {
+        let call = PR::getProcessCall {
+            processId: FixedBytes(*pid),
+        };
+        let tx = TransactionRequest::default()
+            .with_to(self.registry)
+            .with_input(call.abi_encode());
+        let out = self
+            .provider
+            .call(tx)
+            .block(alloy::eips::BlockId::number(block))
+            .await
+            .map_err(|e| Web3Error::Rpc(format!("{}: {e}", PR::getProcessCall::SIGNATURE)))?;
+        let p = PR::getProcessCall::abi_decode_returns(&out)
+            .map_err(|e| Web3Error::Data(format!("{}: {e}", PR::getProcessCall::SIGNATURE)))?;
+        process_checked(&p, pid)
     }
 
     /// `getProcessGraceEnd`, saturating.

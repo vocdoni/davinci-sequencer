@@ -70,6 +70,11 @@ pub trait Chain: Send + Sync {
         0
     }
     async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess, Web3Error>;
+    /// `getProcess` at `block`. Test doubles without block history answer
+    /// at their latest state.
+    async fn process_at(&self, pid: &[u8; 31], _block: u64) -> Result<OnchainProcess, Web3Error> {
+        self.process(pid).await
+    }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error>;
     /// `(block, timestamp)` of the head.
     async fn head(&self) -> Result<(u64, u64), Web3Error>;
@@ -234,6 +239,9 @@ impl Chain for crate::web3::Contracts {
     }
     async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess, Web3Error> {
         crate::web3::Contracts::process(self, pid).await
+    }
+    async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error> {
+        crate::web3::Contracts::process_at(self, pid, block).await
     }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
         crate::web3::Contracts::events(self, from, to).await
@@ -1632,9 +1640,10 @@ impl Actor {
         self.maybe_finalize();
     }
 
-    /// The head time and `getProcess`, from an endpoint whose head has every
-    /// block this actor acted on: a lagging one could rewind what the events
-    /// moved.
+    /// The head time and `getProcess` at that head, which has every block
+    /// this actor acted on: a lagging endpoint could rewind what the events
+    /// moved, and pinning the read to the head keeps a backend behind it (a
+    /// load-balanced URL) from answering.
     async fn fresh_read(&self) -> Result<(u64, OnchainProcess), String> {
         let (block, time) = self
             .deps
@@ -1651,7 +1660,7 @@ impl Actor {
         let p = self
             .deps
             .contracts
-            .process(&self.pid31)
+            .process_at(&self.pid31, block)
             .await
             .map_err(|e| e.to_string())?;
         Ok((time, p))
@@ -1932,6 +1941,9 @@ impl Actor {
             // Never seal off a stale root: wait until the committed tree
             // matches the pinned on-chain root (resync closes the gap).
             || self.state.committed().root != self.record.onchain.state_root
+            // Nor before the log has the tree's last transition: the next
+            // landing would take its index and it would never be recorded.
+            || self.log_root != self.state.committed().root
         {
             return;
         }
@@ -3180,6 +3192,10 @@ impl Actor {
             by_self: self.deps.contracts.signer() == Some(sender),
         };
         warn!(pid = %hex::encode(self.pid31), index = rec.index, "writing a transition record lost at a crash");
+        // As apply_sync: we were at its old root, so it is the target now.
+        if self.record.onchain.state_root == old_root {
+            self.record.onchain.state_root = new_root;
+        }
         self.write_transition(&vids, &rec, &blobs);
     }
 

@@ -280,6 +280,10 @@ pub struct Inner {
     /// While set, `head()` and `process()` answer from this snapshot of
     /// `(proc, block, time)`: an endpoint stuck behind the events.
     frozen: Option<(OnchainProcess, u64, u64)>,
+    /// While set, `process()` answers from this `(proc, block)` snapshot
+    /// while `head()` moves on: a backend behind the head. `process_at` a
+    /// later block fails there.
+    split: Option<(OnchainProcess, u64)>,
     /// Next N blob fetches fail.
     fail_blobs: u32,
     /// Next N `submit_transition` calls fail without landing.
@@ -413,6 +417,7 @@ impl FakeChain {
             fail_process: 0,
             lag_process: 0,
             frozen: None,
+            split: None,
             fail_blobs: 0,
             fail_submits: 0,
             timeout_submits: 0,
@@ -732,6 +737,13 @@ impl FakeChain {
     pub fn freeze_view(&self, on: bool) {
         let mut i = self.inner.lock().unwrap();
         i.frozen = on.then(|| (i.proc.clone(), i.block, i.time));
+    }
+
+    /// From now on `process()` answers as of this block while `head()`
+    /// moves on (the inverse of `freeze_view`), until called with false.
+    pub fn split_view(&self, on: bool) {
+        let mut i = self.inner.lock().unwrap();
+        i.split = on.then(|| (i.proc.clone(), i.block));
     }
 
     pub fn fail_blobs(&self, n: u32) {
@@ -1275,6 +1287,9 @@ impl Chain for FakeChain {
         if let Some((p, _, _)) = &i.frozen {
             return Ok(p.clone());
         }
+        if let Some((p, _)) = &i.split {
+            return Ok(p.clone());
+        }
         if i.lag_process > 0 {
             i.lag_process -= 1;
             let mut p = i.proc.clone();
@@ -1296,6 +1311,19 @@ impl Chain for FakeChain {
             dkg_set_results(&mut i, other, results);
         }
         Ok(i.proc.clone())
+    }
+
+    async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error> {
+        if *pid == pid31()
+            && let Some((p, at)) = &self.inner.lock().unwrap().split
+        {
+            return if block <= *at {
+                Ok(p.clone())
+            } else {
+                Err(Web3Error::Rpc(format!("header not found: {block}")))
+            };
+        }
+        self.process(pid).await
     }
 
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
