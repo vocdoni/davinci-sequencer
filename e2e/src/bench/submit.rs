@@ -1,9 +1,9 @@
 //! Sends ballots to the nodes on schedule, per route, with retries, and
 //! writes one ledger line per send.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -81,6 +81,47 @@ pub struct Submitter {
     ledger: Arc<Ledger>,
     slots: [Arc<Semaphore>; 2],
     paused: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    /// Vote ids with a send past its permit: each has, or gets, a line.
+    started: Arc<Mutex<BTreeSet<u64>>>,
+    /// Sends past their permit whose task has not ended.
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Armed once a send holds its permit: a task dropped before it wrote its
+/// line (a stop's abort, a signal) writes `uncertain` instead, since the
+/// request may have reached the node.
+struct Unsent {
+    ledger: Arc<Ledger>,
+    line: Option<Line>,
+    start: Instant,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Unsent {
+    fn arm(ledger: Arc<Ledger>, line: Line, in_flight: Arc<AtomicUsize>) -> Unsent {
+        in_flight.fetch_add(1, Ordering::SeqCst);
+        Unsent {
+            ledger,
+            line: Some(line),
+            start: Instant::now(),
+            in_flight,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.line = None;
+    }
+}
+
+impl Drop for Unsent {
+    fn drop(&mut self) {
+        if let Some(mut l) = self.line.take() {
+            l.ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let _ = self.ledger.append(l);
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn idx(n: NodeId) -> usize {
@@ -91,7 +132,12 @@ fn idx(n: NodeId) -> usize {
 }
 
 /// How one send ended: its outcome, the final answer's code and the tries.
-async fn send(c: &SequencerClient, rec: &BallotRecord) -> (Outcome, Option<u32>, u32) {
+/// A stop ends the retries as `GIVE_UP` does.
+async fn send(
+    c: &SequencerClient,
+    rec: &BallotRecord,
+    stop: &AtomicBool,
+) -> (Outcome, Option<u32>, u32) {
     let start = Instant::now();
     let mut backoff = BACKOFF_MIN;
     let (mut tries, mut resent) = (0u32, false);
@@ -107,7 +153,7 @@ async fn send(c: &SequencerClient, rec: &BallotRecord) -> (Outcome, Option<u32>,
             Attempt::Retry => {}
             Attempt::Resend => resent = true,
         }
-        if start.elapsed() >= GIVE_UP {
+        if start.elapsed() >= GIVE_UP || stop.load(Ordering::SeqCst) {
             // Only busy answers (429, 40902) and resends get here: a
             // resent vote may be in, a busy one is not.
             let o = if resent {
@@ -132,7 +178,30 @@ impl Submitter {
                 Arc::new(Semaphore::new(IN_FLIGHT)),
             ],
             paused: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            started: Default::default(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Starts no more sends: `run` returns once the sends already past
+    /// their permit end, and those still retrying give up.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Vote ids whose send started; every one has a ledger line once
+    /// [`Submitter::in_flight`] is zero.
+    pub fn started(&self) -> BTreeSet<u64> {
+        self.started.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     /// Holds back sends not yet started (the fee gate).
@@ -148,13 +217,15 @@ impl Submitter {
         route: Route,
         t0: Instant,
     ) -> Result<SubmitStats> {
-        let mut set: JoinSet<Result<Outcome>> = JoinSet::new();
+        // `None`: the send never started (a stop came first).
+        let mut set: JoinSet<Result<Option<Outcome>>> = JoinSet::new();
         let mut stats = SubmitStats::default();
         let mut first_err: Option<anyhow::Error> = None;
-        let mut tally = |r: Result<Result<Outcome>, tokio::task::JoinError>,
+        let mut tally = |r: Result<Result<Option<Outcome>>, tokio::task::JoinError>,
                          stats: &mut SubmitStats| {
             match r.map_err(|e| anyhow!("send task: {e}")).and_then(|r| r) {
-                Ok(o) => {
+                Ok(None) => {}
+                Ok(Some(o)) => {
                     stats.sent += 1;
                     match o {
                         Outcome::Accepted => stats.accepted += 1,
@@ -168,9 +239,20 @@ impl Submitter {
             }
         };
         for (at, rec) in plan {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(t0 + at)).await;
-            while self.paused.load(Ordering::SeqCst) {
+            // Short sleeps, so a stop is seen before a far-off send.
+            let due = t0 + at;
+            while !self.stopped() {
+                let now = Instant::now();
+                if now >= due {
+                    break;
+                }
+                tokio::time::sleep((due - now).min(PAUSE_POLL)).await;
+            }
+            while self.paused.load(Ordering::SeqCst) && !self.stopped() {
                 tokio::time::sleep(PAUSE_POLL).await;
+            }
+            if self.stopped() {
+                break;
             }
             let rec = Arc::new(rec);
             for n in targets(&route, &rec.tag, rec.voter, rec.round) {
@@ -180,20 +262,21 @@ impl Submitter {
                     self.ledger.clone(),
                     rec.clone(),
                 );
+                let (stopped, started, in_flight) = (
+                    self.stopped.clone(),
+                    self.started.clone(),
+                    self.in_flight.clone(),
+                );
                 // The permit is taken inside the task, so a node that is down
                 // never holds back sends to the other.
                 set.spawn(async move {
                     let _permit = slots.acquire_owned().await?;
+                    if stopped.load(Ordering::SeqCst) {
+                        return Ok(None);
+                    }
                     let start = Instant::now();
-                    let t = start.duration_since(t0).as_secs_f64();
-                    let (o, code, tries) = send(&c, &rec).await;
-                    let res = match o {
-                        Outcome::Accepted => "accepted",
-                        Outcome::Refused(_) => "refused",
-                        Outcome::Uncertain => "uncertain",
-                    };
-                    ledger.append(Line {
-                        t,
+                    let line = |res: &str, code, tries| Line {
+                        t: start.duration_since(t0).as_secs_f64(),
                         pid: rec.req.process_id,
                         vid: vote_id_hex(rec.req.vote_id),
                         tag: rec.tag.clone(),
@@ -204,8 +287,21 @@ impl Submitter {
                         code,
                         tries,
                         ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    })?;
-                    Ok(o)
+                    };
+                    if let Ok(mut s) = started.lock() {
+                        s.insert(rec.req.vote_id);
+                    }
+                    let mut guard =
+                        Unsent::arm(ledger.clone(), line("uncertain", None, 0), in_flight);
+                    let (o, code, tries) = send(&c, &rec, &stopped).await;
+                    let res = match o {
+                        Outcome::Accepted => "accepted",
+                        Outcome::Refused(_) => "refused",
+                        Outcome::Uncertain => "uncertain",
+                    };
+                    guard.disarm();
+                    ledger.append(line(res, code, tries))?;
+                    Ok(Some(o))
                 });
             }
             while let Some(r) = set.try_join_next() {
@@ -338,5 +434,88 @@ mod tests {
         assert_eq!((l.res.as_str(), l.tries, l.node), ("accepted", 3, A));
         assert_eq!((l.vid.clone(), l.code), (vote_id_hex(vid), Some(40901)));
         assert_eq!(ledger.entries().unwrap()[&vid].accepted, [A].into());
+    }
+
+    /// A node that reads each request and never answers.
+    async fn silent() -> (String, Arc<AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let n = Arc::new(AtomicUsize::new(0));
+        let seen = n.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                held.push(s);
+            }
+        });
+        (url, n)
+    }
+
+    #[tokio::test]
+    async fn a_stop_records_every_started_send() {
+        let (url, seen) = silent().await;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ledger.jsonl");
+        let ledger = Arc::new(Ledger::create(&p).unwrap());
+        let s = Arc::new(Submitter::new(&url, "http://127.0.0.1:1", ledger.clone()));
+        let rec = |vid: u64, voter: u32| BallotRecord {
+            tag: "R1".into(),
+            voter,
+            round: 1,
+            choices: vec![1, 0],
+            req: fake_req(vid, [voter as u8; 20]),
+        };
+        let (v1, v2) = (1 << 63 | 1, 1 << 63 | 2);
+        let plan = vec![
+            (Duration::ZERO, rec(v1, 1)),
+            (Duration::from_secs(60), rec(v2, 2)),
+        ];
+        let run = {
+            let s = s.clone();
+            tokio::spawn(async move { s.run(plan, Route::Only(A), Instant::now()).await })
+        };
+        for _ in 0..200 {
+            if seen.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the first send reached the node"
+        );
+        // A stop mid-send, then the run dropped (as a drained lane is).
+        s.stop();
+        run.abort();
+        let _ = run.await;
+        for _ in 0..200 {
+            if s.in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(s.in_flight(), 0);
+        ledger.flush().unwrap();
+        let lines: Vec<Line> = std::fs::read_to_string(&p)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            (lines[0].vid.as_str(), lines[0].res.as_str()),
+            (vote_id_hex(v1).as_str(), "uncertain")
+        );
+        assert_eq!(s.started(), [v1].into());
+        // The unscheduled vote leaves the planned set, so it never reads as
+        // missing.
+        let mut planned = BTreeMap::from([("R1".to_string(), [v1, v2].into())]);
+        assert_eq!(
+            crate::bench::run::keep_started(&mut planned, &s.started()),
+            1
+        );
+        assert_eq!(planned["R1"], [v1].into());
     }
 }

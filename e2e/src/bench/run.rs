@@ -74,9 +74,9 @@ const BURST_MAX: Duration = Duration::from_secs(20 * 60);
 /// A shortened end lands a few blocks after it is computed: the registry
 /// wants at least the notice from the transaction's block.
 const SHORTEN_MARGIN: u64 = 15;
-/// After a stop pauses the submitter, sends already in flight get this
-/// long to answer before the lanes are dropped.
-const STOP_DRAIN: Duration = Duration::from_secs(30);
+/// After a stop, sends already past their permit get this long to answer
+/// (they give up their retries at once) before the lanes are dropped.
+const STOP_DRAIN: Duration = Duration::from_secs(120);
 
 fn unix_now() -> f64 {
     std::time::SystemTime::now()
@@ -132,6 +132,22 @@ pub fn select(all: Vec<Scenario>, names: &[String]) -> Result<Vec<Scenario>> {
         .into_iter()
         .filter(|s| names.contains(&s.name))
         .collect())
+}
+
+/// After a stop: keeps in `planned` only the votes whose send started (the
+/// rest never left the harness, so they are not missing); returns how many
+/// it dropped.
+pub fn keep_started(
+    planned: &mut BTreeMap<String, BTreeSet<u64>>,
+    started: &BTreeSet<u64>,
+) -> usize {
+    let mut dropped = 0;
+    for v in planned.values_mut() {
+        let before = v.len();
+        v.retain(|x| started.contains(x));
+        dropped += before - v.len();
+    }
+    dropped
 }
 
 /// A lane's schedule seed: Poisson gaps and overwrite delays repeat run to
@@ -347,14 +363,16 @@ pub fn kind_pid(k: &LogKind) -> Option<&str> {
 
 /// Votes node `r` sealed for `pid`, and whether it synced `pid` at or after
 /// `since` (unix seconds).
+/// Votes node `r` sealed for `pid` at or after `since` (unix seconds), and
+/// whether it synced `pid` since. Per burst: a cumulative count would take
+/// a bisection's re-seals of earlier votes for the newest burst's seal.
 fn sealed_or_synced(ev: &[(Role, f64, LogKind)], r: Role, pid: &str, since: f64) -> (u64, bool) {
     let mut sealed = 0;
     let mut synced = false;
-    for (er, at, k) in ev.iter().filter(|(er, _, _)| *er == r) {
-        let _ = er;
+    for (_, _, k) in ev.iter().filter(|(er, at, _)| *er == r && *at >= since) {
         match k {
             LogKind::Sealed { pid: p, votes, .. } if p == pid => sealed += votes,
-            LogKind::Synced { pid: p, .. } if p == pid && *at >= since => synced = true,
+            LogKind::Synced { pid: p, .. } if p == pid => synced = true,
             _ => {}
         }
     }
@@ -367,6 +385,30 @@ struct LaneDone {
     stats: Option<SubmitStats>,
     /// Unix seconds of the election's end, when this task ended it.
     ended: Option<f64>,
+    /// Why ending it failed, after every retry.
+    end_failed: Option<String>,
+}
+
+/// What the lane tasks reported.
+#[derive(Default)]
+struct Lanes {
+    stats: BTreeMap<String, SubmitStats>,
+    ended: BTreeMap<String, f64>,
+    end_failed: BTreeMap<String, String>,
+}
+
+impl Lanes {
+    fn record(&mut self, d: LaneDone) {
+        if let Some(s) = d.stats {
+            self.stats.insert(d.tag.clone(), s);
+        }
+        if let Some(t) = d.ended {
+            self.ended.insert(d.tag.clone(), t);
+        }
+        if let Some(e) = d.end_failed {
+            self.end_failed.insert(d.tag, e);
+        }
+    }
 }
 
 /// Ends `pid` per `end`; the organizer's transactions go one at a time.
@@ -397,6 +439,63 @@ async fn end_election(
     Ok(())
 }
 
+/// Tries per election end or cancel, and the pause between tries.
+const END_TRIES: u32 = 5;
+const END_RETRY: Duration = Duration::from_secs(10);
+
+/// How the run closes an election: its `End`, or a cancel (budget stop).
+enum Close {
+    End(End),
+    Cancel,
+}
+
+async fn close(
+    org: &Organizer,
+    lock: &tokio::sync::Mutex<()>,
+    pid: &ProcessId,
+    how: &Close,
+) -> Result<()> {
+    match how {
+        Close::End(e) => end_election(org, lock, pid, e).await,
+        Close::Cancel => {
+            let _one = lock.lock().await;
+            Ok(org.cancel_process(&pid.0).await?)
+        }
+    }
+}
+
+/// Closes `pid` until it succeeds, up to `END_TRIES` times; each try
+/// recomputes what it sends (a shortened end whose transaction landed late
+/// reverts `InvalidDuration`). A process no longer READY or PAUSED counts as
+/// closed: already ended or canceled, or an earlier try landed after its
+/// receipt wait gave up. The error is redacted.
+async fn close_with_retries(
+    org: &Organizer,
+    lock: &tokio::sync::Mutex<()>,
+    pid: &ProcessId,
+    how: &Close,
+) -> std::result::Result<(), String> {
+    use davinci_client::api::ProcessStatus as S;
+    let mut last = String::new();
+    for i in 0..END_TRIES {
+        if i > 0 {
+            tokio::time::sleep(END_RETRY).await;
+        }
+        if org
+            .process(&pid.0)
+            .await
+            .is_ok_and(|p| !matches!(p.status, S::Ready | S::Paused))
+        {
+            return Ok(());
+        }
+        match close(org, lock, pid, how).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last = crate::redact_urls(&format!("{e:#}")),
+        }
+    }
+    Err(last)
+}
+
 /// `AfterSettled`: until the registry counts every vote the ledger accepted
 /// for `pid` and neither node has one pending, or nothing is pending and
 /// nothing landed for `SETTLED_STABLE` (an errored vote never settles).
@@ -404,12 +503,16 @@ async fn wait_settled(
     org: &Organizer,
     nodes: &[SequencerClient; 2],
     ledger: &Ledger,
+    sub: &Submitter,
     pid: &ProcessId,
     tag: &str,
 ) -> Result<()> {
     let start = Instant::now();
     let mut last = (u64::MAX, Instant::now());
     loop {
+        if sub.stopped() {
+            return Ok(());
+        }
         let accepted = ledger
             .entries()?
             .values()
@@ -463,7 +566,8 @@ async fn ceiling_lane(
         _ => vec![NodeId::A, NodeId::B],
     };
     let mut st = SubmitStats::default();
-    let mut sent = 0u64;
+    // The previous burst: its size and when it went out.
+    let mut prev = 0u64;
     let mut since = unix_now();
     for (k, (_, recs)) in bursts.into_iter().enumerate() {
         if k > 0 {
@@ -473,10 +577,10 @@ async fn ceiling_lane(
                     let ev = lock(&events);
                     nodes.iter().all(|n| {
                         let (sealed, synced) = sealed_or_synced(&ev, role_of(*n), &pid, since);
-                        sealed >= sent || synced
+                        sealed >= prev || synced
                     })
                 };
-                if ok {
+                if ok || sub.stopped() {
                     break;
                 }
                 if wait.elapsed() >= BURST_MAX {
@@ -485,6 +589,9 @@ async fn ceiling_lane(
                 }
                 tokio::time::sleep(LOG_POLL).await;
             }
+        }
+        if sub.stopped() {
+            break;
         }
         let n = recs.len() as u64;
         since = unix_now();
@@ -498,7 +605,7 @@ async fn ceiling_lane(
         for (c, x) in s.refused {
             *st.refused.entry(c).or_default() += x;
         }
-        sent += n;
+        prev = n;
     }
     Ok(st)
 }
@@ -873,7 +980,10 @@ async fn audit_election(
             q.observer, q.chain, q.pending, q.open
         ));
     }
-    if results.is_none() {
+    if p.status == davinci_client::api::ProcessStatus::Canceled {
+        au.notes
+            .push(format!("{tag}: canceled before results; none expected"));
+    } else if results.is_none() {
         let key = rig.node(role_of(e.spec.key_node))?;
         let ph = pid_hex(&pid);
         let lines: Vec<String> = key
@@ -898,7 +1008,10 @@ async fn audit_election(
         .filter(|(_, k)| kind_pid(k) == Some(ph.as_str()))
         .cloned()
         .collect();
-    let findings = report::findings(scenario, tag, &au, &evs);
+    let mut findings = report::findings(scenario, tag, &au, &evs);
+    if p.status == davinci_client::api::ProcessStatus::Canceled {
+        findings = canceled(findings, scenario, tag);
+    }
     println!(
         "audit {tag}: no_vote_lost={} clean={} tally_ok={} results_ok={} counters_ok={}{}",
         au.no_vote_lost,
@@ -927,6 +1040,20 @@ async fn audit_election(
         rows: tr.rows,
         findings,
     })
+}
+
+/// A canceled election publishes no results: its missing results are no
+/// `results_failed` but one `canceled` row.
+fn canceled(mut f: Vec<Finding>, scenario: &str, tag: &str) -> Vec<Finding> {
+    f.retain(|x| x.kind != report::FindingKind::ResultsFailed);
+    f.push(Finding {
+        scenario: scenario.into(),
+        tag: tag.into(),
+        kind: report::FindingKind::Canceled,
+        count: 1,
+        detail: "canceled before results".into(),
+    });
+    f
 }
 
 /// Folds one election's audit into the scenario's.
@@ -1176,6 +1303,21 @@ fn counter(m: &BTreeMap<String, BTreeMap<String, u64>>, node: &str, k: &str) -> 
     m.get(node)?.get(k).copied()
 }
 
+/// A scenario that never sent: its report says why (spec §13), and a rerun
+/// may use its run directory.
+fn skipped(
+    ctx: &Ctx,
+    dir: &Path,
+    mut report: ScenarioReport,
+    key: &str,
+    why: String,
+) -> Result<ScenarioReport> {
+    report.params.insert(key.into(), why);
+    report::write_run(dir, &report)?;
+    report::write_campaign(&ctx.campaign, &load_reports(&ctx.campaign)?)?;
+    Ok(report)
+}
+
 /// Runs `sc` with no controller held outside; see [`run_scenario_in`].
 pub async fn run_scenario(ctx: &Ctx, rig: &mut Rig, sc: &Scenario) -> Result<ScenarioReport> {
     let mut slot = None;
@@ -1226,13 +1368,11 @@ pub async fn run_scenario_in(
     }
     if lanes.is_empty() {
         println!("{name}: skipped: no planned election");
-        report
-            .params
-            .insert("skipped".into(), "no planned election".into());
-        return Ok(report);
+        return skipped(ctx, &dir, report, "skipped", "no planned election".into());
     }
+    // A skip writes only a report; a ledger means sends went out.
     ensure!(
-        !dir.exists(),
+        !dir.join("ledger.jsonl").exists(),
         "{} exists: {name} already ran and its ballots are spent (rerun it in a new wave)",
         dir.display()
     );
@@ -1247,8 +1387,7 @@ pub async fn run_scenario_in(
         } else {
             "skipped"
         };
-        report.params.insert(key.into(), s.label());
-        return Ok(report);
+        return skipped(ctx, &dir, report, key, s.label());
     }
     // 2. Provers idle.
     provers_idle(rig).await?;
@@ -1349,6 +1488,8 @@ pub async fn run_scenario_in(
     ];
     let pids: BTreeSet<String> = lanes.iter().map(|(_, e)| pid_hex(&e.snap.pid)).collect();
     let mut set: JoinSet<Result<LaneDone>> = JoinSet::new();
+    // The timed ends; a stop aborts them and closes every election itself.
+    let mut timers = Vec::new();
     for ((l, e), s) in lanes.iter().zip(sends) {
         let (sub, tag, route, pid) = (sub.clone(), l.tag.clone(), l.route, e.snap.pid);
         let (events, ledger, api) = (logs.events.clone(), ledger.clone(), api.clone());
@@ -1359,37 +1500,59 @@ pub async fn run_scenario_in(
                 Sends::Plain(plan) => sub.run(plan, route, t0).await?,
                 Sends::Bursts(b) => {
                     let pid = hex::encode(pid.0);
-                    ceiling_lane(sub, events, tag.clone(), pid, route, b, t0).await?
+                    ceiling_lane(sub.clone(), events, tag.clone(), pid, route, b, t0).await?
                 }
             };
-            let mut ended = None;
-            if end == End::AfterSettled {
-                wait_settled(&org, &api, &ledger, &pid, &tag).await?;
-                end_election(&org, &lk, &pid, &end).await?;
-                println!("{tag}: ended after settling");
-                ended = Some(unix_now());
+            let (mut ended, mut end_failed) = (None, None);
+            if end == End::AfterSettled && !sub.stopped() {
+                wait_settled(&org, &api, &ledger, &sub, &pid, &tag).await?;
+            }
+            if end == End::AfterSettled && !sub.stopped() {
+                match close_with_retries(&org, &lk, &pid, &Close::End(end.clone())).await {
+                    Ok(()) => {
+                        println!("{tag}: ended after settling");
+                        ended = Some(unix_now());
+                    }
+                    Err(e) => {
+                        println!("{tag}: end failed: {e}");
+                        end_failed = Some(e);
+                    }
+                }
             }
             Ok(LaneDone {
                 tag,
                 stats: Some(st),
                 ended,
+                end_failed,
             })
         });
         if let End::Shorten { after, .. } | End::Now { after } = l.end {
             let (org, lk, end, tag) = (org.clone(), org_lock.clone(), l.end.clone(), l.tag.clone());
             let at = t0 + l.start + after;
-            set.spawn(async move {
+            timers.push(set.spawn(async move {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
-                end_election(&org, &lk, &pid, &end)
-                    .await
-                    .with_context(|| format!("end {tag}"))?;
-                println!("{tag}: ended ({end:?})");
-                Ok(LaneDone {
-                    tag,
-                    stats: None,
-                    ended: Some(unix_now()),
+                let r = close_with_retries(&org, &lk, &pid, &Close::End(end.clone())).await;
+                Ok(match r {
+                    Ok(()) => {
+                        println!("{tag}: ended ({end:?})");
+                        LaneDone {
+                            tag,
+                            stats: None,
+                            ended: Some(unix_now()),
+                            end_failed: None,
+                        }
+                    }
+                    Err(e) => {
+                        println!("{tag}: end failed: {e}");
+                        LaneDone {
+                            tag,
+                            stats: None,
+                            ended: None,
+                            end_failed: Some(e),
+                        }
+                    }
                 })
-            });
+            }));
         }
     }
     let line = Liner {
@@ -1400,8 +1563,7 @@ pub async fn run_scenario_in(
         t0,
         out: Mutex::new(progress_log),
     };
-    let mut stats: BTreeMap<String, SubmitStats> = BTreeMap::new();
-    let mut ended: BTreeMap<String, f64> = BTreeMap::new();
+    let mut done = Lanes::default();
     let mut stop: Option<Stop> = None;
     let mut fee_since: Option<Instant> = None;
     let mut seen = 0usize;
@@ -1413,14 +1575,7 @@ pub async fn run_scenario_in(
             r = set.join_next() => {
                 let Some(r) = r else { break };
                 match r.map_err(|e| anyhow!("lane task: {e}")).and_then(|r| r) {
-                    Ok(d) => {
-                        if let Some(s) = d.stats {
-                            stats.insert(d.tag.clone(), s);
-                        }
-                        if let Some(t) = d.ended {
-                            ended.insert(d.tag, t);
-                        }
-                    }
+                    Ok(d) => done.record(d),
                     Err(e) => {
                         set.abort_all();
                         return Err(e);
@@ -1431,57 +1586,87 @@ pub async fn run_scenario_in(
                 let (now, fees) = line.print(ctx, &ledger, &logs).await?;
                 if let Some(w) = now.as_ref().and_then(|b| budget_breach(ctx, b)) {
                     stop = Some(Stop::Budget(w));
+                    break;
                 } else if let Some(w) = fee_breach(&ctx.net, fees) {
                     let since = *fee_since.get_or_insert_with(Instant::now);
                     sub.pause(true);
                     if since.elapsed() >= FEE_PAUSE {
                         stop = Some(Stop::Fees(w));
-                    } else {
-                        eprintln!("{name}: fee gate no-go ({w}): sends paused");
+                        break;
                     }
+                    eprintln!("{name}: fee gate no-go ({w}): sends paused");
                 } else if fee_since.take().is_some() {
                     eprintln!("{name}: fee gate go: sends resume");
                     sub.pause(false);
                 }
-                if let Some(s) = &stop {
-                    println!("{name}: stopped {}", s.label());
-                    sub.pause(true);
-                    for (l, e) in &lanes {
-                        if ended.contains_key(&l.tag) {
-                            continue;
-                        }
-                        let pid = &e.snap.pid.0;
-                        let open = org.process(pid).await.is_ok_and(|p| {
-                            matches!(
-                                p.status,
-                                davinci_client::api::ProcessStatus::Ready
-                                    | davinci_client::api::ProcessStatus::Paused
-                            )
-                        });
-                        if !open {
-                            continue;
-                        }
-                        let _one = org_lock.lock().await;
-                        let r = match s {
-                            Stop::Budget(_) => org.cancel_process(pid).await,
-                            Stop::Fees(_) => org.end_process(pid).await,
-                        };
-                        if let Err(e) = r {
-                            println!("{}: {e}", l.tag);
-                        }
-                        ended.insert(l.tag.clone(), unix_now());
-                    }
-                    tokio::time::sleep(STOP_DRAIN).await;
-                    set.abort_all();
-                    while set.join_next().await.is_some() {}
-                    break;
-                }
             }
             _ = chaos_tick.tick(), if chaos.is_some() => {
-                chaos_step(chaos, rig, &ctx.net, &logs.snapshot(), &mut seen, t0_unix, first_end(&ended)).await?;
+                chaos_step(chaos, rig, &ctx.net, &logs.snapshot(), &mut seen, t0_unix, first_end(&done.ended)).await?;
             }
         }
     }
+    if let Some(s) = &stop {
+        // No new send starts; sends past their permit answer, give up, or
+        // are dropped after the drain and write `uncertain`.
+        println!("{name}: stopped {}", s.label());
+        sub.stop();
+        for t in &timers {
+            t.abort();
+        }
+        for (l, e) in &lanes {
+            if done.ended.contains_key(&l.tag) {
+                continue;
+            }
+            let pid = e.snap.pid;
+            let how = match s {
+                Stop::Budget(_) => Close::Cancel,
+                Stop::Fees(_) => Close::End(End::Now {
+                    after: Duration::ZERO,
+                }),
+            };
+            let r = close_with_retries(&org, &org_lock, &pid, &how).await;
+            match r {
+                Ok(()) => {
+                    done.ended.insert(l.tag.clone(), unix_now());
+                    done.end_failed.remove(&l.tag);
+                }
+                Err(e) => {
+                    println!("{}: the stop could not close it: {e}", l.tag);
+                    done.end_failed.insert(l.tag.clone(), e);
+                }
+            }
+        }
+        let drained = tokio::time::timeout(STOP_DRAIN, async {
+            while let Some(r) = set.join_next().await {
+                match r.map_err(|e| anyhow!("lane task: {e}")).and_then(|r| r) {
+                    Ok(d) => done.record(d),
+                    Err(e) => println!("{name}: a lane ended with {e:#}"),
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
+            println!("{name}: lanes still sending after {STOP_DRAIN:?}: dropped");
+        }
+        set.abort_all();
+        while set.join_next().await.is_some() {}
+        // Dropped sends write their `uncertain` line as their task ends.
+        for _ in 0..100 {
+            if sub.in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let unsent = keep_started(&mut planned, &sub.started());
+        println!("{name}: {unsent} planned votes never sent");
+        report.params.insert("unsent".into(), unsent.to_string());
+    }
+    for (tag, e) in &done.end_failed {
+        report.params.insert(format!("end failed {tag}"), e.clone());
+    }
+    let stats = done.stats;
+    let ended = done.ended;
+    let end_failed = done.end_failed;
     ledger.flush()?;
     if let Some(s) = &stop {
         report.params.insert("stopped".into(), s.label());
@@ -1490,7 +1675,14 @@ pub async fn run_scenario_in(
 
     // 8. Results by grace_end + 15 min, on the registry and every node.
     if !budget_stop {
-        let mut todo: Vec<&Election> = lanes.iter().map(|(_, e)| *e).collect();
+        for t in end_failed.keys() {
+            println!("{t}: never ended, no results to wait for");
+        }
+        let mut todo: Vec<&Election> = lanes
+            .iter()
+            .filter(|(l, _)| !end_failed.contains_key(&l.tag))
+            .map(|(_, e)| *e)
+            .collect();
         let started = Instant::now();
         let mut printed = Instant::now();
         while !todo.is_empty() {
@@ -1596,8 +1788,13 @@ pub async fn run_scenario_in(
         report.findings.extend(a.findings);
         rows.extend(a.rows.into_iter().map(|r| (a.tag.clone(), r)));
     }
+    for (t, e) in &end_failed {
+        merged.notes.push(format!("{t}: never ended ({e})"));
+    }
     // The nodes' counters over the scenario: every transition is settled by
-    // exactly one of A and B and synced by O.
+    // exactly one of A and B and synced by O. They live in memory and reset
+    // when a node restarts, so a scenario that kills a node (Task 20) must
+    // add up per-incarnation deltas instead.
     let info1 = info(rig).await;
     let n_tx = rows.len() as u64;
     let delta = |node: &str, k: &str| -> Option<u64> {
@@ -1795,8 +1992,8 @@ pub async fn run_scenario_in(
 }
 
 /// Reruns the audit of a run that crashed, from its `ledger.jsonl`, the
-/// nodes and the chain. Planned votes the run never sent read as missing:
-/// a crash leaves their fate unknown.
+/// nodes and the chain. Planned votes with no ledger line never went out;
+/// a send dropped mid-flight wrote `uncertain`.
 pub async fn audit_run(ctx: &Ctx, rig: &Rig, run_dir: &Path) -> Result<AuditResult> {
     let meta: RunMeta =
         serde_json::from_slice(&std::fs::read(run_dir.join("run.json")).context("run.json")?)
@@ -1833,10 +2030,24 @@ pub async fn audit_run(ctx: &Ctx, rig: &Rig, run_dir: &Path) -> Result<AuditResu
             .find(|e| &e.spec.tag == tag)
             .with_context(|| format!("{tag} is not in plan.json"))?;
         let recs = load_ballots(&ctx.campaign, meta.wave, e)?;
-        let planned = vids
+        // A crash cuts the schedule: votes with no line never left the
+        // harness, and every send that started has a line (`uncertain` when
+        // it was dropped), short of a SIGKILL.
+        let all = vids
             .iter()
             .map(|v| parse_vote_id(v).map_err(|e| anyhow!("{v}: {e}")))
             .collect::<Result<BTreeSet<u64>>>()?;
+        let planned: BTreeSet<u64> = all
+            .iter()
+            .filter(|v| entries.contains_key(v))
+            .copied()
+            .collect();
+        if planned.len() < all.len() {
+            println!(
+                "{tag}: {} planned votes never sent",
+                all.len() - planned.len()
+            );
+        }
         let a = audit_election(
             ctx,
             rig,
@@ -2030,5 +2241,62 @@ mod tests {
         let e = U256::from(10u64).pow(U256::from(18u64));
         assert_eq!(ueth(e, e - U256::from(5_000_000_000_000u64)), 5);
         assert_eq!(ueth(e, e + U256::from(2_000_000_000_000u64)), -2);
+    }
+
+    #[test]
+    fn a_burst_counts_only_seals_since_it_went_out() {
+        let sealed = |at: f64, votes: u64| {
+            (
+                Role::A,
+                at,
+                LogKind::Sealed {
+                    pid: "p".into(),
+                    votes,
+                    reason: String::new(),
+                },
+            )
+        };
+        // Burst 1 (7 votes) sealed at 10 and, after a bisection, again at 20
+        // and 25; burst 2 (7) went out at 30.
+        let mut ev = vec![sealed(10.0, 7), sealed(20.0, 4), sealed(25.0, 3)];
+        assert_eq!(sealed_or_synced(&ev, Role::A, "p", 30.0), (0, false));
+        ev.push(sealed(31.0, 7));
+        ev.push((
+            Role::A,
+            31.0,
+            LogKind::Sealed {
+                pid: "other".into(),
+                votes: 9,
+                reason: String::new(),
+            },
+        ));
+        assert_eq!(sealed_or_synced(&ev, Role::A, "p", 30.0), (7, false));
+        assert_eq!(sealed_or_synced(&ev, Role::B, "p", 30.0), (0, false));
+        ev.push((
+            Role::B,
+            32.0,
+            LogKind::Synced {
+                pid: "p".into(),
+                root: String::new(),
+            },
+        ));
+        assert_eq!(sealed_or_synced(&ev, Role::B, "p", 30.0), (0, true));
+        assert_eq!(sealed_or_synced(&ev, Role::B, "p", 33.0), (0, false));
+    }
+
+    #[test]
+    fn a_canceled_election_has_no_results_failed() {
+        let a = AuditResult {
+            no_vote_lost: true,
+            ..AuditResult::default()
+        };
+        let f = report::findings("w1/R", "R1", &a, &[]);
+        assert!(
+            f.iter()
+                .any(|x| x.kind == report::FindingKind::ResultsFailed)
+        );
+        let f = canceled(f, "w1/R", "R1");
+        let kinds: Vec<_> = f.iter().map(|x| x.kind).collect();
+        assert_eq!(kinds, [report::FindingKind::Canceled]);
     }
 }
