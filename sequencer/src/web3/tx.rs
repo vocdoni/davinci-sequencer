@@ -600,6 +600,7 @@ impl Contracts {
                         if underpriced(&msg) {
                             if attempt == MAX_ATTEMPTS {
                                 // Something of ours holds this nonce at least this price.
+                                // Kept (sent, refused): the next call climbs on to the blob pool's 2x rule.
                                 state.stuck = Some(fees);
                                 return Err(Web3Error::Underpriced(msg));
                             }
