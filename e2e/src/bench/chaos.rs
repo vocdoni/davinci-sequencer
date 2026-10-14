@@ -302,9 +302,27 @@ pub struct ChaosRow {
     pub recovery_s: Option<f64>,
 }
 
+impl ChaosRow {
+    /// One report line.
+    pub fn line(&self) -> String {
+        let s = |v: Option<f64>| v.map_or("n/a".into(), |v| format!("{v:.0} s"));
+        format!(
+            "applied {:.0} s, undone {}, recovery {}, effects: {}",
+            self.applied_s,
+            s(self.undone_s),
+            s(self.recovery_s),
+            if self.effects.is_empty() {
+                "none".into()
+            } else {
+                self.effects.join(", ")
+            }
+        )
+    }
+}
+
 /// Counts of the log kinds an injection provoked, as report lines.
 pub fn effects(kinds: &[Kind]) -> Vec<String> {
-    let mut c = [0usize; 6];
+    let mut c = [0usize; 10];
     for k in kinds {
         let i = match k {
             Kind::RpcFailover { .. } => 0,
@@ -313,6 +331,10 @@ pub fn effects(kinds: &[Kind]) -> Vec<String> {
             Kind::Pause { .. } => 3,
             Kind::Posted { .. } => 4,
             Kind::Bisect { .. } => 5,
+            Kind::PostOnRecord { .. } => 6,
+            Kind::PostReplaced { .. } => 7,
+            Kind::SealPause { .. } => 8,
+            Kind::Transient { .. } => 9,
             _ => continue,
         };
         c[i] += 1;
@@ -324,6 +346,10 @@ pub fn effects(kinds: &[Kind]) -> Vec<String> {
         "pause",
         "post",
         "bisection",
+        "post on record",
+        "replacement",
+        "sealing pause",
+        "transient failure",
     ]
     .iter()
     .zip(c)
@@ -367,7 +393,9 @@ fn due_undos(active: &[Active], now: Instant) -> Vec<usize> {
 pub struct Controller {
     waiting: Vec<Chaos>,
     active: Vec<Active>,
-    recovering: Vec<(ChaosRow, Role)>,
+    /// Undone, waiting for the node's first settlement or sync; their log
+    /// kinds still count (a restarted node's lines come after the undo).
+    recovering: Vec<Active>,
     done: Vec<ChaosRow>,
     /// Anvil only: mining is paused so a post stays pending.
     paused: bool,
@@ -382,6 +410,14 @@ impl Controller {
             done: Vec::new(),
             paused: false,
         }
+    }
+
+    /// Whether an injection waits on a pending Ethereum post: only then is
+    /// [`pending_gap`] worth its four RPC reads a poll.
+    pub fn wants_pending(&self) -> bool {
+        self.waiting
+            .iter()
+            .any(|c| matches!(c.trigger, Trigger::L1Pending(_)))
     }
 
     /// One poll. `events` are the nodes' new log lines as (node, seconds
@@ -405,13 +441,7 @@ impl Controller {
             l1.pause_mining().await?;
             self.paused = true;
         }
-        for a in &mut self.active {
-            for (r, _, k) in events {
-                if *r == a.role {
-                    a.kinds.push(k.clone());
-                }
-            }
-        }
+        self.note(events);
         let mut i = 0;
         while i < self.waiting.len() {
             if !due(&self.waiting[i].trigger, o) {
@@ -444,30 +474,49 @@ impl Controller {
             self.active[i].undo.run(rig).await?;
             self.undone(i, now);
         }
+        self.recover(events, now);
+        Ok(())
+    }
+
+    /// Hands each new log kind to the injections on its node, active or
+    /// recovering.
+    fn note(&mut self, events: &[(Role, f64, Kind)]) {
+        for a in self.active.iter_mut().chain(&mut self.recovering) {
+            for (r, _, k) in events {
+                if *r == a.role {
+                    a.kinds.push(k.clone());
+                }
+            }
+        }
+    }
+
+    /// Closes the rows whose node settled or synced since their undo.
+    fn recover(&mut self, events: &[(Role, f64, Kind)], now: f64) {
         let mut i = 0;
         while i < self.recovering.len() {
-            let (row, r) = &mut self.recovering[i];
-            let undone = row.undone_s.unwrap_or(now);
+            let a = &mut self.recovering[i];
+            let undone = a.row.undone_s.unwrap_or(now);
             let hit = events.iter().find(|(er, at, k)| {
-                er == r && *at >= undone && matches!(k, Kind::Settled { .. } | Kind::Synced { .. })
+                *er == a.role
+                    && *at >= undone
+                    && matches!(k, Kind::Settled { .. } | Kind::Synced { .. })
             });
             if let Some((_, at, _)) = hit {
-                row.recovery_s = Some(at - undone);
-                let (row, _) = self.recovering.remove(i);
-                self.done.push(row);
+                a.row.recovery_s = Some(at - undone);
+                let mut a = self.recovering.remove(i);
+                a.row.effects = effects(&a.kinds);
+                self.done.push(a.row);
             } else {
                 i += 1;
             }
         }
-        Ok(())
     }
 
     /// Moves active injection `i` to recovering, undone at `now` seconds.
     fn undone(&mut self, i: usize, now: f64) {
         let mut a = self.active.remove(i);
         a.row.undone_s = Some(now);
-        a.row.effects = effects(&a.kinds);
-        self.recovering.push((a.row, a.role));
+        self.recovering.push(a);
     }
 
     /// Undoes every active injection and resumes anvil mining, continuing
@@ -516,8 +565,7 @@ impl Controller {
     /// recovery time, one that never fired is absent.
     pub fn rows(&self) -> Vec<ChaosRow> {
         let mut v = self.done.clone();
-        v.extend(self.recovering.iter().map(|(r, _)| r.clone()));
-        v.extend(self.active.iter().map(|a| {
+        v.extend(self.recovering.iter().chain(&self.active).map(|a| {
             let mut r = a.row.clone();
             r.effects = effects(&a.kinds);
             r
@@ -685,6 +733,50 @@ mod tests {
     }
 
     #[test]
+    fn a_kill_counts_what_the_restarted_node_logs() {
+        let mut c = Controller::new(vec![]);
+        c.active
+            .push(active("kill A", Role::A, None, Restore::Start(Role::A)));
+        c.undone(0, 30.0);
+        // After the restart: the post on record, a post, then A settles.
+        let ev = [
+            (Role::A, 31.0, Kind::PostOnRecord { nonce: 4 }),
+            (Role::B, 31.5, Kind::BeaconFailover),
+            (
+                Role::A,
+                40.0,
+                Kind::Posted {
+                    nonce: 4,
+                    tx: "0x1".into(),
+                    blobs: 1,
+                },
+            ),
+        ];
+        c.note(&ev);
+        c.recover(&ev, 40.0);
+        let rows = c.rows();
+        assert_eq!(rows[0].effects, ["post x1", "post on record x1"]);
+        assert_eq!(rows[0].recovery_s, None);
+        assert!(rows[0].line().contains("undone 30 s, recovery n/a"));
+        // A's first settlement after the undo is its recovery.
+        let settled = [(
+            Role::A,
+            52.0,
+            Kind::Settled {
+                pid: "p".into(),
+                votes: 3,
+                root: String::new(),
+            },
+        )];
+        c.note(&settled);
+        c.recover(&settled, 52.0);
+        let rows = c.rows();
+        assert_eq!(rows[0].recovery_s, Some(22.0));
+        assert_eq!(rows[0].effects, ["post x1", "post on record x1"]);
+        assert!(c.recovering.is_empty());
+    }
+
+    #[test]
     fn pause_only_for_a_sealed_pending_trigger() {
         let w = |t| {
             vec![Chaos {
@@ -704,6 +796,8 @@ mod tests {
         assert!(!should_pause(&w(Trigger::L1Pending(NodeId::B)), &sealed));
         assert!(!should_pause(&w(Trigger::Sealed(NodeId::A)), &sealed));
         assert!(!should_pause(&w(Trigger::L1Pending(NodeId::A)), &obs()));
+        assert!(Controller::new(w(Trigger::L1Pending(NodeId::B))).wants_pending());
+        assert!(!Controller::new(w(Trigger::Sealed(NodeId::B))).wants_pending());
     }
 
     #[test]

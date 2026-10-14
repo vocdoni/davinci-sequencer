@@ -1,16 +1,16 @@
 //! The election specs and scenarios of each wave (spec §8). Wave 1: the
 //! realistic elections R1-R4 and the ceiling groups S-2, S-8, S-16 and S-c.
-//! Wave 2: the races X1-X5.
+//! Wave 2: the races X1-X5. Wave 3: the chaos scenarios C1-C8.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
 
-use super::chaos::Chaos;
+use super::chaos::{Action, Chaos, Rpc, Trigger};
 use super::plan::{ElectionSpec, NodeId};
 use super::race::RaceSpec;
-use super::rig::Knobs;
+use super::rig::{Knobs, Role};
 use super::schedule::{Gap, Phase, Schedule};
 use super::submit::Route;
 
@@ -40,6 +40,7 @@ pub fn wave_specs(n: u32, scale: f64) -> Vec<ElectionSpec> {
     let mut v = match n {
         1 => wave1(scale),
         2 => wave2(scale),
+        3 => wave3(scale),
         _ => Vec::new(),
     };
     // The key holder alternates, so both nodes publish results and each S
@@ -150,6 +151,38 @@ fn wave2(scale: f64) -> Vec<ElectionSpec> {
     v
 }
 
+/// Wave 3 (spec §8, §10): each chaos scenario's voters at scale 1, sent at
+/// 30 a minute (Poisson), so a scenario's load lasts `2 × voters` seconds.
+const CHAOS_VOTERS: [(&str, u32); 7] = [
+    ("C1", 600),
+    ("C2", 600),
+    ("C3", 450),
+    ("C4", 600),
+    ("C5", 750),
+    ("C6", 600),
+    ("C7", 750),
+];
+/// C8: the background before its backlog, and the backlog.
+const C8_BACKGROUND: usize = 300;
+const C8_BACKLOG: usize = 1000;
+/// The background load of every chaos election.
+const CHAOS_RATE: f64 = 30.0;
+
+fn wave3(scale: f64) -> Vec<ElectionSpec> {
+    let mut v: Vec<ElectionSpec> = CHAOS_VOTERS
+        .iter()
+        .map(|&(tag, voters)| {
+            let voters = (scaled(voters as usize, scale) as u32).max(MIN_VOTERS);
+            // C7's end-of-election cap holds the flush for 120 s.
+            let grace = if tag == "C7" { 600 } else { GRACE };
+            spec(tag, tag, 8, 1, voters, 1, 0, grace)
+        })
+        .collect();
+    let c8 = scaled(C8_BACKGROUND, scale) + scaled(C8_BACKLOG, scale);
+    v.push(spec("C8", "C8", 8, 1, c8 as u32, 1, 0, 600));
+    v
+}
+
 /// The specs of the named scenarios, by wave; fails on a name no wave has.
 pub fn scenario_specs(names: &[String], scale: f64) -> Result<Vec<(u32, Vec<ElectionSpec>)>> {
     let mut out = Vec::new();
@@ -257,6 +290,7 @@ pub fn scenarios(n: u32, scale: f64) -> Vec<Scenario> {
     match n {
         1 => wave1_scenarios(&specs, scale),
         2 => wave2_scenarios(&specs, scale),
+        3 => wave3_scenarios(&specs, scale),
         _ => Vec::new(),
     }
 }
@@ -642,6 +676,222 @@ fn wave2_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
     out
 }
 
+/// Every chaos scenario runs with these: production's but a 5 min timer,
+/// so each node seals a few times under the background load.
+pub fn chaos_knobs() -> Knobs {
+    Knobs {
+        batch_time: "5m".into(),
+        ..Knobs::production()
+    }
+}
+
+/// A fee cap below any real post (spec §10): the node holds its posts.
+const FEE_CAP: &str = "0.000000001eth";
+/// C7: when B's 15 min cap starts.
+const C7_CAP_AT: u64 = 180;
+const C7_CAP_FOR: u64 = 900;
+
+fn chaos(name: &str, trigger: Trigger, action: Action) -> Chaos {
+    Chaos {
+        name: name.into(),
+        trigger,
+        action,
+    }
+}
+
+fn role(n: NodeId) -> Role {
+    match n {
+        NodeId::A => Role::A,
+        NodeId::B => Role::B,
+    }
+}
+
+fn wave3_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
+    let min5 = secs(300);
+    let capped = Knobs {
+        l1_max_post_fee: Some(FEE_CAP.into()),
+        ..chaos_knobs()
+    };
+    let mut out = Vec::new();
+    for s in specs {
+        let v = u64::from(s.voters);
+        let load = rate(CHAOS_RATE, 2 * v, true);
+        let (schedule, end, faults) = match s.tag.as_str() {
+            "C1" => (
+                vec![load],
+                End::AfterSettled,
+                vec![chaos(
+                    "kill A with its blob post pending",
+                    Trigger::L1Pending(NodeId::A),
+                    Action::Kill {
+                        node: Role::A,
+                        down: secs(30),
+                    },
+                )],
+            ),
+            "C2" => (
+                vec![load],
+                End::AfterSettled,
+                vec![chaos(
+                    "kill B after a seal",
+                    Trigger::Sealed(NodeId::B),
+                    Action::Kill {
+                        node: Role::B,
+                        down: secs(120),
+                    },
+                )],
+            ),
+            // Ended once settled, so the kill hits the results, not votes.
+            "C3" => (
+                vec![load],
+                End::AfterSettled,
+                vec![chaos(
+                    "kill the key holder in the grace window",
+                    Trigger::AfterEnd(secs(60)),
+                    Action::Kill {
+                        node: role(s.key_node),
+                        down: secs(180),
+                    },
+                )],
+            ),
+            // From before A's first timer seal (4.5 min at the jitter floor).
+            "C4" => (
+                vec![load],
+                End::AfterSettled,
+                vec![chaos(
+                    "prover A down",
+                    Trigger::At(secs(240)),
+                    Action::ProverDown {
+                        node: NodeId::A,
+                        for_: secs(600),
+                    },
+                )],
+            ),
+            "C5" => (
+                vec![load],
+                End::AfterSettled,
+                vec![chaos(
+                    "prover B slow",
+                    Trigger::At(secs(180)),
+                    Action::ProverDelay {
+                        node: NodeId::B,
+                        delay: secs(120),
+                        for_: secs(1200),
+                    },
+                )],
+            ),
+            "C6" => (
+                vec![load],
+                End::AfterSettled,
+                vec![
+                    chaos(
+                        "A's OP RPC answers 503",
+                        Trigger::At(min5),
+                        Action::RpcFail {
+                            node: Role::A,
+                            rpc: Rpc::Op,
+                            index: 0,
+                            status: 503,
+                            for_: min5,
+                        },
+                    ),
+                    chaos(
+                        "A's OP RPC down",
+                        Trigger::At(min5 * 2),
+                        Action::RpcDown {
+                            node: Role::A,
+                            rpc: Rpc::Op,
+                            index: 0,
+                            for_: min5,
+                        },
+                    ),
+                    chaos(
+                        "B's Ethereum read RPC down",
+                        Trigger::At(min5),
+                        Action::RpcDown {
+                            node: Role::B,
+                            rpc: Rpc::L1,
+                            index: 0,
+                            for_: min5,
+                        },
+                    ),
+                    chaos(
+                        "O's first beacon down",
+                        Trigger::At(min5),
+                        Action::RpcDown {
+                            node: Role::O,
+                            rpc: Rpc::Beacon,
+                            index: 0,
+                            for_: min5,
+                        },
+                    ),
+                ],
+            ),
+            // An AGM end with votes pending, once B's cap is over: both
+            // nodes flush under the cap until 120 s into the grace window.
+            "C7" => {
+                let after = (2 * v + 120).max(C7_CAP_AT + C7_CAP_FOR + 60);
+                let cap = |n: NodeId, t, f| {
+                    chaos(
+                        &format!("{n} fee cap"),
+                        t,
+                        Action::Knobs {
+                            node: n,
+                            knobs: capped.clone(),
+                            for_: Some(secs(f)),
+                        },
+                    )
+                };
+                (
+                    vec![load],
+                    End::Now { after: secs(after) },
+                    vec![
+                        cap(NodeId::B, Trigger::At(secs(C7_CAP_AT)), C7_CAP_FOR),
+                        cap(NodeId::A, Trigger::AfterEnd(Duration::ZERO), 120),
+                        cap(NodeId::B, Trigger::AfterEnd(Duration::ZERO), 120),
+                    ],
+                )
+            }
+            // The backlog lands at once, then a shortened end with the
+            // registry's least notice. A Poisson overrun delays the burst,
+            // so the end leaves it 3 min.
+            _ => {
+                let bg = scaled(C8_BACKGROUND, scale) as u64;
+                let backlog = scaled(C8_BACKLOG, scale);
+                (
+                    vec![rate(CHAOS_RATE, 2 * bg, true), Phase::Burst { n: backlog }],
+                    End::Shorten {
+                        after: secs(2 * bg + 180),
+                        notice: NOTICE,
+                    },
+                    Vec::new(),
+                )
+            }
+        };
+        out.push(Scenario {
+            name: s.tag.clone(),
+            wave: 3,
+            lanes: vec![Lane {
+                tag: s.tag.clone(),
+                start: Duration::ZERO,
+                route: Route::ByVoter,
+                schedule: Schedule { phases: schedule },
+                gaps: Vec::new(),
+                end,
+            }],
+            knobs: [chaos_knobs(), chaos_knobs()],
+            allowed: if s.tag == "C8" {
+                [(s.tag.clone(), vec!["process closed"])].into()
+            } else {
+                BTreeMap::new()
+            },
+            chaos: faults,
+            kind: Kind::Plain,
+        });
+    }
+    out
+}
+
 /// `15m`, `60s`, `1h` in seconds.
 fn secs_of(s: &str) -> Option<u64> {
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
@@ -728,7 +978,7 @@ mod tests {
     #[test]
     fn max_voters_equal_planned_voters() {
         let seed = seed();
-        for n in [1, 2] {
+        for n in 1..=3 {
             assert!(!wave_specs(n, 1.0).is_empty(), "wave {n}");
         }
         for n in 1..=3 {
@@ -940,6 +1190,176 @@ mod tests {
         assert!(all.iter().all(|s| s.wave == 2 && s.chaos.is_empty()));
     }
 
+    /// The live URL layout (spec §6): each node's OP list as the preset
+    /// rotates it, the preset's Ethereum RPCs, no send RPC, and two beacons
+    /// (the gate wants two: C6 takes O's first down).
+    fn live_layout() -> [[usize; 4]; 3] {
+        use davinci_client::networks::{NetworkDa, OPTIMISM};
+        let op = OPTIMISM.rpc_urls;
+        let lists: Vec<String> = (0..3)
+            .map(|i| format!("{},{}", op[i % op.len()], op[(i + 1) % op.len()]))
+            .collect();
+        let NetworkDa::L1Blobs { l1_rpc_urls, .. } = OPTIMISM.da else {
+            panic!("the OP preset is in L1-blob mode");
+        };
+        let beacon = "https://beacon-1.example,https://beacon-2.example";
+        crate::bench::rig::url_counts(
+            [&lists[0], &lists[1], &lists[2]],
+            Some(&l1_rpc_urls.join(",")),
+            None,
+            Some(beacon),
+        )
+    }
+
+    #[test]
+    fn wave3_scenarios() {
+        use crate::bench::chaos::{Action, Rpc, Trigger};
+        use crate::bench::rig::Role;
+        let all = scenarios(3, 1.0);
+        let specs = wave_specs(3, 1.0);
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"]);
+        let spec = |t: &str| specs.iter().find(|s| s.tag == t).unwrap();
+        let min = Duration::from_secs(60);
+        for sc in &all {
+            assert_eq!((sc.wave, &sc.kind), (3, &Kind::Plain), "{}", sc.name);
+            // Each its own nf 8 election under the background load.
+            assert_eq!(sc.lanes.len(), 1, "{}", sc.name);
+            let l = &sc.lanes[0];
+            assert_eq!(
+                (spec(&l.tag).nf, spec(&l.tag).scenario.as_str()),
+                (8, sc.name.as_str())
+            );
+            assert_eq!(l.route, Route::ByVoter, "{}", sc.name);
+            assert!(
+                matches!(
+                    l.schedule.phases[0],
+                    Phase::Rate { per_min, poisson: true, .. } if per_min == 30.0
+                ),
+                "{}",
+                sc.name
+            );
+            // Only C8 allows `process closed`.
+            if sc.name == "C8" {
+                assert_eq!(sc.allowed(&l.tag), ["process closed"]);
+            } else {
+                assert!(sc.allowed.is_empty(), "{}", sc.name);
+            }
+            assert_eq!(sc.chaos.is_empty(), sc.name == "C8", "{}", sc.name);
+            // No knob changes between C scenarios: a restart re-seeds the
+            // proving estimate and only C7 changes knobs, as its fault.
+            assert_eq!(sc.knobs, all[0].knobs, "{}", sc.name);
+        }
+        let sc = |n: &str| all.iter().find(|s| s.name == n).unwrap();
+        // C1: kill A while its Ethereum blob post is pending, 30 s down.
+        let c = &sc("C1").chaos;
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].trigger, Trigger::L1Pending(NodeId::A));
+        assert!(
+            matches!(c[0].action, Action::Kill { node: Role::A, down } if down.as_secs() == 30)
+        );
+        // C2: kill B right after a seal, 120 s down.
+        let c = &sc("C2").chaos;
+        assert_eq!(c[0].trigger, Trigger::Sealed(NodeId::B));
+        assert!(
+            matches!(c[0].action, Action::Kill { node: Role::B, down } if down.as_secs() == 120)
+        );
+        // C3: the key holder, 60 s into the grace window, 180 s down.
+        let c3 = sc("C3");
+        let key = match spec(&c3.lanes[0].tag).key_node {
+            NodeId::A => Role::A,
+            NodeId::B => Role::B,
+        };
+        assert_eq!(c3.chaos[0].trigger, Trigger::AfterEnd(min));
+        assert!(
+            matches!(c3.chaos[0].action, Action::Kill { node, down } if node == key && down.as_secs() == 180)
+        );
+        // C4: prover A down 10 min; C5: prover B 120 s late for 20 min.
+        assert!(matches!(
+            sc("C4").chaos[0].action,
+            Action::ProverDown { node: NodeId::A, for_ } if for_.as_secs() == 600
+        ));
+        assert!(matches!(
+            sc("C5").chaos[0].action,
+            Action::ProverDelay { node: NodeId::B, delay, for_ }
+                if delay.as_secs() == 120 && for_.as_secs() == 1200
+        ));
+        // C6: A's OP RPC 503 for 5 min then down 5 min; B's Ethereum read
+        // RPC down 5 min; O's first beacon down 5 min.
+        let c = &sc("C6").chaos;
+        let at = |i: usize| match c[i].trigger {
+            Trigger::At(d) => d,
+            t => panic!("{t:?}"),
+        };
+        assert_eq!(c.len(), 4);
+        assert!(matches!(
+            c[0].action,
+            Action::RpcFail { node: Role::A, rpc: Rpc::Op, index: 0, status: 503, for_ }
+                if for_.as_secs() == 300
+        ));
+        assert!(matches!(
+            c[1].action,
+            Action::RpcDown { node: Role::A, rpc: Rpc::Op, index: 0, for_ } if for_.as_secs() == 300
+        ));
+        assert_eq!(at(1), at(0) + Duration::from_secs(300));
+        assert!(matches!(
+            c[2].action,
+            Action::RpcDown { node: Role::B, rpc: Rpc::L1, index: 0, for_ } if for_.as_secs() == 300
+        ));
+        assert!(matches!(
+            c[3].action,
+            Action::RpcDown { node: Role::O, rpc: Rpc::Beacon, index: 0, for_ } if for_.as_secs() == 300
+        ));
+        // C7: B capped 15 min, then both capped at the end and restored
+        // 120 s into the grace window.
+        let c7 = sc("C7");
+        let capped = |k: &Knobs| k.l1_max_post_fee.as_deref() == Some("0.000000001eth");
+        let mut knobs: Vec<(NodeId, Trigger, Option<Duration>)> = Vec::new();
+        for c in &c7.chaos {
+            match &c.action {
+                Action::Knobs {
+                    node,
+                    knobs: k,
+                    for_,
+                } => {
+                    assert!(capped(k), "{}", c.name);
+                    // Only the fee cap changes.
+                    let base = Knobs {
+                        l1_max_post_fee: None,
+                        ..k.clone()
+                    };
+                    assert_eq!(base, c7.knobs[node_idx(*node)], "{}", c.name);
+                    knobs.push((*node, c.trigger, *for_));
+                }
+                a => panic!("C7: {a:?}"),
+            }
+        }
+        let grace = Some(Duration::from_secs(120));
+        assert!(matches!(
+            knobs[..],
+            [
+                (NodeId::B, Trigger::At(_), Some(f)),
+                (NodeId::A, Trigger::AfterEnd(Duration::ZERO), g1),
+                (NodeId::B, Trigger::AfterEnd(Duration::ZERO), g2),
+            ] if f.as_secs() == 900 && g1 == grace && g2 == grace
+        ));
+        // B's 15 min are over before the end, so the end's caps restore the
+        // scenario's knobs, not B's cap.
+        let (Trigger::At(t), Some(f)) = (knobs[0].1, knobs[0].2) else {
+            unreachable!()
+        };
+        let End::Now { after } = c7.lanes[0].end else {
+            panic!("C7 ends at once, with votes pending")
+        };
+        assert!(t + f + min <= after);
+        // C8: a shortened end (60 s notice) over a backlog of 1000, grace 600.
+        let c8 = sc("C8");
+        let l = &c8.lanes[0];
+        assert!(matches!(l.end, End::Shorten { notice: NOTICE, .. }));
+        assert!(l.schedule.phases.contains(&Phase::Burst { n: 1000 }));
+        assert_eq!(spec(&l.tag).grace, 600);
+    }
+
     #[test]
     fn spend_bounds() {
         // X1 at scale 1: 20 tries of one 1-blob post per node.
@@ -980,6 +1400,7 @@ mod tests {
     #[test]
     fn scenarios_are_consistent() {
         let seed = seed();
+        let layout = live_layout();
         let mut seen = 0;
         for n in 1..=3 {
             for scale in [1.0, 0.05] {
@@ -1054,6 +1475,19 @@ mod tests {
                     }
                     for t in sc.allowed.keys() {
                         assert!(sc.tags().contains(&t.as_str()), "{}: {t}", sc.name);
+                    }
+                    // Every action names a node and proxy the live rig has,
+                    // and a list fault leaves the node another entry to
+                    // fail over to.
+                    for c in &sc.chaos {
+                        use crate::bench::chaos::{Action, references_exist};
+                        let at = format!("{} {} at {scale}", sc.name, c.name);
+                        assert!(references_exist(&c.action, &layout), "{at}");
+                        if let Action::RpcDown { node, rpc, .. }
+                        | Action::RpcFail { node, rpc, .. } = &c.action
+                        {
+                            assert!(layout[*node as usize][*rpc as usize] >= 2, "{at}");
+                        }
                     }
                 }
             }
