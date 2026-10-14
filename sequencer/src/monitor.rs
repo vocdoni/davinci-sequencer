@@ -342,9 +342,15 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                     | CensusError::Config(_)
                     | CensusError::Refused(_)),
                 ) => {
-                    error!(pid = %pid_hex(&pid), ?e, "census update can never load; votes are refused until the next one");
-                    if let Err(e) = census.mark_bad(&pid, &root, &e.to_string()) {
-                        error!(pid = %pid_hex(&pid), %e, "persist census failure");
+                    // Another process stored the root meanwhile: it is
+                    // servable, and its process may already run on it.
+                    if census.has(&root).unwrap_or(false) {
+                        warn!(pid = %pid_hex(&pid), ?e, "census document unusable; its root is stored");
+                    } else {
+                        error!(pid = %pid_hex(&pid), ?e, "census update can never load; votes are refused until the next one");
+                        if let Err(e) = census.mark_bad(&pid, &root, &e.to_string()) {
+                            error!(pid = %pid_hex(&pid), %e, "persist census failure");
+                        }
                     }
                     true
                 }

@@ -461,3 +461,49 @@ async fn refused_bootstrap_census_is_ignored_and_forgotten() {
     assert_eq!(boot_attempts(&db, &bad_pid31()), None);
     sd.cancel();
 }
+
+/// Two processes share a census root. The good URI stores it while the
+/// bad one is still downloading, so the bad process spawns on the stored
+/// root; its download then fails for good. That failure must not mark
+/// the running process, or every one of its votes would be refused.
+#[tokio::test]
+async fn shared_root_stored_mid_download_leaves_no_failure_mark() {
+    let s = setup(2, 8, None);
+    let gate = Arc::new(Semaphore::new(0));
+    let hits = Arc::new(AtomicU64::new(0));
+    let uri = census_server(b"not a census".to_vec(), gate.clone(), hits.clone()).await;
+    let mut bad = s.env.cfg.clone();
+    bad.process_id = bad_pid_fr();
+    s.chain.add_bad_process(BadKind::CensusUri {
+        uri,
+        state_root: genesis_root(&bad).unwrap(),
+    });
+    let dir = TempDir::new().unwrap();
+    let sd = CancellationToken::new();
+    let node = start_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        sd.clone(),
+    )
+    .await;
+    wait_until("bad download running", async || {
+        hits.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    let _h = handle(&node).await;
+    wait_until("bad process spawned on the stored root", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    // The download now ends in a terminal format error.
+    gate.add_permits(1);
+    wait_until("download over", async || gate.available_permits() == 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let root = s.env.cfg.census_root;
+    assert_eq!(node.census.bad_reason(&bad_pid_fr(), &root), None);
+    let rec = node.db.process(&bad_pid_fr()).unwrap().unwrap();
+    assert_eq!(rec.local, LocalStatus::Active);
+    sd.cancel();
+}
