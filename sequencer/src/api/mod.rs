@@ -277,13 +277,12 @@ async fn start(
     );
     // L1-blob mode posts a transition in chunks of the per-transaction cap.
     let l1 = match l1 {
-        Some(rpc) => Some(Arc::new(L1Da::new(
-            rpc,
-            db.clone(),
-            cfg.l1_max_post_fee,
-            cfg.poll_interval,
-            cap,
-        )?)),
+        Some(rpc) => {
+            let mut da = L1Da::new(rpc, db.clone(), cfg.l1_max_post_fee, cfg.poll_interval, cap)?;
+            // Hold a post while OP's fee would withhold its settlement.
+            da.op_fees = Some(contracts.clone());
+            Some(Arc::new(da))
+        }
         None => None,
     };
     let prover = Arc::new(ProverService::new(
