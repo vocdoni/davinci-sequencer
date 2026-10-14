@@ -157,8 +157,9 @@ proves no results. If the chain does not come back within 90 s, the node rebuild
    another transition; once the window has closed, the close-out errors what is left.
 
 The rebuild logs an error with its depth and leaves a note in the process record. The node
-notices a divergence at its next chain read (after a landing, an event, a lost race or a results
-attempt), so an idle process rebuilds when it next has work.
+notices a divergence at a chain read: after a landing, an event, a lost race or a failed results
+attempt, and in every process when the monitor sees a reorg at its cursor, so an idle process
+rebuilds too.
 
 ## L1-blob mode (OP Stack)
 

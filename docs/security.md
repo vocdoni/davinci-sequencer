@@ -113,8 +113,9 @@ a DKG mode when no single node should hold the key.
   - a process left ahead of the chain (a read at a root its log passed, or a transition forking
     from one, for 90 s) is rebuilt from the chain: the lost transitions' votes go back to the
     queue and re-seal on the chain's root. The rebuild replays the process from its blobs, so it
-    needs them (see Blob retention), and it starts at the process's next chain read, which an
-    idle process makes only when it next has work.
+    needs them (see Blob retention). A reorg the cursor check misses (its fail-open window) is
+    noticed only at the process's next chain read, which an idle process makes when it next has
+    work.
 
   Results already finalized are not undone by a reorg that drops them, and a reorg deeper than
   the 128-block rewind can leave events of the dropped range unrouted.
