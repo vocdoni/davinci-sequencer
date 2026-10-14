@@ -1,5 +1,6 @@
 //! The election specs and scenarios of each wave (spec §8). Wave 1: the
 //! realistic elections R1-R4 and the ceiling groups S-2, S-8, S-16 and S-c.
+//! Wave 2: the races X1-X5.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use anyhow::{Result, ensure};
 
 use super::chaos::Chaos;
 use super::plan::{ElectionSpec, NodeId};
+use super::race::RaceSpec;
 use super::rig::Knobs;
 use super::schedule::{Gap, Phase, Schedule};
 use super::submit::Route;
@@ -37,6 +39,7 @@ pub fn scaled(n: usize, scale: f64) -> usize {
 pub fn wave_specs(n: u32, scale: f64) -> Vec<ElectionSpec> {
     let mut v = match n {
         1 => wave1(scale),
+        2 => wave2(scale),
         _ => Vec::new(),
     };
     // The key holder alternates, so both nodes publish results and each S
@@ -99,6 +102,54 @@ fn wave1(scale: f64) -> Vec<ElectionSpec> {
     v
 }
 
+/// Wave 2's races (spec §8, §9): fresh votes per round, and how many
+/// races X1, X2 (each) and X3 collect.
+const RACE_K: usize = 64;
+const X1_ROUNDS: usize = 10;
+const X23_ROUNDS: usize = 5;
+/// X2's and X3's hold on the loser's `POST /prove`: longer than the
+/// Ethereum leg plus the OP settlement minus the proof.
+const SKEW: Duration = Duration::from_secs(150);
+/// X3's loser runs this many OP blocks (about 5 min) behind on events.
+const LAG: u64 = 150;
+/// X4's two AGM ends are this far apart, so their flushes do not share a
+/// node's Ethereum window.
+const X4_STAGGER: u64 = 360;
+
+/// K at `scale`: below 1 it shrinks with the elections, to at least 8.
+fn race_k(scale: f64) -> usize {
+    scaled(RACE_K, scale).max(8)
+}
+
+/// Race rounds at `scale`, at least 2.
+fn race_rounds(n: usize, scale: f64) -> usize {
+    scaled(n, scale).max(2)
+}
+
+fn wave2(scale: f64) -> Vec<ElectionSpec> {
+    let k = race_k(scale);
+    // Every round up to twice the target sends K fresh votes.
+    let race = |tag: &str, rounds| {
+        let voters = (2 * k * race_rounds(rounds, scale)) as u32;
+        spec(tag, tag, 2, 1, voters, 1, 0, GRACE)
+    };
+    let mut v = vec![
+        race("X1", X1_ROUNDS),
+        race("X2-a", X23_ROUNDS),
+        race("X2-b", X23_ROUNDS),
+        race("X3", X23_ROUNDS),
+    ];
+    let x4 = (scaled(300, scale) as u32).max(MIN_VOTERS);
+    for i in 1..=2 {
+        v.push(spec(&format!("X4-{i}"), "X4", 16, 1, x4, 1, 0, GRACE));
+    }
+    // Every X5 voter revotes; a 600 s grace leaves the loser of the flush
+    // room to land its re-attempt.
+    let x5 = (scaled(200, scale) as u32).max(MIN_VOTERS);
+    v.push(spec("X5", "X5", 8, 1, x5, 2, 1000, 600));
+    v
+}
+
 /// The specs of the named scenarios, by wave; fails on a name no wave has.
 pub fn scenario_specs(names: &[String], scale: f64) -> Result<Vec<(u32, Vec<ElectionSpec>)>> {
     let mut out = Vec::new();
@@ -147,6 +198,9 @@ pub enum Kind {
     /// Each lane sends its cells in ascending B, a burst at a time, the next
     /// once the previous one has sealed.
     Ceiling(Vec<Cell>),
+    /// One lane, sent in rounds of K fresh votes to both nodes, each once
+    /// the previous round has landed and every node has synced it.
+    Race(RaceSpec),
 }
 
 /// One election of a scenario. R's elections differ in rate, end and start,
@@ -202,8 +256,108 @@ pub fn scenarios(n: u32, scale: f64) -> Vec<Scenario> {
     let specs = wave_specs(n, scale);
     match n {
         1 => wave1_scenarios(&specs, scale),
+        2 => wave2_scenarios(&specs, scale),
         _ => Vec::new(),
     }
+}
+
+/// Fees a spend estimate is quoted at (wei per gas): 0.1 gwei execution,
+/// 0.004 gwei blob.
+pub const EST_EXEC_WEI: u128 = 100_000_000;
+pub const EST_BLOB_WEI: u128 = 4_000_000;
+
+/// Ethereum posts of one node in a scenario: transactions and blobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostBound {
+    pub txs: u64,
+    pub blobs: u64,
+}
+
+/// A blob post's execution gas (the node's `BLOB_TX_GAS`).
+const POST_GAS: u128 = 21_000;
+
+impl PostBound {
+    /// µETH at `exec` wei per gas and `blob` wei per blob gas.
+    pub fn ueth(&self, exec: u128, blob: u128) -> f64 {
+        let wei = u128::from(self.txs) * POST_GAS * exec
+            + u128::from(self.blobs) * u128::from(crate::cost::GAS_PER_BLOB) * blob;
+        wei as f64 / 1e12
+    }
+
+    /// `n` attempts at a batch of `votes` fresh votes at `nf` fields.
+    fn add(&mut self, n: u64, votes: usize, nf: u8) {
+        use davinci_zkvm_sdk::blob::blob_count;
+        use davinci_zkvm_sdk::limits::{TX_BLOB_CAP, refresh_target};
+        if votes == 0 {
+            return;
+        }
+        let blobs = blob_count(votes, votes + refresh_target(votes, 0), nf) as u64;
+        self.blobs += n * blobs;
+        self.txs += n * blobs.div_ceil(TX_BLOB_CAP as u64);
+    }
+}
+
+/// An upper bound of each node's (A, B) Ethereum posts in `sc`, for the
+/// spend estimate. A race round costs each node one post, winner and loser
+/// alike, for up to twice its target rounds; a ceiling burst one post per
+/// node it went to. A plain lane seals at least once per timer period over
+/// its sends, plus the end's flush, and any of those batches may lose a
+/// race and post again.
+pub fn post_bound(sc: &Scenario, specs: &[ElectionSpec], scale: f64) -> [PostBound; 2] {
+    let mut out = [PostBound::default(); 2];
+    for l in &sc.lanes {
+        let Some(s) = specs.iter().find(|s| s.tag == l.tag) else {
+            continue;
+        };
+        let on: Vec<usize> = match l.route {
+            Route::Only(n) => vec![node_idx(n)],
+            _ => vec![0, 1],
+        };
+        for i in on {
+            let b = &mut out[i];
+            match &sc.kind {
+                Kind::Race(r) => b.add(2 * r.rounds as u64, r.k, s.nf),
+                Kind::Ceiling(cells) => {
+                    for c in cells {
+                        b.add(c.bursts as u64, scaled(c.b, scale), s.nf);
+                    }
+                }
+                Kind::Plain => {
+                    let revoters =
+                        (u64::from(s.voters) * u64::from(s.revote_permille)).div_ceil(1000);
+                    let ballots = u64::from(s.voters) + revoters * u64::from(s.rounds.max(1) - 1);
+                    // `ByVoter` and `Cross` split a lane between the nodes.
+                    let mine = match l.route {
+                        Route::Both | Route::Only(_) => ballots,
+                        Route::ByVoter | Route::Cross => ballots.div_ceil(2),
+                    };
+                    let gap = l
+                        .gaps
+                        .iter()
+                        .map(|g| match g {
+                            Gap::Overwrite { max, .. } => *max,
+                            Gap::Revote { secs } => *secs,
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let span = l
+                        .schedule
+                        .offsets(s.voters as usize, 0)
+                        .last()
+                        .map_or(0, Duration::as_secs)
+                        + gap;
+                    let knobs = &sc.knobs[i];
+                    let timer = secs_of(&knobs.batch_time).unwrap_or(900).max(1);
+                    let batches = mine
+                        .div_ceil(knobs.batch_max.max(1) as u64)
+                        .max(span / timer + 1);
+                    let size = mine.div_ceil(batches) as usize;
+                    b.add(2 * batches, size, s.nf);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// What every S group runs with: production's but `batch_max 512` and a
@@ -363,6 +517,143 @@ fn wave1_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
     out
 }
 
+/// Both nodes seal at K, never on the timer.
+pub fn race_knobs(k: usize) -> Knobs {
+    Knobs {
+        batch_max: k,
+        batch_time: "15m".into(),
+        ..Knobs::production()
+    }
+}
+
+fn other(n: NodeId) -> NodeId {
+    match n {
+        NodeId::A => NodeId::B,
+        NodeId::B => NodeId::A,
+    }
+}
+
+fn node_idx(n: NodeId) -> usize {
+    usize::from(n == NodeId::B)
+}
+
+fn wave2_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
+    let k = race_k(scale);
+    let spec = |t: &str| specs.iter().find(|s| s.tag == t);
+    let lane = |tag: &str, start, route, schedule, gaps, end| Lane {
+        tag: tag.into(),
+        start: secs(start),
+        route,
+        schedule: Schedule { phases: schedule },
+        gaps,
+        end,
+    };
+    let race = |name: &str, rounds, skew: Option<NodeId>, lag: bool| {
+        let r = RaceSpec {
+            k,
+            rounds: race_rounds(rounds, scale),
+            skew: skew.map(|n| (n, SKEW)),
+            lag_confirmations: lag.then_some(LAG),
+        };
+        let mut knobs = [race_knobs(k), race_knobs(k)];
+        // The lag holds for the whole scenario rather than a restart per
+        // round: a restart re-bootstraps every campaign election and zeroes
+        // the node's counters.
+        if let (Some(n), Some(c)) = (skew, r.lag_confirmations) {
+            knobs[node_idx(n)].confirmations = Some(c);
+        }
+        Scenario {
+            name: name.into(),
+            wave: 2,
+            lanes: vec![lane(
+                name,
+                0,
+                Route::Both,
+                Vec::new(),
+                Vec::new(),
+                End::AfterSettled,
+            )],
+            knobs,
+            allowed: BTreeMap::new(),
+            chaos: Vec::new(),
+            kind: Kind::Race(r),
+        }
+    };
+    // X3's lagging loser is not its key node, which would see the end and
+    // publish the results 5 min late.
+    let x3_loser = spec("X3").map_or(NodeId::A, |s| other(s.key_node));
+    let mut out = vec![
+        race("X1", X1_ROUNDS, None, false),
+        race("X2-a", X23_ROUNDS, Some(NodeId::B), false),
+        race("X2-b", X23_ROUNDS, Some(NodeId::A), false),
+        race("X3", X23_ROUNDS, Some(x3_loser), true),
+    ];
+    // X4: 300 votes to both nodes at 2 a second, then an AGM end: both
+    // flush the same queue on the same root inside the grace window.
+    let mut x4 = Vec::new();
+    for (i, t) in ["X4-1", "X4-2"].into_iter().enumerate() {
+        let v = spec(t).map_or(0, |s| s.voters as u64);
+        let span = v.div_ceil(2);
+        x4.push(lane(
+            t,
+            i as u64 * X4_STAGGER,
+            Route::Both,
+            vec![rate(120.0, span, false)],
+            Vec::new(),
+            End::Now {
+                after: secs(span + 30),
+            },
+        ));
+    }
+    out.push(Scenario {
+        name: "X4".into(),
+        wave: 2,
+        lanes: x4,
+        knobs: [Knobs::production(), Knobs::production()],
+        allowed: ["X4-1", "X4-2"]
+            .into_iter()
+            .map(|t| (t.to_string(), vec!["process closed"]))
+            .collect(),
+        chaos: Vec::new(),
+        kind: Kind::Plain,
+    });
+    // X5: round 1 to the voter's node and the revote 5 s later to the
+    // other, then a shortened end: whichever flush lands last stands.
+    let v = spec("X5").map_or(0, |s| s.voters as u64);
+    out.push(Scenario {
+        name: "X5".into(),
+        wave: 2,
+        lanes: vec![lane(
+            "X5",
+            0,
+            Route::Cross,
+            vec![rate(60.0, v, false)],
+            vec![Gap::Overwrite { min: 5, max: 5 }],
+            End::Shorten {
+                after: secs(v + 5 + 30),
+                notice: NOTICE,
+            },
+        )],
+        knobs: [Knobs::production(), Knobs::production()],
+        allowed: BTreeMap::new(),
+        chaos: Vec::new(),
+        kind: Kind::Plain,
+    });
+    out
+}
+
+/// `15m`, `60s`, `1h` in seconds.
+fn secs_of(s: &str) -> Option<u64> {
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    let n: u64 = n.parse().ok()?;
+    Some(match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -437,7 +728,9 @@ mod tests {
     #[test]
     fn max_voters_equal_planned_voters() {
         let seed = seed();
-        assert!(!wave_specs(1, 1.0).is_empty());
+        for n in [1, 2] {
+            assert!(!wave_specs(n, 1.0).is_empty(), "wave {n}");
+        }
         for n in 1..=3 {
             for scale in [1.0, 0.02] {
                 let specs = wave_specs(n, scale);
@@ -558,6 +851,132 @@ mod tests {
         );
     }
 
+    fn race_of(sc: &Scenario) -> &RaceSpec {
+        match &sc.kind {
+            Kind::Race(r) => r,
+            k => panic!("{}: {k:?}", sc.name),
+        }
+    }
+
+    #[test]
+    fn wave2_specs() {
+        let all = scenarios(2, 1.0);
+        let specs = wave_specs(2, 1.0);
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["X1", "X2-a", "X2-b", "X3", "X4", "X5"]);
+        let sc = |n: &str| all.iter().find(|s| s.name == n).unwrap();
+        let spec = |t: &str| specs.iter().find(|s| s.tag == t).unwrap();
+        let skew = Duration::from_secs(150);
+        assert_eq!(
+            race_of(sc("X1")),
+            &RaceSpec {
+                k: 64,
+                rounds: 10,
+                skew: None,
+                lag_confirmations: None
+            }
+        );
+        // X2: one scenario per loser, its proof held 150 s, so the other
+        // node wins every round.
+        let mut losers = Vec::new();
+        for n in ["X2-a", "X2-b"] {
+            let r = race_of(sc(n));
+            assert_eq!((r.k, r.rounds, r.lag_confirmations), (64, 5, None), "{n}");
+            let (loser, d) = r.skew.expect("X2 skews its loser");
+            assert_eq!(d, skew, "{n}");
+            losers.push(loser);
+        }
+        assert_eq!(losers, [NodeId::B, NodeId::A]);
+        // X3: the loser is also 150 blocks behind on events, for the whole
+        // scenario.
+        let x3 = sc("X3");
+        let r = race_of(x3);
+        let (loser, d) = r.skew.expect("X3 skews its loser");
+        assert_eq!((d, r.lag_confirmations, r.rounds), (skew, Some(150), 5));
+        let i = |n: NodeId| usize::from(n == NodeId::B);
+        assert_eq!(x3.knobs[i(loser)].confirmations, Some(150));
+        assert_eq!(x3.knobs[1 - i(loser)].confirmations, None);
+        assert_ne!(
+            spec(&x3.lanes[0].tag).key_node,
+            loser,
+            "the lagging loser would publish the results late"
+        );
+        for n in ["X1", "X2-a", "X2-b", "X3"] {
+            let s = sc(n);
+            assert_eq!(s.lanes.len(), 1, "{n}");
+            let l = &s.lanes[0];
+            assert_eq!((l.route, &l.end), (Route::Both, &End::AfterSettled), "{n}");
+            assert_eq!(spec(&l.tag).nf, 2, "{n}");
+            // Both seal on the K-th vote: no timer in the way.
+            for k in &s.knobs {
+                assert_eq!((k.batch_max, k.batch_time.as_str()), (64, "15m"), "{n}");
+            }
+            assert!(s.allowed.is_empty(), "{n}");
+        }
+        // X4: two nf 16 elections of 300 votes to both nodes, then an AGM
+        // end; a re-attempt that no longer fits the grace is expected.
+        let x4 = sc("X4");
+        assert_eq!(x4.kind, Kind::Plain);
+        assert_eq!(x4.tags(), ["X4-1", "X4-2"]);
+        for l in &x4.lanes {
+            assert_eq!(l.route, Route::Both, "{}", l.tag);
+            assert!(matches!(l.end, End::Now { .. }), "{}", l.tag);
+            assert_eq!((spec(&l.tag).nf, spec(&l.tag).voters), (16, 300));
+            assert_eq!(x4.allowed(&l.tag), ["process closed"]);
+        }
+        // X5: nf 8, 200 voters in two rounds, the revote 5 s later on the
+        // other node.
+        let x5 = sc("X5");
+        assert_eq!(x5.kind, Kind::Plain);
+        let l = &x5.lanes[0];
+        assert_eq!(l.route, Route::Cross);
+        assert_eq!(l.gaps, [Gap::Overwrite { min: 5, max: 5 }]);
+        let s = spec(&l.tag);
+        assert_eq!(
+            (s.nf, s.voters, s.rounds, s.revote_permille),
+            (8, 200, 2, 1000)
+        );
+        assert!(x5.allowed.is_empty());
+        assert!(all.iter().all(|s| s.wave == 2 && s.chaos.is_empty()));
+    }
+
+    #[test]
+    fn spend_bounds() {
+        // X1 at scale 1: 20 tries of one 1-blob post per node.
+        let all = scenarios(2, 1.0);
+        let specs = wave_specs(2, 1.0);
+        let b = post_bound(&all[0], &specs, 1.0);
+        assert_eq!(b, [PostBound { txs: 20, blobs: 20 }; 2]);
+        let u = b[0].ueth(EST_EXEC_WEI, EST_BLOB_WEI);
+        // 20 × (21000 × 0.1 gwei + 131072 × 0.004 gwei).
+        assert!((u - 52.48576).abs() < 1e-6, "{u}");
+        // An `Only` lane posts on its node alone.
+        let s2 = &scenarios(1, 1.0)[1];
+        let b = post_bound(s2, &wave_specs(1, 1.0), 1.0);
+        assert!(b[0].txs > 0 && b[1].txs > 0);
+        let one = Scenario {
+            lanes: s2.lanes[..1].to_vec(),
+            ..s2.clone()
+        };
+        let b = post_bound(&one, &wave_specs(1, 1.0), 1.0);
+        let on = usize::from(one.lanes[0].route == Route::Only(NodeId::B));
+        assert!(b[on].txs > 0 && b[1 - on] == PostBound::default());
+    }
+
+    /// Finding 5: wave 2's lost races post too; at 0.1 gwei and a 0.004 gwei
+    /// blob fee it stays within 300 µETH per sequencer key.
+    #[test]
+    fn wave2_fits_the_spend_cap() {
+        let specs = wave_specs(2, 1.0);
+        let mut total = [0.0f64; 2];
+        for sc in scenarios(2, 1.0) {
+            for (t, b) in total.iter_mut().zip(post_bound(&sc, &specs, 1.0)) {
+                *t += b.ueth(EST_EXEC_WEI, EST_BLOB_WEI);
+            }
+        }
+        assert!(total.iter().all(|t| *t > 100.0 && *t <= 300.0), "{total:?}");
+    }
+
     #[test]
     fn scenarios_are_consistent() {
         let seed = seed();
@@ -579,6 +998,18 @@ mod tests {
                     let planned = match &sc.kind {
                         Kind::Plain => available,
                         Kind::Ceiling(cells) => ss.len() * per_burst(cells),
+                        Kind::Race(r) => {
+                            // Both nodes seal on the K-th vote, and every
+                            // round up to twice the target has fresh votes.
+                            assert!(
+                                sc.knobs.iter().all(|k| r.k <= k.batch_max),
+                                "{} at {scale}",
+                                sc.name
+                            );
+                            assert_eq!(ss.len(), 1, "{} at {scale}", sc.name);
+                            assert!(r.rounds > 0 && r.k > 0, "{} at {scale}", sc.name);
+                            2 * r.rounds * r.k
+                        }
                     };
                     assert!(planned <= available, "{} at {scale}", sc.name);
                     for (l, s) in sc.lanes.iter().zip(&ss) {
@@ -610,6 +1041,11 @@ mod tests {
                             Kind::Ceiling(cells) => {
                                 assert_eq!(per_burst(cells), s.voters as usize, "{at}");
                                 assert_eq!(s.rounds, 1, "{at}");
+                            }
+                            Kind::Race(r) => {
+                                assert!(r.k * 2 * r.rounds <= s.voters as usize, "{at}");
+                                assert_eq!(s.rounds, 1, "{at}");
+                                assert_eq!(l.route, Route::Both, "{at}");
                             }
                         }
                         if let End::Shorten { notice, .. } = l.end {

@@ -27,10 +27,13 @@ use super::ledger::{Entry, Ledger};
 use super::merge::ElectionIndex;
 use super::metrics::{self, Kind as LogKind, LogTail};
 use super::money::{self, Balances, Budget, Fees};
-use super::plan::{self, Election, NodeId, Plan, Seed};
+use super::plan::{self, Election, ElectionSpec, NodeId, Plan, Seed};
+use super::race;
 use super::report::{self, Finding, Progress, ScenarioReport, Throughput};
 use super::rig::{Rig, Role};
-use super::scenarios::{Cell, End, Kind, Lane, Scenario, scaled, scenarios};
+use super::scenarios::{
+    Cell, EST_BLOB_WEI, EST_EXEC_WEI, End, Kind, Lane, Scenario, post_bound, scaled, scenarios,
+};
 use super::schedule;
 use super::submit::{Route, SubmitStats, Submitter};
 use crate::net::Net;
@@ -78,13 +81,13 @@ const SHORTEN_MARGIN: u64 = 15;
 /// (they give up their retries at once) before the lanes are dropped.
 const STOP_DRAIN: Duration = Duration::from_secs(120);
 
-fn unix_now() -> f64 {
+pub(super) fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-fn role_of(n: NodeId) -> Role {
+pub(super) fn role_of(n: NodeId) -> Role {
     match n {
         NodeId::A => Role::A,
         NodeId::B => Role::B,
@@ -109,7 +112,7 @@ fn pid_hex(pid: &ProcessId) -> String {
     hex::encode(pid.0)
 }
 
-fn op_provider(net: &Net) -> Result<DynProvider> {
+pub(super) fn op_provider(net: &Net) -> Result<DynProvider> {
     Ok(ProviderBuilder::new()
         .connect_client(chain::rpc(&net.rpc)?)
         .erased())
@@ -610,6 +613,40 @@ async fn ceiling_lane(
     Ok(st)
 }
 
+/// An `AfterSettled` end: once the lane's votes settled, end the election.
+/// Returns when it ended, or why ending failed; nothing after a stop.
+#[allow(clippy::too_many_arguments)]
+async fn end_after_settled(
+    org: &Organizer,
+    lk: &tokio::sync::Mutex<()>,
+    api: &[SequencerClient; 2],
+    ledger: &Ledger,
+    sub: &Submitter,
+    pid: &ProcessId,
+    tag: &str,
+    end: &End,
+) -> Result<(Option<f64>, Option<String>)> {
+    if *end != End::AfterSettled || sub.stopped() {
+        return Ok((None, None));
+    }
+    wait_settled(org, api, ledger, sub, pid, tag).await?;
+    if sub.stopped() {
+        return Ok((None, None));
+    }
+    Ok(
+        match close_with_retries(org, lk, pid, &Close::End(end.clone())).await {
+            Ok(()) => {
+                println!("{tag}: ended after settling");
+                (Some(unix_now()), None)
+            }
+            Err(e) => {
+                println!("{tag}: end failed: {e}");
+                (None, Some(e))
+            }
+        },
+    )
+}
+
 /// Why a scenario stopped early.
 #[derive(Clone, Debug, PartialEq)]
 enum Stop {
@@ -697,7 +734,7 @@ async fn gate_wait(ctx: &Ctx) -> Result<Option<Stop>> {
     }
 }
 
-fn prover_url(rig: &Rig, r: Role) -> Result<String> {
+pub(super) fn prover_url(rig: &Rig, r: Role) -> Result<String> {
     Ok(rig
         .proxies(r)
         .prover
@@ -830,6 +867,59 @@ impl Liner {
     }
 }
 
+/// One progress tick: the line, then the budget (a breach stops) and the
+/// fee gate (a breach pauses new sends, and stops them after `FEE_PAUSE`).
+async fn tick_once(
+    ctx: &Ctx,
+    name: &str,
+    line: &Liner,
+    ledger: &Ledger,
+    logs: &LogReader,
+    sub: &Submitter,
+    fee_since: &mut Option<Instant>,
+) -> Result<Option<Stop>> {
+    let (now, fees) = line.print(ctx, ledger, logs).await?;
+    if let Some(w) = now.as_ref().and_then(|b| budget_breach(ctx, b)) {
+        return Ok(Some(Stop::Budget(w)));
+    }
+    if let Some(w) = fee_breach(&ctx.net, fees) {
+        let since = *fee_since.get_or_insert_with(Instant::now);
+        sub.pause(true);
+        if since.elapsed() >= FEE_PAUSE {
+            return Ok(Some(Stop::Fees(w)));
+        }
+        eprintln!("{name}: fee gate no-go ({w}): sends paused");
+    } else if fee_since.take().is_some() {
+        eprintln!("{name}: fee gate go: sends resume");
+        sub.pause(false);
+    }
+    Ok(None)
+}
+
+/// The start line's spend estimate: the busier key's bound at the quoted
+/// fees and, live, at Ethereum's current ones.
+fn estimate(sc: &Scenario, specs: &[ElectionSpec], scale: f64, live: Option<Fees>) -> String {
+    let b = post_bound(sc, specs, scale);
+    let at = |exec, blob| {
+        b.map(|x| x.ueth(exec, blob))
+            .into_iter()
+            .fold(0.0, f64::max)
+    };
+    let mut s = format!(
+        "est. L1 <= {:.0} µETH per key ({} posts, {} blobs) at 0.1 gwei, blob 0.004 gwei",
+        at(EST_EXEC_WEI, EST_BLOB_WEI),
+        b[0].txs.max(b[1].txs),
+        b[0].blobs.max(b[1].blobs)
+    );
+    if let Some(f) = live {
+        s.push_str(&format!(
+            ", {:.0} at current fees",
+            at(f.base + f.tip, f.blob)
+        ));
+    }
+    s
+}
+
 fn ueth(start: U256, now: U256) -> i64 {
     let d = |a: U256, b: U256| {
         u64::try_from((a - b) / U256::from(1_000_000_000_000u64)).map_or(i64::MAX, |v| v as i64)
@@ -885,6 +975,33 @@ async fn chaos_step(
         new_seals: seals,
     };
     c.step(rig, net, &o, &new).await
+}
+
+/// A race scenario's rows: `races.json` and the report's races table.
+fn race_report(r: &mut ScenarioReport, dir: &Path, sc: &Scenario, o: &race::RaceOut) -> Result<()> {
+    std::fs::write(dir.join("races.json"), serde_json::to_vec_pretty(&o.rows)?)?;
+    let target = match &sc.kind {
+        Kind::Race(s) => s,
+        _ => return Ok(()),
+    };
+    r.races.insert(
+        "races".into(),
+        format!("{}/{} in {} rounds", o.races(), target.rounds, o.rows.len()),
+    );
+    for row in &o.rows {
+        r.races
+            .insert(format!("round {:02}", row.round), row.line());
+    }
+    if let Some((n, d)) = target.skew {
+        r.races.insert(
+            format!("prover {n} held {} s", d.as_secs()),
+            format!("{} /prove held, {} dropped", o.held, o.dropped),
+        );
+    }
+    for (i, n) in o.notes.iter().enumerate() {
+        r.races.insert(format!("note {i}"), n.clone());
+    }
+    Ok(())
 }
 
 /// What `audit --run` needs of a run: written before the first send.
@@ -1411,6 +1528,14 @@ pub async fn run_scenario_in(
     enum Sends {
         Plain(Vec<(Duration, BallotRecord)>),
         Bursts(Vec<(usize, Vec<BallotRecord>)>),
+        Rounds(Vec<Vec<BallotRecord>>),
+    }
+    if let Kind::Race(_) = &sc.kind {
+        // The rounds borrow the rig beside the progress ticks: no chaos.
+        ensure!(
+            lanes.len() == 1 && sc.chaos.is_empty(),
+            "{name}: a race runs one election and no chaos"
+        );
     }
     let mut sends = Vec::new();
     let mut who: BTreeMap<String, HashMap<u64, (u32, Vec<u64>)>> = BTreeMap::new();
@@ -1428,6 +1553,7 @@ pub async fn run_scenario_in(
                 }
                 Sends::Bursts(b)
             }
+            Kind::Race(r) => Sends::Rounds(race::rounds(r, recs)?),
         };
         let vids: BTreeSet<u64> = match &s {
             Sends::Plain(p) => p.iter().map(|(_, r)| r.req.vote_id).collect(),
@@ -1435,11 +1561,16 @@ pub async fn run_scenario_in(
                 .iter()
                 .flat_map(|(_, r)| r.iter().map(|r| r.req.vote_id))
                 .collect(),
+            Sends::Rounds(r) => r.iter().flatten().map(|r| r.req.vote_id).collect(),
         };
         planned.insert(l.tag.clone(), vids);
         sends.push(s);
     }
-    let n_planned: u64 = planned.values().map(|v| v.len() as u64).sum();
+    // A race sends only the rounds it needs, at least `rounds` of K.
+    let n_planned: u64 = match &sc.kind {
+        Kind::Race(r) => (r.k * r.rounds) as u64,
+        _ => planned.values().map(|v| v.len() as u64).sum(),
+    };
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let ledger = Arc::new(Ledger::create(&dir.join("ledger.jsonl"))?);
     let progress_log = std::fs::OpenOptions::new()
@@ -1469,8 +1600,16 @@ pub async fn run_scenario_in(
     if !sc.chaos.is_empty() {
         *chaos = Some((Controller::new(sc.chaos.clone()), t0));
     }
+    let specs: Vec<ElectionSpec> = wave.elections.iter().map(|e| e.spec.clone()).collect();
+    let fees_now = if ctx.net.live {
+        read_fees(&ctx.net).await
+    } else {
+        None
+    };
+    let est = estimate(sc, &specs, scale, fees_now);
+    report.params.insert("estimate".into(), est.clone());
     println!(
-        "{name}: {} elections, {n_planned} ballots, run dir {}",
+        "{name}: {} elections, {n_planned} ballots, {est}, run dir {}",
         lanes.len(),
         dir.display()
     );
@@ -1490,7 +1629,16 @@ pub async fn run_scenario_in(
     let mut set: JoinSet<Result<LaneDone>> = JoinSet::new();
     // The timed ends; a stop aborts them and closes every election itself.
     let mut timers = Vec::new();
+    // A race lane runs in this task, beside the ticks.
+    let mut race_lane = None;
     for ((l, e), s) in lanes.iter().zip(sends) {
+        let s = match s {
+            Sends::Rounds(r) => {
+                race_lane = Some((*l, *e, r));
+                continue;
+            }
+            s => s,
+        };
         let (sub, tag, route, pid) = (sub.clone(), l.tag.clone(), l.route, e.snap.pid);
         let (events, ledger, api) = (logs.events.clone(), ledger.clone(), api.clone());
         let (org1, lk, end) = (org.clone(), org_lock.clone(), l.end.clone());
@@ -1502,23 +1650,10 @@ pub async fn run_scenario_in(
                     let pid = hex::encode(pid.0);
                     ceiling_lane(sub.clone(), events, tag.clone(), pid, route, b, t0).await?
                 }
+                Sends::Rounds(_) => return Err(anyhow!("{tag}: a race lane is not spawned")),
             };
-            let (mut ended, mut end_failed) = (None, None);
-            if end == End::AfterSettled && !sub.stopped() {
-                wait_settled(&org, &api, &ledger, &sub, &pid, &tag).await?;
-            }
-            if end == End::AfterSettled && !sub.stopped() {
-                match close_with_retries(&org, &lk, &pid, &Close::End(end.clone())).await {
-                    Ok(()) => {
-                        println!("{tag}: ended after settling");
-                        ended = Some(unix_now());
-                    }
-                    Err(e) => {
-                        println!("{tag}: end failed: {e}");
-                        end_failed = Some(e);
-                    }
-                }
-            }
+            let (ended, end_failed) =
+                end_after_settled(&org, &lk, &api, &ledger, &sub, &pid, &tag, &end).await?;
             Ok(LaneDone {
                 tag,
                 stats: Some(st),
@@ -1570,7 +1705,61 @@ pub async fn run_scenario_in(
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     let mut chaos_tick = tokio::time::interval(Duration::from_secs(1));
     let first_end = |ended: &BTreeMap<String, f64>| ended.values().copied().reduce(f64::min);
-    loop {
+    let mut race_out: Option<race::RaceOut> = None;
+    if let (Some((l, e, rounds)), Kind::Race(spec)) = (race_lane, &sc.kind) {
+        let rc = race::RaceCtx {
+            ctx,
+            rig: &*rig,
+            org: &org,
+            sub: &sub,
+            e,
+            spec,
+            t0,
+        };
+        let fut = race::race_lane(&rc, rounds);
+        tokio::pin!(fut);
+        let r = loop {
+            tokio::select! {
+                r = &mut fut => break Some(r),
+                _ = tick.tick() => {
+                    if let Some(s) = tick_once(ctx, &name, &line, &ledger, &logs, &sub, &mut fee_since).await? {
+                        stop = Some(s);
+                        // The rounds see the stop: sends give up, waits end.
+                        sub.stop();
+                        break tokio::time::timeout(STOP_DRAIN, &mut fut).await.ok();
+                    }
+                }
+            }
+        };
+        match r {
+            Some(Ok(out)) => race_out = Some(out),
+            Some(Err(e)) if stop.is_none() => return Err(e),
+            Some(Err(e)) => println!(
+                "{name}: the race lane ended with {}",
+                crate::redact_urls(&format!("{e:#}"))
+            ),
+            None => println!("{name}: the race lane still sending after {STOP_DRAIN:?}: dropped"),
+        }
+        let stats = race_out.as_ref().map(|o| o.stats.clone());
+        let (ended, end_failed) = end_after_settled(
+            &org,
+            &org_lock,
+            &api,
+            &ledger,
+            &sub,
+            &e.snap.pid,
+            &l.tag,
+            &l.end,
+        )
+        .await?;
+        done.record(LaneDone {
+            tag: l.tag.clone(),
+            stats,
+            ended,
+            end_failed,
+        });
+    }
+    while stop.is_none() {
         tokio::select! {
             r = set.join_next() => {
                 let Some(r) = r else { break };
@@ -1583,22 +1772,7 @@ pub async fn run_scenario_in(
                 }
             }
             _ = tick.tick() => {
-                let (now, fees) = line.print(ctx, &ledger, &logs).await?;
-                if let Some(w) = now.as_ref().and_then(|b| budget_breach(ctx, b)) {
-                    stop = Some(Stop::Budget(w));
-                    break;
-                } else if let Some(w) = fee_breach(&ctx.net, fees) {
-                    let since = *fee_since.get_or_insert_with(Instant::now);
-                    sub.pause(true);
-                    if since.elapsed() >= FEE_PAUSE {
-                        stop = Some(Stop::Fees(w));
-                        break;
-                    }
-                    eprintln!("{name}: fee gate no-go ({w}): sends paused");
-                } else if fee_since.take().is_some() {
-                    eprintln!("{name}: fee gate go: sends resume");
-                    sub.pause(false);
-                }
+                stop = tick_once(ctx, &name, &line, &ledger, &logs, &sub, &mut fee_since).await?;
             }
             _ = chaos_tick.tick(), if chaos.is_some() => {
                 chaos_step(chaos, rig, &ctx.net, &logs.snapshot(), &mut seen, t0_unix, first_end(&done.ended)).await?;
@@ -1660,6 +1834,15 @@ pub async fn run_scenario_in(
         let unsent = keep_started(&mut planned, &sub.started());
         println!("{name}: {unsent} planned votes never sent");
         report.params.insert("unsent".into(), unsent.to_string());
+    } else if let Kind::Race(_) = &sc.kind {
+        // The rounds a race did not need never left the harness.
+        let unused = keep_started(&mut planned, &sub.started());
+        report
+            .params
+            .insert("unused ballots".into(), unused.to_string());
+    }
+    if let Some(o) = &race_out {
+        race_report(&mut report, &dir, sc, o)?;
     }
     for (tag, e) in &done.end_failed {
         report.params.insert(format!("end failed {tag}"), e.clone());
