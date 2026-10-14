@@ -1430,6 +1430,14 @@ mod tests {
                 )
             })
             .collect();
+        // Wait for the permitted downloads, then check no other one follows.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while served.load(Ordering::SeqCst) < DOWNLOAD_PERMITS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the permitted downloads ran");
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(served.load(Ordering::SeqCst), DOWNLOAD_PERMITS);
         drop(builds);
