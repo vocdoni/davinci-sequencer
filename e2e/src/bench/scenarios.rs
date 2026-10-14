@@ -178,8 +178,9 @@ fn wave3(scale: f64) -> Vec<ElectionSpec> {
         .map(|&(tag, voters)| {
             let voters = (scaled(voters as usize, scale) as u32).max(MIN_VOTERS);
             // C7's end-of-election cap holds the flush for 120 s, then two
-            // restarts and a flush race's loser re-proving must fit.
-            let grace = if tag == "C7" { 900 } else { GRACE };
+            // restarts and a flush race's loser re-proving must fit: the
+            // registry's ceiling, 600 s.
+            let grace = if tag == "C7" { 600 } else { GRACE };
             spec(tag, tag, 8, 1, voters, 1, 0, grace)
         })
         .collect();
@@ -1443,6 +1444,15 @@ mod tests {
         for n in 1..=3 {
             for scale in [1.0, 0.05] {
                 let specs = wave_specs(n, scale);
+                // The live registry's grace floor and ceiling.
+                for s in &specs {
+                    assert!(
+                        (240..=600).contains(&s.grace),
+                        "{} grace {}",
+                        s.tag,
+                        s.grace
+                    );
+                }
                 for sc in scenarios(n, scale) {
                     seen += 1;
                     let ss: Vec<&ElectionSpec> = sc
