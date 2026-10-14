@@ -71,3 +71,5 @@ davinci-client = { workspace = true, features = ["prover"] }
 # RUST_LOG-driven subscriber for the test harness (see common::logs).
 tracing-subscriber.workspace = true
 alloy = { workspace = true, features = ["node-bindings"] }
+# The `--db-cache-mb` test reads the page cache size.
+redb = { workspace = true, features = ["cache_metrics"] }

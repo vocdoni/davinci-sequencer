@@ -4,8 +4,9 @@
 
 use davinci_sequencer::keys::KeyStore;
 use davinci_sequencer::storage::{
-    DB_FILE, Db, ExposedRecord, L1PostRecord, LocalStatus, ProcessRecord, SCHEMA_VERSION_KEY,
-    StorageError, StoredVote, TransitionRecord, VoteStatus, deployment_dir, pid_prefix,
+    DB_FILE, DEFAULT_CACHE_MB, Db, ExposedRecord, L1PostRecord, LocalStatus, ProcessRecord,
+    SCHEMA_VERSION_KEY, StorageError, StoredVote, TransitionRecord, VoteStatus, deployment_dir,
+    pid_prefix,
 };
 use davinci_sequencer::web3::L1Fees;
 use davinci_sequencer::web3::{DkgState, KeyMode, OnchainCensus, OnchainProcess, ProcessStatus};
@@ -533,7 +534,7 @@ fn another_registry_starts_fresh() {
     let dir = tempfile::tempdir().unwrap();
     let a = process_of(&REG_A, 1);
     {
-        let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+        let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
         db.put_process(&a).unwrap();
         db.set_meta_u64("monitor_last_block", 500).unwrap();
         KeyStore::open(&db, 100, REG_A).unwrap();
@@ -543,7 +544,7 @@ fn another_registry_starts_fresh() {
     let before = std::fs::read(&path_a).unwrap();
     assert!(path_a.ends_with(format!("100-0x{}/sequencer.redb", "aa".repeat(20))));
 
-    let db = Db::open_deployment(dir.path(), 100, &REG_B).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_B, DEFAULT_CACHE_MB).unwrap();
     assert!(db.processes().unwrap().is_empty());
     assert_eq!(db.meta_u64("monitor_last_block").unwrap(), None);
     assert_eq!(db.enc_key_count().unwrap(), 0);
@@ -551,7 +552,7 @@ fn another_registry_starts_fresh() {
     assert_eq!(std::fs::read(&path_a).unwrap(), before);
 
     // Back on the first registry, everything is where it was.
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
     assert_eq!(db.processes().unwrap(), vec![a]);
     assert_eq!(db.meta_u64("monitor_last_block").unwrap(), Some(500));
     let mode = |p: &std::path::Path| {
@@ -566,13 +567,15 @@ fn another_registry_starts_fresh() {
 #[test]
 fn a_database_is_bound_to_its_deployment() {
     let dir = tempfile::tempdir().unwrap();
-    drop(Db::open_deployment(dir.path(), 100, &REG_A).unwrap());
+    drop(Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap());
     std::fs::rename(
         deployment_dir(dir.path(), 100, &REG_A),
         deployment_dir(dir.path(), 100, &REG_B),
     )
     .unwrap();
-    let err = Db::open_deployment(dir.path(), 100, &REG_B).err().unwrap();
+    let err = Db::open_deployment(dir.path(), 100, &REG_B, DEFAULT_CACHE_MB)
+        .err()
+        .unwrap();
     assert!(matches!(err, StorageError::Deployment { .. }), "{err}");
 }
 
@@ -589,12 +592,12 @@ fn flat_layout_moves_into_its_deployment() {
         db.set_meta_u64("monitor_last_block", 900).unwrap();
     }
     // Another registry's node leaves it alone.
-    let db = Db::open_deployment(dir.path(), 100, &REG_B).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_B, DEFAULT_CACHE_MB).unwrap();
     assert!(db.processes().unwrap().is_empty());
     drop(db);
     assert!(dir.path().join(DB_FILE).exists());
 
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
     assert!(!dir.path().join(DB_FILE).exists());
     assert_eq!(db.processes().unwrap().len(), 2);
     assert_eq!(db.process(&a.pid).unwrap(), Some(a));
@@ -609,7 +612,7 @@ fn flat_layout_without_processes_stays() {
         let db = Db::open_in(dir.path()).unwrap();
         db.set_meta_u64("monitor_last_block", 900).unwrap();
     }
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
     assert_eq!(db.meta_u64("monitor_last_block").unwrap(), None);
     assert!(dir.path().join(DB_FILE).exists());
 }
@@ -623,7 +626,7 @@ fn flat_layout_of_another_schema_stays() {
         db.put_process(&process_of(&REG_A, 1)).unwrap();
         db.set_meta_u64(SCHEMA_VERSION_KEY, 999).unwrap();
     }
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
     assert!(db.processes().unwrap().is_empty());
     assert!(dir.path().join(DB_FILE).exists());
 }

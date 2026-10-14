@@ -270,6 +270,12 @@ pub struct Config {
     /// `<chain id>-<registry>` subdirectory.
     #[arg(long, env = "DAVINCI_DATADIR", default_value = "~/.davinci-sequencer")]
     pub datadir: PathBuf,
+    /// redb page cache, in MiB. It is long-lived heap, so it bounds most of
+    /// the node's steady memory.
+    #[arg(long, env = "DAVINCI_DB_CACHE_MB",
+        default_value_t = crate::storage::DEFAULT_CACHE_MB as u32,
+        value_parser = clap::value_parser!(u32).range(1..))]
+    pub db_cache_mb: u32,
     #[arg(long, env = "DAVINCI_API_HOST", default_value = "0.0.0.0")]
     pub api_host: String,
     #[arg(long, env = "DAVINCI_API_PORT", default_value_t = 9090)]
@@ -466,6 +472,7 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("network", &self.network.to_string())
             .field("datadir", &self.datadir)
+            .field("db_cache_mb", &self.db_cache_mb)
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
             .field("rpc_url", &Hosts(&self.rpc_url))
@@ -818,6 +825,7 @@ mod tests {
         assert_eq!(c.settle_margin, Duration::from_secs(60));
         assert_eq!(c.l1_settle_lag, Duration::from_secs(110));
         assert_eq!(c.slot_depth, 3);
+        assert_eq!(c.db_cache_mb, 256);
         assert_eq!(c.prove_base, Duration::from_secs(30));
         assert!(c.eager_results);
         assert_eq!(c.blob_source, BlobSourceKind::Anvil);
@@ -840,9 +848,12 @@ mod tests {
             "2",
             "--start-block",
             "41000000",
+            "--db-cache-mb",
+            "64",
         ]);
         let c = Config::parse_args(args).unwrap();
         assert_eq!(c.start_block, Some(41_000_000));
+        assert_eq!(c.db_cache_mb, 64);
         assert_eq!(c.batch_max, 8);
         assert_eq!(c.max_blobs_per_tx, Some(2));
         assert_eq!(c.poll_interval, Duration::from_millis(500));

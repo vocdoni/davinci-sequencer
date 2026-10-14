@@ -26,6 +26,8 @@ pub const SCHEMA_VERSION: u64 = 9;
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The database file inside its directory.
 pub const DB_FILE: &str = "sequencer.redb";
+/// The redb page cache when the caller names none (`--db-cache-mb`).
+pub const DEFAULT_CACHE_MB: usize = 256;
 /// `meta_bytes` key naming the deployment a database belongs to.
 const DEPLOYMENT_KEY: &str = "deployment";
 
@@ -281,6 +283,11 @@ impl Db {
     /// Opens or creates the database file, created with mode 0600 (an
     /// existing file is tightened to 0600). Refuses a different schema version.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, DEFAULT_CACHE_MB)
+    }
+
+    /// [`Db::open`] with a redb page cache of `cache_mb` MiB.
+    pub fn open_with(path: &Path, cache_mb: usize) -> Result<Self> {
         if !path.exists() {
             OpenOptions::new()
                 .write(true)
@@ -289,7 +296,10 @@ impl Db {
                 .open(path)?;
         }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        let db = Database::create(path).map_err(db_err)?;
+        let db = redb::Builder::new()
+            .set_cache_size(cache_mb.saturating_mul(1 << 20))
+            .create(path)
+            .map_err(db_err)?;
         let this = Db {
             db: Arc::new(db),
             arbo_faults: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -310,11 +320,17 @@ impl Db {
     /// empty store and leaves this one alone. A database of the flat layout
     /// (`<datadir>/sequencer.redb`) moves in once if its processes carry this
     /// deployment's id prefix; otherwise it stays where it is.
-    pub fn open_deployment(datadir: &Path, chain_id: u64, registry: &[u8; 20]) -> Result<Self> {
+    pub fn open_deployment(
+        datadir: &Path,
+        chain_id: u64,
+        registry: &[u8; 20],
+        cache_mb: usize,
+    ) -> Result<Self> {
         private_dir(datadir)?;
         let dir = deployment_dir(datadir, chain_id, registry);
         adopt_flat(datadir, &dir, chain_id, registry)?;
-        let db = Self::open_in(&dir)?;
+        private_dir(&dir)?;
+        let db = Self::open_with(&dir.join(DB_FILE), cache_mb)?;
         db.bind_deployment(&deployment_name(chain_id, registry))?;
         Ok(db)
     }

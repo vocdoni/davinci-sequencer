@@ -69,6 +69,7 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--privkey-file` | `DAVINCI_PRIVKEY_FILE` | unset | File with the hex secp256k1 key that signs settlement transactions. |
 | (env only) | `DAVINCI_PRIVKEY` | unset | The same key, from the environment. |
 | `--datadir` | `DAVINCI_DATADIR` | `~/.davinci-sequencer` | One `<chain id>-<registry>/sequencer.redb` per deployment. |
+| `--db-cache-mb` | `DAVINCI_DB_CACHE_MB` | `256` | redb page cache, in MiB. It stays in memory for the node's lifetime, so it bounds most of its steady memory use. |
 | `--api-host` | `DAVINCI_API_HOST` | `0.0.0.0` | API listen address. |
 | `--api-port` | `DAVINCI_API_PORT` | `9090` | API port. |
 | `--batch-max` | `DAVINCI_BATCH_MAX` | `512` | Pending votes that seal a batch at once, and the largest batch (1 to 1024). The prover's host memory limits the largest batch at high field counts: on an RTX 5090 host with 59 GB of RAM, 512 votes at 16 fields with their refreshes ran out of memory while about 370 proved, so set it below that there (384 is used). |

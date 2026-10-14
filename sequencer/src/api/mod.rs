@@ -203,6 +203,16 @@ async fn connect_l1(
     Ok(Arc::new(rpc))
 }
 
+/// The deployment's database, with the configured page cache.
+fn open_db(cfg: &Config, chain_id: u64) -> Result<Db, crate::storage::StorageError> {
+    Db::open_deployment(
+        &cfg.datadir,
+        chain_id,
+        &cfg.registry.into_array(),
+        cfg.db_cache_mb as usize,
+    )
+}
+
 /// Connects, checks the chain, opens the deployment's database and spawns
 /// the node; [`run`] serves it.
 async fn start(
@@ -231,7 +241,7 @@ async fn start(
         datadir = %dir.display(),
         "deployment"
     );
-    let db = Db::open_deployment(&cfg.datadir, contracts.chain_id(), &registry)?;
+    let db = open_db(&cfg, contracts.chain_id())?;
     let mut cfg = cfg;
     let l1 = match da {
         RegistryDa::L1Blobs { l1_block, .. } => {
@@ -323,6 +333,52 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    // `--db-cache-mb` reaches redb: reading 8 MiB back fills a 64 MiB
+    // cache but stays within a 1 MiB one.
+    #[test]
+    fn db_cache_flag_sizes_the_page_cache() {
+        use redb::{ReadableDatabase, TableDefinition};
+        const T: TableDefinition<u64, &[u8]> = TableDefinition::new("cache_probe");
+        let used = |mb: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = Config::parse_args([
+                "davinci-sequencer",
+                "--network",
+                "custom",
+                "--registry",
+                "0x0000000000000000000000000000000000000001",
+                "--rpc-url",
+                "http://127.0.0.1:8545",
+                "--blob-source",
+                "anvil",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--db-cache-mb",
+                mb,
+            ])
+            .unwrap();
+            let row = vec![7u8; 256 << 10];
+            let db = open_db(&cfg, 1).unwrap().database();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(T).unwrap();
+                for i in 0..32u64 {
+                    t.insert(i, row.as_slice()).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            let tx = db.begin_read().unwrap();
+            let t = tx.open_table(T).unwrap();
+            for i in 0..32u64 {
+                assert_eq!(t.get(i).unwrap().unwrap().value().len(), row.len());
+            }
+            db.cache_stats().used_bytes()
+        };
+        let (small, large) = (used("1"), used("64"));
+        assert!(small <= 2 << 20, "{small} B cached under a 1 MiB cap");
+        assert!(large >= 8 << 20, "{large} B cached under a 64 MiB cap");
+    }
 
     #[test]
     fn budget_decision() {
