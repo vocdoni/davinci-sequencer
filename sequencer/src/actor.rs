@@ -1412,6 +1412,23 @@ impl Actor {
         max
     }
 
+    /// While held nothing can land, so only the pending exposed votes ride
+    /// the cycles, picked by membership: a vote skipped by an earlier
+    /// selection must not take an exposed one's place. `None` (the whole
+    /// queue) when not held, or when none is pending (one vote probes).
+    fn held_votes(&self) -> Option<Vec<VerifiedVote>> {
+        if self.prover_hold.is_none() && self.held_reason.is_none() {
+            return None;
+        }
+        let v: Vec<VerifiedVote> = self
+            .pending
+            .iter()
+            .filter(|v| self.exposed_vids.contains(&v.pkg.vote_id))
+            .cloned()
+            .collect();
+        (!v.is_empty()).then_some(v)
+    }
+
     fn accepting(&self) -> bool {
         self.not_closed()
             && self.chain_time >= self.record.onchain.start_time
@@ -2046,55 +2063,57 @@ impl Actor {
             self.state.set_census_root(census_root);
         }
         let max_voters = self.record.onchain.max_voters;
-        let (k, reason) =
-            match self
-                .state
-                .select_batch(&self.pending, max_voters, &self.exposed, usize::MAX)
-            {
-                Ok((refs, blocked)) => {
-                    let k = refs.len();
-                    // Company is the trial size (distinct admissible slots),
-                    // not the queue length.
-                    let seal = k >= 1
-                        && (blocked
-                            || at_max
-                            || (k >= self.min_mix && timer_due)
-                            || (k < self.min_mix && solo_due)
-                            || flush);
-                    if !seal {
-                        return;
-                    }
-                    // Several can hold at once; log the dominant one.
-                    let reason = if flush {
-                        "flush"
-                    } else if at_max {
-                        "at_max"
-                    } else if blocked {
-                        "blocked"
-                    } else if k >= self.min_mix {
-                        "timer"
-                    } else {
-                        "solo"
-                    };
-                    debug!(
-                        pid = %hex::encode(self.pid31),
-                        k,
-                        queued = self.pending.len(),
-                        reason = %reason,
-                        age,
-                        "seal attempt"
-                    );
-                    (k, reason)
-                }
-                Err(StateError::RefreshOverflow { .. }) => {
-                    self.refresh_overflow();
+        let held = self.held_votes();
+        let (k, reason) = match self.state.select_batch(
+            held.as_deref().unwrap_or(&self.pending),
+            max_voters,
+            &self.exposed,
+            usize::MAX,
+        ) {
+            Ok((refs, blocked)) => {
+                let k = refs.len();
+                // Company is the trial size (distinct admissible slots),
+                // not the queue length.
+                let seal = k >= 1
+                    && (blocked
+                        || at_max
+                        || (k >= self.min_mix && timer_due)
+                        || (k < self.min_mix && solo_due)
+                        || flush);
+                if !seal {
                     return;
                 }
-                Err(e) => {
-                    error!(pid = %hex::encode(self.pid31), %e, "select_batch");
-                    return;
-                }
-            };
+                // Several can hold at once; log the dominant one.
+                let reason = if flush {
+                    "flush"
+                } else if at_max {
+                    "at_max"
+                } else if blocked {
+                    "blocked"
+                } else if k >= self.min_mix {
+                    "timer"
+                } else {
+                    "solo"
+                };
+                debug!(
+                    pid = %hex::encode(self.pid31),
+                    k,
+                    queued = self.pending.len(),
+                    reason = %reason,
+                    age,
+                    "seal attempt"
+                );
+                (k, reason)
+            }
+            Err(StateError::RefreshOverflow { .. }) => {
+                self.refresh_overflow();
+                return;
+            }
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "select_batch");
+                return;
+            }
+        };
         // Time budget: the largest batch whose estimated proof plus the
         // landing margin ends before the window closes. While open, the
         // earliest legal close is an END now under a grace lowered to the
@@ -2167,8 +2186,9 @@ impl Actor {
         // unaccounted. So the batch_max and budget caps go into the
         // selection, and a re-proof drop re-runs it over what is left.
         let selected: Vec<VerifiedVote> = loop {
+            let held = self.held_votes();
             let (sized, blocked): (Vec<VerifiedVote>, bool) = match self.state.select_batch_within(
-                &self.pending,
+                held.as_deref().unwrap_or(&self.pending),
                 max_voters,
                 &self.exposed,
                 cap,

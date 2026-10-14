@@ -2064,6 +2064,26 @@ pub fn foreign_batch_of(s: &TestSetup, votes: &[VerifiedVote]) -> davinci_state:
         .unwrap()
 }
 
+/// Another sequencer's batch of `votes` on the root `db`'s transition log
+/// reached (each transition replayed from its stored blobs).
+pub fn peer_batch_of(
+    db: &Db,
+    s: &TestSetup,
+    votes: &[VerifiedVote],
+) -> davinci_state::PreparedBatch {
+    let mut other =
+        davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    for t in db.transitions(&pid_fr()).unwrap() {
+        let blobs = db.blobs(&pid_fr(), t.index).unwrap();
+        let td = davinci_zkvm_sdk::blob::decode_blobs(&blobs, nf).unwrap();
+        other.apply_synced(&td, t.new_root).unwrap();
+    }
+    other
+        .prepare(votes, &mut StdRng::seed_from_u64(9), &Default::default())
+        .unwrap()
+}
+
 // ------------------------------------------------------------ node setup
 
 pub struct TestSetup {

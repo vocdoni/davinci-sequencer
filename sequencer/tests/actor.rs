@@ -5312,6 +5312,22 @@ async fn hold_seals_only_exposed_votes(prover_hold: bool) {
         *prover.wrong_vk.lock().unwrap() = true;
     }
     let mut vids = Vec::new();
+    // Held by a node-side check (a bisection errors votes one by one):
+    // two votes of one slot ahead of the rest. The first selection takes
+    // x1 and skips x2 on the slot clash, so x2 is pending but not exposed.
+    let clash = (!prover_hold).then(|| {
+        (
+            fake_vote(&s.env, 39, &[2, 1], 150),
+            fake_vote(&s.env, 39, &[2, 1], 151),
+        )
+    });
+    if let Some((x1, x2)) = &clash {
+        h.submit(x1.clone()).await.unwrap();
+        h.submit(x2.clone()).await.unwrap();
+        vids.push(x2.pkg.vote_id);
+        // Older than the rest, so it sorts ahead of them after a requeue.
+        s.chain.advance_time(1);
+    }
     for i in 0..n_held {
         let v = fake_vote(&s.env, i, &[2, 1], 200 + i as u64);
         vids.push(v.pkg.vote_id);
@@ -5337,6 +5353,29 @@ async fn hold_seals_only_exposed_votes(prover_hold: bool) {
         .into_iter()
         .collect();
     let e0 = slots.len();
+    if let Some((x1, x2)) = &clash {
+        // A peer settles x1: x2, admitted before the exposed votes, is free.
+        // The next held batch takes only exposed votes, never x2 in their
+        // place.
+        let b = peer_batch_of(&node.db, &s, std::slice::from_ref(x1));
+        s.chain.settle_externally(&b);
+        wait_long("x1 settled by the peer", async || {
+            vote_status(&h, x1.pkg.vote_id).await == Some(VoteStatus::Settled)
+        })
+        .await;
+        let calls = prover.calls();
+        s.chain.advance_time(400);
+        wait_long("a held cycle after the sync", async || {
+            prover.calls() > calls && !h.snapshot().await.unwrap().in_flight
+        })
+        .await;
+        let rec = node.db.exposed(&pid_fr()).unwrap().unwrap();
+        assert!(
+            !rec.vote_ids.contains(&x2.pkg.vote_id),
+            "a non-exposed vote took an exposed vote's place"
+        );
+        assert_eq!(prover.sizes().last(), Some(&n_held));
+    }
     let fresh: Vec<usize> = (n_held..40)
         .filter(|i| !slots.contains(&fake_vote(&s.env, *i, &[1, 2], 1).slot))
         .take(3)
@@ -6652,5 +6691,50 @@ async fn prepare_failure_keeps_the_votes_pending() {
     wait_until("both settled", async || all_settled(&h, &vids).await).await;
     assert_eq!(snap.root, genesis_root(&s.env.cfg).unwrap());
     assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// A hold with no exposed vote left pending (a peer settled them) still
+/// seals one vote of the queue: the probe that lands once the node is fixed
+/// and ends the hold.
+#[tokio::test(start_paused = true)]
+async fn hold_without_pending_exposed_votes_still_probes() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.wrong_vk.lock().unwrap() = true;
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 800);
+    h.submit(a.clone()).await.unwrap();
+    wait_long("held", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&a)));
+    wait_long("a settled by the peer", async || {
+        vote_status(&h, a.pkg.vote_id).await == Some(VoteStatus::Settled)
+    })
+    .await;
+    *prover.wrong_vk.lock().unwrap() = false;
+    let b = fake_vote(&s.env, 1, &[1, 2], 801);
+    h.submit(b.clone()).await.unwrap();
+    wait_long("b settled", async || {
+        all_settled(&h, &[b.pkg.vote_id]).await
+    })
+    .await;
     shutdown.cancel();
 }
