@@ -328,6 +328,7 @@ pub async fn settle(
                 }
                 Err(Web3Error::Revert(RevertReason::Revert { name, data })) => named(name, &data),
                 Err(e @ Web3Error::Lost { .. }) => return Settled::Lost(e.to_string()),
+                Err(e @ Web3Error::FeeCap { .. }) => return Settled::Transient(e.to_string()),
                 Err(e) => return Settled::Transient(e.to_string()),
             },
             Err(RevertReason::Revert { name, data }) => named(name, &data),

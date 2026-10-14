@@ -3801,6 +3801,7 @@ async fn settle_blobs(job: &JobInput, snark: &PlonkSnark) -> JobOutcome {
         Ok(rc) => JobOutcome::Landed(rc),
         Err(Web3Error::Revert(r)) => JobOutcome::Reverted(r.name().unwrap_or("revert").to_string()),
         Err(e @ Web3Error::Lost { .. }) => JobOutcome::Lost(e.to_string()),
+        Err(e @ Web3Error::FeeCap { .. }) => JobOutcome::Transient(e.to_string()),
         Err(e) => JobOutcome::Transient(e.to_string()),
     }
 }

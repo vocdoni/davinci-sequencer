@@ -304,6 +304,7 @@ async fn dkg_fail(
         e if window => Fail::Transient(format!("{what} reverted: {e}")),
         Web3Error::Revert(r) => Fail::Permanent(format!("{what} reverted: {r}")),
         e @ Web3Error::NoSigner => Fail::Permanent(e.to_string()),
+        e @ Web3Error::FeeCap { .. } => Fail::Transient(format!("{what}: {e}")),
         e => Fail::Transient(format!("{what}: {e}")),
     })
 }
@@ -417,6 +418,8 @@ async fn submit(
         Err(Web3Error::Revert(r)) => Err(Fail::Permanent(format!("results reverted: {r}"))),
         // An observer can never submit; retrying would loop forever.
         Err(e @ Web3Error::NoSigner) => Err(Fail::Permanent(e.to_string())),
+        // Over the fee cap: nothing was sent, retry when fees fall.
+        Err(e @ Web3Error::FeeCap { .. }) => Err(Fail::Transient(e.to_string())),
         // Everything else re-arms, a mined revert the replay cannot name
         // (`Lost`) included.
         Err(e) => Err(Fail::Transient(e.to_string())),
