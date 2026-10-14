@@ -912,8 +912,9 @@ struct Actor {
     /// for [`LANDED_EVENT_WAIT`], a reorg took transitions we committed and
     /// the process is rebuilt from the chain.
     diverged: Option<(u64, tokio::time::Instant)>,
-    /// A rebuild dropped the tree and re-creating its genesis failed:
-    /// retried before anything touches the state.
+    /// The state must be reopened at its committed record (a rebuild whose
+    /// genesis write failed, a tree reset that failed): retried before
+    /// anything touches the state.
     state_lost: bool,
     tx: mpsc::Sender<Msg>,
 }
@@ -2035,7 +2036,8 @@ impl Actor {
         self.reopen_state();
     }
 
-    /// Re-creates the genesis a rebuild left to do; false while that fails.
+    /// Reopens the state at its committed record (re-creating the genesis a
+    /// rebuild left to do); false while that fails.
     fn reopen_state(&mut self) -> bool {
         if !self.state_lost {
             return true;
@@ -2508,9 +2510,12 @@ impl Actor {
             Err(e) => {
                 let secs = self.prove_backoff();
                 error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "prepare failed; votes stay pending");
-                // prepare's own reset of the root is best-effort.
+                // prepare's own reset of the root is best-effort. If ours
+                // fails too, reopen at the committed record before any more
+                // state work.
                 if let Err(e) = self.state.reset_to_committed() {
-                    error!(pid = %hex::encode(self.pid31), %e, "tree reset after a failed prepare");
+                    error!(pid = %hex::encode(self.pid31), %e, "tree reset after a failed prepare; reopening");
+                    self.state_lost = true;
                 }
                 return;
             }

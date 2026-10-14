@@ -258,6 +258,22 @@ fn open_stored_reopens_at_the_stored_record() {
     ProcessState::open(env.cfg.clone(), store, &committed).unwrap();
 }
 
+/// Membership is the committed tree's: a prepared batch's vote ids are
+/// not in it until the commit, though the tree's root already moved.
+#[test]
+fn has_vote_id_reads_the_committed_root() {
+    let env = env(2, 8);
+    let mut st = new_state(&env);
+    let votes = vec![fake_vote(&env, 0, &[1, 2], 330)];
+    let b = st
+        .prepare(&votes, &mut StdRng::seed_from_u64(4), &none())
+        .unwrap();
+    assert_eq!(st.root(), b.new_root);
+    assert!(!st.has_vote_id(votes[0].pkg.vote_id).unwrap());
+    st.commit(&b).unwrap();
+    assert!(st.has_vote_id(votes[0].pkg.vote_id).unwrap());
+}
+
 /// Shared storage whose `n`-th write from now fails (a crash there).
 #[derive(Clone)]
 struct CrashAt {

@@ -286,8 +286,14 @@ impl<S: Storage> ProcessState<S> {
         self.occupied.len()
     }
 
+    /// Whether `vid` is in the committed tree. Read at the committed root,
+    /// never the tree's current one, which a prepare (or one whose reset
+    /// failed) has moved ahead.
     pub fn has_vote_id(&self, vid: u64) -> Result<bool, Error> {
-        Ok(self.tree.get(&key_bytes(vid))?.is_some())
+        Ok(self
+            .tree
+            .gen_proof_at(&self.committed.root, &key_bytes(vid))?
+            .exists)
     }
 
     /// The active (committed) ballot of `slot`, if occupied.

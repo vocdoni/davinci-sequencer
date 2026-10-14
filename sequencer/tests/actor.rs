@@ -7077,9 +7077,11 @@ async fn reorg_partly_undone_rebuilds_from_where_the_chain_stops() {
     shutdown.cancel();
 }
 
-/// Two faults inside one prepare: a tree write after the first insert and
-/// prepare's own reset of the root. The node points the tree back at its
-/// committed root itself, so the retry seals without a restart.
+/// Faults inside one prepare: a tree write after the first insert, then
+/// prepare's own reset of the root and the actor's. Membership is read at
+/// the committed root, so the half-inserted vote is never taken as settled,
+/// and the actor reopens its state before the retry, so both votes land
+/// without a restart.
 #[tokio::test]
 async fn prepare_double_fault_resets_the_tree_in_run() {
     let s = setup(2, 8, None);
@@ -7103,15 +7105,35 @@ async fn prepare_double_fault_resets_the_tree_in_run() {
     let v1 = fake_vote(&s.env, 1, &[1, 2], 711);
     let vids = [v0.pkg.vote_id, v1.pkg.vote_id];
     h.submit(v0).await.unwrap();
-    // The first vote-id insert lands, the second and the reset fail.
-    db.fail_arbo_writes_after(1, 2);
+    // The first vote-id insert lands; the second, prepare's reset and the
+    // actor's reset fail.
+    db.fail_arbo_writes_after(1, 3);
     h.submit(v1).await.unwrap();
     h.snapshot().await.unwrap();
     assert_eq!(prover.calls(), 0);
     for vid in vids {
         assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
     }
-    wait_until("both settled", async || all_settled(&h, &vids).await).await;
+    // No vote is ever settled ahead of a transition carrying it.
+    wait_until("both settled", async || {
+        for vid in vids {
+            if vote_status(&h, vid).await == Some(VoteStatus::Settled) {
+                assert!(
+                    h.vote_id_proof(vid).await.is_ok(),
+                    "settled without a committed transition"
+                );
+            }
+        }
+        all_settled(&h, &vids).await
+    })
+    .await;
+    // Settled means on the chain: two voters, each id proved under its root.
+    assert_eq!(s.chain.voters(), 2);
+    for vid in vids {
+        let (p, root) = h.vote_id_proof(vid).await.unwrap();
+        assert!(p.exists);
+        assert_eq!(root, s.chain.root());
+    }
     assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
     shutdown.cancel();
 }
@@ -7168,5 +7190,44 @@ async fn reorged_out_own_transition_rebuilds_and_finalizes_in_dkg_mode() {
     assert_eq!(vote_status(&h, vids[1]).await, Some(VoteStatus::Error));
     assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
+
+/// The same faults, then a peer's transition lands before any retry: the
+/// sync needs the tree at the committed root, which only the reopen after
+/// the failed reset gives back (no seal runs while the pin is ahead).
+#[tokio::test]
+async fn prepare_faults_then_a_peer_landing_syncs() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 720);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 721);
+    let vids = [v0.pkg.vote_id, v1.pkg.vote_id];
+    h.submit(v0).await.unwrap();
+    db.fail_arbo_writes_after(1, 3);
+    h.submit(v1).await.unwrap();
+    let peer = fake_vote(&s.env, 5, &[2, 1], 722);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&peer)));
+    wait_until("synced the peer's transition", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    wait_until("both settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(s.chain.voters(), 3);
     shutdown.cancel();
 }
