@@ -5528,3 +5528,120 @@ async fn onchain_counts_follow_own_and_synced_transitions() {
     assert_eq!(stored_counts(&db), (4, 2));
     stop_b.cancel();
 }
+
+/// A gap replay of older transitions never rewinds the counters the newer
+/// event already pinned.
+#[tokio::test]
+async fn gap_replay_keeps_the_newer_counts() {
+    let s = setup(2, 8, None);
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover_a = FakeProver::gated();
+    let node_a = start_node(
+        Db::open_in(dir_a.path()).unwrap(),
+        dir_a.path(),
+        &s,
+        s.chain.with_signer(0xa1),
+        prover_a.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let node_b = start_node(
+        Db::open_in(dir_b.path()).unwrap(),
+        dir_b.path(),
+        &s,
+        s.chain.with_signer(0xb2),
+        FakeProver::open(),
+        10,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let ha = handle(&node_a).await;
+    let hb = handle(&node_b).await;
+
+    // T1 lands in a block hidden from B's monitor.
+    ha.submit(fake_vote(&s.env, 0, &[1, 2], 71)).await.unwrap();
+    wait_until("A proving", async || prover_a.calls() >= 1).await;
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    prover_a.release(100);
+    wait_until("T1 landed", async || s.chain.voters() == 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // B polls past T1
+    s.chain.hide_block(None);
+    // T2 reaches B as a gap; the replay from its event and the first resync
+    // fail at the blobs, the third attempt waits out a backoff. No getProcess
+    // read heals the counts meanwhile.
+    s.chain.fail_process(u32::MAX);
+    s.chain.fail_blobs(3);
+    ha.submit(fake_vote(&s.env, 1, &[2, 1], 72)).await.unwrap();
+    prover_a.release(100);
+    wait_until("T2 landed", async || s.chain.voters() == 2).await;
+    wait_until("B's replays failed", async || {
+        s.chain.fail_blobs_left() <= 1
+    })
+    .await;
+    assert_ne!(hb.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(stored_counts(&node_b.db), (2, 0));
+    s.chain.fail_process(0);
+    wait_until("B replayed the gap", async || {
+        hb.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(stored_counts(&node_b.db), (2, 0));
+    shutdown.cancel();
+}
+
+/// A node restarted on a record with stale counters heals them from the
+/// chain on its first tick, with no landing.
+#[tokio::test]
+async fn stale_stored_counts_heal_on_the_first_tick() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let stop = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        stop.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    for (i, k) in [(0, 80), (1, 81), (0, 82)] {
+        h.submit(fake_vote(&s.env, i, &[1, 2], k)).await.unwrap();
+        wait_until("landed", async || h.snapshot().await.unwrap().pending == 0).await;
+    }
+    wait_until("counted", async || stored_counts(&node.db) == (2, 1)).await;
+    stop.cancel();
+    drop(h);
+    drop(node);
+
+    // A datadir from before the counters followed the landings.
+    let db = reopen_db(dir.path()).await;
+    let mut rec = db.process(&pid_fr()).unwrap().unwrap();
+    (rec.onchain.voters_count, rec.onchain.overwritten_count) = (0, 0);
+    db.put_process(&rec).unwrap();
+    let submits = s.chain.submit_count();
+    let stop = CancellationToken::new();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        stop.clone(),
+    )
+    .await;
+    handle(&node).await;
+    wait_until("healed", async || stored_counts(&node.db) == (2, 1)).await;
+    assert_eq!(s.chain.submit_count(), submits);
+    stop.cancel();
+}

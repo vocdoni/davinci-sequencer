@@ -1516,12 +1516,25 @@ impl Actor {
         if self.vote_at_stale {
             let why = match self.deps.contracts.process(&self.pid31).await {
                 Ok(p) => {
+                    let pinned = p.state_root == self.record.onchain.state_root;
                     let o = &mut self.record.onchain;
-                    if p.last_vote_at > o.last_vote_at {
-                        o.last_vote_at = p.last_vote_at;
+                    let mut dirty = p.last_vote_at > o.last_vote_at;
+                    o.last_vote_at = o.last_vote_at.max(p.last_vote_at);
+                    // The chain at the pinned root is authoritative for the
+                    // counters: heals a stale bootstrap copy and a reorged-out
+                    // receipt landing.
+                    if pinned
+                        && (o.voters_count, o.overwritten_count)
+                            != (p.voters_count, p.overwritten_count)
+                    {
+                        o.voters_count = p.voters_count;
+                        o.overwritten_count = p.overwritten_count;
+                        dirty = true;
+                    }
+                    if dirty {
                         self.put_record();
                     }
-                    self.vote_at_stale = p.state_root != self.record.onchain.state_root;
+                    self.vote_at_stale = !pinned;
                     format!(
                         "chain root 0x{} behind the events",
                         hex::encode(p.state_root)
@@ -1588,6 +1601,8 @@ impl Actor {
             {
                 warn!(pid = %hex::encode(self.pid31), "pinned root never confirmed; re-pinning from chain");
                 self.record.onchain.state_root = p.state_root;
+                self.record.onchain.voters_count = p.voters_count;
+                self.record.onchain.overwritten_count = p.overwritten_count;
                 self.put_record();
             }
         }

@@ -679,6 +679,10 @@ impl FakeChain {
         self.inner.lock().unwrap().fail_blobs = n;
     }
 
+    pub fn fail_blobs_left(&self) -> u32 {
+        self.inner.lock().unwrap().fail_blobs
+    }
+
     pub fn fail_submits(&self, n: u32) {
         self.inner.lock().unwrap().fail_submits = n;
     }
