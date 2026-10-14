@@ -1056,6 +1056,8 @@ mod tests {
         bare: bool,
         /// Nonce and calldata of every tx sent, refused ones included.
         sent: Vec<(u64, Bytes)>,
+        /// Max fee per gas of every tx sent, in the same order.
+        prices: Vec<u128>,
         pool: std::collections::BTreeMap<u64, B256>,
         mined: Vec<B256>,
     }
@@ -1093,6 +1095,7 @@ mod tests {
                 let env = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
                 let n = env.nonce();
                 c.sent.push((n, env.input().clone()));
+                c.prices.push(env.max_fee_per_gas());
                 if n < c.count {
                     return Some(match c.bare {
                         true => err("nonce too low"),
@@ -1395,6 +1398,39 @@ mod tests {
         let (r, _) = c.send(call(&[3]), None).await.unwrap();
         assert_eq!(r.replacements, 0);
         assert_eq!(sent(&chain), [(5, vec![3])]);
+    }
+
+    // A withheld send records no price: over the cap at the first send,
+    // nothing is held and the next call goes at the market price; a
+    // withheld replacement leaves the price on the pool, and the next call
+    // bumps from that one.
+    #[tokio::test]
+    async fn a_withheld_send_keeps_the_held_price() {
+        let prices = |chain: &Shared| chain.lock().unwrap().prices.clone();
+        let (mut c, chain) = sender(5).await;
+        let want = price(&mut c).await;
+        {
+            let s = c.send_lock.lock().await;
+            assert!(s.stuck.is_none() && s.sent.is_empty(), "{s:?}");
+        }
+        c.max_tx_fee = want;
+        c.send(call(&[1]), None).await.unwrap();
+        let market = prices(&chain)[0];
+        assert_eq!(want, 25_200 * market);
+
+        let (mut c, chain) = sender(5).await;
+        c.max_tx_fee = price(&mut c).await;
+        chain.lock().unwrap().hold = true;
+        let e = c.send(call(&[2]), None).await.unwrap_err();
+        assert!(matches!(e, Web3Error::Stuck { nonce: 5, .. }), "{e}");
+        assert_eq!(prices(&chain), [market], "the replacements were withheld");
+        let held = c.send_lock.lock().await.stuck.expect("held");
+        assert_eq!((held.nonce, held.max_fee), (5, market));
+        c.max_tx_fee = u128::MAX;
+        chain.lock().unwrap().hold = false;
+        c.send(call(&[3]), None).await.unwrap();
+        let next = bumped(&held, market, 0, 0).max_fee;
+        assert_eq!(prices(&chain), [market, next]);
     }
 
     #[test]
