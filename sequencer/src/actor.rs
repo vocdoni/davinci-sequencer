@@ -2053,9 +2053,26 @@ impl Actor {
                 });
             }
         }
+        // Votes the rebuild keeps Settled (in the tree at the fork root) are
+        // checked once the replay converges, with or without coverage.
+        let keep = !coverage.is_empty() || log.iter().any(|t| t.index < d);
         let mut vids = self.exposed_vids.clone();
         vids.extend(synced.iter().flat_map(|r| r.vote_ids.iter().copied()));
         vids.extend(back.iter().map(|(_, v)| v.pkg.vote_id));
+        // A vote an earlier rebuild kept, whose batch only that kept
+        // coverage still knows, is requeued now: its slots ride along.
+        for c in &coverage {
+            let carried: Vec<u64> = c
+                .vote_ids
+                .iter()
+                .copied()
+                .filter(|v| unsettle.contains(v))
+                .collect();
+            if !carried.is_empty() {
+                slots.extend(c.slots.iter().copied());
+                vids.extend(carried);
+            }
+        }
         let exposed = crate::storage::ExposedRecord {
             slots: slots.iter().copied().collect(),
             vote_ids: vids.iter().copied().collect(),
@@ -2071,11 +2088,13 @@ impl Actor {
         ));
         let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
         self.state.release_reads();
-        if let Err(e) = self
-            .deps
-            .db
-            .reset_process(&self.pid, &order, &exposed, &coverage, &record)
-        {
+        if let Err(e) = self.deps.db.reset_process(
+            &self.pid,
+            &order,
+            &exposed,
+            keep.then_some(&coverage[..]),
+            &record,
+        ) {
             error!(%pid, %e, "rebuild write failed; retrying");
             return;
         }
@@ -2107,7 +2126,7 @@ impl Actor {
         self.cap_est = None;
         self.held = None;
         self.vote_at_stale = true;
-        self.rebuild_check = !coverage.is_empty();
+        self.rebuild_check = keep;
         self.state_lost = true;
         self.reopen_state();
     }
@@ -2130,21 +2149,16 @@ impl Actor {
                 return false;
             }
         };
-        let settled = match self
-            .deps
-            .db
-            .vote_ids_with_status(&self.pid, &[VoteStatus::Settled])
-        {
-            Ok(v) => v,
-            Err(e) => {
-                error!(%pid, %e, "settled votes read");
-                return false;
-            }
-        };
-        let missing: Result<Vec<u64>, StateError> = cpu(|| {
+        // A scan of the process's votes and a tree walk per Settled one.
+        let missing: Result<Vec<u64>, String> = cpu(|| {
+            let settled = self
+                .deps
+                .db
+                .vote_ids_with_status(&self.pid, &[VoteStatus::Settled])
+                .map_err(|e| e.to_string())?;
             let mut out = Vec::new();
             for vid in settled {
-                if !self.state.has_vote_id(vid)? {
+                if !self.state.has_vote_id(vid).map_err(|e| e.to_string())? {
                     out.push(vid);
                 }
             }

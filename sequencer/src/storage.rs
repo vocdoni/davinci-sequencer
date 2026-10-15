@@ -909,24 +909,25 @@ impl Db {
     /// A reorg took transitions the process committed: drops its tree
     /// table, every transition and blob, puts `vids` back in the queue
     /// (pending, at its head in this order), and stores the exposed set, the
-    /// coverage kept for the check after the replay (`coverage`; none
-    /// removes it) and the process record, in one commit. The tree is re-created at genesis
+    /// coverage kept for the check after the replay (`coverage`, possibly
+    /// empty; `None` removes it) and the process record, in one commit. The tree is re-created at genesis
     /// after it; a crash in between reopens at genesis (no stored tree).
     pub fn reset_process(
         &self,
         pid: &Fr,
         vids: &[u64],
         exposed: &ExposedRecord,
-        coverage: &[ExposedRecord],
+        coverage: Option<&[ExposedRecord]>,
         process: &ProcessRecord,
     ) -> Result<()> {
         self.write(|tx| {
             let mut kept = tx.open_table(REBUILD_COVERAGE).map_err(db_err)?;
-            if coverage.is_empty() {
-                kept.remove(pid_key(pid).as_slice()).map_err(db_err)?;
-            } else {
-                kept.insert(pid_key(pid).as_slice(), encode(&coverage)?.as_slice())
-                    .map_err(db_err)?;
+            match coverage {
+                Some(c) => drop(
+                    kept.insert(pid_key(pid).as_slice(), encode(&c)?.as_slice())
+                        .map_err(db_err)?,
+                ),
+                None => drop(kept.remove(pid_key(pid).as_slice()).map_err(db_err)?),
             }
             drop(kept);
             let name = Self::arbo_table(pid);

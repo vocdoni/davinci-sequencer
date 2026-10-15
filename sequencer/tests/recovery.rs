@@ -1278,8 +1278,10 @@ async fn replayed_batch_of_a_settled_vote_lost_at_a_crash_keeps_its_slots_covere
 /// is stuck on blob fetches while a reorg takes T1 too. Once the replay
 /// converges on the chain without T1, X goes back to pending and re-seals,
 /// covering every slot T1 published.
-#[tokio::test(start_paused = true)]
-async fn vote_kept_settled_by_a_rebuild_then_reorged_out_reseals() {
+///
+/// With `pre_r4`, the archived records carry no blobs (a datadir from before
+/// R4): no coverage can be kept, yet the check still runs and X re-seals.
+async fn vote_kept_settled_case(pre_r4: bool) {
     let s = setup(2, 26, None);
     let nf = s.env.cfg.ballot_mode.num_fields;
     let dir = TempDir::new().unwrap();
@@ -1312,6 +1314,11 @@ async fn vote_kept_settled_by_a_rebuild_then_reorged_out_reseals() {
         db.transitions(&pid_fr()).unwrap().len() == 3
     })
     .await;
+    if pre_r4 {
+        for t in db.transitions(&pid_fr()).unwrap() {
+            db.put_transition(&pid_fr(), &t, &[]).unwrap();
+        }
+    }
     // T2 reorged out; the rebuild's replay cannot fetch any blob.
     s.chain.reorg_out_last_transition();
     s.chain.fail_blobs(u32::MAX);
@@ -1339,13 +1346,113 @@ async fn vote_kept_settled_by_a_rebuild_then_reorged_out_reseals() {
     assert!(p.exists);
     assert_eq!(root, s.chain.root());
     assert_eq!(s.chain.voters(), 24);
-    let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
-    for slot in t1_slots {
-        assert!(
-            reseal.contains(&slot),
-            "the re-seal left out a slot T1 published"
-        );
+    if !pre_r4 {
+        let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
+        for slot in t1_slots {
+            assert!(
+                reseal.contains(&slot),
+                "the re-seal left out a slot T1 published"
+            );
+        }
     }
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn vote_kept_settled_by_a_rebuild_then_reorged_out_reseals() {
+    vote_kept_settled_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn vote_kept_settled_without_archived_blobs_reseals() {
+    vote_kept_settled_case(true).await;
+}
+
+/// Two rebuilds in a row: our X settles in T1 and our Y in T2 (24 occupied
+/// slots), a peer's T3 on top. T3 is reorged out and the first rebuild keeps
+/// X and Y Settled; its replay re-applies T1 and stalls on T2's blobs, while
+/// a reorg takes T2 and T1. The second rebuild un-settles both: X's slots
+/// come from T1's record, Y's only from what the first rebuild kept. Each
+/// re-seal covers the batch that carried it.
+#[tokio::test(start_paused = true)]
+async fn second_rebuild_covers_votes_the_first_one_kept() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 3800 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    let mut ids = Vec::new();
+    let mut t2_tx = None;
+    for (k, voter) in [3usize, 4].into_iter().enumerate() {
+        let v = fake_vote(&s.env, voter, &[2, 1], 3900 + voter as u64);
+        ids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        s.chain.advance_time(400);
+        prover.release(1);
+        wait_secs("revote settled", 600, async || all_settled(&h, &ids).await).await;
+        if k == 1 {
+            t2_tx = Some(s.chain.last_transition_tx());
+        }
+    }
+    let (xid, yid) = (ids[0], ids[1]);
+    let (t1_slots, t2_slots) = (updated_slots(&db, nf, 1), updated_slots(&db, nf, 2));
+    let peer = fake_vote(&s.env, 25, &[1, 2], 3999);
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&peer)));
+    wait_secs("T3 synced", 600, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 4
+    })
+    .await;
+    // T3 goes; the first rebuild's replay stalls on T2's blobs.
+    s.chain.reorg_out_last_transition();
+    s.chain.withhold_blobs(t2_tx);
+    let block = s.chain.reinclude_transition(0);
+    wait_secs("rerouted", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    wait_secs("first rebuild, T1 replayed", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+            && db.transitions(&pid_fr()).unwrap().len() == 2
+    })
+    .await;
+    // T2 and T1 go too.
+    s.chain.reorg_out_last_transition();
+    s.chain.reorg_out_last_transition();
+    s.chain.withhold_blobs(None);
+    wait_secs("second rebuild", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    s.chain.advance_time(400);
+    prover.release(10);
+    wait_secs("both re-sealed on the chain", 600, async || {
+        all_settled(&h, &[xid, yid]).await && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    for (vid, lost) in [(xid, &t1_slots), (yid, &t2_slots)] {
+        let (p, root) = h.vote_id_proof(vid).await.unwrap();
+        assert!(p.exists);
+        assert_eq!(root, s.chain.root());
+        let reseal = updated_slots(&db, nf, transition_of(&db, nf, vid));
+        let who = if vid == xid { "X" } else { "Y" };
+        for slot in lost {
+            assert!(
+                reseal.contains(slot),
+                "{who}'s re-seal left out a slot its lost batch published"
+            );
+        }
+    }
     shutdown.cancel();
 }
