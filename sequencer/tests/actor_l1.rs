@@ -1122,9 +1122,10 @@ async fn l1_a_foreign_landing_ends_the_pause_but_keeps_the_streak() {
     let miner = mine_every_12s(&l1);
     let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let shutdown = CancellationToken::new();
-    let (prover_a, prover_b) = (FakeProver::open(), FakeProver::open());
-    // A's proofs fail after its posts, four times.
-    *prover_a.fail_batches.lock().unwrap() = 4;
+    // A's settlements fail after their posts and proofs, three times; each
+    // attempt runs when the test releases its proof.
+    let (prover_a, prover_b) = (FakeProver::gated(), FakeProver::open());
+    s.chain.fail_submits(3);
     let (node_a, node_b) = two_l1_nodes(
         &s,
         &l1,
@@ -1135,15 +1136,25 @@ async fn l1_a_foreign_landing_ends_the_pause_but_keeps_the_streak() {
     .await;
     let (ha, hb) = (handle(&node_a).await, handle(&node_b).await);
     let vids_a = submit(&ha, &s, 0..3, 30).await;
+    for k in 1..=3 {
+        wait_secs("A proving", 600, async || prover_a.calls() == k).await;
+        prover_a.release(1);
+    }
     wait_secs("A paused", 600, async || {
-        prover_a.calls() == 3 && !ha.snapshot().await.unwrap().in_flight
+        !ha.snapshot().await.unwrap().in_flight
     })
     .await;
     let vids_b = submit(&hb, &s, 3..6, 40).await;
     wait_secs("B settled", 120, async || all_settled(&hb, &vids_b).await).await;
     // Well inside A's 10 min pause: A seals again, and fails a fourth time.
     wait_secs("A sealed after syncing B", 120, async || {
-        prover_a.calls() == 4 && !ha.snapshot().await.unwrap().in_flight
+        prover_a.calls() == 4
+    })
+    .await;
+    s.chain.fail_submits(1);
+    prover_a.release(1);
+    wait_secs("A's fourth attempt failed", 120, async || {
+        !ha.snapshot().await.unwrap().in_flight
     })
     .await;
     assert_eq!(node_a.metrics.synced_from_others.load(Ordering::SeqCst), 1);
@@ -1164,9 +1175,9 @@ async fn l1_foreign_landings_between_failed_cycles_still_pause() {
     let miner = mine_every_12s(&l1);
     let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let shutdown = CancellationToken::new();
-    // A's proofs fail after its posts, each when the test releases it.
+    // A's settlements fail after its posts and proofs, each attempt when
+    // the test releases its proof.
     let (prover_a, prover_b) = (FakeProver::gated(), FakeProver::open());
-    *prover_a.fail_batches.lock().unwrap() = 100;
     let (node_a, node_b) = two_l1_nodes(
         &s,
         &l1,
@@ -1179,7 +1190,12 @@ async fn l1_foreign_landings_between_failed_cycles_still_pause() {
     let vids_a = submit(&ha, &s, 0..3, 50).await;
     for k in 1..=2 {
         wait_secs("A proving", 120, async || prover_a.calls() == k).await;
+        s.chain.fail_submits(1);
         prover_a.release(1);
+        wait_secs("A's attempt failed", 120, async || {
+            !ha.snapshot().await.unwrap().in_flight
+        })
+        .await;
     }
     // A's third attempt is in flight when B lands: A loses it and syncs.
     wait_secs("A proving again", 120, async || prover_a.calls() == 3).await;
@@ -1191,7 +1207,12 @@ async fn l1_foreign_landings_between_failed_cycles_still_pause() {
     assert!(all_settled(&hb, &vids_b).await);
     for k in 4..=5 {
         wait_secs("A proving", 120, async || prover_a.calls() == k).await;
+        s.chain.fail_submits(1);
         prover_a.release(1);
+        wait_secs("A's attempt failed", 120, async || {
+            !ha.snapshot().await.unwrap().in_flight
+        })
+        .await;
     }
     wait_secs("A's fifth attempt failed", 120, async || {
         !ha.snapshot().await.unwrap().in_flight
@@ -1205,22 +1226,24 @@ async fn l1_foreign_landings_between_failed_cycles_still_pause() {
 }
 
 /// A proof that fails after the blobs went out counts: the cycle posted.
+/// The retries are proof-first, so a flaky prover spends no further post
+/// until a proof passes: one post for the failure, one for the landing.
 #[tokio::test(start_paused = true)]
-async fn l1_a_proof_failure_after_posting_counts() {
+async fn l1_a_proof_failure_after_posting_retries_proof_first() {
     let s = setup(2, 8, None);
     let l1 = FakeL1::new();
     let miner = mine_every_12s(&l1);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
     let prover = FakeProver::open();
-    *prover.fail_batches.lock().unwrap() = 100;
+    *prover.fail_batches.lock().unwrap() = 3;
     let (_node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
     let vids = submit(&h, &s, 0..3, 1800).await;
-    wait_secs("three attempts", 300, async || prover.calls() == 3).await;
-    tokio::time::sleep(Duration::from_secs(400)).await;
-    assert_eq!(prover.calls(), 3, "paused after three posted failures");
-    assert_eq!(l1.sends().len(), 3);
+    wait_secs("three failed attempts", 300, async || prover.calls() == 3).await;
+    assert_eq!(l1.sends().len(), 1, "a retry posted before its proof");
     all_pending(&h, &vids).await;
+    wait_secs("settled", 600, async || all_settled(&h, &vids).await).await;
+    assert_eq!(l1.sends().len(), 2);
     shutdown.cancel();
     miner.abort();
 }
@@ -1378,8 +1401,9 @@ async fn l1_proof_first_retry_is_sized_for_its_exposed_set() {
     shutdown.cancel();
 }
 
-/// A job task that panics after its blobs were mined still counts a failed
-/// cycle: three of them pause sealing, as three posted failures do.
+/// A job task that panics after its blobs were mined counts a failed
+/// cycle, and the retries are proof-first: each panics before posting, so
+/// one post is spent in all.
 #[tokio::test(start_paused = true)]
 async fn l1_a_job_panicking_after_posting_counts() {
     let s = setup(2, 8, None);
@@ -1391,10 +1415,13 @@ async fn l1_a_job_panicking_after_posting_counts() {
     *prover.panic_batches.lock().unwrap() = 100;
     let (_node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
     let vids = submit(&h, &s, 0..3, 1900).await;
-    for k in 1..=3u64 {
+    wait_secs("proving", 600, async || prover.calls() == 1).await;
+    wait_secs("posted", 600, async || l1.sends().len() == 1).await;
+    // Mined, then the job dies.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    prover.release(1);
+    for k in 2..=3u64 {
         wait_secs("proving", 600, async || prover.calls() == k).await;
-        wait_secs("posted", 600, async || l1.sends().len() as u64 == k).await;
-        // Mined, then the job dies.
         tokio::time::sleep(Duration::from_secs(30)).await;
         prover.release(1);
     }
@@ -1402,8 +1429,7 @@ async fn l1_a_job_panicking_after_posting_counts() {
         !h.snapshot().await.unwrap().in_flight
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(400)).await;
-    assert_eq!(prover.calls(), 3, "paused after three posted failures");
+    assert_eq!(l1.sends().len(), 1, "a retry posted before its proof");
     all_pending(&h, &vids).await;
     shutdown.cancel();
     miner.abort();

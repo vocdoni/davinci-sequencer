@@ -224,7 +224,8 @@ Each batch:
 The node bounds the spend of cycles that keep failing. A failed cycle posted at least one blob
 transaction but did not land: the settlement gave up (any of the give-ups above, an OP send failure,
 the deadline), it reverted with an error the node does not handle, or the batch failed after a post.
-After three in a row the node pauses sealing for that process for 10 minutes, and each further
+After a failed cycle the next attempts are proof-first until the node's own landing, so a prover
+that keeps failing spends no further post. After three in a row the node pauses sealing for that process for 10 minutes, and each further
 failed cycle doubles the pause, up to an hour. Each pause logs an error with its length, the count
 and the last failure; the votes stay pending (the grace end errors them as usual) and
 `nextSealNotBefore` shows the pause end. The node's own landing resets the count; another

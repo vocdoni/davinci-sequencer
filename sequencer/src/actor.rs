@@ -2599,10 +2599,12 @@ impl Actor {
         let spv = self.metrics.prove.spv(nf);
         // L1-blob mode posts a batch in chunks of `l1.chunk` blobs. The leg
         // normally runs during the proof and must fit the window on its
-        // own; while bisecting or holding the job is proof-first, so the leg
-        // follows the proof and each chunk takes proof time.
-        let proof_first =
-            self.deps.l1.is_some() && (self.bisect.is_some() || self.prover_hold.is_some());
+        // own. While bisecting or holding, and after any cycle that posted
+        // and failed (until our next landing), the job is proof-first: a
+        // flaky prover spends no post per cycle, the leg follows the proof
+        // and each chunk takes proof time.
+        let proof_first = self.deps.l1.is_some()
+            && (self.bisect.is_some() || self.prover_hold.is_some() || self.failed_cycles > 0);
         let chunk = self.deps.l1.as_ref().map(|l1| l1.chunk);
         let blob_cap = self.state.blob_cap();
         let max_chunks = chunk.map_or(1, |c| blob_cap.div_ceil(c.max(1)));
