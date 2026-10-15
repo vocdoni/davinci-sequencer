@@ -6968,6 +6968,82 @@ async fn a_cancel_first_seen_by_the_close_out_read_waits_for_confirmation() {
     shutdown.cancel();
 }
 
+/// N1 (c): a cancel confirmed by its event, then a reorg deeper than the
+/// confirmations takes it (a read merges Ready, no event), then a second
+/// cancel shows only at the newest block. The first confirmation must not
+/// authorize the second: the vote waits until that one is confirmed.
+#[tokio::test(start_paused = true)]
+async fn a_confirmation_does_not_outlive_its_cancel() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.advance_time(1);
+    let h = handle(&node).await;
+    // The first cancel, confirmed by its event.
+    s.chain.set_status(ProcessStatus::Canceled);
+    s.chain.advance_time(1);
+    wait_long("canceled", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    // A deep reorg takes it; a peer landing makes the node read the head.
+    s.chain.mutate_process(|p| p.status = ProcessStatus::Ready);
+    s.chain.drop_checkpoints();
+    let peer = fake_vote(&s.env, 4, &[1, 2], 91);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&peer)));
+    s.chain.advance_time(1);
+    wait_long("ready again", async || {
+        s.chain.advance_time(1);
+        h.snapshot().await.unwrap().accepting
+    })
+    .await;
+    let vid = submit_n(&h, &s, 1, 92).await[0];
+    // A second cancel, at the newest block only; another peer landing
+    // makes the node read it.
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain
+        .mutate_process(|p| p.status = ProcessStatus::Canceled);
+    let peer2 = fake_vote(&s.env, 5, &[1, 2], 93);
+    s.chain
+        .settle_externally(&peer_batch_of(&node.db, &s, std::slice::from_ref(&peer2)));
+    s.chain.advance_time(1);
+    wait_long("the second cancel merged", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed out on an unconfirmed cancel"
+    );
+    // Confirmed: now it closes.
+    s.chain.drop_checkpoints();
+    s.chain.advance_time(1);
+    wait_long("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    shutdown.cancel();
+}
+
 /// N4: the organizer lowers `maxVoters` (its event arrives) while a batch of
 /// new voters only is in flight, and the settlement reverts
 /// `MaxVotersReached`: the requeued votes are checked against the current
