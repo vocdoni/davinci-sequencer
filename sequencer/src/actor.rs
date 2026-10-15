@@ -584,8 +584,11 @@ impl ActorHandle {
         let _ = self.tx.send(Msg::Event(ev)).await;
     }
 
+    /// A Head never waits on a full mailbox (one busy actor must not hold
+    /// up the others' heads): it is dropped, and the next carries a newer
+    /// block. Events, which must not be lost, still wait.
     pub(crate) async fn head(&self, block: u64, time: u64) {
-        let _ = self.tx.send(Msg::Head { block, time }).await;
+        let _ = self.tx.try_send(Msg::Head { block, time });
     }
 
     pub(crate) async fn reread(&self) {
@@ -4602,6 +4605,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    // A full mailbox never holds up the heartbeat: a Head is dropped (the
+    // next one carries the newer block), never awaited.
+    #[tokio::test]
+    async fn a_head_to_a_full_mailbox_does_not_wait() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let h = super::ActorHandle { tx };
+        h.head(1, 1).await;
+        let sent = tokio::time::timeout(Duration::from_millis(200), h.head(2, 2)).await;
+        assert!(sent.is_ok(), "a head waited on a full mailbox");
+    }
 
     // (votes, cap) per chunk count; `None` from the first infeasible count.
     fn choose(passes: &[Option<(usize, usize)>]) -> Option<(usize, usize)> {

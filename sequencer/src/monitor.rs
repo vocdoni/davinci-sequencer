@@ -812,11 +812,9 @@ async fn heartbeat_loop(
         let confirmed_block = block.saturating_sub(confirmations);
         // Not under the map lock: a full mailbox must not hold up a spawn.
         let hs: Vec<ActorHandle> = processes.read().await.values().cloned().collect();
+        // Never waits: a full mailbox drops this Head, not the others'.
         for h in hs {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = h.head(confirmed_block, time) => {}
-            }
+            h.head(confirmed_block, time).await;
         }
     }
 }
