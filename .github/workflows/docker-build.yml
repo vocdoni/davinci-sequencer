@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: vocdoni/davinci-zkvm
-          ref: v0.2.0
+          ref: v0.3.0
           path: davinci-zkvm
 
       - name: Log in to Docker Hub
