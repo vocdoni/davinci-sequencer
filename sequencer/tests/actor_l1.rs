@@ -554,12 +554,12 @@ async fn l1_the_seal_budget_sizes_a_batch_down_to_fewer_transactions() {
     shutdown.cancel();
 }
 
-/// An exposed set of 126 live slots plus one new vote needs 127 entries: two
+/// A vote whose coverage history holds 126 live slots needs 127 entries: two
 /// blobs. In a window that fits one blob this is a window-limited shortfall,
-/// not a `RefreshOverflow`: no vote errors and the set stays until the grace
-/// after the end opens a window for two (grace raised to 180 s).
+/// not an overflow: the vote is not errored and waits until the grace after
+/// the end opens a window for two (grace raised to 180 s).
 #[tokio::test]
-async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
+async fn l1_a_short_window_waits_for_a_history_that_needs_more_blobs() {
     let s = setup(16, 150, None);
     let l1 = FakeL1::new();
     let dir = TempDir::new().unwrap();
@@ -576,13 +576,14 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
     drop(h);
     drop(node);
 
-    // Phase 2: an exposed record over 126 of those slots, as a lost race
-    // leaves it, then one new vote whose slot is not in it.
+    // Phase 2: a history entry over 126 of those slots, as a reorged-out
+    // peer batch that carried it leaves it, then the vote itself.
     let db = reopen_db(dir.path()).await;
     let late = fake_vote(&s.env, 140, &[1, 2], 3700);
     let late_vid = late.pkg.vote_id;
-    db.put_exposed(
+    db.put_coverage(
         &pid_fr(),
+        &[3; 32],
         &davinci_sequencer::storage::ExposedRecord {
             slots: (0..126)
                 .map(|i| fake_vote(&s.env, i, &[1, 2], 3500 + i as u64).slot)
@@ -610,8 +611,6 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
     )
     .await;
     let h2 = handle(&node2).await;
-    // Read before the submit: a seal tick follows it.
-    let before = node2.db.exposed(&pid_fr()).unwrap().unwrap();
     h2.submit(late).await.unwrap();
     // A few seal ticks in the short window: nothing errors, nothing clears.
     for _ in 0..5 {
@@ -623,7 +622,6 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
         );
         // Still queued, so the loop's ticks do reach the selection.
         assert_eq!(h2.snapshot().await.unwrap().pending, 1);
-        assert_eq!(node2.db.exposed(&pid_fr()).unwrap().as_ref(), Some(&before));
     }
     // The end opens a grace of 180 s: window 180 - 140 fits two chunks.
     s.chain.set_grace(180);
@@ -631,6 +629,100 @@ async fn l1_a_short_window_waits_for_an_exposed_set_that_needs_more_blobs() {
     wait_until("settled", async || all_settled(&h2, &[late_vid]).await).await;
     // The settlement after the end carries two blobs in two transactions.
     assert_eq!(s.chain.l1_last().unwrap().blocks.len(), 2);
+    shutdown2.cancel();
+}
+
+/// R16: two pending votes whose coverage histories (70 live slots each,
+/// disjoint) fit one blob apiece but need two together, in a window that
+/// fits one blob transaction: each vote is charged only its own history,
+/// so both settle in one-blob batches while voting is open.
+#[tokio::test]
+async fn l1_a_short_window_seals_each_vote_with_its_own_history() {
+    let s = setup(16, 150, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(&dir, &s, 140, &[]);
+    let (node, h) = chunked_node(&s, &l1, FakeProver::open(), &dir, cfg, &shutdown).await;
+    let first = submit(&h, &s, 0..140, 3800).await;
+    wait_until("first votes settled", async || {
+        all_settled(&h, &first).await
+    })
+    .await;
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    // Peer batches that carried X1 and X2 (both reorged out before they
+    // reached this node's queue), as their history entries.
+    let db = reopen_db(dir.path()).await;
+    let slot = |i: usize| fake_vote(&s.env, i, &[1, 2], 1).slot;
+    let xs = [
+        fake_vote(&s.env, 140, &[1, 2], 3900),
+        fake_vote(&s.env, 141, &[1, 2], 3901),
+    ];
+    let vids = [xs[0].pkg.vote_id, xs[1].pkg.vote_id];
+    for (k, (v, range)) in [(vids[0], 0..70), (vids[1], 70..140)]
+        .into_iter()
+        .enumerate()
+    {
+        let entry = davinci_sequencer::storage::ExposedRecord {
+            slots: range.map(slot).collect(),
+            vote_ids: vec![v],
+        };
+        db.put_coverage(&pid_fr(), &[k as u8 + 1; 32], &entry)
+            .unwrap();
+    }
+    let shutdown2 = CancellationToken::new();
+    let cfg = chunked_cfg(
+        &dir,
+        &s,
+        140,
+        &[
+            "--l1-settle-lag",
+            "140s",
+            "--batch-time",
+            "100s",
+            "--solo-wait",
+            "100s",
+        ],
+    );
+    let prover = FakeProver::open();
+    let node2 = start_l1_node_cfg(
+        db,
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        cfg,
+        shutdown2.clone(),
+    )
+    .await;
+    let h2 = handle(&node2).await;
+    for v in &xs {
+        h2.submit(v.clone()).await.unwrap();
+    }
+    // Both queued before the timer fires.
+    s.chain.advance_time(115);
+    wait_until("both settled", async || all_settled(&h2, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![1, 1], "one vote per batch");
+    assert_eq!(
+        s.chain.l1_last().unwrap().blocks.len(),
+        1,
+        "one transaction"
+    );
+    assert_eq!(
+        node2.db.process(&pid_fr()).unwrap().unwrap().onchain.status,
+        ProcessStatus::Ready,
+        "settled while voting is open"
+    );
+    for (v, range) in [(vids[0], 0..70), (vids[1], 70..140)] {
+        let nf = s.env.cfg.ballot_mode.num_fields;
+        let reseal = updated_slots(&node2.db, nf, transition_of(&node2.db, nf, v));
+        assert!(
+            range.map(slot).all(|s| reseal.contains(&s)),
+            "a seal left out its history"
+        );
+    }
     shutdown2.cancel();
 }
 

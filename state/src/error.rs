@@ -19,6 +19,9 @@ pub enum Error {
     /// blob cap with even one vote, so no batch can carry them.
     #[error("{exposed} exposed refresh slots do not fit a transition with {votes} votes")]
     RefreshOverflow { exposed: usize, votes: usize },
+    /// A vote's own coverage history does not fit a transition even alone.
+    #[error("vote {vote_id:#x}: {slots} history slots do not fit a transition")]
+    CoverageOverflow { vote_id: u64, slots: usize },
 }
 
 /// Why a vote package was rejected. Mirrors the guest's per-vote checks.

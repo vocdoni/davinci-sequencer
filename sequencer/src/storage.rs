@@ -6,7 +6,7 @@
 //! Keys are big-endian so redb's byte order is the natural order: `pid` is the
 //! process id as BE32, followed by BE8 vote ids / sequence numbers / indexes.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -860,24 +860,30 @@ impl Db {
 
     /// Every slot of every history entry naming one of `vids`.
     pub fn coverage_for(&self, pid: &Fr, vids: &[u64]) -> Result<BTreeSet<u64>> {
+        Ok(self.coverage(pid, vids)?.union(vids))
+    }
+
+    /// The history entries naming any of `vids`, each read once, in one
+    /// read transaction: one index scan per vote, one fetch per entry.
+    pub fn coverage(&self, pid: &Fr, vids: &[u64]) -> Result<davinci_state::Coverage> {
         let tx = self.db.begin_read().map_err(db_err)?;
         let index = tx.open_table(COVERAGE_BY_VOTE).map_err(db_err)?;
-        let mut roots: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut roots: BTreeMap<[u8; 32], Vec<u64>> = BTreeMap::new();
         for vid in vids {
             let (lo, hi) = prefix_range(&key_u64(pid, *vid), 72);
             for row in index.range(lo.as_slice()..=hi.as_slice()).map_err(db_err)? {
                 let (k, _) = row.map_err(db_err)?;
                 if let Ok(r) = <[u8; 32]>::try_from(&k.value()[40..]) {
-                    roots.insert(r);
+                    roots.entry(r).or_default().push(*vid);
                 }
             }
         }
         let history = tx.open_table(COVERAGE_HISTORY).map_err(db_err)?;
-        let mut out = BTreeSet::new();
-        for r in roots {
+        let mut out = davinci_state::Coverage::default();
+        for (r, named) in roots {
             if let Some(v) = history.get(root_key(pid, &r).as_slice()).map_err(db_err)? {
                 let e: ExposedRecord = decode("coverage_history", v.value())?;
-                out.extend(e.slots);
+                out.add(e.slots.into_iter().collect(), &named);
             }
         }
         Ok(out)

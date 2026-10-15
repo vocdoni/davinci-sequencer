@@ -2490,105 +2490,6 @@ async fn onchain_census_growth_respects_max_voters() {
 // --------------------------------- refresh overflow and census indexing
 
 use davinci_sequencer::census::onchain::UsableError;
-use davinci_sequencer::storage::ExposedRecord;
-
-/// Refresh overflow, unit path: only the pending votes the exposed set records are
-/// errored, the set clears everywhere, and later seals start a fresh set.
-#[tokio::test]
-async fn refresh_overflow_errors_only_exposed_votes() {
-    let s = setup(2, 8, None);
-    let dir = TempDir::new().unwrap();
-
-    // Phase 1: three pending votes, no seal (batch_max 5, batch_time 1h).
-    let shutdown = CancellationToken::new();
-    let node = start_node(
-        Db::open_in(dir.path()).unwrap(),
-        dir.path(),
-        &s,
-        s.chain.clone(),
-        FakeProver::open(),
-        5,
-        "0s",
-        shutdown.clone(),
-    )
-    .await;
-    let h = handle(&node).await;
-    let votes: Vec<VerifiedVote> = (0..3)
-        .map(|i| fake_vote(&s.env, i, &[1, 2], 60 + i as u64))
-        .collect();
-    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
-    for v in &votes {
-        h.submit(v.clone()).await.unwrap();
-    }
-    shutdown.cancel();
-    drop(node);
-
-    // Phase 2: seed an exposed record naming votes 0 and 1.
-    let db = reopen_db(dir.path()).await;
-    db.put_exposed(
-        &pid_fr(),
-        &ExposedRecord {
-            slots: vec![1_000_001, 1_000_002],
-            vote_ids: vec![vids[0], vids[1]],
-        },
-    )
-    .unwrap();
-
-    // Phase 3: force the overflow path.
-    let shutdown2 = CancellationToken::new();
-    let prover = FakeProver::gated();
-    let node2 = start_node(
-        db,
-        dir.path(),
-        &s,
-        s.chain.clone(),
-        prover.clone(),
-        5,
-        "0s",
-        shutdown2.clone(),
-    )
-    .await;
-    let h2 = handle(&node2).await;
-    h2.force_refresh_overflow().await;
-    wait_until("recorded votes errored", async || {
-        vote_status(&h2, vids[0]).await == Some(VoteStatus::Error)
-            && vote_status(&h2, vids[1]).await == Some(VoteStatus::Error)
-    })
-    .await;
-    for vid in &vids[..2] {
-        let rec = h2.status(*vid).await.unwrap().unwrap();
-        assert_eq!(
-            rec.error.as_deref(),
-            Some("exposed refresh set too large, recast")
-        );
-    }
-    // The unrecorded vote is untouched and the set is gone from the db.
-    assert_eq!(vote_status(&h2, vids[2]).await, Some(VoteStatus::Pending));
-    assert!(node2.db.exposed(&pid_fr()).unwrap().is_none());
-
-    // The in-memory set cleared too: the next seal records a fresh one.
-    let mut more: Vec<u64> = Vec::new();
-    for i in 3..7 {
-        let v = fake_vote(&s.env, i, &[1, 2], 60 + i as u64);
-        more.push(v.pkg.vote_id);
-        h2.submit(v).await.unwrap();
-    }
-    wait_until("sealed", async || prover.calls() >= 1).await;
-    let e2 = node2
-        .db
-        .exposed(&pid_fr())
-        .unwrap()
-        .expect("fresh exposed set at seal");
-    assert!(!e2.slots.contains(&1_000_001) && !e2.slots.contains(&1_000_002));
-    assert!(!e2.vote_ids.contains(&vids[0]) && !e2.vote_ids.contains(&vids[1]));
-    let mut want = vec![vids[2]];
-    want.extend(&more);
-    want.sort_unstable();
-    assert_eq!(e2.vote_ids, want);
-    prover.release(100);
-    wait_until("survivors settled", async || all_settled(&h2, &want).await).await;
-    shutdown2.cancel();
-}
 
 /// Exposed-set sizing: a batch_max trim that sheds an overwrite of a live exposed
 /// slot errors nothing — the shed votes stay pending and settle later.
@@ -7752,12 +7653,12 @@ async fn orphaned_peer_batch_slots_survive_an_unrelated_landing() {
 /// One blob per batch (nf 16, `--max-blobs-per-tx 1`) fits about 125 slot
 /// updates; 140 slots are occupied. Orphaned peer batches (never applied
 /// here, reorged out) carried our pending X1 and X2 refreshing 70 slots
-/// each, and X3 refreshing all 140. The candidates' union overflows, so the
-/// selection halves: X1 and X2 seal alone, each covering its own history.
-/// X3's history alone overflows: X3 is errored to recast, and Y behind it
-/// still seals.
+/// each, and X3 refreshing all 140; Y is fresh. Each vote is charged only
+/// the histories its batch carries: X3, whose own history fits no
+/// transition, is recast alone; X1 and Y seal together, X2 (which does not
+/// fit next to X1's history) after them, each covering its history.
 #[tokio::test(start_paused = true)]
-async fn history_overflow_halves_then_recasts_alone() {
+async fn history_overflow_recasts_only_the_heavy_vote() {
     let nf = 16u8;
     let s = setup(nf, 144, None);
     let dir = TempDir::new().unwrap();
@@ -7832,8 +7733,8 @@ async fn history_overflow_halves_then_recasts_alone() {
     .await;
     assert_eq!(
         prover.sizes()[calls as usize..],
-        [1, 1, 1],
-        "one vote per batch"
+        [2, 1],
+        "X1 with Y, then X2"
     );
     let err = h.status(x3).await.unwrap().unwrap().error;
     assert_eq!(
@@ -7848,6 +7749,204 @@ async fn history_overflow_halves_then_recasts_alone() {
         );
     }
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
+const ONE_BLOB: &[&str] = &[
+    "--batch-time",
+    "100s",
+    "--solo-wait",
+    "300s",
+    "--max-blobs-per-tx",
+    "1",
+];
+
+/// A 16-field node of one-blob batches (about 125 slot updates each) with
+/// slots 0..140 occupied; returns its datadir's reopened `Db`.
+async fn one_blob_populated(s: &TestSetup, dir: &TempDir) -> Db {
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        s,
+        FakeProver::open(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    let first = submit_n(&h, s, 140, 9300).await;
+    wait_long("140 settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &first).await
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node));
+    reopen_db(dir.path()).await
+}
+
+/// S3-1 in blob mode: a revote queued behind 60 fresh votes, its history
+/// 100 live slots. The fresh votes seal in one batch (each is charged only
+/// what the batch carries), the revote alone after them, covering its
+/// history.
+#[tokio::test(start_paused = true)]
+async fn a_revote_history_does_not_shrink_a_batch_of_fresh_votes() {
+    let nf = 16u8;
+    let s = setup(nf, 200, None);
+    let dir = TempDir::new().unwrap();
+    let db = one_blob_populated(&s, &dir).await;
+    let slot = |i: usize| fake_vote(&s.env, i, &[1, 2], 1).slot;
+    let r = fake_vote(&s.env, 0, &[2, 1], 9600);
+    let rid = r.pkg.vote_id;
+    let hist: std::collections::BTreeSet<u64> = (0..100).map(slot).collect();
+    db.put_coverage(
+        &pid_fr(),
+        &[5; 32],
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: hist.iter().copied().collect(),
+            vote_ids: vec![rid],
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    let mut vids = Vec::new();
+    for i in 140..200 {
+        let v = fake_vote(&s.env, i, &[1, 2], 9400 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    h.submit(r).await.unwrap();
+    vids.push(rid);
+    wait_long("all settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(
+        prover.sizes(),
+        vec![60, 1],
+        "the fresh votes paid the revote's history"
+    );
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, rid));
+    assert!(
+        hist.iter().all(|s| reseal.contains(s)),
+        "the revote left out its history"
+    );
+    shutdown.cancel();
+}
+
+/// S3-3: a live exposed set of 140 slots (more than one batch can refresh,
+/// as repeated lost races leave it) holds exposed vote E. Sealing charges
+/// histories only, so E and a fresh vote F settle; nothing is errored.
+#[tokio::test(start_paused = true)]
+async fn an_oversized_live_set_errors_no_vote() {
+    let s = setup(16, 144, None);
+    let dir = TempDir::new().unwrap();
+    let db = one_blob_populated(&s, &dir).await;
+    let e = fake_vote(&s.env, 140, &[1, 2], 9700);
+    let f = fake_vote(&s.env, 141, &[1, 2], 9701);
+    let vids = [e.pkg.vote_id, f.pkg.vote_id];
+    db.put_exposed(
+        &pid_fr(),
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: (0..140)
+                .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+                .collect(),
+            vote_ids: vec![vids[0]],
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    h.submit(e).await.unwrap();
+    h.submit(f).await.unwrap();
+    wait_long("both settled or one errored", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await || vote_status(&h, vids[0]).await == Some(VoteStatus::Error)
+    })
+    .await;
+    for vid in vids {
+        assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Settled));
+    }
+    shutdown.cancel();
+}
+
+/// S3-2: a refresh overflow from `prepare` (unreachable after a sized
+/// selection, forced here) errors nothing, exposed votes included: they
+/// stay pending and settle after the backoff.
+#[tokio::test(start_paused = true)]
+async fn a_seal_overflow_errors_no_vote() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, &s, 3, 9800).await;
+    shutdown.cancel();
+    drop((h, node));
+    // Exposed, as an earlier public attempt leaves them.
+    let db = reopen_db(dir.path()).await;
+    db.put_exposed(
+        &pid_fr(),
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: Vec::new(),
+            vote_ids: vids.clone(),
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    h.force_seal_overflow().await;
+    s.chain.advance_time(400);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    assert_eq!(prover.calls(), 0, "the forced overflow did not fire");
+    wait_long("settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
     shutdown.cancel();
 }
 
@@ -7903,48 +8002,6 @@ async fn failed_rebuild_check_waits_its_backoff() {
     );
     db.fail_rebuild_check_writes(false);
     wait_long("checked", async || !db.rebuild_check(&pid_fr()).unwrap()).await;
-    shutdown.cancel();
-}
-
-/// A refresh overflow clears an exposed set that holds slots of a public
-/// attempt (a proved batch whose settlement failed): the history still
-/// covers them.
-#[tokio::test]
-async fn refresh_overflow_keeps_the_history() {
-    let s = setup(2, 8, None);
-    let dir = TempDir::new().unwrap();
-    let db = Db::open_in(dir.path()).unwrap();
-    let shutdown = CancellationToken::new();
-    let prover = FakeProver::open();
-    let node = start_node(
-        db.clone(),
-        dir.path(),
-        &s,
-        s.chain.clone(),
-        prover.clone(),
-        1,
-        "0s",
-        shutdown.clone(),
-    )
-    .await;
-    let h = handle(&node).await;
-    s.chain.fail_submits(1);
-    let v = fake_vote(&s.env, 0, &[1, 2], 1680);
-    let vid = v.pkg.vote_id;
-    h.submit(v).await.unwrap();
-    wait_until("proved, send failed, requeued", async || {
-        prover.calls() == 1 && vote_status(&h, vid).await == Some(VoteStatus::Pending)
-    })
-    .await;
-    let slots = db.exposed(&pid_fr()).unwrap().unwrap().slots;
-    h.force_refresh_overflow().await;
-    h.snapshot().await.unwrap();
-    assert!(db.exposed(&pid_fr()).unwrap().is_none());
-    let kept = db.coverage_for(&pid_fr(), &[vid]).unwrap();
-    assert!(
-        slots.iter().all(|s| kept.contains(s)),
-        "the history lost the attempt"
-    );
     shutdown.cancel();
 }
 
@@ -8005,8 +8062,9 @@ fn check_coverage(
     (checked, covered)
 }
 
-/// One random run: own seals, peer batches carrying our pending votes, lost
-/// races, reorgs of the tip and blob-fetch faults, with the invariant
+/// One random run: own seals, peer batches carrying our pending votes or
+/// votes not submitted here yet (submitted later, the identical package),
+/// lost races, reorgs of the tip and blob-fetch faults, with the invariant
 /// checked after every step.
 async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
     use rand::Rng;
@@ -8031,6 +8089,7 @@ async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
     let genesis = genesis_root(&s.env.cfg).unwrap();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut ours: Vec<VerifiedVote> = Vec::new();
+    let mut unsent: Vec<VerifiedVote> = Vec::new();
     let mut kseed = seed * 10_000 + 100;
     let mut from = 0;
     let (mut checked, mut covered) = (0, 0);
@@ -8044,7 +8103,7 @@ async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
         (!pend.is_empty()).then(|| pend[rng.gen_range(0..pend.len())].clone())
     };
     for _ in 0..steps {
-        match rng.gen_range(0..8) {
+        match rng.gen_range(0..10) {
             0..=2 => {
                 kseed += 1;
                 let voter = rng.gen_range(0..36);
@@ -8077,7 +8136,23 @@ async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
                     s.chain.reinclude_transition(0);
                 }
             }
-            _ => s.chain.fail_blobs(rng.gen_range(1..4)),
+            7 => s.chain.fail_blobs(rng.gen_range(1..4)),
+            8 => {
+                kseed += 1;
+                let v = fake_vote(&s.env, rng.gen_range(0..36), &[1, 1], kseed);
+                if let Some(b) = s.chain.try_peer_batch(&s, std::slice::from_ref(&v)) {
+                    s.chain.settle_externally(&b);
+                    unsent.push(v);
+                }
+            }
+            _ => {
+                if !unsent.is_empty() {
+                    let v = unsent.swap_remove(rng.gen_range(0..unsent.len()));
+                    if h.submit(v.clone()).await.is_ok() {
+                        ours.push(v);
+                    }
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
         let sent = s.chain.sent_batches();

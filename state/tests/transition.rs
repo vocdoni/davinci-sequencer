@@ -6,7 +6,9 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::*;
-use davinci_state::{CensusOrigin, Error, ProcessConfig, ProcessState, VerifiedVote, genesis_root};
+use davinci_state::{
+    CensusOrigin, Coverage, Error, ProcessConfig, ProcessState, VerifiedVote, genesis_root,
+};
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::blob::blob_count;
 use davinci_zkvm_sdk::census::slot_key_address;
@@ -734,6 +736,71 @@ fn select_batch_shrinks_for_exposed_refreshes() {
         .unwrap_err();
     assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
     assert_eq!(st.root(), g);
+}
+
+#[test]
+fn select_covered_charges_each_vote_its_own_history() {
+    // 900 occupied 16-field slots; six blobs carry about 760 updates.
+    let env = env(16, 1300);
+    let mut st = committed_state(&env, 900);
+    let fresh: Vec<VerifiedVote> = (900..1000)
+        .map(|i| fake_vote(&env, i, &[1], 30_000 + i as u64))
+        .collect();
+    // A revote of slot 0 whose history is 700 live slots, queued last, and
+    // a later revote of the same slot with no history.
+    let heavy = fake_vote(&env, 0, &[2], 31_000);
+    let later = fake_vote(&env, 0, &[3], 31_001);
+    let hist = slots_of(0..700);
+    let mut cov = Coverage::default();
+    cov.add(hist.clone(), &[heavy.pkg.vote_id]);
+    let mut pending = fresh.clone();
+    pending.push(heavy.clone());
+    pending.push(later.clone());
+    let (sel, blocked, cover) = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
+        .unwrap();
+    // The fresh votes are not charged the heavy history; it waits, and the
+    // later vote of its slot waits behind it.
+    assert_eq!(sel.len(), 100);
+    assert!(blocked);
+    assert!(cover.is_empty());
+    // As before: the history as one set shrinks the fresh batch.
+    let legacy = st
+        .select_batch(&pending, u64::MAX, &hist, usize::MAX)
+        .unwrap()
+        .0
+        .len();
+    assert!(legacy < 100, "{legacy}");
+    // Alone, the heavy vote fits and its cover is exactly its history.
+    let (sel, _, cover) = st
+        .select_covered(
+            &pending[100..],
+            u64::MAX,
+            &none(),
+            &cov,
+            usize::MAX,
+            TX_BLOB_CAP,
+        )
+        .unwrap();
+    assert_eq!(sel.len(), 1);
+    assert_eq!(sel[0].pkg.vote_id, heavy.pkg.vote_id);
+    assert_eq!(cover, hist);
+    let votes: Vec<VerifiedVote> = sel.into_iter().cloned().collect();
+    let b = st
+        .prepare(&votes, &mut StdRng::seed_from_u64(14), &cover)
+        .unwrap();
+    assert!(hist.iter().all(|s| b.updated_slots().contains(s)));
+    st.rollback(&b).unwrap();
+    // A history no transition can carry names its vote.
+    let mut cov = Coverage::default();
+    cov.add(slots_of(0..900), &[heavy.pkg.vote_id]);
+    let err = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::CoverageOverflow { vote_id, .. } if vote_id == heavy.pkg.vote_id),
+        "{err}"
+    );
 }
 
 #[test]
