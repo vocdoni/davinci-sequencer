@@ -1193,15 +1193,45 @@ impl L1Chain for Capped {
 }
 
 /// The events logged on this thread while the guard lives: (level, message).
+///
+/// A process-wide subscriber routes every event to the capturing thread's
+/// sink. A scoped `set_default` per test raced the callsite interest cache
+/// across the binary's parallel tests and now and then dropped an event.
 #[derive(Clone, Default)]
 struct Logs(Arc<Mutex<Vec<(tracing::Level, String)>>>);
 
+thread_local! {
+    static SINK: std::cell::RefCell<Option<Logs>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Ends a capture. Holds a scoped subscriber when the global one is not
+/// ours (`RUST_LOG` runs install theirs first).
+struct Capture {
+    _scoped: Option<tracing::subscriber::DefaultGuard>,
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        SINK.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+/// Sends each event to the current thread's capture, if any.
+struct Route;
+
 impl Logs {
-    fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+    fn capture() -> (Logs, Capture) {
         use tracing_subscriber::layer::SubscriberExt;
+        static OURS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ours = *OURS.get_or_init(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Route))
+                .is_ok()
+        });
         let logs = Logs::default();
-        let sub = tracing_subscriber::registry().with(logs.clone());
-        (logs, tracing::subscriber::set_default(sub))
+        SINK.with(|s| *s.borrow_mut() = Some(logs.clone()));
+        let scoped = (!ours)
+            .then(|| tracing::subscriber::set_default(tracing_subscriber::registry().with(Route)));
+        (logs, Capture { _scoped: scoped })
     }
 
     fn count(&self, level: tracing::Level, needle: &str) -> usize {
@@ -1212,7 +1242,7 @@ impl Logs {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logs {
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Route {
     fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         struct Msg(String);
         impl tracing::field::Visit for Msg {
@@ -1222,9 +1252,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logs {
                 }
             }
         }
-        let mut m = Msg(String::new());
-        e.record(&mut m);
-        self.0.lock().unwrap().push((*e.metadata().level(), m.0));
+        SINK.with(|s| {
+            if let Some(logs) = &*s.borrow() {
+                let mut m = Msg(String::new());
+                e.record(&mut m);
+                logs.0.lock().unwrap().push((*e.metadata().level(), m.0));
+            }
+        });
     }
 }
 
