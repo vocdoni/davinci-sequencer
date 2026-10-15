@@ -455,7 +455,8 @@ async fn apply_sync_crash_window_reopens() {
     )
     .await;
     let h = handle(&node).await;
-    db.fail_next_writes(u32::MAX);
+    // The batch's history entry is written, then the crash.
+    db.fail_writes_after_history();
     let block = s.chain.settle_externally(&foreign_batch(&s, 0, 1));
     wait_until("synced in the tree", async || {
         h.snapshot().await.unwrap().root == s.chain.root()
@@ -1676,7 +1677,7 @@ async fn sealed_before_a_crash_case(crash_at_seal: bool) {
     let xid = x.pkg.vote_id;
     h.submit(x.clone()).await.unwrap();
     if crash_at_seal {
-        db.fail_writes_after_seal();
+        db.fail_writes_after_history();
     }
     s.chain.advance_time(400);
     wait_secs("B sealed", 600, async || prover.calls() >= 2).await;
@@ -1846,5 +1847,52 @@ async fn vote_settled_again_elsewhere_keeps_its_first_batch_covered() {
     })
     .await;
     assert_covers(&s, &db, xid, &[("A", &a_slots), ("Q", &q_slots)]);
+    shutdown.cancel();
+}
+
+/// R15: a peer's P carries revote X before X reached this node, refreshing
+/// all 24 occupied slots; we apply P, then a reorg takes it and we rebuild.
+/// The voter retries the identical package here: its seal covers P.
+#[tokio::test(start_paused = true)]
+async fn peer_batch_of_an_unsubmitted_vote_stays_covered() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let (db, node, h, shutdown) = populated(&s, &dir, FakeProver::open(), 5400).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 5500);
+    let xid = x.pkg.vote_id;
+    let all: std::collections::BTreeSet<u64> = (0..24)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+        .collect();
+    let p = peer_batch_refreshing(&db, &s, std::slice::from_ref(&x), &all);
+    let p_slots: Vec<u64> = davinci_zkvm_sdk::blob::decode_blobs(&p.blobs.blobs, nf)
+        .unwrap()
+        .updates
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    assert!(
+        all.iter().all(|s| p_slots.contains(s)),
+        "P refreshes all 24"
+    );
+    s.chain.settle_externally(&p);
+    wait_secs("P applied", 600, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 2 && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    s.chain.reorg_out_last_transition();
+    rebuild_after_reroute(&s, &db, &node, 1).await;
+    wait_secs("replayed", 600, async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    h.submit(x).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("X sealed here", 600, async || {
+        all_settled(&h, &[xid]).await && db.transitions(&pid_fr()).unwrap().len() == 2
+    })
+    .await;
+    assert_covers(&s, &db, xid, &[("P", &p_slots)]);
     shutdown.cancel();
 }

@@ -59,11 +59,13 @@ const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
 // pid -> []: a rebuild kept votes Settled that its replay may not bring
 // back; the check after the replay converges drops it.
 const REBUILD_CHECK: Bytes = TableDefinition::new("rebuild_check");
-// pid‖root -> `ExposedRecord`: the coverage history. One entry per batch that
-// carried a vote this node stores (our own sealed batches, written in the
-// seal commit before anything can publish them; peer batches, before their
-// sync applies): its updated slots and those votes. Append-only: a reseal of
-// a vote refreshes the slots of every entry naming it.
+// pid‖root -> `ExposedRecord`: the coverage history. One entry per batch
+// carrying votes (our own sealed batches, written in the seal commit before
+// anything can publish them; every peer batch we fetch, with all its vote
+// ids, before its sync applies): its updated slots and those votes.
+// Append-only: a reseal of a vote refreshes the slots of every entry naming
+// it. A full peer batch costs one entry (2560 slots and 512 vote ids as
+// JSON, about 60 KB) and 512 index keys of 72 bytes (about 37 KB).
 const COVERAGE_HISTORY: Bytes = TableDefinition::new("coverage_history");
 // pid‖vid‖root -> []: the history's index by vote.
 const COVERAGE_BY_VOTE: Bytes = TableDefinition::new("coverage_by_vote");
@@ -248,9 +250,10 @@ pub struct Db {
     /// While set, the write after a rebuild's check fails (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     check_faults: Arc<std::sync::atomic::AtomicBool>,
-    /// Armed: the next seal commit is followed by a crash (tests only).
+    /// Armed: the next history write (a seal commit or a synced batch's
+    /// entry) is followed by a crash (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
-    seal_crash: Arc<std::sync::atomic::AtomicBool>,
+    history_crash: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Db {
@@ -360,7 +363,7 @@ impl Db {
             #[cfg(any(test, feature = "test-hooks"))]
             check_faults: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
-            seal_crash: Default::default(),
+            history_crash: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -520,11 +523,12 @@ impl Db {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Every record write after the next seal commit fails, from the very
-    /// next one on (a crash right after it). Test hook.
+    /// Every record write after the next history write (a seal commit or
+    /// a synced batch's entry) fails, from the very next one on (a crash
+    /// right after it). Test hook.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn fail_writes_after_seal(&self) {
-        self.seal_crash
+    pub fn fail_writes_after_history(&self) {
+        self.history_crash
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -653,23 +657,6 @@ impl Db {
             .iter()
             .map(|(_, v)| decode("votes", v))
             .collect()
-    }
-
-    /// Which of `vids` this process has a stored vote for (any status),
-    /// one key lookup each in one read transaction; no record is decoded.
-    pub fn stored_vote_ids(&self, pid: &Fr, vids: &[u64]) -> Result<Vec<u64>> {
-        let tx = self.db.begin_read().map_err(db_err)?;
-        let t = tx.open_table(VOTES).map_err(db_err)?;
-        let mut out = Vec::new();
-        for vid in vids {
-            if t.get(key_u64(pid, *vid).as_slice())
-                .map_err(db_err)?
-                .is_some()
-            {
-                out.push(*vid);
-            }
-        }
-        Ok(out)
     }
 
     /// Ids of a process's votes in one of `statuses`, without loading the
@@ -865,7 +852,10 @@ impl Db {
     /// Records the coverage of the batch reaching `root` (idempotent: the
     /// same root overwrites itself), in its own commit.
     pub fn put_coverage(&self, pid: &Fr, root: &[u8; 32], entry: &ExposedRecord) -> Result<()> {
-        self.write(|tx| tx_put_coverage(tx, pid, root, entry))
+        let r = self.write(|tx| tx_put_coverage(tx, pid, root, entry));
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.crash_after_history(&r);
+        r
     }
 
     /// Every slot of every history entry naming one of `vids`.
@@ -926,14 +916,19 @@ impl Db {
             tx_put_coverage(tx, pid, root, entry)
         });
         #[cfg(any(test, feature = "test-hooks"))]
+        self.crash_after_history(&r);
+        r
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn crash_after_history(&self, r: &Result<()>) {
         if r.is_ok()
             && self
-                .seal_crash
+                .history_crash
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             self.fail_next_writes(u32::MAX);
         }
-        r
     }
 
     /// Votes enter a batch: `aggregated`, out of the pending queue.

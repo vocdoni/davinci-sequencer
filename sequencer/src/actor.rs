@@ -3969,21 +3969,14 @@ impl Actor {
                 return false;
             }
         };
-        // A public batch carrying votes we store (settled ones too: a later
-        // rebuild can requeue them): any re-seal of them must cover its
-        // slots. In the coverage history before the transition becomes
-        // authoritative.
-        let ours = match self.deps.db.stored_vote_ids(&self.pid, &td.vote_ids) {
-            Ok(v) => v,
-            Err(e) => {
-                error!(pid = %hex::encode(self.pid31), %e, "stored votes read");
-                return false;
-            }
-        };
-        if !ours.is_empty() {
+        // Every vote this public batch carries, stored here or not yet (a
+        // voter may retry the same package here after a reorg takes it):
+        // any re-seal of one must cover its slots. In the coverage history
+        // before the transition becomes authoritative.
+        if !td.vote_ids.is_empty() {
             let rec = crate::storage::ExposedRecord {
                 slots: td.updates.iter().map(|(s, _)| *s).collect(),
-                vote_ids: ours,
+                vote_ids: td.vote_ids.clone(),
             };
             if let Err(e) = self.deps.db.put_coverage(&self.pid, &new_root, &rec) {
                 error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's coverage");
