@@ -2506,7 +2506,17 @@ impl Actor {
                 self.seal_max(),
                 self.state.blob_cap(),
             )
-            .map(|sel| (sel.votes.len(), sel.full, sel.cover));
+            .map(|sel| {
+                // The oldest vote's own cover: every batch carries it, so it
+                // is the least a proof-first leg must reserve chunks for.
+                let first: Vec<u64> = sel
+                    .votes
+                    .first()
+                    .map(|v| v.pkg.vote_id)
+                    .into_iter()
+                    .collect();
+                (sel.votes.len(), sel.full, cov.union(&first))
+            });
         let (k, reason, must) = match selected_trial {
             Ok((k, full, must)) => {
                 // Company is the trial size (distinct admissible slots),
@@ -2571,9 +2581,9 @@ impl Actor {
         // chunk after the first adds a post to it, so a short window takes
         // a batch of fewer chunks. While bisecting the job is proof-first:
         // the leg follows the proof, so it gets what a proof of the intended
-        // size leaves, but never fewer chunks than its cover needs (the
-        // trial's, at the count the retry can carry: an upper bound); the
-        // proof gets what the leg leaves:
+        // size leaves, but never fewer chunks than the oldest vote's own
+        // cover needs (the final selection, capped at those chunks, takes
+        // the rest only if it fits); the proof gets what the leg leaves:
         // base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
         let spv = self.metrics.prove.spv(nf);
         let proof_first =

@@ -1076,6 +1076,23 @@ impl FakeChain {
         self.inner.lock().unwrap().proc.max_voters = n;
     }
 
+    /// `setProcessMaxVoters`: the cap moves and its event lands in a new block.
+    pub fn change_max_voters(&self, n: u64) {
+        let mut i = self.inner.lock().unwrap();
+        i.proc.max_voters = n;
+        i.block += 1;
+        let block = i.block;
+        i.events.push(RegistryEvent {
+            block,
+            tx_hash: B256::with_last_byte(5),
+            log_index: 0,
+            kind: EventKind::MaxVotersChanged {
+                pid: pid31(),
+                max_voters: n,
+            },
+        });
+    }
+
     pub fn submit_count(&self) -> u64 {
         self.inner.lock().unwrap().submits
     }

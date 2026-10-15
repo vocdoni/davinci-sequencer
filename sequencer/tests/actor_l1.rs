@@ -644,6 +644,95 @@ async fn l1_a_proof_first_retry_sizes_its_leg_for_the_votes_it_carries() {
     shutdown.cancel();
 }
 
+/// The proof-first chunk minimum comes from the first vote's own cover, not
+/// the retry's union. X (a revote, history F of 70 slots) and fresh W fail
+/// together, so the retry has a bisection cap of two; W leaves (the process
+/// fills and new-slot votes are errored) and Z joins, a revote whose own
+/// history is 69 other slots. X and Z together need two chunks, whose leg
+/// leaves no proof time in the 150 s floor; X alone needs one. X retries
+/// alone and lands while voting is open.
+#[tokio::test]
+async fn l1_a_proof_first_retry_reserves_the_first_votes_chunks() {
+    let s = setup(16, 150, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(&dir, &s, 140, &[]);
+    let (node, h) = chunked_node(&s, &l1, FakeProver::open(), &dir, cfg, &shutdown).await;
+    let first = submit(&h, &s, 0..140, 4200).await;
+    wait_until("first votes settled", async || {
+        all_settled(&h, &first).await
+    })
+    .await;
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    let db = reopen_db(dir.path()).await;
+    let slot = |i: usize| fake_vote(&s.env, i, &[1, 2], 1).slot;
+    let x = fake_vote(&s.env, 0, &[2, 1], 4300);
+    let z = fake_vote(&s.env, 139, &[2, 1], 4301);
+    let w = fake_vote(&s.env, 140, &[1, 2], 4302);
+    let (xid, zid, wid) = (x.pkg.vote_id, z.pkg.vote_id, w.pkg.vote_id);
+    for (k, (v, range)) in [(xid, 1..71), (zid, 71..140)].into_iter().enumerate() {
+        let entry = davinci_sequencer::storage::ExposedRecord {
+            slots: range.map(slot).collect(),
+            vote_ids: vec![v],
+        };
+        db.put_coverage(&pid_fr(), &[k as u8 + 1; 32], &entry)
+            .unwrap();
+    }
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(
+        &dir,
+        &s,
+        140,
+        &[
+            "--l1-settle-lag",
+            "110s",
+            "--batch-time",
+            "100s",
+            "--solo-wait",
+            "100s",
+        ],
+    );
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = 1;
+    let node = start_l1_node_cfg(
+        db,
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    h.submit(x).await.unwrap();
+    h.submit(w).await.unwrap();
+    s.chain.advance_time(115);
+    wait_until("X and W failed once", async || {
+        prover.calls() == 1 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    assert_eq!(prover.sizes(), vec![2]);
+    // The process fills: W, a new slot, is errored at the next read.
+    s.chain.change_max_voters(140);
+    h.submit(z).await.unwrap();
+    wait_until("W errored", async || {
+        vote_status(&h, wid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    wait_until("X settled", async || all_settled(&h, &[xid]).await).await;
+    assert_eq!(
+        node.db.process(&pid_fr()).unwrap().unwrap().onchain.status,
+        ProcessStatus::Ready,
+        "settled while voting is open"
+    );
+    assert_eq!(prover.sizes()[..2], [2, 1]);
+    shutdown.cancel();
+}
+
 /// A vote whose coverage history holds 126 live slots needs 127 entries: two
 /// blobs. In a window that fits one blob this is a window-limited shortfall,
 /// not an overflow: the vote is not errored and waits until the grace after
