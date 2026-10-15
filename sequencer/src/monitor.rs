@@ -145,6 +145,13 @@ pub async fn spawn_node(
     // Events lost in mailboxes at a crash are not routed again: each
     // actor's first tick re-reads its process and applies what moved.
     let (_, chain_time) = ctx.deps.contracts.head().await.unwrap_or((0, 0));
+    if chain_time != 0 && ctx.deps.clock.now().abs_diff(chain_time) > 60 {
+        warn!(
+            local = ctx.deps.clock.now(),
+            head = chain_time,
+            "local clock differs from the chain's head time by over 60 s; admission closes at the later of the two, so a clock running ahead refuses votes early"
+        );
+    }
     let mut map = node.processes.write().await;
     let mut failed = Vec::new();
     for rec in ctx.deps.db.processes()? {
