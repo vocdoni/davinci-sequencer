@@ -2580,6 +2580,9 @@ impl Actor {
             || self.deps.contracts.signer().is_none()
             // The chain left our log: our root may never land.
             || self.diverged.is_some()
+            // Votes a rebuild kept Settled are not checked yet: one it
+            // requeues widens the exposed set this seal must cover.
+            || self.rebuild_check
             // Never seal off a stale root: wait until the committed tree
             // matches the pinned on-chain root (resync closes the gap).
             || self.state.committed().root != self.record.onchain.state_root
@@ -3115,7 +3118,19 @@ impl Actor {
             }
             self.drop_pending(&vids);
         }
-        if let Err(e) = self.deps.db.clear_exposed(&self.pid) {
+        // Its Settled votes may still be requeued by a rebuild: a set with
+        // slots of a public batch no record of ours covers is archived.
+        let archive = self
+            .exposed_published
+            .then(|| crate::storage::ExposedRecord {
+                slots: self.exposed.iter().copied().collect(),
+                vote_ids: self.exposed_vids.iter().copied().collect(),
+            });
+        if let Err(e) = self
+            .deps
+            .db
+            .clear_exposed_archiving(&self.pid, archive.as_ref())
+        {
             error!(pid = %hex::encode(self.pid31), %e, "clear exposed set");
             return; // keep the in-memory set; retried on the next seal
         }
@@ -3127,6 +3142,7 @@ impl Actor {
         );
         self.exposed.clear();
         self.exposed_vids.clear();
+        self.exposed_published = false;
     }
 
     /// Drops the exposed set once every recorded vote is settled or
@@ -3237,17 +3253,11 @@ impl Actor {
         // A proved batch may have been sent (a reverted blob transaction
         // keeps its sidecar), a mined post is on Ethereum: either way public,
         // and with no record of ours to cover it.
-        if (f.proved || f.posted.load(Ordering::Relaxed)) && !self.exposed_published {
-            match self.deps.db.set_exposed_published(&self.pid, true) {
-                Ok(()) => self.exposed_published = true,
-                Err(e) => {
-                    error!(pid = %hex::encode(self.pid31), %e, "mark the exposed set published")
-                }
-            }
-        }
+        let published = f.proved || f.posted.load(Ordering::Relaxed);
         let vids = f.prepared.vote_ids.clone();
-        if let Err(e) = self.deps.db.requeue(&self.pid, &vids) {
-            error!(pid = %hex::encode(self.pid31), %e, "requeue");
+        match self.deps.db.requeue_flight(&self.pid, &vids, published) {
+            Ok(()) => self.exposed_published |= published,
+            Err(e) => error!(pid = %hex::encode(self.pid31), %e, "requeue"),
         }
         self.pending.splice(0..0, f.votes);
         self.pending_at.splice(0..0, f.votes_at);

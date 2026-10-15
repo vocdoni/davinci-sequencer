@@ -68,10 +68,11 @@ const REBUILD_COVERAGE: Bytes = TableDefinition::new("rebuild_coverage");
 // record covers (a sent or posted attempt that did not land here, or slots
 // a rebuild or a fold brought in). Our landing covers them and clears it.
 const EXPOSED_PUBLISHED: Bytes = TableDefinition::new("exposed_published");
-// pid -> JSON list of `ExposedRecord`: exposed sets cleared while flagged,
-// append-only, for a rebuild or the kept-vote check that requeues one of
-// their votes. Never pruned: one entry per lifecycle that ended without our
-// landing (a lost race a peer settled), a handful per election.
+// pid‖seq (BE8) -> `ExposedRecord`: exposed sets cleared while flagged,
+// append-only, one row each, for a rebuild or the kept-vote check that
+// requeues one of their votes. Never pruned: one per lifecycle that ended
+// without our landing (a lost race a peer settled), a handful per election.
+// (A row keyed by the pid alone holds an earlier test build's JSON list.)
 const PUBLISHED_COVERAGE: Bytes = TableDefinition::new("published_coverage");
 /// Schemas this build upgrades in place: 9 only added `l1_posts`, 10 stopped
 /// using the `committed` table (the tree's own record is authoritative).
@@ -800,13 +801,21 @@ impl Db {
         self.write(|tx| {
             if let Some(rec) = archive {
                 let mut t = tx.open_table(PUBLISHED_COVERAGE).map_err(db_err)?;
-                let mut list: Vec<ExposedRecord> = match t.get(pid_key(pid).as_slice()) {
-                    Ok(Some(v)) => decode("published_coverage", v.value())?,
-                    Ok(None) => Vec::new(),
-                    Err(e) => return Err(db_err(e)),
+                let (lo, hi) = prefix_range(&pid_key(pid), 40);
+                let last = t
+                    .range(lo.as_slice()..=hi.as_slice())
+                    .map_err(db_err)?
+                    .next_back()
+                    .transpose()
+                    .map_err(db_err)?
+                    .map(|(k, _)| k.value().to_vec());
+                let seq = match last {
+                    None => 0,
+                    Some(k) => u64_value("published_coverage", k.get(32..).unwrap_or_default())?
+                        .checked_add(1)
+                        .ok_or_else(|| StorageError::Db("published sequence exhausted".into()))?,
                 };
-                list.push(rec.clone());
-                t.insert(pid_key(pid).as_slice(), encode(&list)?.as_slice())
+                t.insert(key_u64(pid, seq).as_slice(), encode(rec)?.as_slice())
                     .map_err(db_err)?;
             }
             tx.open_table(EXPOSED)
@@ -827,13 +836,16 @@ impl Db {
         self.write(|tx| tx_set_published(tx, pid, on))
     }
 
-    /// Exposed sets cleared while they held such slots.
+    /// Exposed sets cleared while they held such slots, oldest first.
     pub fn published_coverage(&self, pid: &Fr) -> Result<Vec<ExposedRecord>> {
-        Ok(self
-            .get(PUBLISHED_COVERAGE, &pid_key(pid))?
-            .map(|v| decode("published_coverage", &v))
-            .transpose()?
-            .unwrap_or_default())
+        let mut out: Vec<ExposedRecord> = match self.get(PUBLISHED_COVERAGE, &pid_key(pid))? {
+            Some(v) => decode("published_coverage", &v)?,
+            None => Vec::new(),
+        };
+        for (_, v) in self.scan(PUBLISHED_COVERAGE, &pid_key(pid), 40)? {
+            out.push(decode("published_coverage", &v)?);
+        }
+        Ok(out)
     }
 
     /// Records a blob transaction before it is sent; a replacement at the
@@ -962,6 +974,19 @@ impl Db {
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Aggregated, None)?;
             tx_remove(tx, pid, vids)
+        })
+    }
+
+    /// [`Db::requeue`] for a flight's votes; `published` (the flight may
+    /// have been sent or posted) flags the exposed set in the same commit.
+    pub fn requeue_flight(&self, pid: &Fr, vids: &[u64], published: bool) -> Result<()> {
+        self.write(|tx| {
+            tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_prepend(tx, pid, vids)?;
+            if published {
+                tx_set_published(tx, pid, true)?;
+            }
+            Ok(())
         })
     }
 

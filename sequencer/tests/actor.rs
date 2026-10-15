@@ -7801,3 +7801,44 @@ async fn failed_rebuild_check_waits_its_backoff() {
     .await;
     shutdown.cancel();
 }
+
+/// A refresh overflow clears an exposed set that holds slots of a public
+/// attempt (a proved batch whose settlement failed): the set is archived,
+/// not forgotten.
+#[tokio::test]
+async fn refresh_overflow_archives_a_published_set() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    s.chain.fail_submits(1);
+    let v = fake_vote(&s.env, 0, &[1, 2], 1680);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("proved, send failed, requeued", async || {
+        prover.calls() == 1 && vote_status(&h, vid).await == Some(VoteStatus::Pending)
+    })
+    .await;
+    let slots = db.exposed(&pid_fr()).unwrap().unwrap().slots;
+    h.force_refresh_overflow().await;
+    h.snapshot().await.unwrap();
+    assert!(db.exposed(&pid_fr()).unwrap().is_none());
+    let archived = db.published_coverage(&pid_fr()).unwrap();
+    assert_eq!(archived.len(), 1, "the published set was not archived");
+    assert_eq!(archived[0].slots, slots);
+    assert!(archived[0].vote_ids.contains(&vid));
+    shutdown.cancel();
+}

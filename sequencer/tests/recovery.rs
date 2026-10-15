@@ -1281,7 +1281,9 @@ async fn replayed_batch_of_a_settled_vote_lost_at_a_crash_keeps_its_slots_covere
 ///
 /// With `pre_r4`, the archived records carry no blobs (a datadir from before
 /// R4): no coverage can be kept, yet the check still runs and X re-seals.
-async fn vote_kept_settled_case(pre_r4: bool) {
+/// With `check_fails`, the check's write fails for a while and another vote
+/// W waits: nothing seals until the check has requeued X.
+async fn vote_kept_settled_case(pre_r4: bool, check_fails: bool) {
     let s = setup(2, 26, None);
     let nf = s.env.cfg.ballot_mode.num_fields;
     let dir = TempDir::new().unwrap();
@@ -1334,12 +1336,28 @@ async fn vote_kept_settled_case(pre_r4: bool) {
     assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Settled));
     // T1 goes too, before the replay brings it back.
     s.chain.reorg_out_last_transition();
+    let calls = prover.calls();
+    if check_fails {
+        db.fail_rebuild_check_writes(true);
+        let w = fake_vote(&s.env, 5, &[2, 1], 3702);
+        h.submit(w).await.unwrap();
+    }
     s.chain.fail_blobs(0);
     s.chain.advance_time(400);
     prover.release(10);
+    if check_fails {
+        wait_secs("replayed, check failing", 600, async || {
+            h.snapshot().await.unwrap().synced
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(db.rebuild_coverage(&pid_fr()).unwrap().is_some());
+        assert_eq!(prover.calls(), calls, "sealed before the kept-vote check");
+        db.fail_rebuild_check_writes(false);
+    }
     wait_secs("X re-sealed on the chain", 600, async || {
         let ts = db.transitions(&pid_fr()).unwrap();
-        ts.len() == 2 && all_settled(&h, &[xid]).await && h.snapshot().await.unwrap().synced
+        ts.len() >= 2 && all_settled(&h, &[xid]).await && h.snapshot().await.unwrap().synced
     })
     .await;
     let (p, root) = h.vote_id_proof(xid).await.unwrap();
@@ -1361,12 +1379,17 @@ async fn vote_kept_settled_case(pre_r4: bool) {
 
 #[tokio::test(start_paused = true)]
 async fn vote_kept_settled_by_a_rebuild_then_reorged_out_reseals() {
-    vote_kept_settled_case(false).await;
+    vote_kept_settled_case(false, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn nothing_seals_while_the_kept_vote_check_fails() {
+    vote_kept_settled_case(false, true).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn vote_kept_settled_without_archived_blobs_reseals() {
-    vote_kept_settled_case(true).await;
+    vote_kept_settled_case(true, false).await;
 }
 
 /// Two rebuilds in a row: our X settles in T1 and our Y in T2 (24 occupied
