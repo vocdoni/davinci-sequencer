@@ -924,6 +924,9 @@ struct Actor {
     /// A rebuild kept votes Settled that its replay may not bring back:
     /// check them once the replay converges (`Db::rebuild_coverage`).
     rebuild_check: bool,
+    /// Synced-batch coverage may be stored that no recorded transition
+    /// dropped: folded into the exposed set before the next seal.
+    sync_orphans: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -1100,6 +1103,7 @@ pub(crate) fn spawn_actor(
         diverged: None,
         state_lost: false,
         rebuild_check: deps.db.rebuild_coverage(&pid).map_err(ierr)?.is_some(),
+        sync_orphans: !deps.db.sync_coverage(&pid).map_err(ierr)?.is_empty(),
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -2127,8 +2131,58 @@ impl Actor {
         self.held = None;
         self.vote_at_stale = true;
         self.rebuild_check = keep;
+        self.sync_orphans = false;
         self.state_lost = true;
         self.reopen_state();
+    }
+
+    /// Sealing waits on a complete log (`log_root == committed`), and a
+    /// recorded transition drops its own synced coverage: what is left is
+    /// the coverage of synced batches that never applied here (their
+    /// transition reorged out). Their slots join the exposed set for the
+    /// pending votes they carried, durably, before anything seals. Whether
+    /// sealing may go on.
+    fn fold_sync_orphans(&mut self) -> bool {
+        let pid = hex::encode(self.pid31);
+        let rows = match self.deps.db.sync_coverage(&self.pid) {
+            Ok(r) => r,
+            Err(e) => {
+                let secs = self.prove_backoff();
+                error!(%pid, %e, retry_in = secs, "synced coverage read");
+                return false;
+            }
+        };
+        let pending: std::collections::HashSet<u64> =
+            self.pending.iter().map(|v| v.pkg.vote_id).collect();
+        let mut slots = self.exposed.clone();
+        let mut vids = self.exposed_vids.clone();
+        for r in &rows {
+            let carried: Vec<u64> = r
+                .vote_ids
+                .iter()
+                .copied()
+                .filter(|v| pending.contains(v))
+                .collect();
+            if !carried.is_empty() {
+                slots.extend(r.slots.iter().copied());
+                vids.extend(carried);
+            }
+        }
+        if !rows.is_empty() {
+            let rec = crate::storage::ExposedRecord {
+                slots: slots.iter().copied().collect(),
+                vote_ids: vids.iter().copied().collect(),
+            };
+            if let Err(e) = self.deps.db.consume_sync_coverage(&self.pid, &rec) {
+                let secs = self.prove_backoff();
+                error!(%pid, %e, retry_in = secs, "fold orphaned synced coverage");
+                return false;
+            }
+            self.exposed = slots;
+            self.exposed_vids = vids;
+        }
+        self.sync_orphans = false;
+        true
     }
 
     /// After a rebuild's replay converged (the tree at the chain's root, the
@@ -2544,6 +2598,9 @@ impl Actor {
         }
         self.settle_pending_in_tree();
         if self.pending.is_empty() {
+            return;
+        }
+        if self.sync_orphans && !self.fold_sync_orphans() {
             return;
         }
         // The batch census root (guest register 20), by origin.
@@ -3996,25 +4053,15 @@ impl Actor {
             }
         };
         if !ours.is_empty() {
-            let stored = self.deps.db.sync_coverage(&self.pid).and_then(|old| {
-                let mut slots: BTreeSet<u64> =
-                    old.iter().flat_map(|r| r.slots.iter().copied()).collect();
-                slots.extend(td.updates.iter().map(|(s, _)| *s));
-                let mut vids: BTreeSet<u64> = old
-                    .iter()
-                    .flat_map(|r| r.vote_ids.iter().copied())
-                    .collect();
-                vids.extend(ours);
-                let rec = crate::storage::ExposedRecord {
-                    slots: slots.into_iter().collect(),
-                    vote_ids: vids.into_iter().collect(),
-                };
-                self.deps.db.put_sync_coverage(&self.pid, &rec)
-            });
-            if let Err(e) = stored {
+            let rec = crate::storage::ExposedRecord {
+                slots: td.updates.iter().map(|(s, _)| *s).collect(),
+                vote_ids: ours,
+            };
+            if let Err(e) = self.deps.db.put_sync_coverage(&self.pid, &new_root, &rec) {
                 error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's slot coverage");
                 return false;
             }
+            self.sync_orphans = true;
         }
         let before = self.state.committed();
         if let Err(e) = cpu(|| self.state.apply_synced(&td, new_root)) {

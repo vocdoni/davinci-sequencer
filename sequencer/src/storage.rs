@@ -56,8 +56,10 @@ const EXPOSED: Bytes = TableDefinition::new("exposed");
 // nonce (BE8) -> `L1PostRecord`: blob transactions of the node's Ethereum
 // account not yet seen mined (L1-blob mode).
 const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
-// pid -> `ExposedRecord`: slots of synced batches that carried our votes,
-// for a rebuild if one is reorged out before its record is written.
+// pid‖new_root -> `ExposedRecord`: the slots of a synced batch that carried
+// our votes, until its transition is recorded; a row whose transition never
+// was is an orphan, consumed by the next seal or a rebuild. (A row keyed by
+// the pid alone is an earlier build's: an orphan too.)
 const SYNC_COVERAGE: Bytes = TableDefinition::new("sync_coverage");
 // pid -> JSON list of `ExposedRecord`, one per archived transition carrying
 // votes we store, kept by a rebuild until its replay converges.
@@ -675,17 +677,42 @@ impl Db {
             .transpose()
     }
 
-    /// Stores the slot coverage of synced batches that carried our votes,
-    /// before the sync makes one authoritative. The next transition record
-    /// (or a rebuild) drops it in its own commit.
-    pub fn put_sync_coverage(&self, pid: &Fr, rec: &ExposedRecord) -> Result<()> {
-        self.put(SYNC_COVERAGE, &pid_key(pid), &encode(rec)?)
+    /// Stores the slot coverage of the synced batch reaching `new_root`,
+    /// before the sync makes it authoritative. Its transition record drops
+    /// it in the same commit.
+    pub fn put_sync_coverage(
+        &self,
+        pid: &Fr,
+        new_root: &[u8; 32],
+        rec: &ExposedRecord,
+    ) -> Result<()> {
+        self.put(SYNC_COVERAGE, &sync_key(pid, new_root), &encode(rec)?)
     }
 
-    pub fn sync_coverage(&self, pid: &Fr) -> Result<Option<ExposedRecord>> {
-        self.get(SYNC_COVERAGE, &pid_key(pid))?
-            .map(|v| decode("sync_coverage", &v))
-            .transpose()
+    /// Every stored synced-batch coverage of the process.
+    pub fn sync_coverage(&self, pid: &Fr) -> Result<Vec<ExposedRecord>> {
+        let mut out: Vec<ExposedRecord> = self
+            .scan(SYNC_COVERAGE, &pid_key(pid), 64)?
+            .iter()
+            .map(|(_, v)| decode("sync_coverage", v))
+            .collect::<Result<_>>()?;
+        if let Some(v) = self.get(SYNC_COVERAGE, &pid_key(pid))? {
+            out.push(decode("sync_coverage", &v)?);
+        }
+        Ok(out)
+    }
+
+    /// Before a seal: the orphaned synced coverage (every row left; a
+    /// recorded transition drops its own) folds into the exposed set, in one
+    /// commit.
+    pub fn consume_sync_coverage(&self, pid: &Fr, exposed: &ExposedRecord) -> Result<()> {
+        self.write(|tx| {
+            tx.open_table(EXPOSED)
+                .map_err(db_err)?
+                .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
+                .map_err(db_err)?;
+            tx_clear_sync_coverage(tx, pid)
+        })
     }
 
     /// What a rebuild kept for the check after its replay: per archived
@@ -897,10 +924,10 @@ impl Db {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;
             tx_remove(tx, pid, vids)?;
             tx_put_transition(tx, pid, t, blobs)?;
-            // The log has the synced transition: its archive covers it.
+            // The log has this transition: its archive covers it now.
             tx.open_table(SYNC_COVERAGE)
                 .map_err(db_err)?
-                .remove(pid_key(pid).as_slice())
+                .remove(sync_key(pid, &t.new_root).as_slice())
                 .map_err(db_err)?;
             tx_put_process(tx, process)
         })
@@ -949,10 +976,7 @@ impl Db {
                 .map_err(db_err)?
                 .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
                 .map_err(db_err)?;
-            tx.open_table(SYNC_COVERAGE)
-                .map_err(db_err)?
-                .remove(pid_key(pid).as_slice())
-                .map_err(db_err)?;
+            tx_clear_sync_coverage(tx, pid)?;
             tx_put_process(tx, process)
         })
     }
@@ -1289,6 +1313,23 @@ fn inspect_flat(path: &Path) -> Result<(Option<u64>, HashSet<[u8; 4]>), redb::Er
         }
     }
     Ok((schema, out))
+}
+
+fn sync_key(pid: &Fr, root: &[u8; 32]) -> [u8; 64] {
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(&pid_key(pid));
+    k[32..].copy_from_slice(root);
+    k
+}
+
+// Drops every synced-batch coverage row of the process.
+fn tx_clear_sync_coverage(tx: &WriteTransaction, pid: &Fr) -> Result<()> {
+    let mut t = tx.open_table(SYNC_COVERAGE).map_err(db_err)?;
+    let (lo, hi) = prefix_range(&pid_key(pid), 64);
+    t.retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
+        .map_err(db_err)?;
+    t.remove(pid_key(pid).as_slice()).map_err(db_err)?;
+    Ok(())
 }
 
 fn tx_push(tx: &WriteTransaction, pid: &Fr, vid: u64) -> Result<()> {

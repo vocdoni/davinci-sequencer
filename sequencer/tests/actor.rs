@@ -5446,7 +5446,7 @@ async fn hold_seals_only_exposed_votes(prover_hold: bool) {
         // rebuild, not added to the live set.
         assert_eq!(exposed(), e0, "the peer's batch widened the exposed set");
         // Its record is written, so its kept coverage went with that commit.
-        assert!(node.db.sync_coverage(&pid_fr()).unwrap().is_none());
+        assert!(node.db.sync_coverage(&pid_fr()).unwrap().is_empty());
     }
     let fresh: Vec<usize> = (n_held..40)
         .filter(|i| !slots.contains(&fake_vote(&s.env, *i, &[1, 2], 1).slot))
@@ -7640,7 +7640,7 @@ async fn uncommitted_sync_whose_transition_vanishes_needs_no_rebuild() {
     s.chain
         .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&x)));
     wait_long("coverage kept, sync not applied", async || {
-        db.sync_coverage(&pid_fr()).unwrap().is_some()
+        db.sync_coverage(&pid_fr()).unwrap().len() == 1
     })
     .await;
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -7659,8 +7659,87 @@ async fn uncommitted_sync_whose_transition_vanishes_needs_no_rebuild() {
     s.chain.advance_time(400);
     wait_long("ours landed", async || all_settled(&h, &[xid]).await).await;
     assert_eq!(s.chain.voters(), 1);
-    assert!(db.sync_coverage(&pid_fr()).unwrap().is_none());
+    assert!(db.sync_coverage(&pid_fr()).unwrap().is_empty());
     tokio::time::sleep(Duration::from_secs(200)).await;
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
     shutdown.cancel();
+}
+
+/// A peer batch carrying our pending revote X (24 occupied slots) never
+/// applies here (every tree write fails) and a reorg takes it: no rebuild,
+/// our tree never left the chain. X then seals here, and that re-seal must
+/// cover every slot the peer's public batch changed. With `unrelated`, an
+/// unrelated peer batch lands and is recorded first: it must not discard the
+/// orphan's slots.
+async fn orphaned_peer_batch_case(unrelated: bool) {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        24,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let first = submit_n(&h, &s, 24, 1700).await;
+    wait_long("24 settled", async || all_settled(&h, &first).await).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 1750);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    let b = peer_batch_of(&db, &s, std::slice::from_ref(&x));
+    let peer_slots: Vec<u64> = decode_blobs(&b.blobs.blobs, nf)
+        .unwrap()
+        .updates
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    let ours = h.snapshot().await.unwrap().root;
+    db.fail_next_arbo_writes(u32::MAX);
+    s.chain.settle_externally(&b);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(h.snapshot().await.unwrap().root, ours, "the sync applied");
+    s.chain.reorg_out_last_transition();
+    db.fail_next_arbo_writes(0);
+    wait_long("back in sync", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    if unrelated {
+        let other = fake_vote(&s.env, 25, &[1, 2], 1751);
+        s.chain
+            .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&other)));
+        wait_long("the unrelated batch recorded", async || {
+            db.transitions(&pid_fr()).unwrap().len() == 2
+                && h.snapshot().await.unwrap().root == s.chain.root()
+        })
+        .await;
+    }
+    s.chain.advance_time(400);
+    wait_long("X sealed here", async || all_settled(&h, &[xid]).await).await;
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
+    for slot in peer_slots {
+        assert!(
+            reseal.contains(&slot),
+            "the seal left out a slot the peer published"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn orphaned_peer_batch_slots_ride_the_next_seal() {
+    orphaned_peer_batch_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn orphaned_peer_batch_slots_survive_an_unrelated_landing() {
+    orphaned_peer_batch_case(true).await;
 }

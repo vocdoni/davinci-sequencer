@@ -1456,3 +1456,65 @@ async fn second_rebuild_covers_votes_the_first_one_kept() {
     }
     shutdown.cancel();
 }
+
+/// The same cut, then a crash: the peer batch carrying our pending revote X
+/// was never applied here, the node restarts after a reorg took it, and X's
+/// seal covers every slot the peer's public batch changed.
+#[tokio::test(start_paused = true)]
+async fn orphaned_peer_batch_slots_ride_the_seal_after_a_restart() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 4100 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 4150);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    let b = peer_batch_of(&db, &s, std::slice::from_ref(&x));
+    let peer_slots: Vec<u64> = davinci_zkvm_sdk::blob::decode_blobs(&b.blobs.blobs, nf)
+        .unwrap()
+        .updates
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    db.fail_next_arbo_writes(u32::MAX);
+    let block = s.chain.settle_externally(&b);
+    wait_secs("event routed", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    shutdown.cancel();
+    drop((h, node, db));
+
+    s.chain.reorg_out_last_transition();
+    let db = reopen_db(dir.path()).await;
+    let shutdown = CancellationToken::new();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, FakeProver::open(), &shutdown).await;
+    wait_secs("in sync", 600, async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    s.chain.advance_time(400);
+    wait_secs("X sealed here", 600, async || all_settled(&h, &[xid]).await).await;
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
+    for slot in peer_slots {
+        assert!(
+            reseal.contains(&slot),
+            "the seal left out a slot the peer published"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
