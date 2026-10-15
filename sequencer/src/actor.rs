@@ -2573,7 +2573,8 @@ impl Actor {
         let cov = {
             let cands = held.as_deref().unwrap_or(&self.pending);
             let ids: Vec<u64> = cands.iter().map(|v| v.pkg.vote_id).collect();
-            match self.deps.db.coverage(&self.pid, &ids) {
+            // One index scan per candidate: off the async worker.
+            match cpu(|| self.deps.db.coverage(&self.pid, &ids)) {
                 Ok(c) => c,
                 Err(e) => {
                     let secs = self.prove_backoff();
@@ -2638,25 +2639,27 @@ impl Actor {
         // the fewest chunks on a tie. A vote is charged only the histories
         // its batch carries, and a vote that does not fit is skipped, so a
         // vote no budget can carry holds up nothing else.
-        let chosen = choose_chunks(
-            max_chunks,
-            |chunks| {
-                let (cap, max_blobs) = budget(chunks)?;
-                Some(
-                    self.state
-                        .select_covered(
-                            held.as_deref().unwrap_or(&self.pending),
-                            max_voters,
-                            &none,
-                            &cov,
-                            cap,
-                            max_blobs,
-                        )
-                        .map(|sel| (cap, max_blobs, sel)),
-                )
-            },
-            |(cap, _, sel)| (sel.votes.len(), sel.full && sel.votes.len() == *cap),
-        );
+        let chosen = cpu(|| {
+            choose_chunks(
+                max_chunks,
+                |chunks| {
+                    let (cap, max_blobs) = budget(chunks)?;
+                    Some(
+                        self.state
+                            .select_covered(
+                                held.as_deref().unwrap_or(&self.pending),
+                                max_voters,
+                                &none,
+                                &cov,
+                                cap,
+                                max_blobs,
+                            )
+                            .map(|sel| (cap, max_blobs, sel)),
+                    )
+                },
+                |(cap, _, sel)| (sel.votes.len(), sel.full && sel.votes.len() == *cap),
+            )
+        });
         let (cap, max_blobs, k, full, mut sized) = match chosen {
             Ok(Some((_, (cap, max_blobs, sel)))) => (
                 cap,
@@ -2734,10 +2737,10 @@ impl Actor {
             }
             let cands = now_held.as_deref().unwrap_or(&self.pending);
             debug_assert!(cands.iter().all(|v| cov.covers(v.pkg.vote_id)));
-            sized = match self
-                .state
-                .select_covered(cands, max_voters, &none, &cov, cap, max_blobs)
-            {
+            sized = match cpu(|| {
+                self.state
+                    .select_covered(cands, max_voters, &none, &cov, cap, max_blobs)
+            }) {
                 Ok(sel) if !sel.votes.is_empty() => sel.votes.into_iter().cloned().collect(),
                 Ok(_) => return,
                 // Unreachable after the passes; never errors votes.
