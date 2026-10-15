@@ -73,7 +73,10 @@ To build a batch, the actor:
 1. takes votes in arrival order, the oldest per slot, within `maxVoters`, the size above and the
    blob limit, counting the refreshes the circuit will require: the chain's per-transaction limit
    in blob mode, the circuit's 32 blobs in L1-blob mode (at most the transactions the time left
-   allows);
+   allows). A vote is charged the coverage history of the votes the batch carries (its own and
+   theirs), never that of votes left out; one that does not fit waits for a later batch (later
+   votes of its slot wait behind it), and one whose own history fits no transition ends in
+   `error` alone (`exposed refresh set too large, recast`);
 2. draws a fresh seed and a refresh selection from the OS random number generator;
 3. re-encrypts every ballot along the seed's scalar chain and re-randomizes a sample of other
    occupied slots, so an observer cannot tell a revote from a routine refresh; every batch that
@@ -106,7 +109,7 @@ the backoff. Other failures:
   votes are settled, and so do the close and a restart (the state is in memory). The count and
   the hold end only at the node's own landing or a restart: another sequencer's landing says
   nothing about this node's prover. While it holds, a batch carries only the held votes, so
-  votes cast meanwhile do not widen the exposed set (see [security.md](security.md)).
+  their re-attempts do not grow with votes cast meanwhile (see [security.md](security.md)).
 - A proof the node's own checks refuse (public outputs, program key or `rootCVadcopFinal` other
   than the pins), and in L1-blob mode an Ethereum proof that carries other blobs, would fail the
   same way for every batch: the votes stay pending under the usual backoff, never bisected or

@@ -191,7 +191,7 @@ On OP Mainnet:
   send. On another chain in blob mode (Ethereum, Gnosis), raise it to that chain's prices. Both
   caps must be above zero: `0` would withhold every send, so the node refuses it at boot.
 - Votes that sit `pending` with `nextSealNotBefore` in the past are held by the time budget; the
-  node logs why at debug level ("no time to land an L1-blob batch", "no batch fits", "the exposed set needs more blob
+  node logs why at debug level ("no time to land an L1-blob batch", "no batch fits", "the coverage needs more blob
   transactions than the window fits").
 
 ## Data directory

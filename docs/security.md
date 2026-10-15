@@ -26,20 +26,20 @@ proofs that match what it computed itself.
   refresh. Participation is not hidden: a refresh only touches an occupied slot, so a slot's first
   write is a new vote, and with a Merkle census the slot follows from the voter's address.
 - **Re-sealing a batch reveals nothing.** A batch may reach the chain even if the node later
-  drops it (a lost race, a prover failure, a restart, a reorg). Every batch carrying a vote the
-  node stores joins a persisted, append-only per-process coverage history (its changed slots and
-  those votes): the node's own in the commit that seals it, before anything can publish it,
-  another sequencer's before its sync applies. A batch that carries one of those votes again
-  refreshes every slot of every such batch it does not write. Until the node's own sealed votes
-  have all settled or errored, every batch also refreshes the slots of those batches (the exposed
-  set). Otherwise two batches with different refresh draws could be compared, and a vote dropped
-  between them would stand out as an overwrite. Both hold exactly the slot keys the blobs already
-  publish, without marking which were writes, so persisting them leaks nothing new. The history
-  is not pruned during an election. If what a batch must refresh no longer fits one transition,
-  the node errors the votes concerned (`exposed refresh set too large, recast`) rather than
-  publish a transition that covers only part of it. One case is inherent: another sequencer's
-  batch that a reorg takes before this node fetched its blobs was never seen here, so a later
-  re-seal of a vote it carried cannot cover it.
+  drops it (a lost race, a prover failure, a restart, a reorg). Every batch carrying votes joins a
+  persisted, append-only per-process coverage history (its changed slots and its votes): the
+  node's own in the commit that seals it, before anything can publish it; every batch of another
+  sequencer the node fetches, with all its vote ids (a voter may later send the same package
+  here), before its sync applies. A batch that carries one of those votes again refreshes every
+  slot of every such batch it does not write. Otherwise two batches with different refresh draws
+  could be compared, and a vote dropped between them would stand out as an overwrite. The history
+  holds exactly the slot keys and vote ids the blobs already publish, without marking which slots
+  were writes, so persisting it leaks nothing new. It is not pruned during an election (a full
+  peer batch adds about 100 KB). If a vote's own history no longer fits one transition, the node
+  errors that vote alone (`exposed refresh set too large, recast`) rather than publish a
+  transition that covers only part of it. One case is inherent: another sequencer's batch that a
+  reorg takes before this node fetched its blobs was never seen here, so a later re-seal of a vote
+  it carried cannot cover it.
 - **Election keys are derived, not stored.** A sequencer key is
   `HMAC-SHA256(master, "davinci-election-key-v1" ‖ chainId ‖ registry ‖ processId)`, expanded and
   reduced into `[1, l)`. `POST /processes/keys` writes nothing, so key requests cannot fill the
