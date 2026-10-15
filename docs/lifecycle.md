@@ -43,7 +43,7 @@ The actor seals a batch when one of these holds:
 
 | Trigger | Condition |
 |---|---|
-| capacity | The queue no longer fits one transaction, or `--batch-max` votes are pending. |
+| capacity | The queue no longer fits one transaction (a vote kept out only by its own coverage history does not count), or `--batch-max` votes are pending. |
 | timer | The batch holds at least `--min-mix` distinct slots and the oldest vote has waited `--batch-time`. |
 | solo | Fewer than `--min-mix` slots, and the oldest vote has waited `--solo-wait`. |
 | flush | The election ends within `--flush-horizon`, or has ended and its grace window is still open. |
