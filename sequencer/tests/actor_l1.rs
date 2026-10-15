@@ -1248,6 +1248,54 @@ async fn l1_a_proof_failure_after_posting_retries_proof_first() {
     miner.abort();
 }
 
+/// N3: after A's cycle posts and fails, its retries stay proof-first until
+/// its own landing, even when another sequencer's landing takes the failed
+/// cycle off the count. Twice: B lands, A's proofs keep failing, and A has
+/// still sent only its original post.
+#[tokio::test(start_paused = true)]
+async fn l1_a_peer_landing_does_not_end_proof_first_retries() {
+    let s = setup(2, 12, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    let dirs = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let shutdown = CancellationToken::new();
+    let (prover_a, prover_b) = (FakeProver::gated(), FakeProver::open());
+    *prover_a.fail_batches.lock().unwrap() = 100;
+    let (node_a, node_b) = two_l1_nodes(
+        &s,
+        &l1,
+        (prover_a.clone(), prover_b.clone()),
+        &dirs,
+        &shutdown,
+    )
+    .await;
+    let (ha, hb) = (handle(&node_a).await, handle(&node_b).await);
+    let b_sender = alloy::primitives::Address::repeat_byte(0x2b);
+    let a_sends = || l1.sends().iter().filter(|x| x.from != b_sender).count();
+    let vids_a = submit(&ha, &s, 0..3, 70).await;
+    wait_secs("A proving", 300, async || prover_a.calls() == 1).await;
+    wait_secs("A posted", 300, async || a_sends() == 1).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    prover_a.release(1);
+    for (k, voters) in [(1, 3..6), (2, 6..9)] {
+        let vids_b = submit(&hb, &s, voters, 80 + k).await;
+        wait_secs("B settled", 300, async || all_settled(&hb, &vids_b).await).await;
+        wait_secs("A synced B", 300, async || {
+            node_a.metrics.synced_from_others.load(Ordering::SeqCst) == k
+        })
+        .await;
+        // A keeps retrying (each proof fails when released).
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            prover_a.release(1);
+        }
+        assert_eq!(a_sends(), 1, "A posted before a proof passed");
+    }
+    all_pending(&ha, &vids_a).await;
+    shutdown.cancel();
+    miner.abort();
+}
+
 /// The END events arrive before a head shows the END block's time: the
 /// first flush is sized by the 600 s grace (all 15 votes, one blob), not
 /// by the open window's now + 150 s floor (12).

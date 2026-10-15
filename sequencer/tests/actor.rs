@@ -6968,6 +6968,85 @@ async fn a_cancel_first_seen_by_the_close_out_read_waits_for_confirmation() {
     shutdown.cancel();
 }
 
+/// N4: the organizer lowers `maxVoters` (its event arrives) while a batch of
+/// new voters only is in flight, and the settlement reverts
+/// `MaxVotersReached`: the requeued votes are checked against the current
+/// cap at once and end `max voters reached`.
+#[tokio::test(start_paused = true)]
+async fn a_requeued_flight_of_new_voters_meets_the_lowered_cap() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let first = submit_n(&h, &s, 2, 60).await;
+    prover.release(1);
+    wait_long("first settled", async || all_settled(&h, &first).await).await;
+    let fresh: Vec<u64> = (2..4)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 70 + i as u64))
+        .map(|v| v.pkg.vote_id)
+        .collect();
+    for i in 2..4 {
+        h.submit(fake_vote(&s.env, i, &[1, 2], 70 + i as u64))
+            .await
+            .unwrap();
+    }
+    wait_long("the new voters in flight", async || {
+        prover.calls() == 2 && h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.change_max_voters(2);
+    s.chain.revert_simulates("MaxVotersReached", 1);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    prover.release(1);
+    wait_long("errored", async || {
+        vote_status(&h, fresh[0]).await == Some(VoteStatus::Error)
+            && vote_status(&h, fresh[1]).await == Some(VoteStatus::Error)
+    })
+    .await;
+    for vid in &fresh {
+        assert_eq!(vote_error(&h, *vid).await, "max voters reached");
+    }
+    shutdown.cancel();
+}
+
+/// N5: heads stop reaching the actor (frozen here; a flooded mailbox drops
+/// them) while the election ends. Admission follows the local clock too, so
+/// a vote after the end is refused.
+#[tokio::test(start_paused = true)]
+async fn admission_closes_at_the_end_without_heads() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.freeze_view(true);
+    s.chain.advance_time(DURATION + 10);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let late = fake_vote(&s.env, 0, &[1, 2], 80);
+    assert!(h.submit(late).await.is_err(), "admitted after the end");
+    shutdown.cancel();
+}
+
 /// A node fault inside `prepare` (one failed tree write) is not the votes'
 /// fault: they stay pending, sealing backs off, and the retry settles them.
 /// One fault only, so prepare's best-effort root reset still succeeds.

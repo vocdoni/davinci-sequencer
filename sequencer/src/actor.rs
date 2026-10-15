@@ -900,6 +900,9 @@ struct Actor {
     cancel_confirmed: bool,
     /// The Head block of the last confirmed-head read of a cancel.
     cancel_confirm_block: Option<u64>,
+    /// A cycle posted and failed: retries are proof-first until our own
+    /// landing (a peer's landing lowers `failed_cycles`, not this).
+    proof_first_until_landing: bool,
     /// Why the last landing-time read left the record stale.
     stale_why: String,
     /// A transition landed since `last_vote_at` was last read from the chain;
@@ -1122,6 +1125,7 @@ pub(crate) fn spawn_actor(
         read_gate: [None; 3],
         cancel_confirmed: false,
         cancel_confirm_block: None,
+        proof_first_until_landing: false,
         stale_why: String::new(),
         // The record may predate the last landing: re-read before closing.
         vote_at_stale: true,
@@ -1509,10 +1513,13 @@ impl Actor {
         (!v.is_empty()).then_some(v)
     }
 
+    /// The end check also follows the local clock: a Head can be dropped
+    /// (a full mailbox), and a stale `chain_time` must not keep admission
+    /// open past the end.
     fn accepting(&self) -> bool {
         self.not_closed()
             && self.chain_time >= self.record.onchain.start_time
-            && self.chain_time < self.end_time()
+            && self.chain_time.max(self.deps.clock.now()) < self.end_time()
     }
 
     /// Active, Ready or Paused, and the head time known.
@@ -2624,7 +2631,9 @@ impl Actor {
         // flaky prover spends no post per cycle, the leg follows the proof
         // and each chunk takes proof time.
         let proof_first = self.deps.l1.is_some()
-            && (self.bisect.is_some() || self.prover_hold.is_some() || self.failed_cycles > 0);
+            && (self.bisect.is_some()
+                || self.prover_hold.is_some()
+                || self.proof_first_until_landing);
         let chunk = self.deps.l1.as_ref().map(|l1| l1.chunk);
         let blob_cap = self.state.blob_cap();
         let max_chunks = chunk.map_or(1, |c| blob_cap.div_ceil(c.max(1)));
@@ -3148,6 +3157,7 @@ impl Actor {
     /// doubling per further failure, at most 1 h. The votes stay pending.
     fn failed_cycle(&mut self, error: &str) {
         self.failed_cycles = self.failed_cycles.saturating_add(1);
+        self.proof_first_until_landing = true;
         let Some(extra) = self.failed_cycles.checked_sub(FAILED_CYCLES_BEFORE_PAUSE) else {
             return;
         };
@@ -3388,6 +3398,9 @@ impl Actor {
                 let secs = self.prove_backoff();
                 warn!(pid = %hex::encode(self.pid31), retry_in = secs, "settlement reverted MaxVotersReached; requeueing");
                 self.requeue_flight(f);
+                // A cap lowered under the flight (its event cleaned only the
+                // queue): its new-slot votes meet the current cap now.
+                self.error_new_slots_if_full();
                 return;
             }
             JobOutcome::Reverted(name)
@@ -3570,6 +3583,7 @@ impl Actor {
         self.vote_at_stale = true;
         self.await_sync = false;
         self.failed_cycles = 0;
+        self.proof_first_until_landing = false;
         self.failed_pause = None;
         self.held_reason = None;
         self.bisect_landed(true);
