@@ -2480,6 +2480,8 @@ impl Actor {
             }
         };
         let none = BTreeSet::new();
+        // At the count a seal can carry (batch_max, the bisection cap, the
+        // hold), so its cover bounds the batch's.
         let selected_trial = self
             .state
             .select_covered(
@@ -2487,7 +2489,7 @@ impl Actor {
                 max_voters,
                 &none,
                 &cov,
-                usize::MAX,
+                self.seal_max(),
                 self.state.blob_cap(),
             )
             .map(|(refs, blocked, cover)| (refs.len(), blocked, cover));
@@ -2554,9 +2556,10 @@ impl Actor {
         // chunk after the first adds a post to it, so a short window takes
         // a batch of fewer chunks. While bisecting the job is proof-first:
         // the leg follows the proof, so it gets what a proof of the intended
-        // size leaves, but never fewer chunks than the live exposed set
-        // (which rides every re-attempt) needs; the proof gets what the leg
-        // leaves: base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
+        // size leaves, but never fewer chunks than its cover needs (the
+        // trial's, at the count the retry can carry: an upper bound); the
+        // proof gets what the leg leaves:
+        // base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
         let spv = self.metrics.prove.spv(nf);
         let proof_first =
             self.deps.l1.is_some() && (self.bisect.is_some() || self.prover_hold.is_some());

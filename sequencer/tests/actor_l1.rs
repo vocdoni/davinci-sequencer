@@ -554,6 +554,96 @@ async fn l1_the_seal_budget_sizes_a_batch_down_to_fewer_transactions() {
     shutdown.cancel();
 }
 
+/// The R18 setup: 140 settled 16-field votes in one-blob transactions, then
+/// X and Y with disjoint 70-slot histories; returns the restarted node (L1
+/// lag 110 s, no margin, the 150 s floor, `extra` flags) and its prover,
+/// which fails its first batch.
+async fn proof_first_setup(
+    s: &TestSetup,
+    l1: &FakeL1,
+    dir: &TempDir,
+    extra: &[&str],
+) -> (
+    Node,
+    ActorHandle,
+    Arc<FakeProver>,
+    [VerifiedVote; 2],
+    CancellationToken,
+) {
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(dir, s, 140, &[]);
+    let (node, h) = chunked_node(s, l1, FakeProver::open(), dir, cfg, &shutdown).await;
+    let first = submit(&h, s, 0..140, 4000).await;
+    wait_until("first votes settled", async || {
+        all_settled(&h, &first).await
+    })
+    .await;
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+    let db = reopen_db(dir.path()).await;
+    let slot = |i: usize| fake_vote(&s.env, i, &[1, 2], 1).slot;
+    let xy = [
+        fake_vote(&s.env, 140, &[1, 2], 4100),
+        fake_vote(&s.env, 141, &[1, 2], 4101),
+    ];
+    for (k, range) in [0..70, 70..140].into_iter().enumerate() {
+        let entry = davinci_sequencer::storage::ExposedRecord {
+            slots: range.map(slot).collect(),
+            vote_ids: vec![xy[k].pkg.vote_id],
+        };
+        db.put_coverage(&pid_fr(), &[k as u8 + 1; 32], &entry)
+            .unwrap();
+    }
+    let shutdown = CancellationToken::new();
+    let mut args = vec!["--l1-settle-lag", "110s"];
+    args.extend_from_slice(extra);
+    let cfg = chunked_cfg(dir, s, 140, &args);
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = 1;
+    let node = start_l1_node_cfg(
+        db,
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    (node, h, prover, xy, shutdown)
+}
+
+/// R18: X failed alone once, so the retry is proof-first with a bisection
+/// cap of one, and Y joins the queue. The leg is sized for the one vote the
+/// retry carries (one chunk: 30 + 110 fits the 150 s floor), not for X and
+/// Y together (two chunks would need 30 + 134), so X settles while voting
+/// is open.
+#[tokio::test]
+async fn l1_a_proof_first_retry_sizes_its_leg_for_the_votes_it_carries() {
+    let s = setup(16, 150, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let (node, h, prover, [x, y], shutdown) =
+        proof_first_setup(&s, &l1, &dir, &["--batch-time", "0s"]).await;
+    let (xid, yid) = (x.pkg.vote_id, y.pkg.vote_id);
+    h.submit(x).await.unwrap();
+    wait_until("X failed once", async || {
+        prover.calls() == 1 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Pending));
+    h.submit(y).await.unwrap();
+    wait_until("X settled", async || all_settled(&h, &[xid]).await).await;
+    assert_eq!(
+        node.db.process(&pid_fr()).unwrap().unwrap().onchain.status,
+        ProcessStatus::Ready,
+        "settled while voting is open"
+    );
+    wait_until("Y settled", async || all_settled(&h, &[yid]).await).await;
+    shutdown.cancel();
+}
+
 /// A vote whose coverage history holds 126 live slots needs 127 entries: two
 /// blobs. In a window that fits one blob this is a window-limited shortfall,
 /// not an overflow: the vote is not errored and waits until the grace after
