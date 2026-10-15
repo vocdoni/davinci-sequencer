@@ -7749,6 +7749,108 @@ async fn orphaned_peer_batch_slots_survive_an_unrelated_landing() {
     orphaned_peer_batch_case(true).await;
 }
 
+/// One blob per batch (nf 16, `--max-blobs-per-tx 1`) fits about 125 slot
+/// updates; 140 slots are occupied. Orphaned peer batches (never applied
+/// here, reorged out) carried our pending X1 and X2 refreshing 70 slots
+/// each, and X3 refreshing all 140. The candidates' union overflows, so the
+/// selection halves: X1 and X2 seal alone, each covering its own history.
+/// X3's history alone overflows: X3 is errored to recast, and Y behind it
+/// still seals.
+#[tokio::test(start_paused = true)]
+async fn history_overflow_halves_then_recasts_alone() {
+    let nf = 16u8;
+    let s = setup(nf, 144, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let mut extra = TIMERS.to_vec();
+    extra.extend(["--max-blobs-per-tx", "1"]);
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1024,
+        &extra,
+        shutdown.clone(),
+    )
+    .await;
+    let mut first = Vec::new();
+    for i in 0..140 {
+        let v = fake_vote(&s.env, i, &[1, 2], 9000 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    s.chain.advance_time(400);
+    wait_long("140 settled", async || {
+        if !all_settled(&h, &first).await {
+            s.chain.advance_time(400);
+            return false;
+        }
+        true
+    })
+    .await;
+    let slot = |i: usize| fake_vote(&s.env, i, &[1, 2], 1).slot;
+    use std::collections::BTreeSet;
+    let half_a: BTreeSet<u64> = (0..70).map(slot).collect();
+    let half_b: BTreeSet<u64> = (70..140).map(slot).collect();
+    let all: BTreeSet<u64> = (0..140).map(slot).collect();
+    let xs: Vec<VerifiedVote> = (140..144)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 9200 + i as u64))
+        .collect();
+    let [x1, x2, x3, y] = [0, 1, 2, 3].map(|i| xs[i].pkg.vote_id);
+    for v in &xs {
+        h.submit(v.clone()).await.unwrap();
+    }
+    db.fail_next_arbo_writes(u32::MAX);
+    for (v, must) in [(&xs[0], &half_a), (&xs[1], &half_b), (&xs[2], &all)] {
+        let n = db.coverage_history(&pid_fr()).unwrap().len();
+        s.chain.settle_externally(&peer_batch_refreshing(
+            &db,
+            &s,
+            std::slice::from_ref(v),
+            must,
+        ));
+        wait_long("the peer entry written", async || {
+            db.coverage_history(&pid_fr()).unwrap().len() > n
+        })
+        .await;
+        s.chain.reorg_out_last_transition();
+    }
+    db.fail_next_arbo_writes(0);
+    wait_long("back in sync", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    let calls = prover.calls();
+    wait_long("X1, X2 and Y settled, X3 errored", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &[x1, x2, y]).await && vote_status(&h, x3).await == Some(VoteStatus::Error)
+    })
+    .await;
+    assert_eq!(
+        prover.sizes()[calls as usize..],
+        [1, 1, 1],
+        "one vote per batch"
+    );
+    let err = h.status(x3).await.unwrap().unwrap().error;
+    assert_eq!(
+        err.as_deref(),
+        Some("exposed refresh set too large, recast")
+    );
+    for (vid, must) in [(x1, &half_a), (x2, &half_b)] {
+        let reseal = updated_slots(&db, nf, transition_of(&db, nf, vid));
+        assert!(
+            must.iter().all(|s| reseal.contains(s)),
+            "a seal left out its history"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
 /// The check after a rebuild's replay fails its write: it waits out its
 /// backoff, whatever messages arrive meanwhile (no tree reads), and runs
 /// again once storage recovers.

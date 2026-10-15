@@ -248,6 +248,9 @@ pub struct Db {
     /// While set, the write after a rebuild's check fails (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     check_faults: Arc<std::sync::atomic::AtomicBool>,
+    /// Armed: the next seal commit is followed by a crash (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    seal_crash: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Db {
@@ -356,6 +359,8 @@ impl Db {
             transition_skip: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             check_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            seal_crash: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -513,6 +518,14 @@ impl Db {
     pub fn fail_rebuild_check_writes(&self, on: bool) {
         self.check_faults
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every record write after the next seal commit fails, from the very
+    /// next one on (a crash right after it). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_writes_after_seal(&self) {
+        self.seal_crash
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Lets the next `skip` transition-record writes through, then fails
@@ -903,7 +916,7 @@ impl Db {
         root: &[u8; 32],
         entry: &ExposedRecord,
     ) -> Result<()> {
-        self.write(|tx| {
+        let r = self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Aggregated, None)?;
             tx_remove(tx, pid, vids)?;
             tx.open_table(EXPOSED)
@@ -911,7 +924,16 @@ impl Db {
                 .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
                 .map_err(db_err)?;
             tx_put_coverage(tx, pid, root, entry)
-        })
+        });
+        #[cfg(any(test, feature = "test-hooks"))]
+        if r.is_ok()
+            && self
+                .seal_crash
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.fail_next_writes(u32::MAX);
+        }
+        r
     }
 
     /// Votes enter a batch: `aggregated`, out of the pending queue.

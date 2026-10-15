@@ -2353,6 +2353,16 @@ pub fn peer_batch_of(
     s: &TestSetup,
     votes: &[VerifiedVote],
 ) -> davinci_state::PreparedBatch {
+    peer_batch_refreshing(db, s, votes, &Default::default())
+}
+
+/// [`peer_batch_of`] refreshing at least the slots in `must`.
+pub fn peer_batch_refreshing(
+    db: &Db,
+    s: &TestSetup,
+    votes: &[VerifiedVote],
+    must: &std::collections::BTreeSet<u64>,
+) -> davinci_state::PreparedBatch {
     let mut other =
         davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new()).unwrap();
     let nf = s.env.cfg.ballot_mode.num_fields;
@@ -2362,7 +2372,7 @@ pub fn peer_batch_of(
         other.apply_synced(&td, t.new_root).unwrap();
     }
     other
-        .prepare(votes, &mut StdRng::seed_from_u64(9), &Default::default())
+        .prepare(votes, &mut StdRng::seed_from_u64(9), must)
         .unwrap()
 }
 

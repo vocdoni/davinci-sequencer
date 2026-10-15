@@ -1664,9 +1664,10 @@ fn assert_covers(s: &TestSetup, db: &Db, vid: u64, lost: &[(&str, &[u64])]) {
 /// R12: our batch B carrying X is sealed and the node dies before any
 /// outcome. After the restart a peer's P settles X and the exposed set
 /// clears; a reorg takes P. X's re-seal covers B (recorded at B's seal,
-/// before anything could publish it), not only P.
-#[tokio::test(start_paused = true)]
-async fn batch_sealed_before_a_crash_stays_covered() {
+/// before anything could publish it), not only P. With `crash_at_seal`
+/// every record write after the seal commit fails: B's entry must be in
+/// that commit.
+async fn sealed_before_a_crash_case(crash_at_seal: bool) {
     let s = setup(2, 26, None);
     let dir = TempDir::new().unwrap();
     let prover = FakeProver::gated();
@@ -1674,8 +1675,17 @@ async fn batch_sealed_before_a_crash_stays_covered() {
     let x = fake_vote(&s.env, 3, &[2, 1], 5100);
     let xid = x.pkg.vote_id;
     h.submit(x.clone()).await.unwrap();
+    if crash_at_seal {
+        db.fail_writes_after_seal();
+    }
     s.chain.advance_time(400);
     wait_secs("B sealed", 600, async || prover.calls() >= 2).await;
+    if crash_at_seal {
+        assert!(
+            db.write_faults_left() > 0,
+            "the crash after the seal never armed"
+        );
+    }
     let b_slots = db.exposed(&pid_fr()).unwrap().unwrap().slots;
     shutdown.cancel();
     drop((h, node, db));
@@ -1702,6 +1712,16 @@ async fn batch_sealed_before_a_crash_stays_covered() {
     .await;
     assert_covers(&s, &db, xid, &[("B", &b_slots), ("P", &p_slots)]);
     shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_sealed_before_a_crash_stays_covered() {
+    sealed_before_a_crash_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crash_right_after_the_seal_commit_stays_covered() {
+    sealed_before_a_crash_case(true).await;
 }
 
 /// R13: our B{X,Y} loses a race to a peer's P{X}; our C re-seals Y alone
