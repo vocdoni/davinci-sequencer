@@ -32,9 +32,25 @@ use crate::validate::VerifiedVote;
 pub struct Coverage {
     entries: Vec<BTreeSet<u64>>,
     by_vote: HashMap<u64, Vec<usize>>,
+    /// The vote ids the histories were read for; `None`: any (no history).
+    requested: Option<HashSet<u64>>,
 }
 
 impl Coverage {
+    /// An empty coverage read for `vids`: a selection takes no other vote,
+    /// whose history it does not know.
+    pub fn for_votes(vids: &[u64]) -> Self {
+        Coverage {
+            requested: Some(vids.iter().copied().collect()),
+            ..Default::default()
+        }
+    }
+
+    /// Whether `vid`'s history was read (a selection may charge it).
+    pub fn covers(&self, vid: u64) -> bool {
+        self.requested.as_ref().is_none_or(|r| r.contains(&vid))
+    }
+
     /// Adds an entry naming `vids`.
     pub fn add(&mut self, slots: BTreeSet<u64>, vids: &[u64]) {
         let i = self.entries.len();
@@ -446,6 +462,10 @@ impl<S: Storage> ProcessState<S> {
                 break;
             }
             if slots.contains(&v.slot) || held.contains(&v.slot) || vids.contains(&v.pkg.vote_id) {
+                continue;
+            }
+            // A vote whose history was not read would be charged nothing.
+            if !cov.covers(v.pkg.vote_id) {
                 continue;
             }
             // A reused vote id would fail the guest's INSERT; a storage

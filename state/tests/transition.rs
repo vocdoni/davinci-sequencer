@@ -739,6 +739,21 @@ fn select_batch_shrinks_for_exposed_refreshes() {
 }
 
 #[test]
+fn select_covered_takes_only_votes_whose_history_it_read() {
+    let env = env(2, 40);
+    let st = committed_state(&env, 24);
+    let a = fake_vote(&env, 30, &[1], 32_000);
+    let b = fake_vote(&env, 31, &[1], 32_001);
+    let cov = Coverage::for_votes(&[a.pkg.vote_id]);
+    let pending = [b, a.clone()];
+    let (sel, _, _) = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
+        .unwrap();
+    let ids: Vec<u64> = sel.iter().map(|v| v.pkg.vote_id).collect();
+    assert_eq!(ids, vec![a.pkg.vote_id]);
+}
+
+#[test]
 fn select_covered_charges_each_vote_its_own_history() {
     // 900 occupied 16-field slots; six blobs carry about 760 updates.
     let env = env(16, 1300);

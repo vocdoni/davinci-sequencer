@@ -879,7 +879,7 @@ impl Db {
             }
         }
         let history = tx.open_table(COVERAGE_HISTORY).map_err(db_err)?;
-        let mut out = davinci_state::Coverage::default();
+        let mut out = davinci_state::Coverage::for_votes(vids);
         for (r, named) in roots {
             if let Some(v) = history.get(root_key(pid, &r).as_slice()).map_err(db_err)? {
                 let e: ExposedRecord = decode("coverage_history", v.value())?;

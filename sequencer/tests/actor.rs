@@ -2487,6 +2487,137 @@ async fn onchain_census_growth_respects_max_voters() {
     shutdown.cancel();
 }
 
+/// R17 on anvil (origin 3): X, the only exposed vote, is held (the node
+/// refuses the prover's key); Y waits outside the hold with a history over
+/// all 24 occupied slots. A census reorg drops X's enrollment, so the
+/// re-proof errors X: the attempt ends there, and Y's seal (read with its
+/// own history) covers all 24 slots.
+#[tokio::test]
+async fn a_hold_emptied_by_the_reproof_seals_the_queue_covered() {
+    if !common::anvil::enabled() {
+        return;
+    }
+    use alloy::primitives::U256;
+    use alloy::providers::Provider;
+    let ch = common::anvil::CensusChain::start().await;
+    let enrolled: Vec<([u8; 20], u128)> = (0..26).map(|i| (voter_address(i), 1)).collect();
+    ch.add(&enrolled).await;
+    let (recorded, _) = ch.state().await;
+    let mut e = env(2, 30, None);
+    e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
+    e.cfg.census_root = fr_from_be(&recorded).unwrap();
+    let census_dir = TempDir::new().unwrap();
+    let chain = FakeChain::new(&e, String::new());
+    let c = ch.census.into_array();
+    chain.set_census_contract(c);
+    chain.set_max_voters(100);
+    // The registry and the census share one chain: keep their heads level.
+    let follow = async |chain: &FakeChain| {
+        let behind = chain.head_block().saturating_sub(ch.head().await);
+        if behind > 0 {
+            let () = ch
+                .reader
+                .raw_request("anvil_mine".into(), (U256::from(behind),))
+                .await
+                .unwrap();
+        }
+        while chain.head_block() < ch.head().await {
+            chain.advance_time(0);
+        }
+    };
+    follow(&chain).await;
+    let dir = census_dir.path().to_path_buf();
+    let s = TestSetup {
+        env: e,
+        chain,
+        _census_dir: census_dir,
+        census_dir: dir,
+    };
+    let dbdir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let url = ch.anvil.endpoint();
+    let cfg = test_config_with(dbdir.path(), &s.census_dir, 1, "0s", &["--rpc-url", &url]);
+    let db = Db::open_in(dbdir.path()).unwrap();
+    let prover = FakeProver::open();
+    let node = start_node_cfg(
+        db.clone(),
+        s.chain.clone(),
+        prover.clone(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let first = submit_n(&h, &s, 24, 9900).await;
+    wait_long("24 settled", async || all_settled(&h, &first).await).await;
+
+    // X's voter enrolls in a block a reorg will take.
+    let snap: U256 = ch
+        .reader
+        .raw_request("evm_snapshot".into(), ())
+        .await
+        .unwrap();
+    ch.add(&[(voter_address(26), 1)]).await;
+    follow(&s.chain).await;
+    wait_long("index at 27", async || {
+        node.onchain.latest(&c).is_some_and(|(_, n, _)| n == 27)
+    })
+    .await;
+    *prover.wrong_vk.lock().unwrap() = true;
+    let x = fake_vote(&s.env, 26, &[1, 2], 9950);
+    let xid = x.pkg.vote_id;
+    h.submit(x).await.unwrap();
+    wait_long("X held", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+            && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    // Y: unexposed, its history over every occupied slot.
+    let y = fake_vote(&s.env, 25, &[1, 2], 9951);
+    let yid = y.pkg.vote_id;
+    let all: Vec<u64> = (0..24)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+        .collect();
+    db.put_coverage(
+        &pid_fr(),
+        &[9; 32],
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: all.clone(),
+            vote_ids: vec![yid],
+        },
+    )
+    .unwrap();
+    h.submit(y).await.unwrap();
+    // The reorg drops X's enrollment; the prover recovers.
+    let reverted: bool = ch
+        .reader
+        .raw_request("evm_revert".into(), (snap,))
+        .await
+        .unwrap();
+    assert!(reverted);
+    follow(&s.chain).await;
+    wait_long("index back at 26", async || {
+        node.onchain.latest(&c).is_some_and(|(_, n, _)| n == 26)
+    })
+    .await;
+    *prover.wrong_vk.lock().unwrap() = false;
+    wait_long("Y settled", async || all_settled(&h, &[yid]).await).await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Error));
+    // Every seal of Y (its history entries) covers the 24 slots.
+    let mut seals = 0;
+    for (root, entry) in db.coverage_history(&pid_fr()).unwrap() {
+        if root != [9; 32] && entry.vote_ids.contains(&yid) {
+            seals += 1;
+            assert!(
+                all.iter().all(|s| entry.slots.contains(s)),
+                "a seal of Y left out its history"
+            );
+        }
+    }
+    assert!(seals >= 1);
+    shutdown.cancel();
+}
+
 // --------------------------------- refresh overflow and census indexing
 
 use davinci_sequencer::census::onchain::UsableError;

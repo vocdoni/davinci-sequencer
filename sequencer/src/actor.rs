@@ -2613,8 +2613,15 @@ impl Actor {
         // unaccounted. So the batch_max and budget caps go into the
         // selection, and a re-proof drop re-runs it over what is left.
         let selected: Vec<VerifiedVote> = loop {
-            let held = self.held_votes();
-            let cands = held.as_deref().unwrap_or(&self.pending);
+            let now_held = self.held_votes();
+            // The re-proof errored the last held vote: the queue is not the
+            // set the coverage was read for. The next tick reads it afresh.
+            if now_held.is_some() != held.is_some() {
+                debug!(pid = %hex::encode(self.pid31), "the held votes are gone; reselecting next tick");
+                return;
+            }
+            let cands = now_held.as_deref().unwrap_or(&self.pending);
+            debug_assert!(cands.iter().all(|v| cov.covers(v.pkg.vote_id)));
             let (sized, blocked): (Vec<VerifiedVote>, bool) = match self
                 .state
                 .select_covered(cands, max_voters, &none, &cov, cap, max_blobs)
