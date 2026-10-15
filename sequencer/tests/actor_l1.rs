@@ -1408,3 +1408,172 @@ async fn l1_a_job_panicking_after_posting_counts() {
     shutdown.cancel();
     miner.abort();
 }
+
+// ------------------------------------- selection under chunk budgets (R19-R21)
+
+/// Settles fresh 16-field votes on slots `0..n` (one blob per L1
+/// transaction), then reopens the datadir's database.
+async fn l1_populated(s: &TestSetup, l1: &FakeL1, dir: &TempDir, n: usize) -> Db {
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(dir, s, 1024, &[]);
+    let (node, h) = chunked_node(s, l1, FakeProver::open(), dir, cfg, &shutdown).await;
+    let first = submit(&h, s, 0..n, 5000).await;
+    for _ in 0..600 {
+        if all_settled(&h, &first).await {
+            break;
+        }
+        s.chain.advance_time(4000);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        all_settled(&h, &first).await,
+        "the first votes never settled"
+    );
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+    reopen_db(dir.path()).await
+}
+
+/// Writes a history entry per `(vote id, slot range)` and restarts the node
+/// with `batch_max` and `extra` flags.
+async fn l1_restart(
+    s: &TestSetup,
+    l1: &FakeL1,
+    dir: &TempDir,
+    db: Db,
+    hist: &[(u64, std::ops::Range<usize>)],
+    batch_max: usize,
+    extra: &[&str],
+) -> (Node, ActorHandle, Arc<FakeProver>, CancellationToken) {
+    for (k, (vid, range)) in hist.iter().enumerate() {
+        let entry = davinci_sequencer::storage::ExposedRecord {
+            slots: range
+                .clone()
+                .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+                .collect(),
+            vote_ids: vec![*vid],
+        };
+        db.put_coverage(&pid_fr(), &[k as u8 + 0x40; 32], &entry)
+            .unwrap();
+    }
+    let shutdown = CancellationToken::new();
+    let cfg = chunked_cfg(dir, s, batch_max, extra);
+    let prover = FakeProver::open();
+    let node = start_l1_node_cfg(
+        db,
+        s.chain.clone(),
+        l1.clone(),
+        prover.clone(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    (node, h, prover, shutdown)
+}
+
+fn ready(node: &Node) -> bool {
+    node.db.process(&pid_fr()).unwrap().unwrap().onchain.status == ProcessStatus::Ready
+}
+
+/// R19: batch_max 1, a window of one one-blob transaction. X's history needs
+/// two blobs (it fits the batch cap, not the window), Y's exceeds
+/// MAX_REFRESH, Z is fresh. Only Y is errored (recast); X waits; Z settles.
+#[tokio::test]
+async fn l1_an_overflowing_vote_behind_a_window_limited_one_is_recast() {
+    let s = setup(16, 2110, None);
+    s.chain.set_max_voters(5000);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let db = l1_populated(&s, &l1, &dir, 2100).await;
+    let [x, y, z] = [2100, 2101, 2102].map(|i| fake_vote(&s.env, i, &[1, 2], 6000 + i as u64));
+    let (xid, yid, zid) = (x.pkg.vote_id, y.pkg.vote_id, z.pkg.vote_id);
+    let (node, h, _prover, shutdown) = l1_restart(
+        &s,
+        &l1,
+        &dir,
+        db,
+        &[(xid, 0..130), (yid, 0..2050)],
+        1,
+        &["--l1-settle-lag", "130s", "--batch-time", "0s"],
+    )
+    .await;
+    for v in [x, y, z] {
+        h.submit(v).await.unwrap();
+    }
+    wait_until("Z settled", async || all_settled(&h, &[zid]).await).await;
+    assert!(ready(&node));
+    assert_eq!(vote_status(&h, yid).await, Some(VoteStatus::Error));
+    assert_eq!(
+        h.status(yid).await.unwrap().unwrap().error.as_deref(),
+        Some("exposed refresh set too large, recast")
+    );
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Pending));
+    shutdown.cancel();
+}
+
+/// R20: a revote whose 126-slot history includes its own slot fits one blob
+/// (125 refreshes plus its write). It fails once, so the retry is
+/// proof-first; one chunk fits the 150 s floor (30 + 110), two do not. The
+/// retry is sized as the selection sizes it, and settles while voting is
+/// open.
+#[tokio::test]
+async fn l1_a_revote_retry_counts_its_own_slot_once() {
+    let s = setup(16, 150, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let db = l1_populated(&s, &l1, &dir, 140).await;
+    let r = fake_vote(&s.env, 0, &[2, 1], 6100);
+    let rid = r.pkg.vote_id;
+    let (node, h, prover, shutdown) = l1_restart(
+        &s,
+        &l1,
+        &dir,
+        db,
+        &[(rid, 0..126)],
+        140,
+        &["--l1-settle-lag", "110s", "--batch-time", "0s"],
+    )
+    .await;
+    *prover.fail_batches_permanent.lock().unwrap() = 1;
+    h.submit(r).await.unwrap();
+    wait_until("R settled", async || all_settled(&h, &[rid]).await).await;
+    assert!(ready(&node), "settled while voting is open");
+    assert_eq!(prover.sizes(), vec![1, 1]);
+    shutdown.cancel();
+}
+
+/// R21: X's history needs two blobs; it failed once (bisection cap one, so
+/// proof-first) and its two-chunk retry does not fit the 150 s floor. Fresh
+/// Y fits one chunk: it seals in the short window while X waits.
+#[tokio::test]
+async fn l1_a_vote_the_window_cannot_carry_does_not_block_the_queue() {
+    let s = setup(16, 150, None);
+    let l1 = FakeL1::new();
+    let dir = TempDir::new().unwrap();
+    let db = l1_populated(&s, &l1, &dir, 140).await;
+    let [x, y] = [140, 141].map(|i| fake_vote(&s.env, i, &[1, 2], 6200 + i as u64));
+    let (xid, yid) = (x.pkg.vote_id, y.pkg.vote_id);
+    let (node, h, prover, shutdown) = l1_restart(
+        &s,
+        &l1,
+        &dir,
+        db,
+        &[(xid, 0..130)],
+        140,
+        &["--l1-settle-lag", "110s", "--batch-time", "0s"],
+    )
+    .await;
+    *prover.fail_batches_permanent.lock().unwrap() = 1;
+    h.submit(x).await.unwrap();
+    wait_until("X failed once", async || {
+        prover.calls() == 1 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    h.submit(y).await.unwrap();
+    wait_until("Y settled", async || all_settled(&h, &[yid]).await).await;
+    assert!(ready(&node), "settled while voting is open");
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Pending));
+    shutdown.cancel();
+}

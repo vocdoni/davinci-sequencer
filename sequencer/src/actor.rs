@@ -2494,76 +2494,6 @@ impl Actor {
             }
         };
         let none = BTreeSet::new();
-        // At the count a seal can carry (batch_max, the bisection cap, the
-        // hold), so its cover bounds the batch's.
-        let selected_trial = self
-            .state
-            .select_covered(
-                held.as_deref().unwrap_or(&self.pending),
-                max_voters,
-                &none,
-                &cov,
-                self.seal_max(),
-                self.state.blob_cap(),
-            )
-            .map(|sel| {
-                // The oldest vote's own cover: every batch carries it, so it
-                // is the least a proof-first leg must reserve chunks for.
-                let first: Vec<u64> = sel
-                    .votes
-                    .first()
-                    .map(|v| v.pkg.vote_id)
-                    .into_iter()
-                    .collect();
-                (sel.votes.len(), sel.full, cov.union(&first))
-            });
-        let (k, reason, must) = match selected_trial {
-            Ok((k, full, must)) => {
-                // Company is the trial size (distinct admissible slots),
-                // not the queue length. A vote kept out by its own history
-                // does not make the batch full: it waits for the timer.
-                let seal = k >= 1
-                    && (full
-                        || at_max
-                        || (k >= self.min_mix && timer_due)
-                        || (k < self.min_mix && solo_due)
-                        || flush);
-                if !seal {
-                    return;
-                }
-                // Several can hold at once; log the dominant one.
-                let reason = if flush {
-                    "flush"
-                } else if at_max {
-                    "at_max"
-                } else if full {
-                    "full"
-                } else if k >= self.min_mix {
-                    "timer"
-                } else {
-                    "solo"
-                };
-                debug!(
-                    pid = %hex::encode(self.pid31),
-                    k,
-                    queued = self.pending.len(),
-                    reason = %reason,
-                    age,
-                    "seal attempt"
-                );
-                (k, reason, must)
-            }
-            // This vote's own history fits no transition: it recasts.
-            Err(StateError::CoverageOverflow { vote_id, .. }) => {
-                self.recast_overflow(vote_id);
-                return;
-            }
-            Err(e) => {
-                let secs = self.prove_backoff();
-                error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "select_batch");
-                return;
-            }
-        };
         // Time budget: the largest batch whose estimated proof plus the
         // landing margin ends before the window closes. While open, the
         // earliest legal close is an END now under a grace lowered to the
@@ -2576,71 +2506,134 @@ impl Actor {
         if self.chain_time < self.end_time() && self.record.onchain.status != ProcessStatus::Ended {
             deadline = deadline.min(now.saturating_add(self.deps.grace.grace_floor));
         }
-        // L1-blob mode: the Ethereum leg runs during the proof, so a landing
-        // takes max(proof, leg) + margin; the leg must fit as well. Each
-        // chunk after the first adds a post to it, so a short window takes
-        // a batch of fewer chunks. While bisecting the job is proof-first:
-        // the leg follows the proof, so it gets what a proof of the intended
-        // size leaves, but never fewer chunks than the oldest vote's own
-        // cover needs (the final selection, capped at those chunks, takes
-        // the rest only if it fits); the proof gets what the leg leaves:
-        // base + n·spv + lag + margin + POST_TIME·(chunks − 1) ≤ window.
+        let window = deadline.saturating_sub(now);
         let spv = self.metrics.prove.spv(nf);
+        // L1-blob mode posts a batch in chunks of `l1.chunk` blobs. The leg
+        // normally runs during the proof and must fit the window on its
+        // own; while bisecting or holding the job is proof-first, so the leg
+        // follows the proof and each chunk takes proof time.
         let proof_first =
             self.deps.l1.is_some() && (self.bisect.is_some() || self.prover_hold.is_some());
-        let (max_blobs, leg) = match &self.deps.l1 {
-            Some(l1) => {
-                let window = deadline.saturating_sub(now);
-                let after = if proof_first {
-                    let want = k.min(self.seal_max()) as f64;
-                    window.saturating_sub((self.prove_base + want * spv).ceil() as u64)
-                } else {
-                    window
-                };
-                let fit = crate::l1da::chunks_fit(after, self.l1_settle_lag, self.settle_margin);
-                let chunks = if proof_first {
-                    let live = must
-                        .iter()
-                        .filter(|s| !matches!(self.state.slot_ballot(**s), Ok(None)))
-                        .count();
-                    let need = blob::blob_count(1, 1 + live, nf).div_ceil(l1.chunk);
-                    fit.unwrap_or(1).max(need)
-                } else if let Some(c) = fit {
-                    c
-                } else {
-                    debug!(pid = %hex::encode(self.pid31), deadline, now, "no time to land an L1-blob batch");
-                    return;
-                };
-                let leg = if proof_first {
-                    self.l1_settle_lag.saturating_add(
-                        crate::l1da::POST_TIME.saturating_mul((chunks as u64).saturating_sub(1)),
-                    )
-                } else {
+        let chunk = self.deps.l1.as_ref().map(|l1| l1.chunk);
+        let blob_cap = self.state.blob_cap();
+        let max_chunks = chunk.map_or(1, |c| blob_cap.div_ceil(c.max(1)));
+        let seal_max = self.seal_max();
+        // (cap, max_blobs) for a batch posted in `chunks` chunks; `None`:
+        // no batch fits (nor does one of more chunks).
+        let budget = |chunks: usize| -> Option<(usize, usize)> {
+            let extra = crate::l1da::POST_TIME.saturating_mul(chunks as u64 - 1);
+            let leg = self.l1_settle_lag.saturating_add(extra);
+            let serial = match chunk {
+                None => 0,
+                Some(_) if proof_first => leg,
+                Some(_) => {
+                    if window < leg.saturating_add(self.settle_margin) {
+                        return None;
+                    }
                     0
-                };
-                (
-                    chunks.saturating_mul(l1.chunk).min(self.state.blob_cap()),
-                    leg,
-                )
+                }
+            };
+            let left = window as f64 - self.prove_base - self.settle_margin as f64 - serial as f64;
+            let n_max = (left / spv).floor();
+            if n_max < 1.0 {
+                return None;
             }
-            None => (self.state.blob_cap(), 0),
+            let cap = seal_max
+                .min(n_max.min(MAX_BATCH_SIZE as f64) as usize)
+                .max(1);
+            Some((cap, chunk.map_or(blob_cap, |c| (chunks * c).min(blob_cap))))
         };
-        let left =
-            deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64 - leg as f64;
-        let n_max = (left / spv).floor();
-        if n_max < 1.0 {
-            debug!(pid = %hex::encode(self.pid31), left, "no batch fits before the window closes");
-            return; // nothing fits; the window closes on these votes
+        // One selection per feasible chunk count: the largest batch wins,
+        // the fewest chunks on a tie. A vote is charged only the histories
+        // its batch carries, and a vote that does not fit is skipped, so a
+        // vote no budget can carry holds up nothing else.
+        let chosen = choose_chunks(
+            max_chunks,
+            |chunks| {
+                let (cap, max_blobs) = budget(chunks)?;
+                Some(
+                    self.state
+                        .select_covered(
+                            held.as_deref().unwrap_or(&self.pending),
+                            max_voters,
+                            &none,
+                            &cov,
+                            cap,
+                            max_blobs,
+                        )
+                        .map(|sel| (cap, max_blobs, sel)),
+                )
+            },
+            |(cap, _, sel)| (sel.votes.len(), sel.full && sel.votes.len() == *cap),
+        );
+        let (cap, max_blobs, k, full, mut sized) = match chosen {
+            Ok(Some((_, (cap, max_blobs, sel)))) => (
+                cap,
+                max_blobs,
+                sel.votes.len(),
+                sel.full,
+                sel.votes
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<VerifiedVote>>(),
+            ),
+            Ok(None) => {
+                debug!(pid = %hex::encode(self.pid31), window, "no batch fits before the window closes");
+                return; // the window closes on these votes
+            }
+            // This vote's own history fits no transition: it recasts.
+            Err(StateError::CoverageOverflow { vote_id, .. }) => {
+                self.recast_overflow(vote_id);
+                return;
+            }
+            Err(e) => {
+                let secs = self.prove_backoff();
+                error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "select_batch; votes stay pending");
+                return;
+            }
+        };
+        // Company is the batch size (distinct admissible slots), not the
+        // queue length. A vote kept out by its own history does not make
+        // the batch full: it waits for the timer.
+        let seal = k >= 1
+            && (full
+                || at_max
+                || (k >= self.min_mix && timer_due)
+                || (k < self.min_mix && solo_due)
+                || flush);
+        if !seal {
+            return;
         }
-        let cap = k
-            .min(self.seal_max())
-            .min(n_max.min(MAX_BATCH_SIZE as f64) as usize);
-        // Selection and seal-time re-proof. prepare must only ever see a
-        // set select_batch sized: shedding a vote after sizing can put an
-        // overwritten exposed slot back into the must-include refreshes
-        // unaccounted. So the batch_max and budget caps go into the
-        // selection, and a re-proof drop re-runs it over what is left.
+        // Several can hold at once; log the dominant one.
+        let reason = if flush {
+            "flush"
+        } else if at_max {
+            "at_max"
+        } else if full {
+            "full"
+        } else if k >= self.min_mix {
+            "timer"
+        } else {
+            "solo"
+        };
+        debug!(
+            pid = %hex::encode(self.pid31),
+            k,
+            queued = self.pending.len(),
+            reason = %reason,
+            age,
+            "seal attempt"
+        );
+        // Seal-time re-proof (origins 2/3) under the chosen budget: changed
+        // voters are errored, and what is left is selected again.
         let selected: Vec<VerifiedVote> = loop {
+            let n_sized = sized.len();
+            let Some(keep) = self.reproof(census_root, sized).await else {
+                return; // census layer trouble; retry next tick
+            };
+            if keep.len() == n_sized {
+                break keep; // nothing dropped, sizing holds
+            }
             let now_held = self.held_votes();
             // The re-proof errored the last held vote: the queue is not the
             // set the coverage was read for. The next tick reads it afresh.
@@ -2650,35 +2643,19 @@ impl Actor {
             }
             let cands = now_held.as_deref().unwrap_or(&self.pending);
             debug_assert!(cands.iter().all(|v| cov.covers(v.pkg.vote_id)));
-            let (sized, blocked): (Vec<VerifiedVote>, bool) = match self
+            sized = match self
                 .state
                 .select_covered(cands, max_voters, &none, &cov, cap, max_blobs)
             {
-                // A vote whose history does not fit the window is skipped
-                // and waits; one that never fits was recast by the trial.
-                Ok(sel) => (sel.votes.into_iter().cloned().collect(), sel.blocked),
-                // Unreachable after the trial; never errors votes.
+                Ok(sel) if !sel.votes.is_empty() => sel.votes.into_iter().cloned().collect(),
+                Ok(_) => return,
+                // Unreachable after the passes; never errors votes.
                 Err(e) => {
                     let secs = self.prove_backoff();
                     error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "select_batch; votes stay pending");
                     return;
                 }
             };
-            if sized.is_empty() {
-                if blocked && max_blobs < self.state.blob_cap() {
-                    debug!(pid = %hex::encode(self.pid31), max_blobs, cap = self.state.blob_cap(), "the coverage needs more blob transactions than the window fits");
-                }
-                return;
-            }
-            // Seal-time re-proof at the batch root (origins 2/3): changed
-            // voters are errored, the rest carry fresh witnesses.
-            let n_sized = sized.len();
-            let Some(keep) = self.reproof(census_root, sized).await else {
-                return; // census layer trouble; retry next tick
-            };
-            if keep.len() == n_sized {
-                break keep; // nothing dropped, sizing holds
-            }
         };
         let vids: Vec<u64> = selected.iter().map(|v| v.pkg.vote_id).collect();
         // Exactly what these votes' seal must refresh: the cover the
@@ -4494,13 +4471,85 @@ impl From<crate::l1da::Settled> for JobOutcome {
     }
 }
 
+/// Runs `pass` for 1, 2, … `max_chunks` chunks while it finds a budget
+/// (`None`: neither this count nor a larger one fits) and keeps the largest
+/// selection, the fewest chunks on a tie. A pass full at its cap ends the
+/// scan: a larger count never raises the cap, so it cannot select more. A
+/// pass error ends the scan with it. `size`: (votes, full at its cap).
+fn choose_chunks<S, E>(
+    max_chunks: usize,
+    mut pass: impl FnMut(usize) -> Option<Result<S, E>>,
+    size: impl Fn(&S) -> (usize, bool),
+) -> Result<Option<(usize, S)>, E> {
+    let mut best: Option<(usize, S)> = None;
+    for chunks in 1..=max_chunks {
+        let Some(r) = pass(chunks) else { break };
+        let s = r?;
+        let (n, saturated) = size(&s);
+        if n > best.as_ref().map_or(0, |(_, b)| size(b).0) {
+            best = Some((chunks, s));
+        }
+        if saturated {
+            break;
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProverService, WAIT_WINDOWS, serr};
+    use super::{ProverService, WAIT_WINDOWS, choose_chunks, serr};
     use davinci_zkvm_sdk::Error as E;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    // (votes, cap) per chunk count; `None` from the first infeasible count.
+    fn choose(passes: &[Option<(usize, usize)>]) -> Option<(usize, usize)> {
+        let r: Result<_, ()> = choose_chunks(
+            passes.len(),
+            |c| passes[c - 1].map(Ok),
+            |&(n, cap)| (n, n == cap),
+        );
+        r.unwrap().map(|(c, (n, _))| (c, n))
+    }
+
+    // The largest batch wins, ties to the fewest chunks; an infeasible
+    // count ends the scan; an empty pass is never chosen.
+    #[test]
+    fn chunk_choice_rule() {
+        assert_eq!(choose(&[Some((3, 9)), Some((5, 9))]), Some((2, 5)));
+        assert_eq!(choose(&[Some((4, 9)), Some((4, 8))]), Some((1, 4)));
+        assert_eq!(choose(&[Some((0, 9)), Some((2, 9))]), Some((2, 2)));
+        assert_eq!(choose(&[Some((0, 9)), Some((0, 9))]), None);
+        assert_eq!(choose(&[Some((1, 9)), None, Some((7, 9))]), Some((1, 1)));
+        // Full at its cap: no later pass is looked at.
+        assert_eq!(choose(&[Some((9, 9)), Some((8, 9))]), Some((1, 9)));
+    }
+
+    // Over random inputs with caps that never grow (a larger chunk count
+    // never raises the cap) the early stop equals the full scan.
+    #[test]
+    fn chunk_choice_early_stop_never_discards_a_larger_pass() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        for _ in 0..10_000 {
+            let k = rng.gen_range(1..6);
+            let mut cap = rng.gen_range(1..8);
+            let mut passes = Vec::new();
+            for _ in 0..k {
+                cap = rng.gen_range(1..=cap);
+                passes.push(Some((rng.gen_range(0..=cap), cap)));
+            }
+            let mut want: Option<(usize, usize)> = None;
+            for (i, (n, _)) in passes.iter().flatten().enumerate() {
+                if *n > want.map_or(0, |(_, m)| m) {
+                    want = Some((i + 1, *n));
+                }
+            }
+            assert_eq!(choose(&passes), want, "{passes:?}");
+        }
+    }
 
     // A 4xx on submit is a refusal of this input; server trouble is not,
     // and neither are 408/429, which describe the moment, not the input.
