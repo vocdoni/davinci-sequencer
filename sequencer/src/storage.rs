@@ -238,6 +238,9 @@ pub struct Db {
     transition_faults: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-hooks"))]
     transition_skip: Arc<std::sync::atomic::AtomicU32>,
+    /// While set, the write after a rebuild's check fails (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    check_faults: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Db {
@@ -344,6 +347,8 @@ impl Db {
             transition_faults: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             transition_skip: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            check_faults: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -495,6 +500,13 @@ impl Db {
     pub fn fail_transition_writes(&self, on: bool) {
         self.fail_transition_writes_after(0);
         self.transition_faults
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `on`, [`Db::finish_rebuild_check`] fails. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_rebuild_check_writes(&self, on: bool) {
+        self.check_faults
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -733,6 +745,10 @@ impl Db {
         vids: &[u64],
         exposed: Option<&ExposedRecord>,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.check_faults.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StorageError::Db("scripted rebuild check failure".into()));
+        }
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
             tx_prepend(tx, pid, vids)?;

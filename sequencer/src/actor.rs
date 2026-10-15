@@ -2320,18 +2320,22 @@ impl Actor {
         if !behind(self) {
             // Converged after a rebuild: check the votes it kept Settled,
             // once; a failed check retries under the resync backoff.
-            if self.rebuild_check
-                && self.diverged.is_none()
-                && self
+            if self.rebuild_check && self.diverged.is_none() {
+                // A failed check waits out its backoff, which only a
+                // successful one resets.
+                if self
                     .resync_after
-                    .is_none_or(|t| tokio::time::Instant::now() >= t)
-                && !self.check_kept_settled()
-            {
-                let ms = (self.resync_backoff_ms * 2).clamp(100, 60_000);
-                self.resync_backoff_ms = ms;
-                self.resync_after =
-                    Some(tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
-                return;
+                    .is_some_and(|t| tokio::time::Instant::now() < t)
+                {
+                    return;
+                }
+                if !self.check_kept_settled() {
+                    let ms = (self.resync_backoff_ms * 2).clamp(100, 60_000);
+                    self.resync_backoff_ms = ms;
+                    self.resync_after =
+                        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
+                    return;
+                }
             }
             self.resync_after = None;
             self.resync_backoff_ms = 0;

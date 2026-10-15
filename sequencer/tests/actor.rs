@@ -7743,3 +7743,61 @@ async fn orphaned_peer_batch_slots_ride_the_next_seal() {
 async fn orphaned_peer_batch_slots_survive_an_unrelated_landing() {
     orphaned_peer_batch_case(true).await;
 }
+
+/// The check after a rebuild's replay fails its write: it waits out its
+/// backoff, whatever messages arrive meanwhile (no tree reads), and runs
+/// again once storage recovers.
+#[tokio::test(start_paused = true)]
+async fn failed_rebuild_check_waits_its_backoff() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1660 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    s.chain.reorg_out_last_transition();
+    db.fail_rebuild_check_writes(true);
+    let block = s.chain.reinclude_transition(0);
+    wait_long("rerouted", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    wait_long("rebuilt and replayed", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1 && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(db.rebuild_coverage(&pid_fr()).unwrap().is_some());
+    let reads = db.arbo_reads();
+    for _ in 0..20 {
+        h.status(vids[0]).await.unwrap();
+    }
+    assert_eq!(
+        db.arbo_reads(),
+        reads,
+        "the check ran again before its backoff"
+    );
+    db.fail_rebuild_check_writes(false);
+    wait_long("checked", async || {
+        db.rebuild_coverage(&pid_fr()).unwrap().is_none()
+    })
+    .await;
+    shutdown.cancel();
+}
