@@ -2380,7 +2380,7 @@ impl Actor {
 
     /// Smallest selection that could fill a transaction, taking every vote
     /// as an overwrite and the whole exposed set as live. A shorter queue
-    /// can never trip the blob cap, so its trial is skipped. In memory only.
+    /// can never trip the blob cap, so its selection is skipped. In memory only.
     fn capacity_estimate(&mut self) -> usize {
         let key = (self.state.occupied(), self.exposed.len());
         if let Some((k, n)) = self.cap_est
@@ -2447,7 +2447,7 @@ impl Actor {
         if self.chain_time < self.record.onchain.start_time {
             return;
         }
-        // Triggers. The trial selection reads storage, so it runs only when
+        // Triggers. The selection reads storage, so it runs only when
         // a trigger can fire: the queue could fill a transaction, a
         // deadline passed, or flush mode.
         let j = *self.jitter.get_or_insert_with(|| seal_jitter(&mut OsRng));
