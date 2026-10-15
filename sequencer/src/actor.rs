@@ -749,6 +749,16 @@ const L1_JOB_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 24 *
 /// root behind the events) before the node warns and counts a stall; it
 /// warns again every as many ticks.
 const STALE_WARN_TICKS: u32 = 30;
+/// Shortest wait between chain reads that settle nothing, at one Head block.
+const READ_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why a tick reads the chain (each paced on its own).
+#[derive(Clone, Copy)]
+enum Read {
+    Landing,
+    Rebuild,
+    CloseOut,
+}
 
 /// How long a pause read on-chain, but not yet routed as an event, holds
 /// sealing back.
@@ -876,6 +886,14 @@ struct Actor {
     results_sent: Option<tokio::time::Instant>,
     /// The Head block of the last results confirmation read.
     confirm_block: Option<u64>,
+    /// After a chain read that failed or settled nothing (the landing time
+    /// still stale, a close-out not yet due): the Head block it ran at and
+    /// when the next may run. The next waits for a new Head or
+    /// [`READ_RETRY`], not the next message.
+    /// One per [`Read`] purpose, so one path's reads never starve another's.
+    read_gate: [Option<(u64, tokio::time::Instant)>; 3],
+    /// Why the last landing-time read left the record stale.
+    stale_why: String,
     /// A transition landed since `last_vote_at` was last read from the chain;
     /// the grace end may have moved, so nothing closes on it until re-read.
     vote_at_stale: bool,
@@ -1093,6 +1111,8 @@ pub(crate) fn spawn_actor(
         held: None,
         results_sent: None,
         confirm_block: None,
+        read_gate: [None; 3],
+        stale_why: String::new(),
         // The record may predate the last landing: re-read before closing.
         vote_at_stale: true,
         stale_ticks: 0,
@@ -1632,8 +1652,10 @@ impl Actor {
         // runs from. Stale until the read shows the tip the events reached.
         // Close-out and results wait on it, so a read that keeps failing
         // (or an endpoint stuck behind the events) is logged and counted.
-        if self.vote_at_stale {
-            let why = match self.fresh_read().await {
+        // One try per Head (or READ_RETRY) while it stays stale: a failing
+        // or lagging endpoint is not asked again on every message.
+        if self.vote_at_stale && !self.read_gated(Read::Landing) {
+            self.stale_why = match self.gated_read(Read::Landing).await {
                 Ok((block, _, p)) => {
                     self.vote_at_stale = !self.apply_read(&p, block);
                     format!(
@@ -1644,19 +1666,22 @@ impl Actor {
                 Err(e) => e,
             };
             if self.vote_at_stale {
-                self.stale_ticks += 1;
-                if self.stale_ticks.is_multiple_of(STALE_WARN_TICKS) {
-                    self.metrics.stalled_reads.fetch_add(1, Ordering::SeqCst);
-                    warn!(
-                        pid = %hex::encode(self.pid31),
-                        ticks = self.stale_ticks,
-                        %why,
-                        "cannot read the latest landing time; close-out and results wait"
-                    );
-                }
-            } else {
-                self.stale_ticks = 0;
+                self.gate_reads(Read::Landing);
             }
+        }
+        if self.vote_at_stale {
+            self.stale_ticks += 1;
+            if self.stale_ticks.is_multiple_of(STALE_WARN_TICKS) {
+                self.metrics.stalled_reads.fetch_add(1, Ordering::SeqCst);
+                warn!(
+                    pid = %hex::encode(self.pid31),
+                    ticks = self.stale_ticks,
+                    why = %self.stale_why,
+                    "cannot read the latest landing time; close-out and results wait"
+                );
+            }
+        } else {
+            self.stale_ticks = 0;
         }
         if results_due && !self.vote_at_stale {
             self.results_sent = None;
@@ -1728,6 +1753,33 @@ impl Actor {
         self.maybe_recheck_census().await;
         self.maybe_seal().await;
         self.maybe_finalize();
+    }
+
+    /// [`Self::fresh_read`] at most once per Head after one that failed or
+    /// settled nothing: a failing or lagging endpoint is not asked again on
+    /// every message.
+    async fn gated_read(&mut self, why: Read) -> Result<(u64, u64, OnchainProcess), String> {
+        if self.read_gated(why) {
+            return Err("waiting for the next head".into());
+        }
+        let r = self.fresh_read().await;
+        if r.is_err() {
+            self.gate_reads(why);
+        }
+        r
+    }
+
+    fn read_gated(&self, why: Read) -> bool {
+        self.read_gate[why as usize].is_some_and(|(block, until)| {
+            block == self.last_head_block && tokio::time::Instant::now() < until
+        })
+    }
+
+    fn gate_reads(&mut self, why: Read) {
+        self.read_gate[why as usize] = Some((
+            self.last_head_block,
+            tokio::time::Instant::now() + READ_RETRY,
+        ));
     }
 
     /// The head block and time, and `getProcess` at that head, which has every block
@@ -1904,7 +1956,7 @@ impl Actor {
         if tokio::time::Instant::now() < since + LANDED_EVENT_WAIT {
             return;
         }
-        let p = match self.fresh_read().await {
+        let p = match self.gated_read(Read::Rebuild).await {
             Ok((_, _, p)) => p,
             Err(e) => {
                 debug!(pid = %hex::encode(self.pid31), %e, "divergence read; retrying");
@@ -2302,13 +2354,15 @@ impl Actor {
         {
             return;
         }
-        let (block, time, p) = match self.fresh_read().await {
+        let (block, time, p) = match self.gated_read(Read::CloseOut).await {
             Ok(r) => r,
             Err(e) => {
                 debug!(pid = %hex::encode(self.pid31), %e, "close-out read; retrying");
                 return;
             }
         };
+        // Not closing on this read: the next one waits for a new Head.
+        self.gate_reads(Read::CloseOut);
         // The read is also the refresh: a moved grace end, status or root
         // lands in the record (and latches a sync) before the decision.
         self.vote_at_stale = !self.apply_read(&p, block);

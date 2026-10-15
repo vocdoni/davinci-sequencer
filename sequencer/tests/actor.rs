@@ -8029,6 +8029,91 @@ async fn a_lowered_max_voters_under_a_flight_requeues_the_overwrites() {
     shutdown.cancel();
 }
 
+/// I2: while the landing-time read fails, it is retried once per Head, not
+/// after every message: 50 status polls with no new Head cost at most one
+/// read. Once reads work again, the next Head clears the stale read.
+#[tokio::test(start_paused = true)]
+async fn a_failing_landing_read_is_retried_once_per_head() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 20);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    wait_until("first settled", async || all_settled(&h, &[vid0]).await).await;
+    // From now on getProcess fails; the next landing arms the stale read.
+    s.chain.fail_process(1_000_000);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 21);
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v1).await.unwrap();
+    wait_until("second settled", async || all_settled(&h, &[vid1]).await).await;
+    let before = s.chain.process_at_calls();
+    for _ in 0..50 {
+        h.status(vid1).await.unwrap();
+    }
+    let reads = s.chain.process_at_calls() - before;
+    assert!(reads <= 1, "{reads} reads in 50 polls without a new head");
+    // Reads work again: a Head retries, and the read clears the latch.
+    s.chain.fail_process(0);
+    s.chain.advance_time(5);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let before = s.chain.process_at_calls();
+    for _ in 0..50 {
+        h.status(vid1).await.unwrap();
+    }
+    assert_eq!(s.chain.process_at_calls(), before, "still re-reading");
+    shutdown.cancel();
+}
+
+/// I2, the close-out read: past the grace end with a vote pending and
+/// every read failing, status polls without a new Head cost at most one
+/// read per path (the landing time and the close-out), not one per poll.
+#[tokio::test(start_paused = true)]
+async fn a_failing_close_out_read_is_not_retried_per_message() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vid = submit_n(&h, &s, 1, 30).await[0];
+    s.chain.fail_process(1_000_000);
+    s.chain.pass_grace();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    let before = s.chain.process_at_calls();
+    for _ in 0..50 {
+        h.status(vid).await.unwrap();
+    }
+    let reads = s.chain.process_at_calls() - before;
+    assert!(reads <= 2, "{reads} reads in 50 polls without a new head");
+    s.chain.fail_process(0);
+    wait_long("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    shutdown.cancel();
+}
+
 /// M4-1: 42 fresh votes (enough to wake the capacity trigger), then a
 /// revote whose 124-slot history fits a blob alone but not next to them.
 /// The batch is not full (only the revote's own history kept it out), so
