@@ -66,7 +66,10 @@ the worst legal close: the organizer ends the election right after the seal and 
 to the registry's floor. In L1-blob mode the Ethereum leg (`--l1-settle-lag`) runs during the
 proof, so it plus `--settle-margin` must fit before that deadline as well, plus 24 s for each blob
 transaction after the first (they go out one after another): a short window takes a batch of
-fewer transactions. When not even one vote fits, nothing seals and the votes wait.
+fewer transactions. The node selects the batch once per transaction count the window allows and
+keeps the largest (the fewest transactions on a tie), so a vote that needs more transactions than
+the window fits waits without holding up the votes behind it, other than later votes of its own
+slot. When not even one vote fits, nothing seals and the votes wait.
 
 To build a batch, the actor:
 
@@ -121,7 +124,8 @@ the backoff. Other failures:
 In L1-blob mode the retries of a bisection are proof-first: the blobs go out only once the proof
 passed its checks, so a failing retry posts nothing and is not a failed cycle (only the first
 failure, which posted, is). Such a batch is sized for the proof and the Ethereum leg one after
-the other. Each case logs an error and counts in `GET /info` (`bisections`, `isolatedVotes`,
+the other: each transaction count leaves less time to prove, and the count that carries the most
+votes wins. Each case logs an error and counts in `GET /info` (`bisections`, `isolatedVotes`,
 `heldBatches`, `guestRejections`).
 
 ## Races and sync
