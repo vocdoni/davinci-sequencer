@@ -892,6 +892,11 @@ struct Actor {
     /// [`READ_RETRY`], not the next message.
     /// One per [`Read`] purpose, so one path's reads never starve another's.
     read_gate: [Option<(u64, tokio::time::Instant)>; 3],
+    /// The cancel is confirmed (its event, or a read at the confirmed
+    /// head): only then does it close out. A depth-0 read may be reorged.
+    cancel_confirmed: bool,
+    /// The Head block of the last confirmed-head read of a cancel.
+    cancel_confirm_block: Option<u64>,
     /// Why the last landing-time read left the record stale.
     stale_why: String,
     /// A transition landed since `last_vote_at` was last read from the chain;
@@ -1112,6 +1117,8 @@ pub(crate) fn spawn_actor(
         results_sent: None,
         confirm_block: None,
         read_gate: [None; 3],
+        cancel_confirmed: false,
+        cancel_confirm_block: None,
         stale_why: String::new(),
         // The record may predate the last landing: re-read before closing.
         vote_at_stale: true,
@@ -2327,6 +2334,28 @@ impl Actor {
         }
     }
 
+    /// A cancel seen only in a head read (depth 0) closes out once the
+    /// confirmed head shows it too; one try per Head block.
+    async fn confirm_cancel(&mut self) -> bool {
+        if self.cancel_confirmed {
+            return true;
+        }
+        if self.cancel_confirm_block == Some(self.last_head_block) {
+            return false;
+        }
+        self.cancel_confirm_block = Some(self.last_head_block);
+        let confirmed = match self.deps.contracts.confirmed_head(self.confirmations).await {
+            Ok(block) => self.deps.contracts.process_at(&self.pid31, block).await,
+            Err(e) => Err(e),
+        };
+        match confirmed {
+            Ok(p) if p.status == ProcessStatus::Canceled => self.cancel_confirmed = true,
+            Ok(_) => {}
+            Err(e) => debug!(pid = %hex::encode(self.pid31), %e, "cancel confirmation read"),
+        }
+        self.cancel_confirmed
+    }
+
     /// A cancel or the results closed the process for good: no grace end
     /// to wait for.
     fn close_requested(&self) -> bool {
@@ -2352,6 +2381,9 @@ impl Actor {
             || !(self.close_requested()
                 || (self.chain_time != 0 && self.chain_time >= self.grace_end()))
         {
+            return;
+        }
+        if self.record.onchain.status == ProcessStatus::Canceled && !self.confirm_cancel().await {
             return;
         }
         let (block, time, p) = match self.gated_read(Read::CloseOut).await {
@@ -3542,6 +3574,8 @@ impl Actor {
         match ev.kind {
             EventKind::ProcessCreated { .. } => {}
             EventKind::StatusChanged { new, .. } => {
+                // Events come from confirmed blocks.
+                self.cancel_confirmed = new == ProcessStatus::Canceled;
                 self.status_moved(new);
                 self.put_record();
             }

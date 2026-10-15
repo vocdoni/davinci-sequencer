@@ -6768,6 +6768,70 @@ async fn results_read_at_the_head_does_not_finalize_until_confirmed() {
     shutdown.cancel();
 }
 
+/// M1: a cancel only a depth-0 read shows (its block not confirmed, its
+/// event not routed) does not close out the pending votes; once a new
+/// block confirms it, they close.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_read_at_the_head_closes_out_only_when_confirmed() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vid = submit_n(&h, &s, 1, 40).await[0];
+    shutdown.cancel();
+    drop((h, node));
+
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.set_status(ProcessStatus::Canceled);
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        reopen_db(dir.path()).await,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_long("the head read merged the cancel", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed out on a depth-0 read"
+    );
+    // A new block confirms the cancel (its event stays hidden: the
+    // confirmed-head read decides).
+    s.chain.drop_checkpoints();
+    s.chain.advance_time(1);
+    wait_long("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    assert_eq!(vote_error(&h, vid).await, "process closed");
+    shutdown.cancel();
+}
+
 /// A node fault inside `prepare` (one failed tree write) is not the votes'
 /// fault: they stay pending, sealing backs off, and the retry settles them.
 /// One fault only, so prepare's best-effort root reset still succeeds.

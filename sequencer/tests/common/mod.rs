@@ -774,6 +774,11 @@ impl FakeChain {
         i.history.push(snap);
     }
 
+    /// Forgets the checkpoints: reads at any block see the current state.
+    pub fn drop_checkpoints(&self) {
+        self.inner.lock().unwrap().history.clear();
+    }
+
     /// How many times any node read the process with `process_at`.
     pub fn process_at_calls(&self) -> u64 {
         self.inner.lock().unwrap().process_at_calls
