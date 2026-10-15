@@ -785,6 +785,8 @@ struct Flight {
     /// The proof passed its checks (`Msg::JobProved`): what fails after
     /// this is the settlement.
     proved: bool,
+    /// L1-blob mode: the job's post was mined (shared with the job).
+    posted: Arc<std::sync::atomic::AtomicBool>,
     /// Cancels the job when the flight is dropped (rollback, requeue,
     /// shutdown), so an L1-blob job stops waiting on Ethereum.
     _abort: tokio_util::sync::DropGuard,
@@ -927,6 +929,9 @@ struct Actor {
     /// Synced-batch coverage may be stored that no recorded transition
     /// dropped: folded into the exposed set before the next seal.
     sync_orphans: bool,
+    /// Mirrors `Db::exposed_published`: the exposed set holds slots of
+    /// public batches no local record covers; its clear archives it.
+    exposed_published: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -1104,6 +1109,7 @@ pub(crate) fn spawn_actor(
         state_lost: false,
         rebuild_check: deps.db.rebuild_coverage(&pid).map_err(ierr)?.is_some(),
         sync_orphans: !deps.db.sync_coverage(&pid).map_err(ierr)?.is_empty(),
+        exposed_published: deps.db.exposed_published(&pid).map_err(ierr)?,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -2064,8 +2070,16 @@ impl Actor {
         vids.extend(synced.iter().flat_map(|r| r.vote_ids.iter().copied()));
         vids.extend(back.iter().map(|(_, v)| v.pkg.vote_id));
         // A vote an earlier rebuild kept, whose batch only that kept
-        // coverage still knows, is requeued now: its slots ride along.
-        for c in &coverage {
+        // coverage still knows, is requeued now: its slots ride along; so do
+        // those of our public attempts no record covers.
+        let published = match self.deps.db.published_coverage(&self.pid) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: published coverage");
+                return;
+            }
+        };
+        for c in coverage.iter().chain(&published) {
             let carried: Vec<u64> = c
                 .vote_ids
                 .iter()
@@ -2132,6 +2146,7 @@ impl Actor {
         self.vote_at_stale = true;
         self.rebuild_check = keep;
         self.sync_orphans = false;
+        self.exposed_published |= !order.is_empty();
         self.state_lost = true;
         self.reopen_state();
     }
@@ -2156,6 +2171,7 @@ impl Actor {
             self.pending.iter().map(|v| v.pkg.vote_id).collect();
         let mut slots = self.exposed.clone();
         let mut vids = self.exposed_vids.clone();
+        let mut folded = false;
         for r in &rows {
             let carried: Vec<u64> = r
                 .vote_ids
@@ -2166,6 +2182,7 @@ impl Actor {
             if !carried.is_empty() {
                 slots.extend(r.slots.iter().copied());
                 vids.extend(carried);
+                folded = true;
             }
         }
         if !rows.is_empty() {
@@ -2173,13 +2190,14 @@ impl Actor {
                 slots: slots.iter().copied().collect(),
                 vote_ids: vids.iter().copied().collect(),
             };
-            if let Err(e) = self.deps.db.consume_sync_coverage(&self.pid, &rec) {
+            if let Err(e) = self.deps.db.consume_sync_coverage(&self.pid, &rec, folded) {
                 let secs = self.prove_backoff();
                 error!(%pid, %e, retry_in = secs, "fold orphaned synced coverage");
                 return false;
             }
             self.exposed = slots;
             self.exposed_vids = vids;
+            self.exposed_published |= folded;
         }
         self.sync_orphans = false;
         true
@@ -2242,9 +2260,16 @@ impl Actor {
         }
         back.sort_by_key(|(at, _)| *at);
         let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
+        let published = match self.deps.db.published_coverage(&self.pid) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(%pid, %e, "published coverage read");
+                return false;
+            }
+        };
         let mut slots = self.exposed.clone();
         let mut vids = self.exposed_vids.clone();
-        for c in &coverage {
+        for c in coverage.iter().chain(&published) {
             let carried: Vec<u64> = c
                 .vote_ids
                 .iter()
@@ -2272,6 +2297,7 @@ impl Actor {
             warn!(%pid, votes = order.len(), "votes the rebuild kept settled are gone from the chain; re-sealing them");
             self.exposed = slots;
             self.exposed_vids = vids;
+            self.exposed_published = true;
             for (at, v) in back {
                 self.pending.push(v);
                 self.pending_at.push(at);
@@ -2854,6 +2880,7 @@ impl Actor {
             "batch sealed"
         );
         let cancel = CancellationToken::new();
+        let posted: Arc<std::sync::atomic::AtomicBool> = Default::default();
         // The grace end known now; it only moves later.
         let left = std::time::Duration::from_secs(self.grace_end().saturating_sub(now));
         let job = JobInput {
@@ -2874,7 +2901,7 @@ impl Actor {
             proof_first,
             deadline: tokio::time::Instant::now() + left.min(L1_JOB_CAP),
             cancel: cancel.clone(),
-            posted: Default::default(),
+            posted: posted.clone(),
         };
         self.in_flight = Some(Flight {
             generation: self.generation,
@@ -2883,6 +2910,7 @@ impl Actor {
             votes_at,
             landed_deadline: None,
             proved: false,
+            posted,
             _abort: cancel.drop_guard(),
         });
         tokio::spawn(run_job(job));
@@ -3124,12 +3152,25 @@ impl Actor {
                 }
             }
         }
-        if let Err(e) = self.deps.db.clear_exposed(&self.pid) {
+        // Slots of a public batch no record of ours covers outlive the set:
+        // a later rebuild may requeue one of its votes.
+        let archive = self
+            .exposed_published
+            .then(|| crate::storage::ExposedRecord {
+                slots: self.exposed.iter().copied().collect(),
+                vote_ids: self.exposed_vids.iter().copied().collect(),
+            });
+        if let Err(e) = self
+            .deps
+            .db
+            .clear_exposed_archiving(&self.pid, archive.as_ref())
+        {
             error!(pid = %hex::encode(self.pid31), %e, "clear exposed set");
             return;
         }
         self.exposed.clear();
         self.exposed_vids.clear();
+        self.exposed_published = false;
     }
 
     fn drop_pending(&mut self, vids: &[u64]) {
@@ -3193,6 +3234,17 @@ impl Actor {
     /// Puts a flight's votes back in the queue with their original age,
     /// ahead of the later votes of their slots.
     fn requeue_flight(&mut self, f: Flight) {
+        // A proved batch may have been sent (a reverted blob transaction
+        // keeps its sidecar), a mined post is on Ethereum: either way public,
+        // and with no record of ours to cover it.
+        if (f.proved || f.posted.load(Ordering::Relaxed)) && !self.exposed_published {
+            match self.deps.db.set_exposed_published(&self.pid, true) {
+                Ok(()) => self.exposed_published = true,
+                Err(e) => {
+                    error!(pid = %hex::encode(self.pid31), %e, "mark the exposed set published")
+                }
+            }
+        }
         let vids = f.prepared.vote_ids.clone();
         if let Err(e) = self.deps.db.requeue(&self.pid, &vids) {
             error!(pid = %hex::encode(self.pid31), %e, "requeue");
@@ -3585,6 +3637,13 @@ impl Actor {
         // Votes, transition, pin and counts in one write after the tree's.
         self.record.onchain.state_root = p.new_root;
         self.write_transition(&p.vote_ids, &rec, &p.blobs.blobs);
+        // Our landing refreshed every exposed slot: its record covers them.
+        if self.exposed_published && self.log_root == p.new_root {
+            match self.deps.db.set_exposed_published(&self.pid, false) {
+                Ok(()) => self.exposed_published = false,
+                Err(e) => error!(pid = %hex::encode(self.pid31), %e, "unmark the exposed set"),
+            }
+        }
         self.vote_at_stale = true;
         self.await_sync = false;
         self.failed_cycles = 0;

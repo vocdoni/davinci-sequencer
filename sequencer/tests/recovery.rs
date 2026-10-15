@@ -1518,3 +1518,68 @@ async fn orphaned_peer_batch_slots_ride_the_seal_after_a_restart() {
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
     shutdown.cancel();
 }
+
+/// Our batch B carrying revote X is sent and loses the race to a peer's P
+/// carrying X (24 occupied slots); the sync of P settles X and the exposed
+/// set clears. A reorg later takes P: the rebuild requeues X, and its
+/// re-seal must cover B's slots too (B's blobs are public), not only P's.
+#[tokio::test(start_paused = true)]
+async fn lost_race_batch_slots_survive_a_later_reorg() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 4200 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 4250);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("B sealed", 600, async || prover.calls() >= 2).await;
+    let b_slots = db.exposed(&pid_fr()).unwrap().unwrap().slots;
+    // P lands in the block ahead of B's send: B reverts, P settles X.
+    s.chain
+        .race_next_submit(peer_batch_of(&db, &s, std::slice::from_ref(&x)));
+    prover.release(1);
+    wait_secs("X settled by P, exposure cleared", 600, async || {
+        all_settled(&h, &[xid]).await && db.exposed(&pid_fr()).unwrap().is_none()
+    })
+    .await;
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 1);
+    // A reorg takes P; the rebuild requeues X.
+    s.chain.reorg_out_last_transition();
+    let block = s.chain.reinclude_transition(0);
+    wait_secs("rerouted", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    wait_secs("rebuilt", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    s.chain.advance_time(400);
+    prover.release(10);
+    wait_secs("X re-sealed on the chain", 600, async || {
+        all_settled(&h, &[xid]).await
+            && db.transitions(&pid_fr()).unwrap().len() == 2
+            && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
+    for slot in b_slots {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out a slot B published"
+        );
+    }
+    shutdown.cancel();
+}
