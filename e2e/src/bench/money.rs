@@ -31,16 +31,26 @@ pub const MAX_EXEC: u128 = 500_000_000;
 /// Blob base fee, at most 0.02 gwei.
 pub const MAX_BLOB: u128 = 20_000_000;
 
+/// A ceiling in wei, raised for a deliberate high-fee run by `var`.
+fn ceiling(var: &str, default: u128) -> u128 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 pub fn gate(f: &Fees) -> Result<(), String> {
+    let max_exec = ceiling("DAVINCI_BENCH_MAX_EXEC_WEI", MAX_EXEC);
+    let max_blob = ceiling("DAVINCI_BENCH_MAX_BLOB_WEI", MAX_BLOB);
     let mut why = Vec::new();
-    if f.base + f.tip > MAX_EXEC {
+    if f.base + f.tip > max_exec {
         why.push(format!(
-            "base {} + tip {} wei is above {MAX_EXEC}",
+            "base {} + tip {} wei is above {max_exec}",
             f.base, f.tip
         ));
     }
-    if f.blob > MAX_BLOB {
-        why.push(format!("blob base fee {} wei is above {MAX_BLOB}", f.blob));
+    if f.blob > max_blob {
+        why.push(format!("blob base fee {} wei is above {max_blob}", f.blob));
     }
     if why.is_empty() {
         Ok(())
