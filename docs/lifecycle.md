@@ -258,9 +258,13 @@ by round, and `graceMaxTotal` caps the extension.
   at the on-chain root, nothing is in flight, and a fresh read (the head first, then the process)
   confirms the window closed. A landing the events have not shown yet moves the grace end in that
   read, and a vote another sequencer settled settles from the sync instead of erroring. A cancel
-  or the results close out the same way, without waiting for the grace end.
+  or the results close out the same way, without waiting for the grace end, once confirmed: by
+  their event, or by a read at the confirmed head (a read at the newest block alone may be
+  reorged). While those reads fail or settle nothing, they are retried on a new block or after
+  2 s, not on every vote or status request.
 - A settlement that reverts `InvalidStatus` or `InvalidTimeBounds` while the window is open puts
-  its votes back to pending.
+  its votes back to pending, and so does `MaxVotersReached` (the organizer lowered `maxVoters`):
+  only the votes for a new slot that the new cap can never fit end in `error`.
 - The node reads the grace parameters from the registry at boot, and re-reads the process after
   every landing to learn `lastVoteAt`.
 
