@@ -59,6 +59,9 @@ const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
 // pid -> `ExposedRecord`: slots of synced batches that carried our votes,
 // for a rebuild if one is reorged out before its record is written.
 const SYNC_COVERAGE: Bytes = TableDefinition::new("sync_coverage");
+// pid -> JSON list of `ExposedRecord`, one per archived transition carrying
+// votes we store, kept by a rebuild until its replay converges.
+const REBUILD_COVERAGE: Bytes = TableDefinition::new("rebuild_coverage");
 /// Schemas this build upgrades in place: 9 only added `l1_posts`, 10 stopped
 /// using the `committed` table (the tree's own record is authoritative).
 const UPGRADES_FROM: [u64; 2] = [8, 9];
@@ -423,6 +426,7 @@ impl Db {
                 EXPOSED,
                 L1_POSTS,
                 SYNC_COVERAGE,
+                REBUILD_COVERAGE,
             ] {
                 tx.open_table(t).map_err(db_err)?;
             }
@@ -684,6 +688,41 @@ impl Db {
             .transpose()
     }
 
+    /// What a rebuild kept for the check after its replay: per archived
+    /// transition carrying votes we store, its slots and those votes.
+    pub fn rebuild_coverage(&self, pid: &Fr) -> Result<Option<Vec<ExposedRecord>>> {
+        self.get(REBUILD_COVERAGE, &pid_key(pid))?
+            .map(|v| decode("rebuild_coverage", &v))
+            .transpose()
+    }
+
+    /// The check after a rebuild's replay: `vids` (settled, but not on the
+    /// chain the replay reached) go back to pending at the queue head, the
+    /// exposed set becomes `exposed` when given, and the kept coverage is
+    /// dropped, in one commit.
+    pub fn finish_rebuild_check(
+        &self,
+        pid: &Fr,
+        vids: &[u64],
+        exposed: Option<&ExposedRecord>,
+    ) -> Result<()> {
+        self.write(|tx| {
+            tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_prepend(tx, pid, vids)?;
+            if let Some(e) = exposed {
+                tx.open_table(EXPOSED)
+                    .map_err(db_err)?
+                    .insert(pid_key(pid).as_slice(), encode(e)?.as_slice())
+                    .map_err(db_err)?;
+            }
+            tx.open_table(REBUILD_COVERAGE)
+                .map_err(db_err)?
+                .remove(pid_key(pid).as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
     pub fn clear_exposed(&self, pid: &Fr) -> Result<()> {
         self.write(|tx| {
             let mut t = tx.open_table(EXPOSED).map_err(db_err)?;
@@ -869,17 +908,27 @@ impl Db {
 
     /// A reorg took transitions the process committed: drops its tree
     /// table, every transition and blob, puts `vids` back in the queue
-    /// (pending, at its head in this order), and stores the exposed set and
-    /// the process record, in one commit. The tree is re-created at genesis
+    /// (pending, at its head in this order), and stores the exposed set, the
+    /// coverage kept for the check after the replay (`coverage`; none
+    /// removes it) and the process record, in one commit. The tree is re-created at genesis
     /// after it; a crash in between reopens at genesis (no stored tree).
     pub fn reset_process(
         &self,
         pid: &Fr,
         vids: &[u64],
         exposed: &ExposedRecord,
+        coverage: &[ExposedRecord],
         process: &ProcessRecord,
     ) -> Result<()> {
         self.write(|tx| {
+            let mut kept = tx.open_table(REBUILD_COVERAGE).map_err(db_err)?;
+            if coverage.is_empty() {
+                kept.remove(pid_key(pid).as_slice()).map_err(db_err)?;
+            } else {
+                kept.insert(pid_key(pid).as_slice(), encode(&coverage)?.as_slice())
+                    .map_err(db_err)?;
+            }
+            drop(kept);
             let name = Self::arbo_table(pid);
             tx.delete_table(TableDefinition::<&[u8], &[u8]>::new(&name))
                 .map_err(db_err)?;

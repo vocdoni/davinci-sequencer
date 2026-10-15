@@ -1270,3 +1270,82 @@ async fn replayed_batch_of_a_settled_vote_lost_at_a_crash_keeps_its_slots_covere
     }
     shutdown.cancel();
 }
+
+/// A rebuild keeps a vote Settled when its transition is in the tree at the
+/// fork root; a second reorg takes that transition before the replay brings
+/// it back. Our revote X settles in T1 (24 occupied slots); a peer's T2 on
+/// top is reorged out and the node rebuilds, keeping X Settled; the replay
+/// is stuck on blob fetches while a reorg takes T1 too. Once the replay
+/// converges on the chain without T1, X goes back to pending and re-seals,
+/// covering every slot T1 published.
+#[tokio::test(start_paused = true)]
+async fn vote_kept_settled_by_a_rebuild_then_reorged_out_reseals() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], 3600 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 3700);
+    let xid = x.pkg.vote_id;
+    h.submit(x).await.unwrap();
+    s.chain.advance_time(400);
+    prover.release(1);
+    wait_secs("X settled in T1", 600, async || {
+        all_settled(&h, &[xid]).await
+    })
+    .await;
+    let t1_slots = updated_slots(&db, nf, 1);
+    let peer = fake_vote(&s.env, 25, &[1, 2], 3701);
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&peer)));
+    wait_secs("T2 synced", 600, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 3
+    })
+    .await;
+    // T2 reorged out; the rebuild's replay cannot fetch any blob.
+    s.chain.reorg_out_last_transition();
+    s.chain.fail_blobs(u32::MAX);
+    let block = s.chain.reinclude_transition(0);
+    wait_secs("rerouted", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    wait_secs("rebuilt", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Settled));
+    // T1 goes too, before the replay brings it back.
+    s.chain.reorg_out_last_transition();
+    s.chain.fail_blobs(0);
+    s.chain.advance_time(400);
+    prover.release(10);
+    wait_secs("X re-sealed on the chain", 600, async || {
+        let ts = db.transitions(&pid_fr()).unwrap();
+        ts.len() == 2 && all_settled(&h, &[xid]).await && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    let (p, root) = h.vote_id_proof(xid).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
+    assert_eq!(s.chain.voters(), 24);
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
+    for slot in t1_slots {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out a slot T1 published"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}

@@ -921,6 +921,9 @@ struct Actor {
     /// genesis write failed, a tree reset that failed): retried before
     /// anything touches the state.
     state_lost: bool,
+    /// A rebuild kept votes Settled that its replay may not bring back:
+    /// check them once the replay converges (`Db::rebuild_coverage`).
+    rebuild_check: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -1096,6 +1099,7 @@ pub(crate) fn spawn_actor(
         held_reason: None,
         diverged: None,
         state_lost: false,
+        rebuild_check: deps.db.rebuild_coverage(&pid).map_err(ierr)?.is_some(),
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -2007,20 +2011,46 @@ impl Actor {
         };
         let mut slots = self.exposed.clone();
         slots.extend(synced.iter().flat_map(|r| r.slots.iter().copied()));
+        // The votes kept Settled come back only if the replay re-applies
+        // their transitions: per archived transition carrying votes we store,
+        // keep its slots for the check after the replay (with any an earlier
+        // rebuild kept and has not checked yet).
+        let mut coverage = match self.deps.db.rebuild_coverage(&self.pid) {
+            Ok(c) => c.unwrap_or_default(),
+            Err(e) => {
+                error!(%pid, %e, "rebuild: kept coverage");
+                return;
+            }
+        };
         let lost = log.iter().filter(|t| t.index >= d);
-        for t in lost.clone().filter(|_| !unsettle.is_empty()) {
+        for t in &log {
             let td = match self.deps.db.blobs(&self.pid, t.index) {
                 Ok(b) if !b.is_empty() => cpu(|| decode_blobs(&b, nf)).ok(),
                 _ => None,
             };
-            match td {
-                Some(td) if td.vote_ids.iter().any(|v| unsettle.contains(v)) => {
-                    slots.extend(td.updates.iter().map(|(s, _)| *s));
+            let Some(td) = td else {
+                if t.index >= d && !unsettle.is_empty() {
+                    warn!(%pid, index = t.index, "rebuild: blobs of a lost transition unreadable; its slots stay out of the exposed set");
+                } else {
+                    warn!(%pid, index = t.index, "rebuild: blobs of a transition unreadable; a vote it settled is re-sealed without its slots should the chain drop it");
                 }
-                Some(_) => {}
-                None => {
-                    warn!(%pid, index = t.index, "rebuild: blobs of a lost transition unreadable; its slots stay out of the exposed set")
+                continue;
+            };
+            if t.index >= d && td.vote_ids.iter().any(|v| unsettle.contains(v)) {
+                slots.extend(td.updates.iter().map(|(s, _)| *s));
+            }
+            let ours = match self.deps.db.stored_vote_ids(&self.pid, &td.vote_ids) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(%pid, %e, "rebuild: stored votes read");
+                    return;
                 }
+            };
+            if !ours.is_empty() {
+                coverage.push(crate::storage::ExposedRecord {
+                    slots: td.updates.iter().map(|(s, _)| *s).collect(),
+                    vote_ids: ours,
+                });
             }
         }
         let mut vids = self.exposed_vids.clone();
@@ -2044,7 +2074,7 @@ impl Actor {
         if let Err(e) = self
             .deps
             .db
-            .reset_process(&self.pid, &order, &exposed, &record)
+            .reset_process(&self.pid, &order, &exposed, &coverage, &record)
         {
             error!(%pid, %e, "rebuild write failed; retrying");
             return;
@@ -2077,8 +2107,111 @@ impl Actor {
         self.cap_est = None;
         self.held = None;
         self.vote_at_stale = true;
+        self.rebuild_check = !coverage.is_empty();
         self.state_lost = true;
         self.reopen_state();
+    }
+
+    /// After a rebuild's replay converged (the tree at the chain's root, the
+    /// log complete): a vote still Settled but not in the tree was kept by
+    /// the rebuild and then lost with its transition. Back to pending, its
+    /// re-seal covering the slots of the batches that carried it, and the
+    /// kept coverage dropped, in one write. Whether the check is done.
+    fn check_kept_settled(&mut self) -> bool {
+        let pid = hex::encode(self.pid31);
+        let coverage = match self.deps.db.rebuild_coverage(&self.pid) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                self.rebuild_check = false;
+                return true;
+            }
+            Err(e) => {
+                error!(%pid, %e, "kept coverage read");
+                return false;
+            }
+        };
+        let settled = match self
+            .deps
+            .db
+            .vote_ids_with_status(&self.pid, &[VoteStatus::Settled])
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!(%pid, %e, "settled votes read");
+                return false;
+            }
+        };
+        let missing: Result<Vec<u64>, StateError> = cpu(|| {
+            let mut out = Vec::new();
+            for vid in settled {
+                if !self.state.has_vote_id(vid)? {
+                    out.push(vid);
+                }
+            }
+            Ok(out)
+        });
+        let missing = match missing {
+            Ok(m) => m,
+            Err(e) => {
+                error!(%pid, %e, "settled votes check");
+                return false;
+            }
+        };
+        let mut back: Vec<(u64, VerifiedVote)> = Vec::new();
+        for vid in &missing {
+            match self.deps.db.vote(&self.pid, *vid) {
+                Ok(Some(sv)) => match unpack_vote(&sv.package) {
+                    Ok(v) => back.push((sv.created_at, v)),
+                    // Pending in storage: recover() errors it at a restart.
+                    Err(e) => warn!(%pid, vid, %e, "unreadable stored vote"),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    error!(%pid, %e, "vote read");
+                    return false;
+                }
+            }
+        }
+        back.sort_by_key(|(at, _)| *at);
+        let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
+        let mut slots = self.exposed.clone();
+        let mut vids = self.exposed_vids.clone();
+        for c in &coverage {
+            let carried: Vec<u64> = c
+                .vote_ids
+                .iter()
+                .copied()
+                .filter(|v| order.contains(v))
+                .collect();
+            if !carried.is_empty() {
+                slots.extend(c.slots.iter().copied());
+                vids.extend(carried);
+            }
+        }
+        let rec = (!order.is_empty()).then(|| crate::storage::ExposedRecord {
+            slots: slots.iter().copied().collect(),
+            vote_ids: vids.iter().copied().collect(),
+        });
+        if let Err(e) = self
+            .deps
+            .db
+            .finish_rebuild_check(&self.pid, &order, rec.as_ref())
+        {
+            error!(%pid, %e, "rebuild check write");
+            return false;
+        }
+        if !order.is_empty() {
+            warn!(%pid, votes = order.len(), "votes the rebuild kept settled are gone from the chain; re-sealing them");
+            self.exposed = slots;
+            self.exposed_vids = vids;
+            for (at, v) in back {
+                self.pending.push(v);
+                self.pending_at.push(at);
+            }
+            self.sort_pending();
+        }
+        self.rebuild_check = false;
+        true
     }
 
     /// Reopens the state at its committed record (re-creating the genesis a
@@ -2117,6 +2250,21 @@ impl Actor {
             a.await_sync || root != a.record.onchain.state_root || a.log_root != root
         };
         if !behind(self) {
+            // Converged after a rebuild: check the votes it kept Settled,
+            // once; a failed check retries under the resync backoff.
+            if self.rebuild_check
+                && self.diverged.is_none()
+                && self
+                    .resync_after
+                    .is_none_or(|t| tokio::time::Instant::now() >= t)
+                && !self.check_kept_settled()
+            {
+                let ms = (self.resync_backoff_ms * 2).clamp(100, 60_000);
+                self.resync_backoff_ms = ms;
+                self.resync_after =
+                    Some(tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
+                return;
+            }
             self.resync_after = None;
             self.resync_backoff_ms = 0;
             return;
