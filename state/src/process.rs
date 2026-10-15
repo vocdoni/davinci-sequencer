@@ -25,6 +25,18 @@ use crate::error::Error;
 use crate::transition::PreparedBatch;
 use crate::validate::VerifiedVote;
 
+/// What [`ProcessState::select_covered`] picked.
+#[derive(Debug)]
+pub struct Selection<'a> {
+    pub votes: Vec<&'a VerifiedVote>,
+    /// A vote was turned away (it waits for a later batch).
+    pub blocked: bool,
+    /// The batch is full: no further vote fits for its size alone.
+    pub full: bool,
+    /// The slots the selection's seal must refresh.
+    pub cover: BTreeSet<u64>,
+}
+
 /// Per-vote coverage for a selection: the history entries (slot sets) and,
 /// per vote id, the entries naming it. A seal of a vote refreshes every
 /// slot of every entry naming it.
@@ -404,7 +416,7 @@ impl<S: Storage> ProcessState<S> {
         max_blobs: usize,
     ) -> Result<(Vec<&'a VerifiedVote>, bool), Error> {
         let none = Coverage::default();
-        let (out, blocked, _) = self.select_covered(
+        let sel = self.select_covered(
             pending,
             max_voters,
             must_include,
@@ -412,7 +424,7 @@ impl<S: Storage> ProcessState<S> {
             max_votes,
             max_blobs,
         )?;
-        Ok((out, blocked))
+        Ok((sel.votes, sel.blocked))
     }
 
     /// [`Self::select_batch_within`] with per-vote coverage: a vote is
@@ -421,8 +433,10 @@ impl<S: Storage> ProcessState<S> {
     /// fit is skipped (its slot too, keeping cast order), the rest go on.
     /// `CoverageOverflow` names a vote whose own history does not fit even
     /// alone at the blob cap; `RefreshOverflow` means `base` alone does not.
-    /// Returns the selection, the blocked flag, and the slots its seal must
-    /// refresh (`base` and the selected votes' histories).
+    /// Returns the selection, whether a vote was turned away (`blocked`) and
+    /// whether that was the batch being full (`full`: `max_votes` reached, or
+    /// a vote bringing no history of its own did not fit), and the slots its
+    /// seal must refresh (`base` and the selected votes' histories).
     pub fn select_covered<'a>(
         &self,
         pending: &'a [VerifiedVote],
@@ -431,7 +445,7 @@ impl<S: Storage> ProcessState<S> {
         cov: &Coverage,
         max_votes: usize,
         max_blobs: usize,
-    ) -> Result<(Vec<&'a VerifiedVote>, bool, BTreeSet<u64>), Error> {
+    ) -> Result<Selection<'a>, Error> {
         if max_blobs == 0 {
             return Err(Error::Invalid("max_blobs must be at least 1".into()));
         }
@@ -457,8 +471,10 @@ impl<S: Storage> ProcessState<S> {
         // Live cover slots that stay refresh candidates (not written).
         let mut exposed = cover.iter().filter(|s| live(s)).count();
         let mut blocked = false;
+        let mut full = false;
         for v in pending {
             if out.len() >= max_votes.min(MAX_BATCH_SIZE) {
+                full = true;
                 break;
             }
             if slots.contains(&v.slot) || held.contains(&v.slot) || vids.contains(&v.pkg.vote_id) {
@@ -499,6 +515,7 @@ impl<S: Storage> ProcessState<S> {
             let w1 = w + overwrite as usize;
             if !fits(out.len() + 1, w1, e1, cap) {
                 blocked = true;
+                full |= added.is_empty();
                 held.insert(v.slot);
                 // Alone, at the blob cap: does it ever fit?
                 let mut alone: BTreeSet<u64> = base.clone();
@@ -533,7 +550,12 @@ impl<S: Storage> ProcessState<S> {
             vids.insert(v.pkg.vote_id);
             out.push(v);
         }
-        Ok((out, blocked, cover))
+        Ok(Selection {
+            votes: out,
+            blocked,
+            full,
+            cover,
+        })
     }
 
     /// Applies a prepared batch after its proof was accepted: slot store,

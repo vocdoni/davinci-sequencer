@@ -383,7 +383,12 @@ mod tests {
     fn budget_decision() {
         let d = std::time::Duration::from_secs;
         assert!(budget_error(d(110), d(30), 150, true).is_none());
+        // At the floor exactly one chunk still lands in a window of it; one
+        // second more and none does, which the boot refuses.
         assert!(budget_error(d(110), d(40), 150, true).is_none());
+        assert_eq!(crate::l1da::chunks_fit(150, 110, 40), Some(1));
+        assert!(budget_error(d(110), d(41), 150, true).unwrap().0);
+        assert_eq!(crate::l1da::chunks_fit(150, 110, 41), None);
         let (fatal, e) = budget_error(d(110), d(60), 150, true).unwrap();
         assert!(fatal && e.contains("--settle-margin") && e.contains("150"));
         assert!(!budget_error(d(110), d(60), 150, false).unwrap().0);

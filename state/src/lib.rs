@@ -16,7 +16,7 @@ mod validate;
 
 pub use config::{CensusOrigin, ProcessConfig, genesis_root};
 pub use error::{Error, VoteError};
-pub use process::{Committed, Coverage, ProcessState};
+pub use process::{Committed, Coverage, ProcessState, Selection};
 pub use transition::PreparedBatch;
 pub use validate::{
     VerifiedVote, VotePackage, ballot_from_be_coords, validate_vote, vote_still_valid,

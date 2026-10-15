@@ -7978,6 +7978,61 @@ async fn a_revote_history_does_not_shrink_a_batch_of_fresh_votes() {
     shutdown.cancel();
 }
 
+/// M4-1: 42 fresh votes (enough to wake the capacity trigger), then a
+/// revote whose 124-slot history fits a blob alone but not next to them.
+/// The batch is not full (only the revote's own history kept it out), so
+/// nothing seals before the timer; then the fresh votes seal together and
+/// the revote alone.
+#[tokio::test(start_paused = true)]
+async fn a_heavy_revote_does_not_seal_the_queue_early() {
+    let nf = 16u8;
+    let s = setup(nf, 190, None);
+    let dir = TempDir::new().unwrap();
+    let db = one_blob_populated(&s, &dir).await;
+    let r = fake_vote(&s.env, 0, &[2, 1], 9990);
+    let rid = r.pkg.vote_id;
+    db.put_coverage(
+        &pid_fr(),
+        &[6; 32],
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: (1..125)
+                .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+                .collect(),
+            vote_ids: vec![rid],
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    let mut vids = Vec::new();
+    for i in 140..182 {
+        let v = fake_vote(&s.env, i, &[1, 2], 9700 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    h.submit(r).await.unwrap();
+    vids.push(rid);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(prover.calls(), 0, "sealed before the timer");
+    wait_long("all settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(prover.sizes(), vec![42, 1]);
+    shutdown.cancel();
+}
+
 /// S3-3: a live exposed set of 140 slots (more than one batch can refresh,
 /// as repeated lost races leave it) holds exposed vote E. Sealing charges
 /// histories only, so E and a fresh vote F settle; nothing is errored.
@@ -8020,6 +8075,48 @@ async fn an_oversized_live_set_errors_no_vote() {
     for vid in vids {
         assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Settled));
     }
+    shutdown.cancel();
+}
+
+/// M4-2: a prepared batch over the blob cap (unreachable after a sized
+/// selection, forced here) backs off: the messages that follow run no
+/// selection (no tree reads) until the backoff ends, then the votes settle.
+#[tokio::test(start_paused = true)]
+async fn a_blob_cap_belt_backs_off() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    h.force_blob_belt().await;
+    let vids = submit_n(&h, &s, 3, 9850).await;
+    s.chain.advance_time(400);
+    h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0, "the belt did not fire");
+    let reads = db.arbo_reads();
+    for _ in 0..20 {
+        h.status(vids[0]).await.unwrap();
+    }
+    assert_eq!(
+        db.arbo_reads(),
+        reads,
+        "the seal ran again before its backoff"
+    );
+    wait_long("settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
     shutdown.cancel();
 }
 
@@ -8195,19 +8292,22 @@ fn check_coverage(
 
 /// One random run: own seals, peer batches carrying our pending votes or
 /// votes not submitted here yet (submitted later, the identical package),
-/// lost races, reorgs of the tip and blob-fetch faults, with the invariant
-/// checked after every step.
+/// lost races, reorgs of the tip, blob-fetch faults and holds (a node-side
+/// check refusing every proof), with the invariant checked after every
+/// step. (A census re-proof under a hold needs origin 3 on anvil; see
+/// `a_hold_emptied_by_the_reproof_seals_the_queue_covered`.)
 async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
     use rand::Rng;
     let s = setup(2, 40, None);
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
     let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
     let (_node, h) = batching_node(
         db.clone(),
         dir.path(),
         &s,
-        FakeProver::open(),
+        prover.clone(),
         8,
         TIMERS,
         shutdown.clone(),
@@ -8234,7 +8334,7 @@ async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
         (!pend.is_empty()).then(|| pend[rng.gen_range(0..pend.len())].clone())
     };
     for _ in 0..steps {
-        match rng.gen_range(0..10) {
+        match rng.gen_range(0..11) {
             0..=2 => {
                 kseed += 1;
                 let voter = rng.gen_range(0..36);
@@ -8276,13 +8376,18 @@ async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
                     unsent.push(v);
                 }
             }
-            _ => {
+            9 => {
                 if !unsent.is_empty() {
                     let v = unsent.swap_remove(rng.gen_range(0..unsent.len()));
                     if h.submit(v.clone()).await.is_ok() {
                         ours.push(v);
                     }
                 }
+            }
+            // A node-side check holds batches (or stops holding them).
+            _ => {
+                let mut w = prover.wrong_vk.lock().unwrap();
+                *w = !*w;
             }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -8292,6 +8397,7 @@ async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
     }
     // Let everything left settle (or close) and check once more.
     s.chain.fail_blobs(0);
+    *prover.wrong_vk.lock().unwrap() = false;
     for _ in 0..6 {
         s.chain.advance_time(400);
         tokio::time::sleep(Duration::from_secs(120)).await;

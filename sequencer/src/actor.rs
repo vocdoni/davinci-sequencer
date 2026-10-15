@@ -520,6 +520,8 @@ pub(crate) enum Msg {
     /// Test hook: the next `prepare` reports a refresh overflow (an arm a
     /// sized selection never reaches).
     ForceSealOverflow,
+    /// Test hook: the next prepared batch trips the blob-cap belt.
+    ForceBlobBelt,
     /// The monitor saw a reorg: re-read the process at the next tick.
     Reread,
 }
@@ -599,6 +601,12 @@ impl ActorHandle {
     #[doc(hidden)]
     pub async fn force_seal_overflow(&self) {
         let _ = self.tx.send(Msg::ForceSealOverflow).await;
+    }
+
+    /// Test hook: the next prepared batch trips the blob-cap belt.
+    #[doc(hidden)]
+    pub async fn force_blob_belt(&self) {
+        let _ = self.tx.send(Msg::ForceBlobBelt).await;
     }
 }
 
@@ -926,6 +934,8 @@ struct Actor {
     rebuild_check: bool,
     /// Test hook: the next `prepare` reports a refresh overflow.
     force_overflow: bool,
+    /// Test hook: the next prepared batch trips the blob-cap belt.
+    force_belt: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -1103,6 +1113,7 @@ pub(crate) fn spawn_actor(
         state_lost: false,
         rebuild_check: deps.db.rebuild_check(&pid).map_err(ierr)?,
         force_overflow: false,
+        force_belt: false,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1260,6 +1271,7 @@ impl Actor {
                 posted,
             } => self.on_job_done(generation, outcome, posted).await,
             Msg::ForceSealOverflow => self.force_overflow = true,
+            Msg::ForceBlobBelt => self.force_belt = true,
             Msg::Reread => self.vote_at_stale = true,
             Msg::ResultsHeld {
                 generation,
@@ -2455,6 +2467,8 @@ impl Actor {
         if self.pending.is_empty() {
             return;
         }
+        // Without the votes that just settled.
+        let at_max = self.pending.len() >= self.seal_max();
         // The batch census root (guest register 20), by origin.
         let Some(census_root) = self.batch_census_root() else {
             return;
@@ -2492,13 +2506,14 @@ impl Actor {
                 self.seal_max(),
                 self.state.blob_cap(),
             )
-            .map(|(refs, blocked, cover)| (refs.len(), blocked, cover));
+            .map(|sel| (sel.votes.len(), sel.full, sel.cover));
         let (k, reason, must) = match selected_trial {
-            Ok((k, blocked, must)) => {
+            Ok((k, full, must)) => {
                 // Company is the trial size (distinct admissible slots),
-                // not the queue length.
+                // not the queue length. A vote kept out by its own history
+                // does not make the batch full: it waits for the timer.
                 let seal = k >= 1
-                    && (blocked
+                    && (full
                         || at_max
                         || (k >= self.min_mix && timer_due)
                         || (k < self.min_mix && solo_due)
@@ -2511,8 +2526,8 @@ impl Actor {
                     "flush"
                 } else if at_max {
                     "at_max"
-                } else if blocked {
-                    "blocked"
+                } else if full {
+                    "full"
                 } else if k >= self.min_mix {
                     "timer"
                 } else {
@@ -2631,7 +2646,7 @@ impl Actor {
             {
                 // A vote whose history does not fit the window is skipped
                 // and waits; one that never fits was recast by the trial.
-                Ok((refs, blocked, _)) => (refs.into_iter().cloned().collect(), blocked),
+                Ok(sel) => (sel.votes.into_iter().cloned().collect(), sel.blocked),
                 // Unreachable after the trial; never errors votes.
                 Err(e) => {
                     let secs = self.prove_backoff();
@@ -2688,11 +2703,13 @@ impl Actor {
         };
         // Belt: select_batch sized the batch for the cap, so this never
         // fires; a batch above it could never land.
-        if prepared.blobs.blobs.len() > max_blobs {
+        if prepared.blobs.blobs.len() > max_blobs || std::mem::take(&mut self.force_belt) {
+            let secs = self.prove_backoff();
             error!(
                 pid = %hex::encode(self.pid31),
                 blobs = prepared.blobs.blobs.len(),
                 cap = max_blobs,
+                retry_in = secs,
                 "prepared batch exceeds the blob cap; not sealing"
             );
             self.rollback_prepared(&prepared);

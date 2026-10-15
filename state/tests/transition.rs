@@ -746,10 +746,10 @@ fn select_covered_takes_only_votes_whose_history_it_read() {
     let b = fake_vote(&env, 31, &[1], 32_001);
     let cov = Coverage::for_votes(&[a.pkg.vote_id]);
     let pending = [b, a.clone()];
-    let (sel, _, _) = st
+    let sel = st
         .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
         .unwrap();
-    let ids: Vec<u64> = sel.iter().map(|v| v.pkg.vote_id).collect();
+    let ids: Vec<u64> = sel.votes.iter().map(|v| v.pkg.vote_id).collect();
     assert_eq!(ids, vec![a.pkg.vote_id]);
 }
 
@@ -771,14 +771,20 @@ fn select_covered_charges_each_vote_its_own_history() {
     let mut pending = fresh.clone();
     pending.push(heavy.clone());
     pending.push(later.clone());
-    let (sel, blocked, cover) = st
+    let sel = st
         .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
         .unwrap();
     // The fresh votes are not charged the heavy history; it waits, and the
-    // later vote of its slot waits behind it.
-    assert_eq!(sel.len(), 100);
-    assert!(blocked);
-    assert!(cover.is_empty());
+    // later vote of its slot waits behind it. The batch is not full: only
+    // the heavy vote's own history kept it out.
+    assert_eq!(sel.votes.len(), 100);
+    assert!(sel.blocked && !sel.full);
+    assert!(sel.cover.is_empty());
+    // A cap reached is full.
+    let sel = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, 50, TX_BLOB_CAP)
+        .unwrap();
+    assert!(sel.full && sel.votes.len() == 50);
     // As before: the history as one set shrinks the fresh batch.
     let legacy = st
         .select_batch(&pending, u64::MAX, &hist, usize::MAX)
@@ -787,7 +793,7 @@ fn select_covered_charges_each_vote_its_own_history() {
         .len();
     assert!(legacy < 100, "{legacy}");
     // Alone, the heavy vote fits and its cover is exactly its history.
-    let (sel, _, cover) = st
+    let sel = st
         .select_covered(
             &pending[100..],
             u64::MAX,
@@ -797,6 +803,8 @@ fn select_covered_charges_each_vote_its_own_history() {
             TX_BLOB_CAP,
         )
         .unwrap();
+    let cover = sel.cover;
+    let sel = sel.votes;
     assert_eq!(sel.len(), 1);
     assert_eq!(sel[0].pkg.vote_id, heavy.pkg.vote_id);
     assert_eq!(cover, hist);
