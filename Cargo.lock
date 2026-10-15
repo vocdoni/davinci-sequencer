@@ -2565,7 +2565,9 @@ version = "0.5.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "arbo",
  "davinci-client",
+ "davinci-state",
  "davinci-zkvm-sdk",
  "hex",
  "k256",

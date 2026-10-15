@@ -752,6 +752,55 @@ pub async fn aid_log_blocks(
         .collect())
 }
 
+/// The `requestResultsDecryption` inputs a follower's archive implies: the
+/// process state rebuilt from the transitions and blobs `node` serves (in
+/// L1-blob mode, the blobs it fetched from Ethereum), as its final root, the
+/// 64 accumulator coordinates (big-endian) and the results-leaf siblings.
+pub async fn follower_inputs(
+    node: &davinci_client::SequencerClient,
+    p: &davinci_client::organizer::OnchainProcess,
+) -> Result<([u8; 32], [[u8; 32]; 64], Vec<[u8; 32]>)> {
+    use davinci_state::{CensusOrigin, ProcessConfig, ProcessState};
+    use davinci_zkvm_sdk::blob::{Blob, decode_blobs};
+    use davinci_zkvm_sdk::crypto::field::{fr_from_be, u256_to_be};
+    let mut pid = [0u8; 32];
+    pid[1..].copy_from_slice(&p.id);
+    let census_origin = match p.census_origin {
+        1 => CensusOrigin::MerkleStatic,
+        2 => CensusOrigin::MerkleOffchainDynamic,
+        3 => CensusOrigin::MerkleOnchainDynamic,
+        4 => CensusOrigin::Csp,
+        o => bail!("census origin {o}"),
+    };
+    let cfg = ProcessConfig {
+        process_id: fr_from_be(&pid)?,
+        ballot_mode: p.ballot_mode,
+        enc_key: p.encryption_key,
+        census_origin,
+        census_root: p.census_root,
+        ballot_vk_hash: chain::ballot_vk_hash()?,
+    };
+    let mut st = ProcessState::create(cfg, arbo::MemoryStorage::new())?;
+    let nf = p.ballot_mode.num_fields;
+    for t in node.transitions(&p.id).await? {
+        let blobs = node
+            .transition_blobs(&p.id, t.index)
+            .await?
+            .into_iter()
+            .map(|b| {
+                let n = b.len();
+                Blob::try_from(b.into_boxed_slice())
+                    .map_err(|_| anyhow::anyhow!("a blob of {n} bytes"))
+            })
+            .collect::<Result<Vec<Blob>>>()?;
+        let td = decode_blobs(&blobs, nf)?;
+        st.apply_synced(&td, t.new_root)
+            .with_context(|| format!("replay transition {}", t.index))?;
+    }
+    let (acc, siblings) = st.dkg_results_inputs()?;
+    Ok((st.committed().root, acc.map(|c| u256_to_be(&c)), siblings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

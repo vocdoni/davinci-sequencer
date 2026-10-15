@@ -80,7 +80,8 @@ harness copies the Ethereum block `DAVINCI_E2E_L1_LAG` (default 6) blocks behind
 5 to 7 of that anvil), every node reads blobs from the Ethereum anvil, and the scenario adds a
 node killed while its blob transaction waits in the paused Ethereum pool: after the restart it
 proves the batch again and replaces the pending transaction at its nonce with every fee doubled.
-DKG processes are refused (their key modes are not on OP Stack chains). With
+With `DAVINCI_E2E_DKG=1` the DKG contracts and committee run on the OP-side anvil and the
+registry takes the DKG manager, as in blob mode. With
 `DAVINCI_E2E_NEGATIVE=1` the L1 settlement is replayed tampered: blob mode's entry point
 (`WrongDAMode`), a broken header chain (`BrokenHeaderChain`), a transaction proof of another trie
 (`MerkleTrie: invalid root hash`), a swapped commitment (`InvalidBlobsDigest`), an extra blob
@@ -117,7 +118,7 @@ prover. On failure the node logs, anvil log and datadirs are kept and their path
 | `DAVINCI_E2E_L1_BLOCK_TIME`, `DAVINCI_E2E_L1_LAG` | L1-blob mode on anvil: the Ethereum anvil's block time (default 2 s) and the relayer's lag (default 6 blocks, at most 48). |
 | `DAVINCI_E2E_GRACE` | The anvil registry's grace window, `default,floor,ceil,max_total,notice` in seconds (default `davinci_e2e::chain::GRACE_ARGS`). |
 | `DAVINCI_E2E_GRACE_ONLY=1` | Runs only the grace window phase. |
-| `DAVINCI_E2E_DKG=1` | Adds a DKG automatic process ended with a batch in flight, a locked one decrypted after the reveal, and a zero-vote one. On anvil the harness deploys the DKG contracts and runs three `davinci-dkg-node` operators, built from `DAVINCI_DKG_DIR` unless `DAVINCI_E2E_DKG_NODE_BIN` is set; their circuit artifacts (about 1.1 GB) go to `DAVINCI_E2E_DKG_ARTIFACTS`. |
+| `DAVINCI_E2E_DKG=1` | Adds a DKG automatic process ended with a batch in flight, a locked one decrypted after the reveal, and a zero-vote one. On anvil the harness deploys the DKG contracts and runs three `davinci-dkg-node` operators, built from `DAVINCI_DKG_DIR` unless `DAVINCI_E2E_DKG_NODE_BIN` is set; their circuit artifacts (about 1.1 GB) go to `DAVINCI_E2E_DKG_ARTIFACTS`. After each decryption request the observer, which never settles (in L1-blob mode it rebuilt every transition from Ethereum blobs), replays its archive to the requested root, accumulator and siblings. Works in both DA modes. There is no Council e2e: the Council key mode is covered by the live OP test only. |
 | `DAVINCI_E2E_NEGATIVE=1` | Replays settled transactions, tampered, through `eth_call` and requires each to revert with the expected error. |
 | `DAVINCI_E2E_LIVE=1` | Runs on an existing deployment instead of anvil, see below. |
 | `DAVINCI_E2E_RESILIENCE=1` | Live only: full RPC, prover and beacon outages and an observer RPC failover, through loopback proxies. |

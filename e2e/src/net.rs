@@ -323,10 +323,6 @@ impl Net {
 
     async fn anvil(dir: &Path) -> Result<Net> {
         let l1_mode = l1::enabled()?;
-        ensure!(
-            !(l1_mode && dkg::enabled()),
-            "DAVINCI_E2E_DKG: the DKG key modes are not on OP Stack chains (L1-blob mode)"
-        );
         let contracts = chain::contracts_dir();
         chain::forge_build(&contracts)?;
         let anvil = Anvil::start(&dir.join("anvil.log")).await?;
@@ -341,7 +337,7 @@ impl Net {
             .as_ref()
             .map_or(Address::ZERO, |d| d.deployment.manager);
         let (dep, l1) = if l1_mode {
-            let dep = chain::deploy_l1(&anvil.url, &contracts).await?;
+            let dep = chain::deploy_l1(&anvil.url, &contracts, manager).await?;
             let l1 = l1::anvil_net(dir, &anvil.url, &dep).await?;
             (dep, Some(l1))
         } else {

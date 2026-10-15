@@ -39,7 +39,10 @@
 //! the registry; live the committee of the registry adapter's manager
 //! (`DAVINCI_E2E_DKG_MANAGER` overrides it). Then, after the sequencer-key
 //! processes, an automatic, a locked and a zero-vote DKG process and the
-//! eth_call negatives around their requests.
+//! eth_call negatives around their requests; after each request the
+//! observer's archive (in L1-blob mode, rebuilt from Ethereum blobs) replays
+//! to the same `requestResultsDecryption` inputs. In both DA modes. There is
+//! no Council e2e.
 //!
 //! Every process closes after the registry's grace window, and the last
 //! phase exercises it (`grace`): an AGM END with batches in flight, a
@@ -2220,6 +2223,64 @@ async fn dkg_request(
     .await
 }
 
+/// The observer, which never settles (in L1-blob mode it rebuilt every
+/// transition from Ethereum blobs), confirms `req`: once at the chain's final
+/// root, its archive replays to the very accumulator and siblings the
+/// sequencer sent in `requestResultsDecryption`.
+async fn follower_confirms(
+    nodes: &[Node],
+    net: &Net,
+    reader: &RegistryReader,
+    p: &OnchainProcess,
+    req: &chain::RegistryTx,
+) -> Result<()> {
+    let obs = &nodes[OBS];
+    ensure!(
+        obs.address.is_none(),
+        "node {} is not an observer",
+        obs.name
+    );
+    let root = reader.process(&p.id).await?.state_root;
+    wait::until(
+        &format!("the observer at {}'s final root", ProcessId(p.id)),
+        sync_timeout(),
+        Duration::from_secs(2),
+        || async {
+            alive(nodes)?;
+            let v = obs.api.process(&p.id).await?;
+            Ok((v.local_state_root == Some(root)).then_some(()))
+        },
+    )
+    .await?;
+    let (got_root, acc, siblings) = dkg::follower_inputs(&obs.api, p).await?;
+    ensure!(
+        got_root == root,
+        "the observer's archive replays to another root"
+    );
+    let provider = alloy::providers::ProviderBuilder::new().connect_client(chain::rpc(&net.rpc)?);
+    let tx = alloy::providers::Provider::get_transaction_by_hash(&provider, req.tx)
+        .await?
+        .context("request tx not found")?;
+    let call = ProcessRegistry::requestResultsDecryptionCall::abi_decode(
+        alloy::consensus::Transaction::input(tx.inner.inner()),
+    )
+    .context("decode the request")?;
+    ensure!(
+        call.accumulator == acc.map(alloy::primitives::U256::from_be_bytes),
+        "the observer's accumulator differs from the request's"
+    );
+    ensure!(
+        call.siblings == siblings.iter().map(|s| FixedBytes(*s)).collect::<Vec<_>>(),
+        "the observer's siblings differ from the request's"
+    );
+    say!(
+        "{}: the observer's archive confirms the decryption request ({} transitions replayed)",
+        ProcessId(p.id),
+        obs.api.transitions(&p.id).await?.len()
+    );
+    Ok(())
+}
+
 /// Block of `pid`'s `ProcessResultsSet`.
 async fn results_block(net: &Net, pid: &[u8; 31]) -> Result<u64> {
     let from = net.start_block.unwrap_or(net.from_block);
@@ -2364,6 +2425,9 @@ async fn dkg_processes(
         .await
         .context("automatic")?;
     let req_a = dkg_request(net, nodes, &pa.id, sync_timeout()).await?;
+    follower_confirms(nodes, net, reader, &pa, &req_a)
+        .await
+        .context("automatic")?;
     grace::closed_after_grace(net, reader, &pa.id).await?;
     let res_a = results_block(net, &pa.id).await?;
     let a = reader.process(&pa.id).await?.dkg.context("dkg")?;
@@ -2426,6 +2490,9 @@ async fn dkg_processes(
     .await?;
     let wait_end = Duration::from_secs(locked_duration) + results_timeout();
     let req_l = dkg_request(net, nodes, &pl.id, wait_end).await?;
+    follower_confirms(nodes, net, reader, &pl, &req_l)
+        .await
+        .context("locked")?;
     let p = reader.process(&pl.id).await?;
     let l = p.dkg.context("dkg")?;
     ensure!(

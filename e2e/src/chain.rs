@@ -235,10 +235,10 @@ pub async fn deploy(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deplo
 }
 
 /// [`deploy`] in L1-blob mode, for an OP-like anvil: `MockL1Block`, then an
-/// `L1BlobVerifier` that reads it, then the registry on that verifier. No
-/// DKG: its key modes are not on OP Stack chains.
-pub async fn deploy_l1(url: &str, dir: &Path) -> Result<Deployment> {
-    deploy_with(url, dir, Address::ZERO, true).await
+/// `L1BlobVerifier` that reads it, then the registry on that verifier, with
+/// `dkg_manager` as in blob mode.
+pub async fn deploy_l1(url: &str, dir: &Path, dkg_manager: Address) -> Result<Deployment> {
+    deploy_with(url, dir, dkg_manager, true).await
 }
 
 async fn deploy_with(url: &str, dir: &Path, dkg_manager: Address, l1: bool) -> Result<Deployment> {
