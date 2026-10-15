@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::web3::OnchainProcess;
 
 /// Bump on any incompatible change to a table layout or record encoding.
-pub const SCHEMA_VERSION: u64 = 10;
+pub const SCHEMA_VERSION: u64 = 11;
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The database file inside its directory.
 pub const DB_FILE: &str = "sequencer.redb";
@@ -67,9 +67,6 @@ const REBUILD_CHECK: Bytes = TableDefinition::new("rebuild_check");
 const COVERAGE_HISTORY: Bytes = TableDefinition::new("coverage_history");
 // pid‖vid‖root -> []: the history's index by vote.
 const COVERAGE_BY_VOTE: Bytes = TableDefinition::new("coverage_by_vote");
-/// Schemas this build upgrades in place: 9 only added `l1_posts`, 10 stopped
-/// using the `committed` table (the tree's own record is authoritative).
-const UPGRADES_FROM: [u64; 2] = [8, 9];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -81,6 +78,13 @@ pub enum StorageError {
          is the source of truth); keep the old file, it holds the master secret"
     )]
     Schema { found: u64, expected: u64 },
+    /// No upgrade: the batches it sealed or synced have no coverage history,
+    /// so their votes' reseals would leave slots out.
+    #[error(
+        "this datadir predates the coverage history; start this node with a fresh datadir \
+         (move the old one aside and keep it: it holds the master secret)"
+    )]
+    PredatesHistory,
     #[error("corrupt {table} row: {reason}")]
     Corrupt { table: &'static str, reason: String },
     #[error("not found: {0}")]
@@ -366,8 +370,7 @@ impl Db {
     /// Opens the database of one deployment, [`deployment_dir`] under
     /// `datadir`, created on first use: another registry starts from an
     /// empty store and leaves this one alone. A database of the flat layout
-    /// (`<datadir>/sequencer.redb`) moves in once if its processes carry this
-    /// deployment's id prefix; otherwise it stays where it is.
+    /// (`<datadir>/sequencer.redb`) predates the coverage history: refused.
     pub fn open_deployment(
         datadir: &Path,
         chain_id: u64,
@@ -376,7 +379,9 @@ impl Db {
     ) -> Result<Self> {
         private_dir(datadir)?;
         let dir = deployment_dir(datadir, chain_id, registry);
-        adopt_flat(datadir, &dir, chain_id, registry)?;
+        if datadir.join(DB_FILE).exists() {
+            return Err(StorageError::PredatesHistory);
+        }
         private_dir(&dir)?;
         let db = Self::open_with(&dir.join(DB_FILE), cache_mb)?;
         db.bind_deployment(&deployment_name(chain_id, registry))?;
@@ -409,11 +414,7 @@ impl Db {
                         .map_err(db_err)?;
                 }
                 Some(v) if v == SCHEMA_VERSION => {}
-                // Nothing to rewrite: new tables are opened below.
-                Some(v) if UPGRADES_FROM.contains(&v) => {
-                    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION)
-                        .map_err(db_err)?;
-                }
+                Some(v) if v < SCHEMA_VERSION => return Err(StorageError::PredatesHistory),
                 Some(v) => {
                     return Err(StorageError::Schema {
                         found: v,
@@ -1253,95 +1254,6 @@ fn private_dir(dir: &Path) -> Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
-}
-
-// Moves `<datadir>/sequencer.redb` (the flat layout) to `dir` when every
-// process it holds is this deployment's. Anything else stays in place.
-fn adopt_flat(datadir: &Path, dir: &Path, chain_id: u64, registry: &[u8; 20]) -> Result<()> {
-    let flat = datadir.join(DB_FILE);
-    if !flat.exists() {
-        return Ok(());
-    }
-    let target = dir.join(DB_FILE);
-    if target.exists() {
-        tracing::info!(
-            path = %flat.display(),
-            "database of the flat datadir layout left in place: this deployment has its own"
-        );
-        return Ok(());
-    }
-    let (schema, prefixes) = match inspect_flat(&flat) {
-        Ok(v) => v,
-        Err(redb::Error::DatabaseAlreadyOpen) => {
-            return Err(StorageError::Db(format!(
-                "{} is open in another process",
-                flat.display()
-            )));
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %flat.display(),
-                error = %e,
-                "database of the flat datadir layout is unreadable: left in place"
-            );
-            return Ok(());
-        }
-    };
-    let ours = pid_prefix(chain_id, registry);
-    let why = if prefixes.is_empty() || ours.is_none() {
-        "its deployment is unknown (no process to tell it by)"
-    } else if prefixes.iter().any(|p| Some(*p) != ours) {
-        "it belongs to another deployment"
-    } else if !schema.is_some_and(|v| v == SCHEMA_VERSION || UPGRADES_FROM.contains(&v)) {
-        "its schema version is not this build's"
-    } else {
-        ""
-    };
-    if !why.is_empty() {
-        tracing::warn!(
-            path = %flat.display(),
-            deployment = %dir.display(),
-            "database of the flat datadir layout left in place, {why}; this deployment starts empty"
-        );
-        return Ok(());
-    }
-    private_dir(dir)?;
-    std::fs::rename(&flat, &target)?;
-    tracing::info!(
-        from = %flat.display(),
-        to = %target.display(),
-        "moved the flat datadir layout into its deployment directory"
-    );
-    Ok(())
-}
-
-// The schema version of a database file and the distinct id prefixes of its
-// processes, read from the keys only, so records of any shape do.
-fn inspect_flat(path: &Path) -> Result<(Option<u64>, HashSet<[u8; 4]>), redb::Error> {
-    let db = Database::open(path)?;
-    let tx = db.begin_read()?;
-    let schema = match tx.open_table(META) {
-        Ok(t) => t.get(SCHEMA_VERSION_KEY)?.map(|v| v.value()),
-        Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(e) => return Err(e.into()),
-    };
-    let t = match tx.open_table(PROCESSES) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((schema, HashSet::new())),
-        Err(e) => return Err(e.into()),
-    };
-    let mut out = HashSet::new();
-    for row in t.iter()? {
-        let (k, _) = row?;
-        if let Some(p) = k
-            .value()
-            .get(21..25)
-            .and_then(|p| <[u8; 4]>::try_from(p).ok())
-        {
-            out.insert(p);
-        }
-    }
-    Ok((schema, out))
 }
 
 // A history entry and its index rows.

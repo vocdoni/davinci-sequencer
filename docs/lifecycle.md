@@ -441,5 +441,7 @@ nonce with doubled fees instead of queueing behind it, whichever of the batch's 
 was. Records of another account (a rotated L1 key) are dropped at start. Transactions mined
 before the crash are wasted.
 
-A datadir written by an earlier release (storage schema 8 or 9) is upgraded in place on first
-start: schema 9 adds the `l1_posts` table, and schema 10 stops using the `committed` table.
+A datadir written by an earlier release (storage schema 10 or older) is refused at start: it
+predates the coverage history, so the batches it sealed or synced have no entries and a later
+re-seal of their votes would leave slots out. Start the node with a fresh datadir (the chain is
+the source of truth), and keep the old one aside: it holds the master secret.

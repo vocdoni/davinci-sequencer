@@ -209,9 +209,9 @@ starts an empty database for it at the registry's start block. The previous depl
 directory stays untouched, and pointing the node back at it resumes where it stopped. Each
 database records its deployment and refuses to open under another.
 
-A database from the older flat layout (`<datadir>/sequencer.redb`) is moved into its deployment
-directory once, when its process ids belong to that deployment. Otherwise it stays in place and
-the node logs why; delete it when that deployment is no longer needed.
+A datadir holding a database from the older flat layout (`<datadir>/sequencer.redb`) is refused:
+that layout predates the coverage history (see [lifecycle.md](lifecycle.md#restarts)). Move it
+aside, keeping it for its master secret.
 
 Each database holds the deployment's master secret, drawn on first boot, from which every
 sequencer election key the node hands out is derived. Back it up and protect it like a key.

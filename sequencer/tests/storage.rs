@@ -614,56 +614,29 @@ fn a_database_is_bound_to_its_deployment() {
     assert!(matches!(err, StorageError::Deployment { .. }), "{err}");
 }
 
-// The flat layout (`<datadir>/sequencer.redb`) moves into the deployment
-// its processes belong to.
+// The flat layout (`<datadir>/sequencer.redb`) predates the coverage
+// history: refused, with or without processes, and left in place.
 #[test]
-fn flat_layout_moves_into_its_deployment() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = process_of(&REG_A, 1);
-    {
-        let db = Db::open_in(dir.path()).unwrap();
-        db.put_process(&a).unwrap();
-        db.put_process(&process_of(&REG_A, 2)).unwrap();
-        db.set_meta_u64("monitor_last_block", 900).unwrap();
+fn flat_layout_is_refused() {
+    for with_process in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open_in(dir.path()).unwrap();
+            if with_process {
+                db.put_process(&process_of(&REG_A, 1)).unwrap();
+            }
+        }
+        let err = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB)
+            .err()
+            .unwrap();
+        assert!(matches!(err, StorageError::PredatesHistory), "{err}");
+        assert!(dir.path().join(DB_FILE).exists());
+        assert!(
+            !deployment_dir(dir.path(), 100, &REG_A)
+                .join(DB_FILE)
+                .exists()
+        );
     }
-    // Another registry's node leaves it alone.
-    let db = Db::open_deployment(dir.path(), 100, &REG_B, DEFAULT_CACHE_MB).unwrap();
-    assert!(db.processes().unwrap().is_empty());
-    drop(db);
-    assert!(dir.path().join(DB_FILE).exists());
-
-    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
-    assert!(!dir.path().join(DB_FILE).exists());
-    assert_eq!(db.processes().unwrap().len(), 2);
-    assert_eq!(db.process(&a.pid).unwrap(), Some(a));
-    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), Some(900));
-}
-
-// Without processes the flat database's deployment is unknown: it stays.
-#[test]
-fn flat_layout_without_processes_stays() {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let db = Db::open_in(dir.path()).unwrap();
-        db.set_meta_u64("monitor_last_block", 900).unwrap();
-    }
-    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
-    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), None);
-    assert!(dir.path().join(DB_FILE).exists());
-}
-
-// A flat database of another schema is not moved: it would be refused.
-#[test]
-fn flat_layout_of_another_schema_stays() {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let db = Db::open_in(dir.path()).unwrap();
-        db.put_process(&process_of(&REG_A, 1)).unwrap();
-        db.set_meta_u64(SCHEMA_VERSION_KEY, 999).unwrap();
-    }
-    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
-    assert!(db.processes().unwrap().is_empty());
-    assert!(dir.path().join(DB_FILE).exists());
 }
 
 fn post(nonce: u64, fee: u128) -> L1PostRecord {
@@ -706,31 +679,23 @@ fn l1_posts_round_trip_by_nonce() {
     );
 }
 
+// Every earlier schema predates the coverage history: no upgrade.
 #[test]
-fn schema_8_and_9_files_upgrade_in_place() {
-    for old in [8, 9] {
+fn files_before_the_coverage_history_are_refused() {
+    for old in [7, 8, 9, 10] {
         let dir = tempfile::tempdir().unwrap();
         {
             let db = open(&dir);
             db.put_process(&process(3)).unwrap();
             db.set_meta_u64(SCHEMA_VERSION_KEY, old).unwrap();
         }
-        let db = open(&dir);
-        assert_eq!(db.meta_u64(SCHEMA_VERSION_KEY).unwrap(), Some(10));
-        assert_eq!(db.process(&pid(3)).unwrap(), Some(process(3)));
-        db.put_l1_post(&post(1, 1)).unwrap();
+        let err = Db::open(&dir.path().join("sequencer.redb")).err().unwrap();
+        assert!(matches!(err, StorageError::PredatesHistory), "{old}: {err}");
+        assert!(
+            err.to_string()
+                .contains("start this node with a fresh datadir")
+        );
     }
-    // Older versions are still refused.
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let db = open(&dir);
-        db.set_meta_u64(SCHEMA_VERSION_KEY, 7).unwrap();
-    }
-    let err = Db::open(&dir.path().join("sequencer.redb")).err().unwrap();
-    assert!(
-        matches!(err, StorageError::Schema { found: 7, .. }),
-        "{err}"
-    );
 }
 
 #[test]
