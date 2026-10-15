@@ -1106,3 +1106,34 @@ async fn l1_proof_first_retry_is_sized_for_its_exposed_set() {
     );
     shutdown.cancel();
 }
+
+/// A job task that panics after its blobs were mined still counts a failed
+/// cycle: three of them pause sealing, as three posted failures do.
+#[tokio::test(start_paused = true)]
+async fn l1_a_job_panicking_after_posting_counts() {
+    let s = setup(2, 8, None);
+    let l1 = FakeL1::new();
+    let miner = mine_every_12s(&l1);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    *prover.panic_batches.lock().unwrap() = 100;
+    let (_node, h) = l1_node(&s, &l1, prover.clone(), &dir, &shutdown).await;
+    let vids = submit(&h, &s, 0..3, 1900).await;
+    for k in 1..=3u64 {
+        wait_secs("proving", 600, async || prover.calls() == k).await;
+        wait_secs("posted", 600, async || l1.sends().len() as u64 == k).await;
+        // Mined, then the job dies.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        prover.release(1);
+    }
+    wait_secs("the third cycle ended", 600, async || {
+        !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(400)).await;
+    assert_eq!(prover.calls(), 3, "paused after three posted failures");
+    all_pending(&h, &vids).await;
+    shutdown.cancel();
+    miner.abort();
+}

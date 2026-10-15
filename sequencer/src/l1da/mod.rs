@@ -230,7 +230,8 @@ pub struct L1Job<'a> {
     /// Fired when the actor drops the flight (rollback, shutdown).
     pub cancel: CancellationToken,
     /// Set once any chunk of this job is mined: the job spent on Ethereum.
-    pub posted: AtomicBool,
+    /// Shared, so a job task that dies still reports it.
+    pub posted: std::sync::Arc<AtomicBool>,
 }
 
 /// What [`with_post`] leaves for [`settle`].

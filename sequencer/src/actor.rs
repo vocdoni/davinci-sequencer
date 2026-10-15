@@ -2799,6 +2799,7 @@ impl Actor {
             proof_first,
             deadline: tokio::time::Instant::now() + left.min(L1_JOB_CAP),
             cancel: cancel.clone(),
+            posted: Default::default(),
         };
         self.in_flight = Some(Flight {
             generation: self.generation,
@@ -4341,6 +4342,8 @@ struct JobInput {
     deadline: tokio::time::Instant,
     /// Fired when the actor drops the flight.
     cancel: CancellationToken,
+    /// L1-blob mode: set once a post of this job is mined.
+    posted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Sends `msg` to the actor when dropped still armed: a task that ends
@@ -4349,12 +4352,26 @@ struct JobInput {
 struct ReportOnDrop {
     tx: mpsc::Sender<Msg>,
     msg: Option<Msg>,
+    /// A job's L1 post flag, read when the report goes out.
+    posted: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Drop for ReportOnDrop {
     fn drop(&mut self) {
-        if let Some(m) = self.msg.take() {
-            let _ = self.tx.try_send(m);
+        let Some(mut m) = self.msg.take() else {
+            return;
+        };
+        if let (Msg::JobDone { posted, .. }, Some(flag)) = (&mut m, &self.posted) {
+            *posted = flag.load(Ordering::Relaxed);
+        }
+        // A full mailbox must not lose it: wait for room on the runtime.
+        if let Err(mpsc::error::TrySendError::Full(m)) = self.tx.try_send(m)
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let tx = self.tx.clone();
+            rt.spawn(async move {
+                let _ = tx.send(m).await;
+            });
         }
     }
 }
@@ -4378,6 +4395,7 @@ fn spawn_finalize(
                     dkg_requested: None,
                 }),
             }),
+            posted: None,
         };
         task.await;
         guard.msg = None;
@@ -4394,6 +4412,7 @@ async fn run_job(job: JobInput) {
             outcome: JobOutcome::Transient("job task ended without a result".into()),
             posted: false,
         }),
+        posted: Some(job.posted.clone()),
     };
     let (outcome, posted) = job_inner(job).await;
     guard.msg = None;
@@ -4425,7 +4444,7 @@ async fn job_inner(job: JobInput) -> (JobOutcome, bool) {
         blobs: &job.blobs,
         deadline: job.deadline,
         cancel: job.cancel.clone(),
-        posted: Default::default(),
+        posted: job.posted.clone(),
     };
     let work = async {
         let (proved, posting) = if job.proof_first {
