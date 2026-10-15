@@ -243,7 +243,8 @@ as in blob mode. A lost race wastes the loser's blob transaction (a few cents at
 
 ## The end and the grace window
 
-Admission closes at the election's end time, or when the process is ended or canceled.
+Admission closes at the election's end time (by the latest head or the node's own clock, whichever
+is later), or when the process is ended or canceled.
 Settlement continues: the registry accepts transitions until the grace end,
 
 ```
@@ -263,8 +264,10 @@ by round, and `graceMaxTotal` caps the extension.
   read, and a vote another sequencer settled settles from the sync instead of erroring. A cancel
   or the results close out the same way, without waiting for the grace end, once confirmed: by
   their event, or by a read at the confirmed head (a read at the newest block alone may be
-  reorged). While those reads fail or settle nothing, they are retried on a new block or after
-  2 s, not on every vote or status request.
+  reorged). Until then the node keeps checking: when the confirmed head does not show the cancel, a
+  fresh read of the newest block decides, so a cancel whose block is reorged out reopens the process
+  (admission and sealing resume, queued votes stay). While those reads fail or settle nothing, they
+  are retried on a new block or after 2 s, not on every vote or status request.
 - A settlement that reverts `InvalidStatus` or `InvalidTimeBounds` while the window is open puts
   its votes back to pending, and so does `MaxVotersReached` (the organizer lowered `maxVoters`):
   only the votes for a new slot that the new cap can never fit end in `error`.
