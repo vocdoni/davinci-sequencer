@@ -6832,6 +6832,142 @@ async fn a_cancel_read_at_the_head_closes_out_only_when_confirmed() {
     shutdown.cancel();
 }
 
+/// A node whose stored record holds `pending` votes (none sealed: a 1 h
+/// timer) restarts with one confirmation while a cancel sits in the newest
+/// block, its event hidden. Returns the node once a head read merged it.
+async fn unconfirmed_cancel(
+    s: &TestSetup,
+    dir: &TempDir,
+    pending: usize,
+) -> (Node, ActorHandle, Vec<u64>, CancellationToken) {
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, s, pending, 40).await;
+    shutdown.cancel();
+    drop((h, node));
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.set_status(ProcessStatus::Canceled);
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        reopen_db(dir.path()).await,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_long("the head read merged the cancel", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    (node, h, vids, shutdown)
+}
+
+/// N1: the block of an unconfirmed cancel is reorged out (no event ever
+/// shows either change). The confirmed head never shows the cancel, so a
+/// fresh head read reconciles: the process accepts votes again and the
+/// retained and new votes settle, with or without votes pending at the
+/// cancel.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_reorged_out_before_confirmation_reopens_the_process() {
+    for pending in [1, 0] {
+        let s = setup(2, 8, None);
+        let dir = TempDir::new().unwrap();
+        let (_node, h, mut vids, shutdown) = unconfirmed_cancel(&s, &dir, pending).await;
+        // The cancel's block is replaced: Ready again, no event.
+        s.chain.mutate_process(|p| p.status = ProcessStatus::Ready);
+        s.chain.drop_checkpoints();
+        s.chain.advance_time(1);
+        wait_long("accepting again", async || {
+            s.chain.advance_time(1);
+            h.snapshot().await.unwrap().accepting
+        })
+        .await;
+        let v = fake_vote(&s.env, 5, &[1, 2], 90);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || {
+            s.chain.advance_time(3700);
+            all_settled(&h, &vids).await
+        })
+        .await;
+        shutdown.cancel();
+    }
+}
+
+/// N2: the close-out's own read is the first sighting of an unconfirmed
+/// cancel (the events are behind, so the stored grace end has passed while
+/// the chain extended the election in the same block). The votes stay
+/// pending; once the cancel is gone they settle.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_first_seen_by_the_close_out_read_waits_for_confirmation() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    // One block confirms the creation.
+    s.chain.advance_time(1);
+    let h = handle(&node).await;
+    let vids = submit_n(&h, &s, 1, 50).await;
+    // In one hidden block: the election is extended far ahead and canceled.
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.mutate_process(|p| {
+        p.duration += 10 * DURATION;
+        p.status = ProcessStatus::Canceled;
+    });
+    // Heads move past the stored grace end.
+    s.chain.advance_time(DURATION + 2000);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(
+        vote_status(&h, vids[0]).await,
+        Some(VoteStatus::Pending),
+        "closed out on an unconfirmed cancel"
+    );
+    // The cancel's block is replaced; the extension stays.
+    s.chain.mutate_process(|p| p.status = ProcessStatus::Ready);
+    s.chain.drop_checkpoints();
+    wait_long("settled", async || {
+        s.chain.advance_time(3700);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    shutdown.cancel();
+}
+
 /// A node fault inside `prepare` (one failed tree write) is not the votes'
 /// fault: they stay pending, sealing backs off, and the retry settles them.
 /// One fault only, so prepare's best-effort root reset still succeeds.

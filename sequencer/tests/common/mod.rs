@@ -774,6 +774,14 @@ impl FakeChain {
         i.history.push(snap);
     }
 
+    /// Changes the process in a new block with no event: a reorg that
+    /// replaced the block of an earlier change, or one whose event is hidden.
+    pub fn mutate_process(&self, f: impl FnOnce(&mut OnchainProcess)) {
+        let mut i = self.inner.lock().unwrap();
+        f(&mut i.proc);
+        i.block += 1;
+    }
+
     /// Forgets the checkpoints: reads at any block see the current state.
     pub fn drop_checkpoints(&self) {
         self.inner.lock().unwrap().history.clear();

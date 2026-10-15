@@ -1753,6 +1753,10 @@ impl Actor {
         // Reconcile before anything closes: a vote a synced transition
         // settled must never be errored.
         self.maybe_resync().await;
+        // An unconfirmed cancel is reconciled whether or not votes wait.
+        if self.unconfirmed_cancel() {
+            self.confirm_cancel().await;
+        }
         self.maybe_close_out().await;
         self.confirm_results().await;
         if self.record.local != LocalStatus::Active {
@@ -1885,6 +1889,8 @@ impl Actor {
             self.held = None;
             self.results_sent = None;
             self.confirm_block = None;
+            self.cancel_confirmed = false;
+            self.cancel_confirm_block = None;
         }
         merge_onchain(&mut self.record.onchain, p);
         let o = self.record.onchain.clone();
@@ -2353,10 +2359,19 @@ impl Actor {
         };
         match confirmed {
             Ok(p) if p.status == ProcessStatus::Canceled => self.cancel_confirmed = true,
-            Ok(_) => {}
+            // Not (yet) confirmed: its block may have been reorged out. A
+            // fresh head read (paced by the landing gate) merges the truth;
+            // the older confirmed snapshot is not merged.
+            Ok(_) => self.vote_at_stale = true,
             Err(e) => debug!(pid = %hex::encode(self.pid31), %e, "cancel confirmation read"),
         }
         self.cancel_confirmed
+    }
+
+    /// The record says Canceled, from a read the confirmed head has not
+    /// shown yet.
+    fn unconfirmed_cancel(&self) -> bool {
+        self.record.onchain.status == ProcessStatus::Canceled && !self.cancel_confirmed
     }
 
     /// A cancel or the results closed the process for good: no grace end
@@ -2386,7 +2401,8 @@ impl Actor {
         {
             return;
         }
-        if self.record.onchain.status == ProcessStatus::Canceled && !self.confirm_cancel().await {
+        let grace_passed = self.chain_time != 0 && self.chain_time >= self.grace_end();
+        if self.unconfirmed_cancel() && !grace_passed {
             return;
         }
         let (block, time, p) = match self.gated_read(Read::CloseOut).await {
@@ -2401,10 +2417,13 @@ impl Actor {
         // The read is also the refresh: a moved grace end, status or root
         // lands in the record (and latches a sync) before the decision.
         self.vote_at_stale = !self.apply_read(&p, block);
+        // The refreshed record decides: a cancel this read brought in closes
+        // nothing until confirmed.
+        let requested = self.close_requested() && !self.unconfirmed_cancel();
         if p.state_root != committed
             || self.await_sync
             || committed != self.record.onchain.state_root
-            || !(self.close_requested() || time >= p.grace_end(self.deps.grace.grace_max_total))
+            || !(requested || time >= p.grace_end(self.deps.grace.grace_max_total))
         {
             return;
         }
@@ -3670,6 +3689,11 @@ impl Actor {
     /// The process status moved (its event, or a chain read showing it).
     fn status_moved(&mut self, new: ProcessStatus) {
         self.record.onchain.status = new;
+        // A confirmation never outlives its cancel.
+        if new != ProcessStatus::Canceled {
+            self.cancel_confirmed = false;
+            self.cancel_confirm_block = None;
+        }
         self.pause_hold = None;
         // Ended flushes through the grace; the tick closes out at its end.
         // Canceled and RESULTS close out from the tick too, once a read
