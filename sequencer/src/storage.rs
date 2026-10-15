@@ -56,24 +56,9 @@ const EXPOSED: Bytes = TableDefinition::new("exposed");
 // nonce (BE8) -> `L1PostRecord`: blob transactions of the node's Ethereum
 // account not yet seen mined (L1-blob mode).
 const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
-// pid‖new_root -> `ExposedRecord`: the slots of a synced batch that carried
-// our votes, until its transition is recorded; a row whose transition never
-// was is an orphan, consumed by the next seal or a rebuild. (A row keyed by
-// the pid alone is an earlier build's: an orphan too.)
-const SYNC_COVERAGE: Bytes = TableDefinition::new("sync_coverage");
-// pid -> JSON list of `ExposedRecord`, one per archived transition carrying
-// votes we store, kept by a rebuild until its replay converges.
-const REBUILD_COVERAGE: Bytes = TableDefinition::new("rebuild_coverage");
-// pid -> []: the live exposed set holds slots of public batches no local
-// record covers (a sent or posted attempt that did not land here, or slots
-// a rebuild or a fold brought in). Our landing covers them and clears it.
-const EXPOSED_PUBLISHED: Bytes = TableDefinition::new("exposed_published");
-// pid‖seq (BE8) -> `ExposedRecord`: exposed sets cleared while flagged,
-// append-only, one row each, for a rebuild or the kept-vote check that
-// requeues one of their votes. Never pruned: one per lifecycle that ended
-// without our landing (a lost race a peer settled), a handful per election.
-// (A row keyed by the pid alone holds an earlier test build's JSON list.)
-const PUBLISHED_COVERAGE: Bytes = TableDefinition::new("published_coverage");
+// pid -> []: a rebuild kept votes Settled that its replay may not bring
+// back; the check after the replay converges drops it.
+const REBUILD_CHECK: Bytes = TableDefinition::new("rebuild_check");
 // pid‖root -> `ExposedRecord`: the coverage history. One entry per batch that
 // carried a vote this node stores (our own sealed batches, written in the
 // seal commit before anything can publish them; peer batches, before their
@@ -450,10 +435,7 @@ impl Db {
                 META_BYTES,
                 EXPOSED,
                 L1_POSTS,
-                SYNC_COVERAGE,
-                REBUILD_COVERAGE,
-                EXPOSED_PUBLISHED,
-                PUBLISHED_COVERAGE,
+                REBUILD_CHECK,
                 COVERAGE_HISTORY,
                 COVERAGE_BY_VOTE,
             ] {
@@ -711,71 +693,15 @@ impl Db {
             .transpose()
     }
 
-    /// Stores the slot coverage of the synced batch reaching `new_root`,
-    /// before the sync makes it authoritative. Its transition record drops
-    /// it in the same commit.
-    pub fn put_sync_coverage(
-        &self,
-        pid: &Fr,
-        new_root: &[u8; 32],
-        rec: &ExposedRecord,
-    ) -> Result<()> {
-        self.put(SYNC_COVERAGE, &sync_key(pid, new_root), &encode(rec)?)
-    }
-
-    /// Every stored synced-batch coverage of the process.
-    pub fn sync_coverage(&self, pid: &Fr) -> Result<Vec<ExposedRecord>> {
-        let mut out: Vec<ExposedRecord> = self
-            .scan(SYNC_COVERAGE, &pid_key(pid), 64)?
-            .iter()
-            .map(|(_, v)| decode("sync_coverage", v))
-            .collect::<Result<_>>()?;
-        if let Some(v) = self.get(SYNC_COVERAGE, &pid_key(pid))? {
-            out.push(decode("sync_coverage", &v)?);
-        }
-        Ok(out)
-    }
-
-    /// Before a seal: the orphaned synced coverage (every row left; a
-    /// recorded transition drops its own) folds into the exposed set, in one
-    /// commit.
-    /// `folded`: the set gained an orphan's slots (flags it published).
-    pub fn consume_sync_coverage(
-        &self,
-        pid: &Fr,
-        exposed: &ExposedRecord,
-        folded: bool,
-    ) -> Result<()> {
-        self.write(|tx| {
-            tx.open_table(EXPOSED)
-                .map_err(db_err)?
-                .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
-                .map_err(db_err)?;
-            if folded {
-                tx_set_published(tx, pid, true)?;
-            }
-            tx_clear_sync_coverage(tx, pid)
-        })
-    }
-
-    /// What a rebuild kept for the check after its replay: per archived
-    /// transition carrying votes we store, its slots and those votes.
-    pub fn rebuild_coverage(&self, pid: &Fr) -> Result<Option<Vec<ExposedRecord>>> {
-        self.get(REBUILD_COVERAGE, &pid_key(pid))?
-            .map(|v| decode("rebuild_coverage", &v))
-            .transpose()
+    /// Whether a rebuild's kept-vote check is pending.
+    pub fn rebuild_check(&self, pid: &Fr) -> Result<bool> {
+        Ok(self.get(REBUILD_CHECK, &pid_key(pid))?.is_some())
     }
 
     /// The check after a rebuild's replay: `vids` (settled, but not on the
-    /// chain the replay reached) go back to pending at the queue head, the
-    /// exposed set becomes `exposed` when given, and the kept coverage is
-    /// dropped, in one commit.
-    pub fn finish_rebuild_check(
-        &self,
-        pid: &Fr,
-        vids: &[u64],
-        exposed: Option<&ExposedRecord>,
-    ) -> Result<()> {
+    /// chain the replay reached) go back to pending at the queue head and
+    /// the marker is dropped, in one commit.
+    pub fn finish_rebuild_check(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
         if self.check_faults.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(StorageError::Db("scripted rebuild check failure".into()));
@@ -783,16 +709,7 @@ impl Db {
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
             tx_prepend(tx, pid, vids)?;
-            if let Some(e) = exposed {
-                tx.open_table(EXPOSED)
-                    .map_err(db_err)?
-                    .insert(pid_key(pid).as_slice(), encode(e)?.as_slice())
-                    .map_err(db_err)?;
-            }
-            if !vids.is_empty() {
-                tx_set_published(tx, pid, true)?;
-            }
-            tx.open_table(REBUILD_COVERAGE)
+            tx.open_table(REBUILD_CHECK)
                 .map_err(db_err)?
                 .remove(pid_key(pid).as_slice())
                 .map_err(db_err)?;
@@ -801,61 +718,13 @@ impl Db {
     }
 
     pub fn clear_exposed(&self, pid: &Fr) -> Result<()> {
-        self.clear_exposed_archiving(pid, None)
-    }
-
-    /// Drops the exposed set. When `archive` is given (the set held slots
-    /// of a public batch no local record covers), it is appended to the
-    /// published coverage first, in the same commit.
-    pub fn clear_exposed_archiving(&self, pid: &Fr, archive: Option<&ExposedRecord>) -> Result<()> {
         self.write(|tx| {
-            if let Some(rec) = archive {
-                let mut t = tx.open_table(PUBLISHED_COVERAGE).map_err(db_err)?;
-                let (lo, hi) = prefix_range(&pid_key(pid), 40);
-                let last = t
-                    .range(lo.as_slice()..=hi.as_slice())
-                    .map_err(db_err)?
-                    .next_back()
-                    .transpose()
-                    .map_err(db_err)?
-                    .map(|(k, _)| k.value().to_vec());
-                let seq = match last {
-                    None => 0,
-                    Some(k) => u64_value("published_coverage", k.get(32..).unwrap_or_default())?
-                        .checked_add(1)
-                        .ok_or_else(|| StorageError::Db("published sequence exhausted".into()))?,
-                };
-                t.insert(key_u64(pid, seq).as_slice(), encode(rec)?.as_slice())
-                    .map_err(db_err)?;
-            }
             tx.open_table(EXPOSED)
                 .map_err(db_err)?
                 .remove(pid_key(pid).as_slice())
                 .map_err(db_err)?;
-            tx_set_published(tx, pid, false)
+            Ok(())
         })
-    }
-
-    /// Whether the exposed set holds slots of public batches no local
-    /// record covers.
-    pub fn exposed_published(&self, pid: &Fr) -> Result<bool> {
-        Ok(self.get(EXPOSED_PUBLISHED, &pid_key(pid))?.is_some())
-    }
-
-    pub fn set_exposed_published(&self, pid: &Fr, on: bool) -> Result<()> {
-        self.write(|tx| tx_set_published(tx, pid, on))
-    }
-
-    /// Exposed sets cleared while they held such slots, oldest first.
-    pub fn published_coverage(&self, pid: &Fr) -> Result<Vec<ExposedRecord>> {
-        let mut out: Vec<ExposedRecord> = match self.get(PUBLISHED_COVERAGE, &pid_key(pid))? {
-            Some(v) => decode("published_coverage", &v)?,
-            None => Vec::new(),
-        };
-        for (_, v) in self.scan(PUBLISHED_COVERAGE, &pid_key(pid), 40)? {
-            out.push(decode("published_coverage", &v)?);
-        }
-        Ok(out)
     }
 
     /// Records a blob transaction before it is sent; a replacement at the
@@ -1002,7 +871,7 @@ impl Db {
         let history = tx.open_table(COVERAGE_HISTORY).map_err(db_err)?;
         let mut out = BTreeSet::new();
         for r in roots {
-            if let Some(v) = history.get(sync_key(pid, &r).as_slice()).map_err(db_err)? {
+            if let Some(v) = history.get(root_key(pid, &r).as_slice()).map_err(db_err)? {
                 let e: ExposedRecord = decode("coverage_history", v.value())?;
                 out.extend(e.slots);
             }
@@ -1052,19 +921,6 @@ impl Db {
         })
     }
 
-    /// [`Db::requeue`] for a flight's votes; `published` (the flight may
-    /// have been sent or posted) flags the exposed set in the same commit.
-    pub fn requeue_flight(&self, pid: &Fr, vids: &[u64], published: bool) -> Result<()> {
-        self.write(|tx| {
-            tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
-            tx_prepend(tx, pid, vids)?;
-            if published {
-                tx_set_published(tx, pid, true)?;
-            }
-            Ok(())
-        })
-    }
-
     /// Votes go back to `pending` (error cleared) at the queue head: they
     /// were sealed ahead of every queued vote of their slot, so the head
     /// keeps each slot's cast order. Votes still queued keep their place.
@@ -1102,11 +958,6 @@ impl Db {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;
             tx_remove(tx, pid, vids)?;
             tx_put_transition(tx, pid, t, blobs)?;
-            // The log has this transition: its archive covers it now.
-            tx.open_table(SYNC_COVERAGE)
-                .map_err(db_err)?
-                .remove(sync_key(pid, &t.new_root).as_slice())
-                .map_err(db_err)?;
             tx_put_process(tx, process)
         })
     }
@@ -1114,27 +965,28 @@ impl Db {
     /// A reorg took transitions the process committed: drops its tree
     /// table, every transition and blob, puts `vids` back in the queue
     /// (pending, at its head in this order), and stores the exposed set, the
-    /// coverage kept for the check after the replay (`coverage`, possibly
-    /// empty; `None` removes it) and the process record, in one commit. The tree is re-created at genesis
+    /// kept-vote check marker (`check`) and the process record, in one
+    /// commit. The coverage history stays. The tree is re-created at genesis
     /// after it; a crash in between reopens at genesis (no stored tree).
     pub fn reset_process(
         &self,
         pid: &Fr,
         vids: &[u64],
         exposed: &ExposedRecord,
-        coverage: Option<&[ExposedRecord]>,
+        check: bool,
         process: &ProcessRecord,
     ) -> Result<()> {
         self.write(|tx| {
-            let mut kept = tx.open_table(REBUILD_COVERAGE).map_err(db_err)?;
-            match coverage {
-                Some(c) => drop(
-                    kept.insert(pid_key(pid).as_slice(), encode(&c)?.as_slice())
+            let mut marker = tx.open_table(REBUILD_CHECK).map_err(db_err)?;
+            match check {
+                true => drop(
+                    marker
+                        .insert(pid_key(pid).as_slice(), &[][..])
                         .map_err(db_err)?,
                 ),
-                None => drop(kept.remove(pid_key(pid).as_slice()).map_err(db_err)?),
+                false => drop(marker.remove(pid_key(pid).as_slice()).map_err(db_err)?),
             }
-            drop(kept);
+            drop(marker);
             let name = Self::arbo_table(pid);
             tx.delete_table(TableDefinition::<&[u8], &[u8]>::new(&name))
                 .map_err(db_err)?;
@@ -1154,11 +1006,6 @@ impl Db {
                 .map_err(db_err)?
                 .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
                 .map_err(db_err)?;
-            // The requeued votes' batches are gone from the archive.
-            if !vids.is_empty() {
-                tx_set_published(tx, pid, true)?;
-            }
-            tx_clear_sync_coverage(tx, pid)?;
             tx_put_process(tx, process)
         })
     }
@@ -1506,7 +1353,7 @@ fn tx_put_coverage(
 ) -> Result<()> {
     tx.open_table(COVERAGE_HISTORY)
         .map_err(db_err)?
-        .insert(sync_key(pid, root).as_slice(), encode(entry)?.as_slice())
+        .insert(root_key(pid, root).as_slice(), encode(entry)?.as_slice())
         .map_err(db_err)?;
     let mut index = tx.open_table(COVERAGE_BY_VOTE).map_err(db_err)?;
     for vid in &entry.vote_ids {
@@ -1518,31 +1365,11 @@ fn tx_put_coverage(
     Ok(())
 }
 
-fn tx_set_published(tx: &WriteTransaction, pid: &Fr, on: bool) -> Result<()> {
-    let mut t = tx.open_table(EXPOSED_PUBLISHED).map_err(db_err)?;
-    if on {
-        t.insert(pid_key(pid).as_slice(), &[][..]).map_err(db_err)?;
-    } else {
-        t.remove(pid_key(pid).as_slice()).map_err(db_err)?;
-    }
-    Ok(())
-}
-
-fn sync_key(pid: &Fr, root: &[u8; 32]) -> [u8; 64] {
+fn root_key(pid: &Fr, root: &[u8; 32]) -> [u8; 64] {
     let mut k = [0u8; 64];
     k[..32].copy_from_slice(&pid_key(pid));
     k[32..].copy_from_slice(root);
     k
-}
-
-// Drops every synced-batch coverage row of the process.
-fn tx_clear_sync_coverage(tx: &WriteTransaction, pid: &Fr) -> Result<()> {
-    let mut t = tx.open_table(SYNC_COVERAGE).map_err(db_err)?;
-    let (lo, hi) = prefix_range(&pid_key(pid), 64);
-    t.retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
-        .map_err(db_err)?;
-    t.remove(pid_key(pid).as_slice()).map_err(db_err)?;
-    Ok(())
 }
 
 fn tx_push(tx: &WriteTransaction, pid: &Fr, vid: u64) -> Result<()> {

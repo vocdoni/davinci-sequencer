@@ -785,8 +785,6 @@ struct Flight {
     /// The proof passed its checks (`Msg::JobProved`): what fails after
     /// this is the settlement.
     proved: bool,
-    /// L1-blob mode: the job's post was mined (shared with the job).
-    posted: Arc<std::sync::atomic::AtomicBool>,
     /// Cancels the job when the flight is dropped (rollback, requeue,
     /// shutdown), so an L1-blob job stops waiting on Ethereum.
     _abort: tokio_util::sync::DropGuard,
@@ -924,14 +922,8 @@ struct Actor {
     /// anything touches the state.
     state_lost: bool,
     /// A rebuild kept votes Settled that its replay may not bring back:
-    /// check them once the replay converges (`Db::rebuild_coverage`).
+    /// check them once the replay converges (`Db::rebuild_check`).
     rebuild_check: bool,
-    /// Synced-batch coverage may be stored that no recorded transition
-    /// dropped: folded into the exposed set before the next seal.
-    sync_orphans: bool,
-    /// Mirrors `Db::exposed_published`: the exposed set holds slots of
-    /// public batches no local record covers; its clear archives it.
-    exposed_published: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -1107,9 +1099,7 @@ pub(crate) fn spawn_actor(
         held_reason: None,
         diverged: None,
         state_lost: false,
-        rebuild_check: deps.db.rebuild_coverage(&pid).map_err(ierr)?.is_some(),
-        sync_orphans: !deps.db.sync_coverage(&pid).map_err(ierr)?.is_empty(),
-        exposed_published: deps.db.exposed_published(&pid).map_err(ierr)?,
+        rebuild_check: deps.db.rebuild_check(&pid).map_err(ierr)?,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -1971,8 +1961,7 @@ impl Actor {
     /// A reorg took transitions from index `d` on, which we committed. In
     /// one write: drop the tree and the log, put the votes those transitions
     /// settled back in the queue (the close-out errors them after the
-    /// resync if the window closed), widen the exposed set by every slot
-    /// they changed (their blobs are public), pin the chain's root. Then
+    /// resync if the window closed), pin the chain's root. Then
     /// re-create the genesis and replay the chain from its blobs.
     fn rebuild_from_chain(&mut self, d: u64, p: &OnchainProcess) {
         let pid = hex::encode(self.pid31);
@@ -2028,95 +2017,19 @@ impl Actor {
             }
         }
         back.sort_by_key(|(at, _)| *at);
-        // Re-seals of these votes cover every slot of the public batches
-        // that carried them.
-        let nf = self.state.config().ballot_mode.num_fields;
-        // Synced batches lost before their record: kept apart until now.
-        let synced = match self.deps.db.sync_coverage(&self.pid) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(%pid, %e, "rebuild: synced slot coverage");
-                return;
-            }
-        };
-        let mut slots = self.exposed.clone();
-        slots.extend(synced.iter().flat_map(|r| r.slots.iter().copied()));
-        // The votes kept Settled come back only if the replay re-applies
-        // their transitions: per archived transition carrying votes we store,
-        // keep its slots for the check after the replay (with any an earlier
-        // rebuild kept and has not checked yet).
-        let mut coverage = match self.deps.db.rebuild_coverage(&self.pid) {
-            Ok(c) => c.unwrap_or_default(),
-            Err(e) => {
-                error!(%pid, %e, "rebuild: kept coverage");
-                return;
-            }
-        };
-        let lost = log.iter().filter(|t| t.index >= d);
-        for t in &log {
-            let td = match self.deps.db.blobs(&self.pid, t.index) {
-                Ok(b) if !b.is_empty() => cpu(|| decode_blobs(&b, nf)).ok(),
-                _ => None,
-            };
-            let Some(td) = td else {
-                if t.index >= d && !unsettle.is_empty() {
-                    warn!(%pid, index = t.index, "rebuild: blobs of a lost transition unreadable; its slots stay out of the exposed set");
-                } else {
-                    warn!(%pid, index = t.index, "rebuild: blobs of a transition unreadable; a vote it settled is re-sealed without its slots should the chain drop it");
-                }
-                continue;
-            };
-            if t.index >= d && td.vote_ids.iter().any(|v| unsettle.contains(v)) {
-                slots.extend(td.updates.iter().map(|(s, _)| *s));
-            }
-            let ours = match self.deps.db.stored_vote_ids(&self.pid, &td.vote_ids) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!(%pid, %e, "rebuild: stored votes read");
-                    return;
-                }
-            };
-            if !ours.is_empty() {
-                coverage.push(crate::storage::ExposedRecord {
-                    slots: td.updates.iter().map(|(s, _)| *s).collect(),
-                    vote_ids: ours,
-                });
-            }
-        }
         // Votes the rebuild keeps Settled (in the tree at the fork root) are
-        // checked once the replay converges, with or without coverage.
-        let keep = !coverage.is_empty() || log.iter().any(|t| t.index < d);
+        // checked once the replay converges. Any requeued vote's reseal
+        // covers every batch that carried it through the coverage history.
+        let keep = log.iter().any(|t| t.index < d);
         let mut vids = self.exposed_vids.clone();
-        vids.extend(synced.iter().flat_map(|r| r.vote_ids.iter().copied()));
         vids.extend(back.iter().map(|(_, v)| v.pkg.vote_id));
-        // A vote an earlier rebuild kept, whose batch only that kept
-        // coverage still knows, is requeued now: its slots ride along; so do
-        // those of our public attempts no record covers.
-        let published = match self.deps.db.published_coverage(&self.pid) {
-            Ok(p) => p,
-            Err(e) => {
-                error!(%pid, %e, "rebuild: published coverage");
-                return;
-            }
-        };
-        for c in coverage.iter().chain(&published) {
-            let carried: Vec<u64> = c
-                .vote_ids
-                .iter()
-                .copied()
-                .filter(|v| unsettle.contains(v))
-                .collect();
-            if !carried.is_empty() {
-                slots.extend(c.slots.iter().copied());
-                vids.extend(carried);
-            }
-        }
         let exposed = crate::storage::ExposedRecord {
-            slots: slots.iter().copied().collect(),
+            slots: self.exposed.iter().copied().collect(),
             vote_ids: vids.iter().copied().collect(),
         };
         // The tree's unrecorded landing is lost too.
-        let depth = lost.count() + usize::from(self.state.committed().root != self.log_root);
+        let lost = log.iter().filter(|t| t.index >= d).count();
+        let depth = lost + usize::from(self.state.committed().root != self.log_root);
         let mut record = self.record.clone();
         record.onchain.state_root = p.state_root;
         record.onchain.voters_count = p.voters_count;
@@ -2126,13 +2039,11 @@ impl Actor {
         ));
         let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
         self.state.release_reads();
-        if let Err(e) = self.deps.db.reset_process(
-            &self.pid,
-            &order,
-            &exposed,
-            keep.then_some(&coverage[..]),
-            &record,
-        ) {
+        if let Err(e) = self
+            .deps
+            .db
+            .reset_process(&self.pid, &order, &exposed, keep, &record)
+        {
             error!(%pid, %e, "rebuild write failed; retrying");
             return;
         }
@@ -2146,7 +2057,6 @@ impl Actor {
         );
         self.metrics.rebuilds.fetch_add(1, Ordering::SeqCst);
         self.record = record;
-        self.exposed = slots;
         self.exposed_vids = vids;
         for (at, v) in back {
             self.pending.push(v);
@@ -2165,82 +2075,17 @@ impl Actor {
         self.held = None;
         self.vote_at_stale = true;
         self.rebuild_check = keep;
-        self.sync_orphans = false;
-        self.exposed_published |= !order.is_empty();
         self.state_lost = true;
         self.reopen_state();
     }
 
-    /// Sealing waits on a complete log (`log_root == committed`), and a
-    /// recorded transition drops its own synced coverage: what is left is
-    /// the coverage of synced batches that never applied here (their
-    /// transition reorged out). Their slots join the exposed set for the
-    /// pending votes they carried, durably, before anything seals. Whether
-    /// sealing may go on.
-    fn fold_sync_orphans(&mut self) -> bool {
-        let pid = hex::encode(self.pid31);
-        let rows = match self.deps.db.sync_coverage(&self.pid) {
-            Ok(r) => r,
-            Err(e) => {
-                let secs = self.prove_backoff();
-                error!(%pid, %e, retry_in = secs, "synced coverage read");
-                return false;
-            }
-        };
-        let pending: std::collections::HashSet<u64> =
-            self.pending.iter().map(|v| v.pkg.vote_id).collect();
-        let mut slots = self.exposed.clone();
-        let mut vids = self.exposed_vids.clone();
-        let mut folded = false;
-        for r in &rows {
-            let carried: Vec<u64> = r
-                .vote_ids
-                .iter()
-                .copied()
-                .filter(|v| pending.contains(v))
-                .collect();
-            if !carried.is_empty() {
-                slots.extend(r.slots.iter().copied());
-                vids.extend(carried);
-                folded = true;
-            }
-        }
-        if !rows.is_empty() {
-            let rec = crate::storage::ExposedRecord {
-                slots: slots.iter().copied().collect(),
-                vote_ids: vids.iter().copied().collect(),
-            };
-            if let Err(e) = self.deps.db.consume_sync_coverage(&self.pid, &rec, folded) {
-                let secs = self.prove_backoff();
-                error!(%pid, %e, retry_in = secs, "fold orphaned synced coverage");
-                return false;
-            }
-            self.exposed = slots;
-            self.exposed_vids = vids;
-            self.exposed_published |= folded;
-        }
-        self.sync_orphans = false;
-        true
-    }
-
     /// After a rebuild's replay converged (the tree at the chain's root, the
     /// log complete): a vote still Settled but not in the tree was kept by
-    /// the rebuild and then lost with its transition. Back to pending, its
-    /// re-seal covering the slots of the batches that carried it, and the
-    /// kept coverage dropped, in one write. Whether the check is done.
+    /// the rebuild and then lost with its transition. Back to pending (its
+    /// re-seal covers the batches that carried it through the history), and
+    /// the check marker dropped, in one write. Whether the check is done.
     fn check_kept_settled(&mut self) -> bool {
         let pid = hex::encode(self.pid31);
-        let coverage = match self.deps.db.rebuild_coverage(&self.pid) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                self.rebuild_check = false;
-                return true;
-            }
-            Err(e) => {
-                error!(%pid, %e, "kept coverage read");
-                return false;
-            }
-        };
         // A scan of the process's votes and a tree walk per Settled one.
         let missing: Result<Vec<u64>, String> = cpu(|| {
             let settled = self
@@ -2280,44 +2125,12 @@ impl Actor {
         }
         back.sort_by_key(|(at, _)| *at);
         let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
-        let published = match self.deps.db.published_coverage(&self.pid) {
-            Ok(p) => p,
-            Err(e) => {
-                error!(%pid, %e, "published coverage read");
-                return false;
-            }
-        };
-        let mut slots = self.exposed.clone();
-        let mut vids = self.exposed_vids.clone();
-        for c in coverage.iter().chain(&published) {
-            let carried: Vec<u64> = c
-                .vote_ids
-                .iter()
-                .copied()
-                .filter(|v| order.contains(v))
-                .collect();
-            if !carried.is_empty() {
-                slots.extend(c.slots.iter().copied());
-                vids.extend(carried);
-            }
-        }
-        let rec = (!order.is_empty()).then(|| crate::storage::ExposedRecord {
-            slots: slots.iter().copied().collect(),
-            vote_ids: vids.iter().copied().collect(),
-        });
-        if let Err(e) = self
-            .deps
-            .db
-            .finish_rebuild_check(&self.pid, &order, rec.as_ref())
-        {
+        if let Err(e) = self.deps.db.finish_rebuild_check(&self.pid, &order) {
             error!(%pid, %e, "rebuild check write");
             return false;
         }
         if !order.is_empty() {
             warn!(%pid, votes = order.len(), "votes the rebuild kept settled are gone from the chain; re-sealing them");
-            self.exposed = slots;
-            self.exposed_vids = vids;
-            self.exposed_published = true;
             for (at, v) in back {
                 self.pending.push(v);
                 self.pending_at.push(at);
@@ -2600,8 +2413,8 @@ impl Actor {
             || self.deps.contracts.signer().is_none()
             // The chain left our log: our root may never land.
             || self.diverged.is_some()
-            // Votes a rebuild kept Settled are not checked yet: one it
-            // requeues widens the exposed set this seal must cover.
+            // Votes a rebuild kept Settled are not checked yet: one gone
+            // from the chain goes back to pending first.
             || self.rebuild_check
             // Never seal off a stale root: wait until the committed tree
             // matches the pinned on-chain root (resync closes the gap).
@@ -2651,9 +2464,6 @@ impl Actor {
         }
         self.settle_pending_in_tree();
         if self.pending.is_empty() {
-            return;
-        }
-        if self.sync_orphans && !self.fold_sync_orphans() {
             return;
         }
         // The batch census root (guest register 20), by origin.
@@ -2971,7 +2781,6 @@ impl Actor {
             "batch sealed"
         );
         let cancel = CancellationToken::new();
-        let posted: Arc<std::sync::atomic::AtomicBool> = Default::default();
         // The grace end known now; it only moves later.
         let left = std::time::Duration::from_secs(self.grace_end().saturating_sub(now));
         let job = JobInput {
@@ -2992,7 +2801,7 @@ impl Actor {
             proof_first,
             deadline: tokio::time::Instant::now() + left.min(L1_JOB_CAP),
             cancel: cancel.clone(),
-            posted: posted.clone(),
+            posted: Default::default(),
         };
         self.in_flight = Some(Flight {
             generation: self.generation,
@@ -3001,7 +2810,6 @@ impl Actor {
             votes_at,
             landed_deadline: None,
             proved: false,
-            posted,
             _abort: cancel.drop_guard(),
         });
         tokio::spawn(run_job(job));
@@ -3206,19 +3014,7 @@ impl Actor {
             }
             self.drop_pending(&vids);
         }
-        // Its Settled votes may still be requeued by a rebuild: a set with
-        // slots of a public batch no record of ours covers is archived.
-        let archive = self
-            .exposed_published
-            .then(|| crate::storage::ExposedRecord {
-                slots: self.exposed.iter().copied().collect(),
-                vote_ids: self.exposed_vids.iter().copied().collect(),
-            });
-        if let Err(e) = self
-            .deps
-            .db
-            .clear_exposed_archiving(&self.pid, archive.as_ref())
-        {
+        if let Err(e) = self.deps.db.clear_exposed(&self.pid) {
             error!(pid = %hex::encode(self.pid31), %e, "clear exposed set");
             return; // keep the in-memory set; retried on the next seal
         }
@@ -3230,7 +3026,6 @@ impl Actor {
         );
         self.exposed.clear();
         self.exposed_vids.clear();
-        self.exposed_published = false;
     }
 
     /// Drops the exposed set once every recorded vote is settled or
@@ -3238,9 +3033,7 @@ impl Actor {
     /// An errored exposed vote recast later is a fresh transition, like any
     /// cross-batch revote; the exposed set only ties re-attempts of one batch.
     fn maybe_clear_exposed(&mut self) {
-        // The last landing has no record (nor archive) yet: its sealed slots
-        // live only here, and a rebuild would need them.
-        if self.exposed_vids.is_empty() || self.log_root != self.state.committed().root {
+        if self.exposed_vids.is_empty() {
             return;
         }
         for vid in &self.exposed_vids {
@@ -3256,25 +3049,13 @@ impl Actor {
                 }
             }
         }
-        // Slots of a public batch no record of ours covers outlive the set:
-        // a later rebuild may requeue one of its votes.
-        let archive = self
-            .exposed_published
-            .then(|| crate::storage::ExposedRecord {
-                slots: self.exposed.iter().copied().collect(),
-                vote_ids: self.exposed_vids.iter().copied().collect(),
-            });
-        if let Err(e) = self
-            .deps
-            .db
-            .clear_exposed_archiving(&self.pid, archive.as_ref())
-        {
+        // The coverage history keeps every batch's slots for a later reseal.
+        if let Err(e) = self.deps.db.clear_exposed(&self.pid) {
             error!(pid = %hex::encode(self.pid31), %e, "clear exposed set");
             return;
         }
         self.exposed.clear();
         self.exposed_vids.clear();
-        self.exposed_published = false;
     }
 
     fn drop_pending(&mut self, vids: &[u64]) {
@@ -3338,14 +3119,8 @@ impl Actor {
     /// Puts a flight's votes back in the queue with their original age,
     /// ahead of the later votes of their slots.
     fn requeue_flight(&mut self, f: Flight) {
-        // A proved batch may have been sent (a reverted blob transaction
-        // keeps its sidecar), a mined post is on Ethereum: either way public,
-        // and with no record of ours to cover it.
-        let published = f.proved || f.posted.load(Ordering::Relaxed);
-        let vids = f.prepared.vote_ids.clone();
-        match self.deps.db.requeue_flight(&self.pid, &vids, published) {
-            Ok(()) => self.exposed_published |= published,
-            Err(e) => error!(pid = %hex::encode(self.pid31), %e, "requeue"),
+        if let Err(e) = self.deps.db.requeue(&self.pid, &f.prepared.vote_ids) {
+            error!(pid = %hex::encode(self.pid31), %e, "requeue");
         }
         self.pending.splice(0..0, f.votes);
         self.pending_at.splice(0..0, f.votes_at);
@@ -3735,13 +3510,6 @@ impl Actor {
         // Votes, transition, pin and counts in one write after the tree's.
         self.record.onchain.state_root = p.new_root;
         self.write_transition(&p.vote_ids, &rec, &p.blobs.blobs);
-        // Our landing refreshed every exposed slot: its record covers them.
-        if self.exposed_published && self.log_root == p.new_root {
-            match self.deps.db.set_exposed_published(&self.pid, false) {
-                Ok(()) => self.exposed_published = false,
-                Err(e) => error!(pid = %hex::encode(self.pid31), %e, "unmark the exposed set"),
-            }
-        }
         self.vote_at_stale = true;
         self.await_sync = false;
         self.failed_cycles = 0;
@@ -3962,8 +3730,8 @@ impl Actor {
             }
             Some(l) => self.deps.blobs.blobs_for_l1(&l.blocks, &l.vhs).await,
         };
-        // No record without its archive: a rebuild after a reorg needs the
-        // blobs to know which slots the batch published. The resync retries.
+        // No record without its archive: a rebuild after a reorg replays
+        // from it. The resync retries.
         let blobs = match fetched {
             Ok(b) => b,
             Err(e) => {
@@ -4202,10 +3970,9 @@ impl Actor {
             }
         };
         // A public batch carrying votes we store (settled ones too: a later
-        // rebuild can requeue them): should a reorg take it before its record
-        // is written, their re-seal must cover its slots. Durable before the
-        // transition becomes authoritative, and kept apart from the live
-        // exposed set (only a rebuild reads it).
+        // rebuild can requeue them): any re-seal of them must cover its
+        // slots. In the coverage history before the transition becomes
+        // authoritative.
         let ours = match self.deps.db.stored_vote_ids(&self.pid, &td.vote_ids) {
             Ok(v) => v,
             Err(e) => {
@@ -4218,15 +3985,10 @@ impl Actor {
                 slots: td.updates.iter().map(|(s, _)| *s).collect(),
                 vote_ids: ours,
             };
-            if let Err(e) = self.deps.db.put_sync_coverage(&self.pid, &new_root, &rec) {
-                error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's slot coverage");
-                return false;
-            }
             if let Err(e) = self.deps.db.put_coverage(&self.pid, &new_root, &rec) {
                 error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's coverage");
                 return false;
             }
-            self.sync_orphans = true;
         }
         let before = self.state.committed();
         if let Err(e) = cpu(|| self.state.apply_synced(&td, new_root)) {

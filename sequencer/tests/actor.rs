@@ -5442,11 +5442,17 @@ async fn hold_seals_only_exposed_votes(prover_hold: bool) {
             "a non-exposed vote took an exposed vote's place"
         );
         assert_eq!(prover.sizes().last(), Some(&n_held));
-        // The peer's batch carried a vote of ours: its slots are kept for a
-        // rebuild, not added to the live set.
+        // The peer's batch carried a vote of ours: its slots go to the
+        // coverage history, not to the live set.
         assert_eq!(exposed(), e0, "the peer's batch widened the exposed set");
-        // Its record is written, so its kept coverage went with that commit.
-        assert!(node.db.sync_coverage(&pid_fr()).unwrap().is_empty());
+        let nf = s.env.cfg.ballot_mode.num_fields;
+        let kept = node.db.coverage_for(&pid_fr(), &[x1.pkg.vote_id]).unwrap();
+        for (slot, _) in decode_blobs(&b.blobs.blobs, nf).unwrap().updates {
+            assert!(
+                kept.contains(&slot),
+                "the peer's batch is not in the history"
+            );
+        }
     }
     let fresh: Vec<usize> = (n_held..40)
         .filter(|i| !slots.contains(&fake_vote(&s.env, *i, &[1, 2], 1).slot))
@@ -7615,8 +7621,7 @@ async fn panicking_results_task_is_retried() {
 /// The coverage of a peer batch carrying our vote is written, but the sync
 /// never commits (every tree write fails) and the peer transition is
 /// reorged out meanwhile: no rebuild is needed (our tree never left the
-/// chain), the stale coverage row is harmless, and our vote seals and lands,
-/// whose record drops the row.
+/// chain), and our vote seals and lands; the history keeps the peer entry.
 #[tokio::test(start_paused = true)]
 async fn uncommitted_sync_whose_transition_vanishes_needs_no_rebuild() {
     let s = setup(2, 8, None);
@@ -7640,7 +7645,7 @@ async fn uncommitted_sync_whose_transition_vanishes_needs_no_rebuild() {
     s.chain
         .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&x)));
     wait_long("coverage kept, sync not applied", async || {
-        db.sync_coverage(&pid_fr()).unwrap().len() == 1
+        db.coverage_history(&pid_fr()).unwrap().len() == 1
     })
     .await;
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -7659,7 +7664,7 @@ async fn uncommitted_sync_whose_transition_vanishes_needs_no_rebuild() {
     s.chain.advance_time(400);
     wait_long("ours landed", async || all_settled(&h, &[xid]).await).await;
     assert_eq!(s.chain.voters(), 1);
-    assert!(db.sync_coverage(&pid_fr()).unwrap().is_empty());
+    assert_eq!(db.coverage_history(&pid_fr()).unwrap().len(), 2);
     tokio::time::sleep(Duration::from_secs(200)).await;
     assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
     shutdown.cancel();
@@ -7784,7 +7789,7 @@ async fn failed_rebuild_check_waits_its_backoff() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(30)).await;
-    assert!(db.rebuild_coverage(&pid_fr()).unwrap().is_some());
+    assert!(db.rebuild_check(&pid_fr()).unwrap());
     let reads = db.arbo_reads();
     for _ in 0..20 {
         h.status(vids[0]).await.unwrap();
@@ -7795,18 +7800,15 @@ async fn failed_rebuild_check_waits_its_backoff() {
         "the check ran again before its backoff"
     );
     db.fail_rebuild_check_writes(false);
-    wait_long("checked", async || {
-        db.rebuild_coverage(&pid_fr()).unwrap().is_none()
-    })
-    .await;
+    wait_long("checked", async || !db.rebuild_check(&pid_fr()).unwrap()).await;
     shutdown.cancel();
 }
 
 /// A refresh overflow clears an exposed set that holds slots of a public
-/// attempt (a proved batch whose settlement failed): the set is archived,
-/// not forgotten.
+/// attempt (a proved batch whose settlement failed): the history still
+/// covers them.
 #[tokio::test]
-async fn refresh_overflow_archives_a_published_set() {
+async fn refresh_overflow_keeps_the_history() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
@@ -7836,10 +7838,11 @@ async fn refresh_overflow_archives_a_published_set() {
     h.force_refresh_overflow().await;
     h.snapshot().await.unwrap();
     assert!(db.exposed(&pid_fr()).unwrap().is_none());
-    let archived = db.published_coverage(&pid_fr()).unwrap();
-    assert_eq!(archived.len(), 1, "the published set was not archived");
-    assert_eq!(archived[0].slots, slots);
-    assert!(archived[0].vote_ids.contains(&vid));
+    let kept = db.coverage_for(&pid_fr(), &[vid]).unwrap();
+    assert!(
+        slots.iter().all(|s| kept.contains(s)),
+        "the history lost the attempt"
+    );
     shutdown.cancel();
 }
 

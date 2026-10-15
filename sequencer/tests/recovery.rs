@@ -696,13 +696,13 @@ async fn wait_secs(what: &str, secs: u64, mut f: impl AsyncFnMut() -> bool) {
 }
 
 /// The repair of a revote's lost transition record waits while its blobs
-/// cannot be fetched: no record without its archive, and the batch's
-/// exposed set is kept meanwhile. Once the record is written with its
+/// cannot be fetched: no record without its archive, and the coverage
+/// history keeps the batch's slots. Once the record is written with its
 /// blobs, a reorg that takes the revote rebuilds, and the re-seal covers
 /// every slot the revote's batch published (24 occupied slots: a batch
 /// refreshes a random 16 of them).
 #[tokio::test(start_paused = true)]
-async fn repair_waits_for_the_blobs_and_keeps_the_exposed_set() {
+async fn repair_waits_for_the_blobs_and_keeps_the_coverage() {
     let s = setup(2, 26, None);
     let nf = s.env.cfg.ballot_mode.num_fields;
     let dir = TempDir::new().unwrap();
@@ -750,8 +750,11 @@ async fn repair_waits_for_the_blobs_and_keeps_the_exposed_set() {
         1,
         "the revote's record was written without its blobs"
     );
-    let kept = db.exposed(&pid_fr()).unwrap().map(|r| r.slots);
-    assert_eq!(kept.as_ref(), Some(&exposed), "the exposed set was dropped");
+    let kept = db.coverage_for(&pid_fr(), &[rvid]).unwrap();
+    assert!(
+        exposed.iter().all(|s| kept.contains(s)),
+        "the coverage was dropped"
+    );
     s.chain.fail_blobs(0);
     wait_secs("the record with its blobs", 600, async || {
         db.transitions(&pid_fr()).unwrap().len() == 2
@@ -1351,7 +1354,7 @@ async fn vote_kept_settled_case(pre_r4: bool, check_fails: bool) {
         })
         .await;
         tokio::time::sleep(Duration::from_secs(120)).await;
-        assert!(db.rebuild_coverage(&pid_fr()).unwrap().is_some());
+        assert!(db.rebuild_check(&pid_fr()).unwrap());
         assert_eq!(prover.calls(), calls, "sealed before the kept-vote check");
         db.fail_rebuild_check_writes(false);
     }
@@ -1806,7 +1809,7 @@ async fn vote_settled_again_elsewhere_keeps_its_first_batch_covered() {
     wait_secs("replayed onto Q", 600, async || {
         db.transitions(&pid_fr()).unwrap().len() == 2
             && h.snapshot().await.unwrap().synced
-            && db.rebuild_coverage(&pid_fr()).unwrap().is_none()
+            && !db.rebuild_check(&pid_fr()).unwrap()
     })
     .await;
     assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Settled));
