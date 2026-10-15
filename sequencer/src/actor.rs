@@ -1420,15 +1420,6 @@ impl Actor {
         Some(due.min(flush_at).max(paused))
     }
 
-    /// Exposed slots still occupied: the refreshes every re-attempt carries.
-    /// A failed read counts as live.
-    fn live_exposed(&self) -> usize {
-        self.exposed
-            .iter()
-            .filter(|s| !matches!(self.state.slot_ballot(**s), Ok(None)))
-            .count()
-    }
-
     /// Most votes the next seal takes: `--batch-max`, or less while a
     /// bisection halves a failing batch. While held nothing can land, so
     /// only the pending exposed votes ride the cycles: fresh ones would just
@@ -1449,6 +1440,35 @@ impl Actor {
             max = max.min(exposed.max(1));
         }
         max
+    }
+
+    /// What a seal of `votes` must refresh: the live exposed set, and every
+    /// slot of every batch that carried one of them (the coverage history).
+    fn must_include(&self, votes: &[VerifiedVote]) -> Result<BTreeSet<u64>, String> {
+        let ids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+        let mut must = self
+            .deps
+            .db
+            .coverage_for(&self.pid, &ids)
+            .map_err(|e| e.to_string())?;
+        must.extend(self.exposed.iter().copied());
+        Ok(must)
+    }
+
+    /// A vote whose own coverage history no transition can refresh: errored
+    /// to recast (a new vote id is a fresh transition), as a refresh
+    /// overflow of the exposed set errors its votes.
+    fn recast_overflow(&mut self, vid: u64) {
+        error!(pid = %hex::encode(self.pid31), "a vote's coverage history is too large to refresh; it must recast");
+        self.set_status(
+            &[vid],
+            VoteStatus::Error,
+            Some("exposed refresh set too large, recast"),
+        );
+        if let Err(e) = self.deps.db.remove_pending(&self.pid, &[vid]) {
+            error!(pid = %hex::encode(self.pid31), %e, "remove_pending");
+        }
+        self.drop_pending(&[vid]);
     }
 
     /// While held nothing can land, so only the pending exposed votes ride
@@ -2645,14 +2665,59 @@ impl Actor {
         }
         let max_voters = self.record.onchain.max_voters;
         let held = self.held_votes();
-        let (k, reason) = match self.state.select_batch(
-            held.as_deref().unwrap_or(&self.pending),
-            max_voters,
-            &self.exposed,
-            usize::MAX,
-        ) {
-            Ok((refs, blocked)) => {
-                let k = refs.len();
+        // The candidates (oldest first) and what their seal must refresh:
+        // the live exposed set and every slot of every batch that carried
+        // one of them (the coverage history). While that overflows, the
+        // older half alone; a single vote whose own history overflows is
+        // errored to recast.
+        let mut n = held.as_ref().map_or(self.pending.len(), |h| h.len());
+        let trial = loop {
+            let base = held.as_deref().unwrap_or(&self.pending);
+            let cands = &base[..n.min(base.len())];
+            let must = match self.must_include(cands) {
+                Ok(m) => m,
+                Err(e) => {
+                    let secs = self.prove_backoff();
+                    error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "coverage history read");
+                    return;
+                }
+            };
+            match self
+                .state
+                .select_batch(cands, max_voters, &must, usize::MAX)
+            {
+                Err(StateError::RefreshOverflow { .. }) if n > 1 => n /= 2,
+                Err(StateError::RefreshOverflow { .. }) => {
+                    let lone = cands.first().map(|v| v.pkg.vote_id);
+                    break Err(lone);
+                }
+                r => break Ok((r.map(|(refs, b)| (refs.len(), b)), must)),
+            }
+        };
+        let (selected_trial, must) = match trial {
+            Ok(t) => t,
+            Err(lone) => {
+                // Our live set alone overflows: the old policy. Otherwise
+                // this vote's own history does.
+                let exposed_alone = held.as_deref().unwrap_or(&self.pending).first().map(|v| {
+                    self.state.select_batch(
+                        std::slice::from_ref(v),
+                        max_voters,
+                        &self.exposed,
+                        usize::MAX,
+                    )
+                });
+                match (exposed_alone, lone) {
+                    (Some(Err(StateError::RefreshOverflow { .. })), _) | (_, None) => {
+                        self.refresh_overflow()
+                    }
+                    (_, Some(vid)) => self.recast_overflow(vid),
+                }
+                return;
+            }
+        };
+        let (k, reason) = match selected_trial {
+            Ok((k, blocked)) => {
                 // Company is the trial size (distinct admissible slots),
                 // not the queue length.
                 let seal = k >= 1
@@ -2729,7 +2794,11 @@ impl Actor {
                 };
                 let fit = crate::l1da::chunks_fit(after, self.l1_settle_lag, self.settle_margin);
                 let chunks = if proof_first {
-                    let need = blob::blob_count(1, 1 + self.live_exposed(), nf).div_ceil(l1.chunk);
+                    let live = must
+                        .iter()
+                        .filter(|s| !matches!(self.state.slot_ballot(**s), Ok(None)))
+                        .count();
+                    let need = blob::blob_count(1, 1 + live, nf).div_ceil(l1.chunk);
                     fit.unwrap_or(1).max(need)
                 } else if let Some(c) = fit {
                     c
@@ -2768,13 +2837,19 @@ impl Actor {
         // selection, and a re-proof drop re-runs it over what is left.
         let selected: Vec<VerifiedVote> = loop {
             let held = self.held_votes();
-            let (sized, blocked): (Vec<VerifiedVote>, bool) = match self.state.select_batch_within(
-                held.as_deref().unwrap_or(&self.pending),
-                max_voters,
-                &self.exposed,
-                cap,
-                max_blobs,
-            ) {
+            let base = held.as_deref().unwrap_or(&self.pending);
+            let cands = &base[..n.min(base.len())];
+            let must = match self.must_include(cands) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(pid = %hex::encode(self.pid31), %e, "coverage history read");
+                    return;
+                }
+            };
+            let (sized, blocked): (Vec<VerifiedVote>, bool) = match self
+                .state
+                .select_batch_within(cands, max_voters, &must, cap, max_blobs)
+            {
                 // A window too small for the exposed set yields an empty
                 // selection and waits; an overflow is permanent.
                 Ok((refs, blocked)) => (refs.into_iter().cloned().collect(), blocked),
@@ -2804,7 +2879,16 @@ impl Actor {
             }
         };
         let vids: Vec<u64> = selected.iter().map(|v| v.pkg.vote_id).collect();
-        let prepared = match cpu(|| self.state.prepare(&selected, &mut OsRng, &self.exposed)) {
+        // Exactly what these votes' seal must refresh (a subset of the set
+        // the selection was sized against).
+        let must = match self.must_include(&selected) {
+            Ok(m) => m,
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "coverage history read");
+                return;
+            }
+        };
+        let prepared = match cpu(|| self.state.prepare(&selected, &mut OsRng, &must)) {
             Ok(p) => p,
             Err(StateError::RefreshOverflow { .. }) => {
                 self.refresh_overflow();
@@ -2838,8 +2922,10 @@ impl Actor {
             self.rollback_prepared(&prepared);
             return;
         }
-        // Persist the widened exposed set before the batch can reach
-        // the chain — a re-seal after a lost race must cover these slots.
+        // One commit before the batch can reach the chain: the votes go
+        // aggregated, the widened exposed set is stored, and the batch joins
+        // the coverage history (a reseal of any of its votes refreshes its
+        // slots, whatever happens to this batch).
         let mut slots = self.exposed.clone();
         slots.extend(prepared.updated_slots());
         let mut evids = self.exposed_vids.clone();
@@ -2848,20 +2934,22 @@ impl Actor {
             slots: slots.iter().copied().collect(),
             vote_ids: evids.iter().copied().collect(),
         };
-        if let Err(e) = self.deps.db.put_exposed(&self.pid, &rec) {
-            let secs = self.prove_backoff();
-            error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "persist exposed set");
-            self.rollback_prepared(&prepared);
-            return;
-        }
-        self.exposed = slots;
-        self.exposed_vids = evids;
-        if let Err(e) = self.deps.db.seal_batch(&self.pid, &vids) {
+        let entry = crate::storage::ExposedRecord {
+            slots: prepared.updated_slots(),
+            vote_ids: vids.clone(),
+        };
+        if let Err(e) =
+            self.deps
+                .db
+                .seal_batch_covered(&self.pid, &vids, &rec, &prepared.new_root, &entry)
+        {
             let secs = self.prove_backoff();
             error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "seal_batch");
             self.rollback_prepared(&prepared);
             return;
         }
+        self.exposed = slots;
+        self.exposed_vids = evids;
         let at: std::collections::HashMap<u64, u64> = self
             .pending
             .iter()
@@ -4132,6 +4220,10 @@ impl Actor {
             };
             if let Err(e) = self.deps.db.put_sync_coverage(&self.pid, &new_root, &rec) {
                 error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's slot coverage");
+                return false;
+            }
+            if let Err(e) = self.deps.db.put_coverage(&self.pid, &new_root, &rec) {
+                error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's coverage");
                 return false;
             }
             self.sync_orphans = true;

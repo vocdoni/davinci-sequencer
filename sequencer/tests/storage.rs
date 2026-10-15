@@ -744,3 +744,87 @@ fn dropped_arbo_handle_releases_its_snapshot() {
     drop(store);
     assert_eq!(db.arbo_snapshots_open(), 0);
 }
+
+/// The coverage history: an entry per batch root, re-writing a root is
+/// idempotent, and `coverage_for` unions exactly the entries naming a vote.
+#[test]
+fn coverage_history_is_append_by_root_and_read_by_vote() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let rec = |slots: &[u64], vids: &[u64]| ExposedRecord {
+        slots: slots.to_vec(),
+        vote_ids: vids.to_vec(),
+    };
+    db.put_coverage(&pid(1), &[1; 32], &rec(&[10, 11], &[100, 101]))
+        .unwrap();
+    db.put_coverage(&pid(1), &[2; 32], &rec(&[20, 21], &[101]))
+        .unwrap();
+    db.put_coverage(&pid(1), &[3; 32], &rec(&[30], &[102]))
+        .unwrap();
+    // Another process's entries never leak in.
+    db.put_coverage(&pid(2), &[4; 32], &rec(&[40], &[100]))
+        .unwrap();
+    let cov = |vids: &[u64]| db.coverage_for(&pid(1), vids).unwrap();
+    assert_eq!(cov(&[100]).into_iter().collect::<Vec<_>>(), [10, 11]);
+    assert_eq!(
+        cov(&[101]).into_iter().collect::<Vec<_>>(),
+        [10, 11, 20, 21]
+    );
+    assert_eq!(
+        cov(&[102, 100]).into_iter().collect::<Vec<_>>(),
+        [10, 11, 30]
+    );
+    assert!(cov(&[999]).is_empty());
+    // The same root again (a replay) changes nothing.
+    db.put_coverage(&pid(1), &[1; 32], &rec(&[10, 11], &[100, 101]))
+        .unwrap();
+    assert_eq!(db.coverage_history(&pid(1)).unwrap().len(), 3);
+    // A large entry (a full batch plus MAX_REFRESH refreshes) round-trips.
+    let big: Vec<u64> = (0..2560).collect();
+    db.put_coverage(&pid(1), &[5; 32], &rec(&big, &[103]))
+        .unwrap();
+    drop(db);
+    let db = open(&dir);
+    assert_eq!(db.coverage_for(&pid(1), &[103]).unwrap().len(), 2560);
+}
+
+/// A seal is one commit: the votes go aggregated, the exposed set and the
+/// history entry are stored together, or nothing is.
+#[test]
+fn seal_with_coverage_is_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let base = 1u64 << 63;
+    let (a, b) = (base + 1, base + 2);
+    db.admit_vote(&vote(1, a)).unwrap();
+    db.admit_vote(&vote(1, b)).unwrap();
+    let exposed = ExposedRecord {
+        slots: vec![1, 2, 3],
+        vote_ids: vec![a, b],
+    };
+    let entry = ExposedRecord {
+        slots: vec![1, 2, 3],
+        vote_ids: vec![a, b],
+    };
+    db.fail_next_writes(1);
+    assert!(
+        db.seal_batch_covered(&pid(1), &[a, b], &exposed, &[9; 32], &entry)
+            .is_err()
+    );
+    assert_eq!(
+        db.vote(&pid(1), a).unwrap().unwrap().status,
+        VoteStatus::Pending
+    );
+    assert_eq!(db.pending(&pid(1)).unwrap(), vec![a, b]);
+    assert_eq!(db.exposed(&pid(1)).unwrap(), None);
+    assert!(db.coverage_for(&pid(1), &[a]).unwrap().is_empty());
+    db.seal_batch_covered(&pid(1), &[a, b], &exposed, &[9; 32], &entry)
+        .unwrap();
+    assert_eq!(
+        db.vote(&pid(1), a).unwrap().unwrap().status,
+        VoteStatus::Aggregated
+    );
+    assert!(db.pending(&pid(1)).unwrap().is_empty());
+    assert_eq!(db.exposed(&pid(1)).unwrap(), Some(exposed));
+    assert_eq!(db.coverage_for(&pid(1), &[b]).unwrap().len(), 3);
+}

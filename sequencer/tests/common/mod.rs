@@ -293,6 +293,13 @@ pub struct Inner {
     fail_blobs: u32,
     /// Fetches of this transaction's blobs fail while set.
     withheld: Option<B256>,
+    /// Every batch published, in order: (tx, blobs, ours). Ours include the
+    /// ones that reverted in a lost race (their blobs went out too).
+    sent: Vec<(B256, Vec<Blob>, bool)>,
+    /// Transactions whose blobs a node fetched.
+    fetched: std::collections::HashSet<B256>,
+    /// Foreign settlements so far (their transaction hashes).
+    foreign: u64,
     /// Next N `submit_transition` calls fail without landing.
     fail_submits: u32,
     /// Next N `submit_transition` calls land but report a receipt timeout.
@@ -429,6 +436,9 @@ impl FakeChain {
             process_at_calls: 0,
             fail_blobs: 0,
             withheld: None,
+            sent: Vec::new(),
+            fetched: Default::default(),
+            foreign: 0,
             fail_submits: 0,
             timeout_submits: 0,
             hide_block: None,
@@ -854,6 +864,109 @@ impl FakeChain {
         self.inner.lock().unwrap().fail_blobs = n;
     }
 
+    /// Every batch published so far, in order: (tx, blobs, ours).
+    pub fn sent_batches(&self) -> Vec<(B256, Vec<Blob>, bool)> {
+        self.inner.lock().unwrap().sent.clone()
+    }
+
+    /// Transactions whose blobs a node fetched.
+    pub fn fetched_txs(&self) -> std::collections::HashSet<B256> {
+        self.inner.lock().unwrap().fetched.clone()
+    }
+
+    /// The `(old_root, new_root)` of the transition `tx` landed, if its
+    /// event is still on the chain.
+    pub fn transition_roots(&self, tx: &B256) -> Option<([u8; 32], [u8; 32])> {
+        let i = self.inner.lock().unwrap();
+        i.events.iter().find_map(|e| match e.kind {
+            EventKind::StateTransitioned {
+                old_root, new_root, ..
+            } if e.tx_hash == *tx => Some((old_root, new_root)),
+            _ => None,
+        })
+    }
+
+    /// Which of `slots` hold a ballot at `root`, replaying the chain's
+    /// transitions from genesis; `None` when `root` is not on the chain.
+    pub fn occupied_at(&self, s: &TestSetup, root: &[u8; 32], slots: &[u64]) -> Option<Vec<bool>> {
+        let mut st =
+            davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new())
+                .unwrap();
+        let nf = s.env.cfg.ballot_mode.num_fields;
+        let i = self.inner.lock().unwrap();
+        for e in &i.events {
+            if st.committed().root == *root {
+                break;
+            }
+            let EventKind::StateTransitioned {
+                old_root,
+                new_root,
+                n_blobs,
+                ..
+            } = e.kind
+            else {
+                continue;
+            };
+            if old_root != st.committed().root {
+                continue;
+            }
+            let mut b = i.blobs.get(&e.tx_hash)?.clone();
+            b.truncate(n_blobs as usize);
+            let td = davinci_zkvm_sdk::blob::decode_blobs(&b, nf).ok()?;
+            st.apply_synced(&td, new_root).ok()?;
+        }
+        if st.committed().root != *root {
+            return None;
+        }
+        slots
+            .iter()
+            .map(|slot| st.slot_ballot(*slot).ok().map(|b| b.is_some()))
+            .collect()
+    }
+
+    /// Drops a race armed with `race_next_submit` that no submit took.
+    pub fn clear_race(&self) {
+        self.inner.lock().unwrap().race_submit = None;
+    }
+
+    /// [`Self::peer_batch`], or `None` when the votes cannot go on top of
+    /// the chain's root (one is already in it).
+    pub fn try_peer_batch(
+        &self,
+        s: &TestSetup,
+        votes: &[VerifiedVote],
+    ) -> Option<davinci_state::PreparedBatch> {
+        let mut st =
+            davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new())
+                .unwrap();
+        let nf = s.env.cfg.ballot_mode.num_fields;
+        let i = self.inner.lock().unwrap();
+        for e in &i.events {
+            let EventKind::StateTransitioned {
+                old_root,
+                new_root,
+                n_blobs,
+                ..
+            } = e.kind
+            else {
+                continue;
+            };
+            if old_root != st.committed().root {
+                continue;
+            }
+            let mut b = i.blobs.get(&e.tx_hash)?.clone();
+            b.truncate(n_blobs as usize);
+            let td = davinci_zkvm_sdk::blob::decode_blobs(&b, nf).ok()?;
+            st.apply_synced(&td, new_root).ok()?;
+        }
+        if st.committed().root != i.proc.state_root {
+            return None;
+        }
+        drop(i);
+        st.prepare(votes, &mut StdRng::seed_from_u64(13), &Default::default())
+            .ok()
+    }
+
     /// Fetches of `tx`'s blobs fail until called with `None`.
     pub fn withhold_blobs(&self, tx: Option<B256>) {
         self.inner.lock().unwrap().withheld = tx;
@@ -1150,8 +1263,12 @@ fn settle_foreign(i: &mut Inner, b: &davinci_state::PreparedBatch) -> u64 {
     i.proc.overwritten_count += b.expected.overwrites as u64;
     i.proc.batch_number += 1;
     i.block += 1;
-    let tx = B256::repeat_byte(0x5e);
+    i.foreign += 1;
+    let mut h = [0x5e; 32];
+    h[24..].copy_from_slice(&i.foreign.to_be_bytes());
+    let tx = B256::from(h);
     i.blobs.insert(tx, b.blobs.blobs.clone());
+    i.sent.push((tx, b.blobs.blobs.clone(), false));
     // L1-blob mode: the winner posted its blobs on Ethereum.
     let l1 = i.l1.clone().map(|l1| {
         let vhs: Vec<B256> = b
@@ -1562,6 +1679,10 @@ impl Chain for FakeChain {
         if let Some(b) = i.race_submit.take() {
             let block = settle_foreign(&mut i, &b);
             if check_transition(&i, &p).is_err() {
+                // Reverted, but its blob sidecar went out.
+                let mut h = [0x10; 32];
+                h[24..].copy_from_slice(&(i.sent.len() as u64).to_be_bytes());
+                i.sent.push((B256::from(h), blobs.blobs.clone(), true));
                 return Err(Web3Error::Lost {
                     tx_hash: B256::repeat_byte(0x10),
                     block,
@@ -1570,6 +1691,7 @@ impl Chain for FakeChain {
         }
         check_transition(&i, &p).map_err(Web3Error::Revert)?;
         let tx = land(&mut i, pid, sender, &p, blobs.blobs.len() as u64, None);
+        i.sent.push((tx, blobs.blobs.clone(), true));
         i.blobs.insert(tx, blobs.blobs.clone());
         if i.timeout_submits > 0 {
             // The tx landed (root moved, event queued) but the receipt
@@ -1924,6 +2046,7 @@ impl BlobSource for FakeBlobs {
             )));
         }
         b.truncate(n_blobs as usize);
+        i.fetched.insert(tx);
         Ok(b)
     }
 

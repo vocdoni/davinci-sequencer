@@ -6,7 +6,7 @@
 //! Keys are big-endian so redb's byte order is the natural order: `pid` is the
 //! process id as BE32, followed by BE8 vote ids / sequence numbers / indexes.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -74,6 +74,14 @@ const EXPOSED_PUBLISHED: Bytes = TableDefinition::new("exposed_published");
 // without our landing (a lost race a peer settled), a handful per election.
 // (A row keyed by the pid alone holds an earlier test build's JSON list.)
 const PUBLISHED_COVERAGE: Bytes = TableDefinition::new("published_coverage");
+// pid‖root -> `ExposedRecord`: the coverage history. One entry per batch that
+// carried a vote this node stores (our own sealed batches, written in the
+// seal commit before anything can publish them; peer batches, before their
+// sync applies): its updated slots and those votes. Append-only: a reseal of
+// a vote refreshes the slots of every entry naming it.
+const COVERAGE_HISTORY: Bytes = TableDefinition::new("coverage_history");
+// pid‖vid‖root -> []: the history's index by vote.
+const COVERAGE_BY_VOTE: Bytes = TableDefinition::new("coverage_by_vote");
 /// Schemas this build upgrades in place: 9 only added `l1_posts`, 10 stopped
 /// using the `committed` table (the tree's own record is authoritative).
 const UPGRADES_FROM: [u64; 2] = [8, 9];
@@ -446,6 +454,8 @@ impl Db {
                 REBUILD_COVERAGE,
                 EXPOSED_PUBLISHED,
                 PUBLISHED_COVERAGE,
+                COVERAGE_HISTORY,
+                COVERAGE_BY_VOTE,
             ] {
                 tx.open_table(t).map_err(db_err)?;
             }
@@ -969,6 +979,71 @@ impl Db {
             .transpose()
     }
 
+    /// Records the coverage of the batch reaching `root` (idempotent: the
+    /// same root overwrites itself), in its own commit.
+    pub fn put_coverage(&self, pid: &Fr, root: &[u8; 32], entry: &ExposedRecord) -> Result<()> {
+        self.write(|tx| tx_put_coverage(tx, pid, root, entry))
+    }
+
+    /// Every slot of every history entry naming one of `vids`.
+    pub fn coverage_for(&self, pid: &Fr, vids: &[u64]) -> Result<BTreeSet<u64>> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let index = tx.open_table(COVERAGE_BY_VOTE).map_err(db_err)?;
+        let mut roots: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for vid in vids {
+            let (lo, hi) = prefix_range(&key_u64(pid, *vid), 72);
+            for row in index.range(lo.as_slice()..=hi.as_slice()).map_err(db_err)? {
+                let (k, _) = row.map_err(db_err)?;
+                if let Ok(r) = <[u8; 32]>::try_from(&k.value()[40..]) {
+                    roots.insert(r);
+                }
+            }
+        }
+        let history = tx.open_table(COVERAGE_HISTORY).map_err(db_err)?;
+        let mut out = BTreeSet::new();
+        for r in roots {
+            if let Some(v) = history.get(sync_key(pid, &r).as_slice()).map_err(db_err)? {
+                let e: ExposedRecord = decode("coverage_history", v.value())?;
+                out.extend(e.slots);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every history entry of the process, by root. Test hook and diagnostics.
+    pub fn coverage_history(&self, pid: &Fr) -> Result<Vec<([u8; 32], ExposedRecord)>> {
+        self.scan(COVERAGE_HISTORY, &pid_key(pid), 64)?
+            .iter()
+            .map(|(k, v)| {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(&k[32..]);
+                Ok((r, decode("coverage_history", v)?))
+            })
+            .collect()
+    }
+
+    /// A seal, in one commit before anything can publish the batch: its
+    /// votes go `aggregated` and leave the queue, the exposed set is stored,
+    /// and the batch (reaching `root`) joins the coverage history.
+    pub fn seal_batch_covered(
+        &self,
+        pid: &Fr,
+        vids: &[u64],
+        exposed: &ExposedRecord,
+        root: &[u8; 32],
+        entry: &ExposedRecord,
+    ) -> Result<()> {
+        self.write(|tx| {
+            tx_status(tx, pid, vids, VoteStatus::Aggregated, None)?;
+            tx_remove(tx, pid, vids)?;
+            tx.open_table(EXPOSED)
+                .map_err(db_err)?
+                .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
+                .map_err(db_err)?;
+            tx_put_coverage(tx, pid, root, entry)
+        })
+    }
+
     /// Votes enter a batch: `aggregated`, out of the pending queue.
     pub fn seal_batch(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
         self.write(|tx| {
@@ -1420,6 +1495,27 @@ fn inspect_flat(path: &Path) -> Result<(Option<u64>, HashSet<[u8; 4]>), redb::Er
         }
     }
     Ok((schema, out))
+}
+
+// A history entry and its index rows.
+fn tx_put_coverage(
+    tx: &WriteTransaction,
+    pid: &Fr,
+    root: &[u8; 32],
+    entry: &ExposedRecord,
+) -> Result<()> {
+    tx.open_table(COVERAGE_HISTORY)
+        .map_err(db_err)?
+        .insert(sync_key(pid, root).as_slice(), encode(entry)?.as_slice())
+        .map_err(db_err)?;
+    let mut index = tx.open_table(COVERAGE_BY_VOTE).map_err(db_err)?;
+    for vid in &entry.vote_ids {
+        let mut k = [0u8; 72];
+        k[..40].copy_from_slice(&key_u64(pid, *vid));
+        k[40..].copy_from_slice(root);
+        index.insert(k.as_slice(), &[][..]).map_err(db_err)?;
+    }
+    Ok(())
 }
 
 fn tx_set_published(tx: &WriteTransaction, pid: &Fr, on: bool) -> Result<()> {

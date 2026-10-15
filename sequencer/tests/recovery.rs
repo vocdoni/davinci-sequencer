@@ -1606,3 +1606,222 @@ async fn lost_race_batch_slots_survive_a_later_reorg() {
     }
     shutdown.cancel();
 }
+
+// ------------------------------------------- the coverage history
+
+/// The 24 first votes settled in one batch; a node of 24-vote batches.
+async fn populated(
+    s: &TestSetup,
+    dir: &TempDir,
+    prover: Arc<FakeProver>,
+    kseed: u64,
+) -> (Db, Node, ActorHandle, CancellationToken) {
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = timed_node(db.clone(), dir.path(), s, prover.clone(), &shutdown).await;
+    let mut first = Vec::new();
+    for i in 0..24 {
+        let v = fake_vote(&s.env, i, &[1, 2], kseed + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    prover.release(1);
+    wait_secs("24 settled", 600, async || all_settled(&h, &first).await).await;
+    (db, node, h, shutdown)
+}
+
+/// Re-routes an old transition (the monitor's rewind) and waits for the
+/// `n`-th rebuild.
+async fn rebuild_after_reroute(s: &TestSetup, db: &Db, node: &Node, n: u64) {
+    let block = s.chain.reinclude_transition(0);
+    wait_secs("rerouted", 600, async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    wait_secs("rebuilt", 600, async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == n
+    })
+    .await;
+}
+
+/// Asserts `vid` sealed on the chain covering every slot in each of `lost`.
+fn assert_covers(s: &TestSetup, db: &Db, vid: u64, lost: &[(&str, &[u64])]) {
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let reseal = updated_slots(db, nf, transition_of(db, nf, vid));
+    for (name, slots) in lost {
+        for slot in slots.iter() {
+            assert!(
+                reseal.contains(slot),
+                "the re-seal left out a slot {name} published"
+            );
+        }
+    }
+}
+
+/// R12: our batch B carrying X is sealed and the node dies before any
+/// outcome. After the restart a peer's P settles X and the exposed set
+/// clears; a reorg takes P. X's re-seal covers B (recorded at B's seal,
+/// before anything could publish it), not only P.
+#[tokio::test(start_paused = true)]
+async fn batch_sealed_before_a_crash_stays_covered() {
+    let s = setup(2, 26, None);
+    let dir = TempDir::new().unwrap();
+    let prover = FakeProver::gated();
+    let (db, node, h, shutdown) = populated(&s, &dir, prover.clone(), 5000).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 5100);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("B sealed", 600, async || prover.calls() >= 2).await;
+    let b_slots = db.exposed(&pid_fr()).unwrap().unwrap().slots;
+    shutdown.cancel();
+    drop((h, node, db));
+
+    let db = reopen_db(dir.path()).await;
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&x)));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = timed_node(db.clone(), dir.path(), &s, prover, &shutdown).await;
+    wait_secs("X settled by P, exposure cleared", 600, async || {
+        all_settled(&h, &[xid]).await && db.exposed(&pid_fr()).unwrap().is_none()
+    })
+    .await;
+    let p_slots = updated_slots(&db, s.env.cfg.ballot_mode.num_fields, 1);
+    s.chain.reorg_out_last_transition();
+    rebuild_after_reroute(&s, &db, &node, 1).await;
+    s.chain.advance_time(400);
+    wait_secs("X re-sealed on the chain", 600, async || {
+        all_settled(&h, &[xid]).await
+            && db.transitions(&pid_fr()).unwrap().len() == 2
+            && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    assert_covers(&s, &db, xid, &[("B", &b_slots), ("P", &p_slots)]);
+    shutdown.cancel();
+}
+
+/// R13: our B{X,Y} loses a race to a peer's P{X}; our C re-seals Y alone
+/// (covering B); a peer's T on top is reorged out and the rebuild keeps X
+/// and Y Settled, its replay stalled; reorgs take C and P, and a peer's Q
+/// carries Y only. X, requeued by the check after the replay, re-seals
+/// covering B, which only C (naming Y) had carried before.
+#[tokio::test(start_paused = true)]
+async fn vote_requeued_after_its_sibling_landed_alone_stays_covered() {
+    let s = setup(2, 27, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let prover = FakeProver::gated();
+    let (db, node, h, shutdown) = populated(&s, &dir, prover.clone(), 5200).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 5300);
+    let y = fake_vote(&s.env, 4, &[2, 1], 5301);
+    let (xid, yid) = (x.pkg.vote_id, y.pkg.vote_id);
+    h.submit(x.clone()).await.unwrap();
+    h.submit(y.clone()).await.unwrap();
+    s.chain.advance_time(400);
+    wait_secs("B sealed", 600, async || prover.calls() >= 2).await;
+    let b_slots = db.exposed(&pid_fr()).unwrap().unwrap().slots;
+    s.chain
+        .race_next_submit(peer_batch_of(&db, &s, std::slice::from_ref(&x)));
+    prover.release(1);
+    wait_secs("X settled by P", 600, async || {
+        all_settled(&h, &[xid]).await
+    })
+    .await;
+    s.chain.advance_time(400);
+    prover.release(1);
+    wait_secs("Y settled by C", 600, async || {
+        all_settled(&h, &[yid]).await && db.exposed(&pid_fr()).unwrap().is_none()
+    })
+    .await;
+    let t = fake_vote(&s.env, 25, &[1, 2], 5302);
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&t)));
+    wait_secs("T synced", 600, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 4
+    })
+    .await;
+    s.chain.reorg_out_last_transition();
+    s.chain.fail_blobs(u32::MAX);
+    rebuild_after_reroute(&s, &db, &node, 1).await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Settled));
+    // C and P go; Q carries Y alone.
+    s.chain.reorg_out_last_transition();
+    s.chain.reorg_out_last_transition();
+    s.chain
+        .settle_externally(&s.chain.peer_batch(&s, std::slice::from_ref(&y)));
+    s.chain.fail_blobs(0);
+    s.chain.advance_time(400);
+    prover.release(10);
+    wait_secs("X re-sealed on the chain", 600, async || {
+        all_settled(&h, &[xid, yid]).await
+            && db.transitions(&pid_fr()).unwrap().len() == 3
+            && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    let (p, root) = h.vote_id_proof(xid).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
+    assert_covers(&s, &db, xid, &[("B", &b_slots)]);
+    let _ = nf;
+    shutdown.cancel();
+}
+
+/// R14: our A settles X; a peer's T on top is reorged out and the rebuild
+/// keeps X Settled, its replay stalled; a reorg takes A and a peer's Q
+/// settles X; the replay converges with X present (via Q); a reorg takes Q.
+/// X's re-seal covers A and Q.
+#[tokio::test(start_paused = true)]
+async fn vote_settled_again_elsewhere_keeps_its_first_batch_covered() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let prover = FakeProver::gated();
+    let (db, node, h, shutdown) = populated(&s, &dir, prover.clone(), 5400).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 5500);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    s.chain.advance_time(400);
+    prover.release(1);
+    wait_secs("X settled in A", 600, async || {
+        all_settled(&h, &[xid]).await
+    })
+    .await;
+    let a_slots = updated_slots(&db, nf, 1);
+    let t = fake_vote(&s.env, 25, &[1, 2], 5501);
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&t)));
+    wait_secs("T synced", 600, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 3
+    })
+    .await;
+    s.chain.reorg_out_last_transition();
+    s.chain.fail_blobs(u32::MAX);
+    rebuild_after_reroute(&s, &db, &node, 1).await;
+    // A goes; Q settles X; the replay converges with X present.
+    s.chain.reorg_out_last_transition();
+    s.chain
+        .settle_externally(&s.chain.peer_batch(&s, std::slice::from_ref(&x)));
+    s.chain.fail_blobs(0);
+    wait_secs("replayed onto Q", 600, async || {
+        db.transitions(&pid_fr()).unwrap().len() == 2
+            && h.snapshot().await.unwrap().synced
+            && db.rebuild_coverage(&pid_fr()).unwrap().is_none()
+    })
+    .await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Settled));
+    let q_slots = updated_slots(&db, nf, 1);
+    // Q goes too.
+    s.chain.reorg_out_last_transition();
+    rebuild_after_reroute(&s, &db, &node, 2).await;
+    s.chain.advance_time(400);
+    prover.release(10);
+    wait_secs("X re-sealed on the chain", 600, async || {
+        all_settled(&h, &[xid]).await
+            && db.transitions(&pid_fr()).unwrap().len() == 2
+            && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    assert_covers(&s, &db, xid, &[("A", &a_slots), ("Q", &q_slots)]);
+    shutdown.cancel();
+}

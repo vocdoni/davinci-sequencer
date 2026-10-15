@@ -7842,3 +7842,173 @@ async fn refresh_overflow_archives_a_published_set() {
     assert!(archived[0].vote_ids.contains(&vid));
     shutdown.cancel();
 }
+
+// ----------------------------------------- the coverage invariant, directly
+
+/// Checks every own landing in `sent[from..]`: for each vote it carries,
+/// its updated slots cover every slot, still occupied at the landing's base
+/// root, of every earlier batch carrying that vote that this node learned
+/// of (its own, landed or reverted; a peer's whose blobs it fetched). A slot
+/// empty at that root cannot be refreshed (the batch that filled it is gone)
+/// and, absent from the landing, adds nothing to an intersection. Returns
+/// (landings checked, earlier batches covered).
+fn check_coverage(
+    seed: u64,
+    s: &TestSetup,
+    sent: &[(B256, Vec<Blob>, bool)],
+    fetched: &std::collections::HashSet<B256>,
+    from: usize,
+) -> (usize, usize) {
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let mut checked = 0;
+    let mut covered = 0;
+    for (idx, (tx, blobs, own)) in sent.iter().enumerate().skip(from) {
+        // Our landings (a reverted send of ours starts with 0x10), while
+        // still on the chain.
+        if !own || tx[0] != 0 {
+            continue;
+        }
+        let Some((base, _)) = s.chain.transition_roots(tx) else {
+            continue;
+        };
+        let td = decode_blobs(blobs, nf).unwrap();
+        let updates: std::collections::HashSet<u64> = td.updates.iter().map(|(s, _)| *s).collect();
+        for vid in &td.vote_ids {
+            for (j, (tx2, blobs2, own2)) in sent[..idx].iter().enumerate() {
+                if !own2 && !fetched.contains(tx2) {
+                    continue;
+                }
+                let earlier = decode_blobs(blobs2, nf).unwrap();
+                if !earlier.vote_ids.contains(vid) {
+                    continue;
+                }
+                let slots: Vec<u64> = earlier.updates.iter().map(|(s, _)| *s).collect();
+                let Some(live) = s.chain.occupied_at(s, &base, &slots) else {
+                    continue;
+                };
+                covered += 1;
+                for (slot, live) in slots.iter().zip(live) {
+                    assert!(
+                        !live || updates.contains(slot),
+                        "seed {seed}: batch {idx} re-sealing {vid:#x} left out slot {slot:#x} of batch {j}"
+                    );
+                }
+            }
+        }
+        checked += 1;
+    }
+    (checked, covered)
+}
+
+/// One random run: own seals, peer batches carrying our pending votes, lost
+/// races, reorgs of the tip and blob-fetch faults, with the invariant
+/// checked after every step.
+async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
+    use rand::Rng;
+    let s = setup(2, 40, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        8,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    // 20 occupied slots: a batch refreshes a random 16 of them.
+    let first = submit_n(&h, &s, 20, seed * 10_000 + 1).await;
+    s.chain.advance_time(400);
+    wait_long("20 settled", async || all_settled(&h, &first).await).await;
+    let genesis = genesis_root(&s.env.cfg).unwrap();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut ours: Vec<VerifiedVote> = Vec::new();
+    let mut kseed = seed * 10_000 + 100;
+    let mut from = 0;
+    let (mut checked, mut covered) = (0, 0);
+    let pending_vote = async |ours: &[VerifiedVote], rng: &mut StdRng| {
+        let mut pend = Vec::new();
+        for v in ours {
+            if vote_status(&h, v.pkg.vote_id).await == Some(VoteStatus::Pending) {
+                pend.push(v.clone());
+            }
+        }
+        (!pend.is_empty()).then(|| pend[rng.gen_range(0..pend.len())].clone())
+    };
+    for _ in 0..steps {
+        match rng.gen_range(0..8) {
+            0..=2 => {
+                kseed += 1;
+                let voter = rng.gen_range(0..36);
+                let v = fake_vote(&s.env, voter, &[2, 1], kseed);
+                if h.submit(v.clone()).await.is_ok() {
+                    ours.push(v);
+                }
+            }
+            3 => s.chain.advance_time(400),
+            4 => {
+                if let Some(v) = pending_vote(&ours, &mut rng).await
+                    && let Some(b) = s.chain.try_peer_batch(&s, &[v])
+                {
+                    s.chain.settle_externally(&b);
+                }
+            }
+            5 => {
+                if let Some(v) = pending_vote(&ours, &mut rng).await
+                    && let Some(b) = s.chain.try_peer_batch(&s, &[v])
+                {
+                    s.chain.race_next_submit(b);
+                    s.chain.advance_time(400);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    s.chain.clear_race();
+                }
+            }
+            6 => {
+                if s.chain.root() != genesis {
+                    s.chain.reorg_out_last_transition();
+                    s.chain.reinclude_transition(0);
+                }
+            }
+            _ => s.chain.fail_blobs(rng.gen_range(1..4)),
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let sent = s.chain.sent_batches();
+        let (c, r) = check_coverage(seed, &s, &sent, &s.chain.fetched_txs(), from);
+        (checked, covered, from) = (checked + c, covered + r, sent.len());
+    }
+    // Let everything left settle (or close) and check once more.
+    s.chain.fail_blobs(0);
+    for _ in 0..6 {
+        s.chain.advance_time(400);
+        tokio::time::sleep(Duration::from_secs(120)).await;
+    }
+    let sent = s.chain.sent_batches();
+    let (c, r) = check_coverage(seed, &s, &sent, &s.chain.fetched_txs(), from);
+    shutdown.cancel();
+    (checked + c, covered + r)
+}
+
+/// The coverage invariant, stated directly and over many random runs:
+/// every landing of ours refreshes every slot of every batch that ever
+/// carried one of its votes and that the node learned of.
+#[tokio::test(start_paused = true)]
+async fn coverage_invariant_holds_under_random_reorgs() {
+    let seeds: u64 = std::env::var("COVERAGE_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let (mut checked, mut covered) = (0, 0);
+    for seed in 0..seeds {
+        let (c, r) = coverage_run(seed, 40).await;
+        checked += c;
+        covered += r;
+    }
+    eprintln!("coverage invariant: {checked} landings checked, {covered} earlier batches covered");
+    assert!(
+        checked > 0 && covered > 0,
+        "the runs never re-sealed a vote"
+    );
+}
