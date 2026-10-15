@@ -7978,6 +7978,57 @@ async fn a_revote_history_does_not_shrink_a_batch_of_fresh_votes() {
     shutdown.cancel();
 }
 
+/// I1: the organizer lowers `maxVoters` under a flight carrying a revote
+/// and a new voter, and the settlement reverts `MaxVotersReached`. Nothing
+/// is errored for the revert: the votes are requeued, the read merges the
+/// new cap, the new-slot vote alone ends `max voters reached`, and the
+/// revote settles.
+#[tokio::test(start_paused = true)]
+async fn a_lowered_max_voters_under_a_flight_requeues_the_overwrites() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let first = submit_n(&h, &s, 1, 10).await;
+    let v2 = fake_vote(&s.env, 2, &[1, 2], 13);
+    let mut first = first;
+    first.push(v2.pkg.vote_id);
+    h.submit(v2).await.unwrap();
+    wait_until("first settled", async || all_settled(&h, &first).await).await;
+    s.chain.set_max_voters(2);
+    s.chain.revert_simulates("MaxVotersReached", 1);
+    let revote = fake_vote(&s.env, 0, &[2, 1], 11);
+    let fresh = fake_vote(&s.env, 1, &[1, 2], 12);
+    let (rv, fv) = (revote.pkg.vote_id, fresh.pkg.vote_id);
+    h.submit(revote).await.unwrap();
+    h.submit(fresh).await.unwrap();
+    // The revote alone waits for the batch timer (1 h).
+    wait_long("the revote settled or errored", async || {
+        s.chain.advance_time(600);
+        matches!(
+            vote_status(&h, rv).await,
+            Some(VoteStatus::Settled | VoteStatus::Error)
+        )
+    })
+    .await;
+    assert_eq!(vote_status(&h, rv).await, Some(VoteStatus::Settled));
+    let f = h.status(fv).await.unwrap().unwrap();
+    assert_eq!(f.status, VoteStatus::Error);
+    assert_eq!(f.error.as_deref(), Some("max voters reached"));
+    shutdown.cancel();
+}
+
 /// M4-1: 42 fresh votes (enough to wake the capacity trigger), then a
 /// revote whose 124-slot history fits a blob alone but not next to them.
 /// The batch is not full (only the revote's own history kept it out), so

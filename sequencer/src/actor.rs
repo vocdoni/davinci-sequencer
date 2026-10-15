@@ -3266,6 +3266,17 @@ impl Actor {
                 self.requeue_flight(f);
                 return;
             }
+            JobOutcome::Reverted(name) if name == "MaxVotersReached" => {
+                // The organizer lowered maxVoters under the flight. Requeue
+                // (never error the batch): the read merges the new cap, and
+                // only new-slot votes that can never fit are errored.
+                self.rollback_flight(&f);
+                self.vote_at_stale = true;
+                let secs = self.prove_backoff();
+                warn!(pid = %hex::encode(self.pid31), retry_in = secs, "settlement reverted MaxVotersReached; requeueing");
+                self.requeue_flight(f);
+                return;
+            }
             JobOutcome::Reverted(name)
                 if name == "InvalidStatus" || name == "InvalidTimeBounds" =>
             {
