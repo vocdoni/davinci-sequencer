@@ -76,7 +76,9 @@ To build a batch, the actor:
    allows);
 2. draws a fresh seed and a refresh selection from the OS random number generator;
 3. re-encrypts every ballot along the seed's scalar chain and re-randomizes a sample of other
-   occupied slots, so an observer cannot tell a revote from a routine refresh;
+   occupied slots, so an observer cannot tell a revote from a routine refresh; every batch that
+   ever carried one of its votes (the node's earlier attempts, another sequencer's batches) is
+   refreshed again in full when that vote is resealed (see [security.md](security.md));
 4. builds the state-tree witnesses, the blobs with their KZG commitments and openings, and the
    public outputs it expects.
 
@@ -149,8 +151,8 @@ shows a transition leaving such a root for another one. From then on it seals no
 proves no results. If the chain does not come back within 90 s, the node rebuilds the process:
 
 1. One write drops the state tree, the transition log and the stored blobs, puts the votes the
-   lost transitions settled back in the queue, widens the exposed set by every slot of the lost
-   batches that carried them, and pins the chain's root.
+   lost transitions settled back in the queue and pins the chain's root. The coverage history
+   stays, so their re-seals refresh every slot of the lost batches that carried them.
 2. The node re-creates the genesis and replays every transition the chain has from its blobs,
    as a late bootstrap does.
 3. The votes re-seal on the chain's root, or settle from the replay if the chain kept them in
@@ -392,8 +394,8 @@ A wrong secret reverts with `InvalidOrganizerSecret`.
 ## Restarts
 
 The node persists process records, votes and the queue, each process's state tree and committed
-state, transitions and blobs, the census data, the per-process exposed slot set (see
-[security.md](security.md)) and the master secret election keys are derived from.
+state, transitions and blobs, the census data, the per-process exposed slot set and coverage
+history (see [security.md](security.md)) and the master secret election keys are derived from.
 
 The per-batch seed and refresh selection exist only in memory for one batch, by design. On
 restart, votes that were in a batch (`aggregated` or `processed`) go back to `pending` and the
