@@ -59,8 +59,8 @@ impl Network {
 pub const OPTIMISM: Network = Network {
     name: "optimism",
     chain_id: 10,
-    registry: address!("7bfa68879f118C98B864FB52d2aD3a112eF1558F"),
-    start_block: 158_164_175,
+    registry: address!("64d41aD49009204E8dAcc153Fc98a5Ee14cB6916"),
+    start_block: 158_245_426,
     rpc_urls: &[
         "https://optimism-rpc.publicnode.com",
         "https://mainnet.optimism.io",
@@ -141,10 +141,15 @@ mod tests {
         );
     }
 
+    // The registry with the DKG and Council adapters (davinci-contracts'
+    // deployments/10.json), whose pins equal the ones above.
     #[test]
     fn optimism_preset_is_deployed() {
-        assert_ne!(OPTIMISM.registry, Address::ZERO, "optimism registry unset");
-        assert_ne!(OPTIMISM.start_block, 0, "optimism start block unset");
+        assert_eq!(
+            OPTIMISM.registry,
+            address!("64d41aD49009204E8dAcc153Fc98a5Ee14cB6916")
+        );
+        assert_eq!(OPTIMISM.start_block, 158_245_426);
     }
 
     #[test]

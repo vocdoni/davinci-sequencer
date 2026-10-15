@@ -1,10 +1,9 @@
 //! Demo elections on a live deployment (OP Mainnet by default), gated by
 //! `DAVINCI_E2E_DEMO`, one phase per run, for the election set
 //! `DAVINCI_DEMO_WAVE` names (1, the default, 2 or 3; see
-//! `davinci_e2e::demo::Wave`). The DKG and Council waves need a registry
-//! with a DKG adapter; no preset has one in this release (DKG and Council
-//! on OP come later), so they need `DAVINCI_E2E_RPC` and
-//! `DAVINCI_E2E_REGISTRY` pointing at such a registry:
+//! `davinci_e2e::demo::Wave`). The DKG and Council waves need the
+//! registry's DKG and Council committees live (the `optimism` preset's
+//! registry has both adapters):
 //!
 //! - `prepare` draws every voter key, the CSP key and the seed behind every
 //!   ballot secret and choice into the private directory

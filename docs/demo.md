@@ -13,9 +13,8 @@ the deployment's DKG committee. It is gated by `DAVINCI_E2E_DEMO`, which names o
 
 `run` needs the organizer key file in `DAVINCI_DEMO_ORGANIZER_KEY` (required, there is no default),
 the circom artifacts and the built census contract project. The chain comes from `DAVINCI_E2E_RPC` and
-`DAVINCI_E2E_REGISTRY`, defaulting to the `optimism` preset. The DKG and Council waves need a registry with a DKG adapter,
-which no preset provides in this release (DKG and Council on OP come later): point
-`DAVINCI_E2E_RPC` and `DAVINCI_E2E_REGISTRY` at such a registry for them. It records its progress in a state
+`DAVINCI_E2E_REGISTRY`, defaulting to the `optimism` preset, whose registry has the DKG and
+Council adapters: the DKG and Council waves need their committees live on that chain. It records its progress in a state
 file next to the keys and resumes from it without duplicates. With
 `DAVINCI_DEMO_EXPLORER_URL` the report links every election to that explorer.
 
