@@ -480,7 +480,8 @@ fn process_config(vk_hash: [u8; 32], rec: &ProcessRecord) -> Result<ProcessConfi
 }
 
 /// A process whose bootstrap failed transiently: retried with backoff up to
-/// [`BOOT_ATTEMPT_CAP`], then recorded ignored. Attempts survive restarts.
+/// [`BOOT_ATTEMPT_CAP`], then recorded ignored, unless it has a stored
+/// record (then retried at the longest backoff). Attempts survive restarts.
 struct BootRetry {
     pid: Fr,
     pid31: [u8; 31],

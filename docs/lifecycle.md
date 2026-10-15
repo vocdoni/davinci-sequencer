@@ -21,8 +21,10 @@ is stored, and a failed download costs one attempt. At most 4 downloads and 2 bu
 a download that brings less than 16 KiB in a 30 s window after its first byte is cut off and
 retried. For an on-chain census (origin 3) the node indexes the census contract and serves votes
 after the first sync. A process that fails a permanent check is marked `ignored` with the reason.
-Transient failures are retried from a persisted list, and the process is ignored after 10
-attempts. A late bootstrap scans the registry logs from the process's creation block and replays
+Transient failures are retried from a persisted list, and a process with no stored record is
+ignored after 10 attempts. A process with a stored record (its actor failed to start, say after a
+crash) is never ignored: it keeps retrying at the longest backoff (32 poll intervals) and logs an
+error each time. A late bootstrap scans the registry logs from the process's creation block and replays
 every transition from its blobs.
 
 ## Admission
