@@ -302,6 +302,24 @@ Watchtower. `:latest` is the newest release, so the node follows releases; set
 `DAVINCI_SEQUENCER_TAG=v1.2.3` to stay on one. A release that moves the network to a new registry
 needs no action: the node opens a fresh database for it.
 
+### Pinning a production node
+
+A production node should not move on its own: a later release could follow its preset to a new
+registry (a fresh, empty database) or refuse a registry whose pins it no longer proves. Pin the
+image and the registry in `.env`, no code change needed:
+
+```bash
+DAVINCI_SEQUENCER_TAG=v0.6.0
+DAVINCI_REGISTRY=0x64d41aD49009204E8dAcc153Fc98a5Ee14cB6916
+DAVINCI_START_BLOCK=158245426
+```
+
+Watchtower then only picks up a re-push of that same tag, and the explicit registry pins the
+node to it (see [Networks](#networks)); the rest of the chain settings still come from the
+`optimism` preset. Move the prover the same way, with `DAVINCI_ZKVM_TAG` or its own pin, between
+proving jobs. Upgrading is an explicit change of these lines; the values of each registry are in
+[deployments.md](deployments.md).
+
 To build both images from sibling checkouts instead, give them a tag Watchtower cannot find
 upstream:
 
