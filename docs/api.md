@@ -21,7 +21,7 @@ requests time out after 60 s.
 | Method | Path | Purpose | Error codes |
 |---|---|---|---|
 | GET | `/ping` | Liveness (`pong`). | |
-| GET | `/info` | Sequencer address (`null` for an observer), chain id, registry, ballot VK hash, both program verification keys, `observer`, and the counters `settledBySelf`, `syncedFromOthers`, `lostRaces`, `bisections` (batches the prover failed for good, requeued for bisection), `isolatedVotes` (votes a bisection errored alone), `heldBatches` (batches held pending after a node-side check failed) and `guestRejections` (batches the circuit rejected, their votes errored). | |
+| GET | `/info` | Sequencer address (`null` for an observer), chain id, registry, ballot VK hash, both program verification keys, `observer`, and the counters `settledBySelf`, `syncedFromOthers`, `lostRaces`, `bisections` (batches the prover failed for good, requeued for bisection), `isolatedVotes` (votes a bisection errored alone), `heldBatches` (batches held pending after a node-side check failed) `guestRejections` (batches the circuit rejected, their votes errored), `reorgs` (reorgs seen at the event cursor, events re-routed) and `rebuilds` (processes rebuilt from the chain after a reorg took transitions they had committed). | |
 | GET | `/processes` | Process ids this node knows. | |
 | GET | `/processes/{pid}` | On-chain parameters plus the node's view, described below. | 40001, 40402 |
 | POST | `/processes/keys` | Body `{"processId"}`: this node's election key for that future process, as `{x, y}`. | 40001, 41203, 42901 |

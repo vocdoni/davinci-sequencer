@@ -639,6 +639,13 @@ pub struct Info {
     /// Batches the guest rejected; their votes are errored.
     #[serde(default)]
     pub guest_rejections: u64,
+    /// Reorgs seen at the event cursor (events re-routed).
+    #[serde(default)]
+    pub reorgs: u64,
+    /// Processes rebuilt from the chain after a reorg took transitions they
+    /// had committed.
+    #[serde(default)]
+    pub rebuilds: u64,
 }
 
 /// On-chain process status (the registry enum, lowercase).

@@ -212,6 +212,17 @@ async fn ping_info_and_process_views() {
     assert_eq!(info.settled_by_self, 0);
     assert_eq!(info.synced_from_others, 0);
     assert_eq!(info.lost_races, 0);
+    assert_eq!((info.reorgs, info.rebuilds), (0, 0));
+    t.node
+        .metrics
+        .reorgs
+        .store(3, std::sync::atomic::Ordering::SeqCst);
+    t.node
+        .metrics
+        .rebuilds
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let info = t.client.info().await.unwrap();
+    assert_eq!((info.reorgs, info.rebuilds), (3, 2));
 
     assert_eq!(
         t.client.processes().await.unwrap(),

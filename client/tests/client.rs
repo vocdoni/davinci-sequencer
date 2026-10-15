@@ -142,6 +142,8 @@ fn router(seen: Seen, evil: bool) -> Router {
                     isolated_votes: 0,
                     held_batches: 0,
                     guest_rejections: 0,
+                    reorgs: 0,
+                    rebuilds: 0,
                 })
             }),
         )

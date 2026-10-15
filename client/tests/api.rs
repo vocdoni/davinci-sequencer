@@ -369,12 +369,15 @@ fn info_and_census_file_roundtrip() {
         isolated_votes: 1,
         held_batches: 2,
         guest_rejections: 0,
+        reorgs: 5,
+        rebuilds: 6,
     };
     let j = serde_json::to_value(&i).unwrap();
     assert_eq!(j["chainId"], json!(31337));
     assert_eq!(j["ballotVkHash"], json!(format!("0x{}", "03".repeat(32))));
     assert_eq!(j["isolatedVotes"], json!(1));
     assert_eq!(j["heldBatches"], json!(2));
+    assert_eq!((&j["reorgs"], &j["rebuilds"]), (&json!(5), &json!(6)));
     assert_eq!(serde_json::from_value::<Info>(j).unwrap(), i);
     let obs = Info {
         sequencer_address: None,
