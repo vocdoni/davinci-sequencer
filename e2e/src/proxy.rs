@@ -477,7 +477,8 @@ mod tests {
         assert!(t.elapsed() >= Duration::from_millis(300));
         let t = Instant::now();
         c.get(format!("{}/health", p.url)).send().await?;
-        assert!(t.elapsed() < Duration::from_millis(100));
+        // Undelayed: well under the 300 ms hold (a tight bound flakes under host load).
+        assert!(t.elapsed() < Duration::from_millis(250));
         assert_eq!(p.delayed(), 1);
         Ok(())
     }
