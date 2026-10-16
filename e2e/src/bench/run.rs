@@ -33,7 +33,7 @@ use super::report::{self, Finding, Progress, ScenarioReport, Throughput};
 use super::rig::{Rig, Role};
 use super::scenarios::{
     Cell, EST_BLOB_WEI, EST_EXEC_WEI, End, Kind, Lane, Scenario, on_anvil, post_bound, scaled,
-    scenarios,
+    scenarios, secs_of,
 };
 use super::schedule;
 use super::submit::{Route, SubmitStats, Submitter};
@@ -1192,6 +1192,44 @@ struct RunMeta {
     t0: f64,
     /// Per tag, the vote ids the run scheduled.
     planned: BTreeMap<String, Vec<String>>,
+    /// Unix seconds of a budget stop, which cancels the open elections.
+    #[serde(default)]
+    budget_stop_at: Option<f64>,
+}
+
+/// The allowed error reasons of a lane: a budget stop's cancel closes out
+/// any lane's pending votes.
+fn allowed_of<'a>(sc: &'a Scenario, tag: &str, budget_stop: bool) -> Vec<&'a str> {
+    let mut allowed = sc.allowed(tag).to_vec();
+    if budget_stop {
+        allowed.push("process closed");
+    }
+    allowed
+}
+
+/// The longest batch time A or B runs in `sc`, chaos knob changes included;
+/// `None` when one does not parse.
+fn batch_secs(sc: &Scenario) -> Option<u64> {
+    let chaos = sc.chaos.iter().filter_map(|c| match &c.action {
+        chaos::Action::Knobs { knobs, .. } => Some(knobs),
+        _ => None,
+    });
+    sc.knobs
+        .iter()
+        .chain(chaos)
+        .map(|k| secs_of(&k.batch_time))
+        .try_fold(0, |m, s| Some(m.max(s?)))
+}
+
+/// Ledger time from which a vote may be closed out unsettled (`process
+/// closed`): the lane's close (the registry's end, or a budget stop's cancel
+/// when earlier) less the last batch window (`batch`) and a margin of one
+/// more batch time, for the seal jitter (up to 10 %) and the batch in
+/// flight ahead of the vote's (one per process). A vote accepted earlier had
+/// a whole window to settle in; the grace window after the end adds slack.
+fn late_from(end: u64, stop_at: Option<f64>, t0: f64, batch: u64) -> f64 {
+    let close = stop_at.map_or(end as f64, |s| s.min(end as f64));
+    close - t0 - 2.0 * batch as f64
 }
 
 /// One election's audit.
@@ -1218,6 +1256,9 @@ async fn audit_election(
     allowed: &[&str],
     events: &[(NodeId, LogKind)],
     max: Duration,
+    t0: f64,
+    stop_at: Option<f64>,
+    batch: Option<u64>,
 ) -> Result<Audited> {
     let pid = e.snap.pid;
     let tag = e.spec.tag.as_str();
@@ -1243,11 +1284,16 @@ async fn audit_election(
     let tr = chain_view::transitions(o, [a, b], &op, ctx.net.registry, &pid.0, e.spec.nf, &q.logs)
         .await
         .with_context(|| format!("{tag}: transitions"))?;
-    let c = audit::classify(&mine, &tr.rows, &q.statuses, allowed, planned);
-    let mut au = c.summary();
-    let x = audit::expect(&tr.rows, &|v| who.get(&v).cloned(), usize::from(e.spec.nf));
     let org = ctx.net.organizer()?;
     let p = org.process(&pid.0).await?;
+    let end = p.start_time.saturating_add(p.duration);
+    let late = batch.map(|b| late_from(end, stop_at, t0, b));
+    if late.is_none() && allowed.iter().any(|a| a.starts_with("process closed")) {
+        println!("{tag}: no batch time, so every `process closed` is a finding");
+    }
+    let c = audit::classify(&mine, &tr.rows, &q.statuses, allowed, planned, late);
+    let mut au = c.summary();
+    let x = audit::expect(&tr.rows, &|v| who.get(&v).cloned(), usize::from(e.spec.nf));
     let results = org.results(&pid.0).await?;
     let mut views = Vec::new();
     for (name, r) in [("a", Role::A), ("b", Role::B), ("o", Role::O)] {
@@ -1868,7 +1914,7 @@ pub async fn run_scenario_in(
         "fee ceilings".into(),
         money::ceilings().map_or_else(|e| e, |c| money::describe(&c)),
     );
-    let meta = RunMeta {
+    let mut meta = RunMeta {
         name: sc.name.clone(),
         wave: sc.wave,
         scale,
@@ -1877,6 +1923,7 @@ pub async fn run_scenario_in(
             .iter()
             .map(|(t, v)| (t.clone(), v.iter().map(|x| vote_id_hex(*x)).collect()))
             .collect(),
+        budget_stop_at: None,
     };
     std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(&meta)?)?;
     if !injections.is_empty() {
@@ -2061,6 +2108,12 @@ pub async fn run_scenario_in(
             }
         }
     }
+    // Before the cancel, so the audit's window starts no later.
+    let stop_at = matches!(stop, Some(Stop::Budget(_))).then(unix_now);
+    if stop_at.is_some() {
+        meta.budget_stop_at = stop_at;
+        std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(&meta)?)?;
+    }
     if let Some(s) = &stop {
         // No new send starts; sends past their permit answer, give up, or
         // are dropped after the drain and write `uncertain`.
@@ -2226,10 +2279,7 @@ pub async fn run_scenario_in(
     let mut merged = passing();
     let mut rows: Vec<(String, TransitionRow)> = Vec::new();
     for (l, e) in &lanes {
-        let mut allowed: Vec<&str> = sc.allowed(&l.tag).to_vec();
-        if budget_stop {
-            allowed.push("process closed");
-        }
+        let allowed = allowed_of(sc, &l.tag, budget_stop);
         let a = audit_election(
             ctx,
             rig,
@@ -2243,6 +2293,9 @@ pub async fn run_scenario_in(
             deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(10)),
+            t0_unix,
+            stop_at,
+            batch_secs(sc),
         )
         .await?;
         merge_audit(&mut merged, &a.audit);
@@ -2523,11 +2576,14 @@ pub async fn audit_run(ctx: &Ctx, rig: &Rig, run_dir: &Path) -> Result<AuditResu
             &entries,
             &who_of(&recs),
             &planned,
-            sc.allowed(tag),
+            &allowed_of(&sc, tag, meta.budget_stop_at.is_some()),
             &events,
             deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(10)),
+            meta.t0,
+            meta.budget_stop_at,
+            batch_secs(&sc),
         )
         .await?;
         merge_audit(&mut merged, &a.audit);
@@ -2874,6 +2930,28 @@ mod tests {
         now.l1[1] += ueth(10);
         assert!(fits(&budget, &now, need).is_ok());
         assert_eq!(Stop::Fit(err).label().split(':').next(), Some("budget"));
+    }
+
+    #[test]
+    fn process_closed_window_and_allowed_reasons() {
+        let w1 = scenarios(1, 1.0);
+        let r = w1.iter().find(|s| s.name == "R").unwrap();
+        assert_eq!(batch_secs(r), Some(900));
+        let w3 = scenarios(3, 1.0);
+        let c7 = w3.iter().find(|s| s.name == "C7").unwrap();
+        assert_eq!(batch_secs(c7), Some(300));
+        let mut bad = r.clone();
+        bad.knobs[1].batch_time = "soon".into();
+        assert_eq!(batch_secs(&bad), None);
+        // From the registry's end, less two batch times, in ledger time.
+        assert_eq!(late_from(10_000, None, 4_000.0, 300), 5_400.0);
+        // A budget stop's cancel before the end closes earlier.
+        assert_eq!(late_from(10_000, Some(8_000.0), 4_000.0, 300), 3_400.0);
+        assert_eq!(late_from(10_000, Some(12_000.0), 4_000.0, 300), 5_400.0);
+        // audit --run allows what the live run does after a budget stop.
+        assert_eq!(allowed_of(r, "R2", false), ["process closed"]);
+        assert!(allowed_of(r, "R1", false).is_empty());
+        assert_eq!(allowed_of(r, "R1", true), ["process closed"]);
     }
 
     #[test]
