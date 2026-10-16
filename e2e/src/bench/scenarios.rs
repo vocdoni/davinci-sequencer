@@ -917,7 +917,7 @@ fn wave3_scenarios(specs: &[ElectionSpec], scale: f64) -> Vec<Scenario> {
 }
 
 /// `15m`, `60s`, `1h` in seconds.
-fn secs_of(s: &str) -> Option<u64> {
+pub fn secs_of(s: &str) -> Option<u64> {
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
     let n: u64 = n.parse().ok()?;
     Some(match unit {
