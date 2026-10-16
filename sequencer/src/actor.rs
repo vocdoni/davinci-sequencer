@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use davinci_state::{
-    CensusOrigin, Committed, Error as StateError, ProcessConfig, ProcessState, VerifiedVote,
-    VotePackage, genesis_root, vote_still_valid,
+    CensusOrigin, Error as StateError, ProcessConfig, ProcessState, VerifiedVote, VotePackage,
+    genesis_root, vote_still_valid,
 };
 use davinci_zkvm_sdk::ballot::Ballot;
 use davinci_zkvm_sdk::blob::{TransitionBlobs, decode_blobs};
@@ -32,9 +32,10 @@ use crate::config::Config;
 use crate::keys::KeyStore;
 use crate::metrics::Metrics;
 use crate::storage::{Db, LocalStatus, ProcessRecord, StoredVote, VoteStatus, fr_hex};
+use crate::web3::l1proof::L1BlobProof;
 use crate::web3::{
-    BlobSource, EventKind, GraceParams, KeyMode, OnchainProcess, ProcessStatus, RegistryEvent,
-    RevertReason, TxReceipt, Web3Error,
+    BlobSource, EventKind, GraceParams, KeyMode, L1Blobs, L1Origin, OnchainProcess, ProcessStatus,
+    RegistryEvent, RevertReason, TxReceipt, Web3Error,
 };
 
 /// Votes an actor holds in memory before sealing; beyond it submits are refused.
@@ -53,6 +54,10 @@ fn gate_backoff(n: u32) -> std::time::Duration {
         .min(GATE_POLL_MAX)
 }
 
+fn not_l1() -> Web3Error {
+    Web3Error::Config("the registry is not in L1-blob mode".into())
+}
+
 // ------------------------------------------------------------------ traits
 
 /// The chain operations the node needs; `Contracts` implements it, tests
@@ -65,10 +70,18 @@ pub trait Chain: Send + Sync {
         0
     }
     async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess, Web3Error>;
+    /// `getProcess` at `block`. Required, so a wrapper cannot fall back to
+    /// the unpinned read.
+    async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error>;
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error>;
     /// `(block, timestamp)` of the head.
     async fn head(&self) -> Result<(u64, u64), Web3Error>;
     async fn confirmed_head(&self, confirmations: u64) -> Result<u64, Web3Error>;
+    /// Hash of block `n`; `None` when unknown (past the endpoint's head, or
+    /// a test double without blocks: the monitor then skips reorg checks).
+    async fn block_hash(&self, _n: u64) -> Result<Option<[u8; 32]>, Web3Error> {
+        Ok(None)
+    }
     async fn simulate_transition(
         &self,
         pid: &[u8; 31],
@@ -102,6 +115,34 @@ pub trait Chain: Send + Sync {
     async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error>;
     /// DKG modes: `finalizeResultsFromDKG`.
     async fn finalize_results_from_dkg(&self, pid: &[u8; 31]) -> Result<TxReceipt, Web3Error>;
+    /// L1-blob mode: OP's L1 origin (`L1Block` read at one block).
+    async fn l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        Err(not_l1())
+    }
+    /// L1-blob mode: `record()` on the verifier; the origin it stored.
+    async fn record_l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        Err(not_l1())
+    }
+    /// L1-blob mode: the pre-flight `eth_call` of `submitStateTransitionL1`.
+    async fn simulate_transition_l1(
+        &self,
+        _pid: &[u8; 31],
+        _snark: &PlonkSnark,
+        _blobs: &TransitionBlobs,
+        _proof: &L1BlobProof,
+    ) -> Result<(), RevertReason> {
+        Err(RevertReason::Rpc(not_l1().to_string()))
+    }
+    /// L1-blob mode: `submitStateTransitionL1`.
+    async fn submit_transition_l1(
+        &self,
+        _pid: &[u8; 31],
+        _snark: &PlonkSnark,
+        _blobs: &TransitionBlobs,
+        _proof: &L1BlobProof,
+    ) -> Result<TxReceipt, Web3Error> {
+        Err(not_l1())
+    }
 }
 
 /// `permanent` marks failures retrying cannot fix: the proving job itself
@@ -170,6 +211,8 @@ pub struct CensusAccess {
     pub store: Arc<crate::census::CensusStore>,
     /// Origin-3 census contracts.
     pub onchain: Arc<crate::census::onchain::OnchainIndex>,
+    /// Origin-2 downloads (the monitor's queue).
+    pub queue: crate::monitor::CensusQueue,
 }
 
 /// Everything an actor talks to.
@@ -185,6 +228,8 @@ pub struct Deps {
     /// Actor and monitor tasks; `api::run` awaits it on shutdown so the
     /// database handle is released before the process exits.
     pub tasks: tokio_util::task::TaskTracker,
+    /// L1-blob mode: the Ethereum side (poster, proofs); `None` in blob mode.
+    pub l1: Option<Arc<crate::l1da::L1Da>>,
 }
 
 #[async_trait]
@@ -198,6 +243,9 @@ impl Chain for crate::web3::Contracts {
     async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess, Web3Error> {
         crate::web3::Contracts::process(self, pid).await
     }
+    async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error> {
+        crate::web3::Contracts::process_at(self, pid, block).await
+    }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
         crate::web3::Contracts::events(self, from, to).await
     }
@@ -206,6 +254,9 @@ impl Chain for crate::web3::Contracts {
     }
     async fn confirmed_head(&self, confirmations: u64) -> Result<u64, Web3Error> {
         crate::web3::Contracts::confirmed_head(self, confirmations).await
+    }
+    async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>, Web3Error> {
+        crate::web3::Contracts::block_hash(self, n).await
     }
     async fn simulate_transition(
         &self,
@@ -246,6 +297,30 @@ impl Chain for crate::web3::Contracts {
     }
     async fn finalize_results_from_dkg(&self, pid: &[u8; 31]) -> Result<TxReceipt, Web3Error> {
         crate::web3::Contracts::finalize_results_from_dkg(self, pid).await
+    }
+    async fn l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        crate::web3::Contracts::l1_origin(self).await
+    }
+    async fn record_l1_origin(&self) -> Result<L1Origin, Web3Error> {
+        crate::web3::Contracts::record_l1_origin(self).await
+    }
+    async fn simulate_transition_l1(
+        &self,
+        pid: &[u8; 31],
+        snark: &PlonkSnark,
+        blobs: &TransitionBlobs,
+        proof: &L1BlobProof,
+    ) -> Result<(), RevertReason> {
+        crate::web3::Contracts::simulate_transition_l1(self, pid, snark, blobs, proof).await
+    }
+    async fn submit_transition_l1(
+        &self,
+        pid: &[u8; 31],
+        snark: &PlonkSnark,
+        blobs: &TransitionBlobs,
+        proof: &L1BlobProof,
+    ) -> Result<TxReceipt, Web3Error> {
+        crate::web3::Contracts::submit_transition_l1(self, pid, snark, blobs, proof).await
     }
 }
 
@@ -405,7 +480,7 @@ pub struct ProcessSnapshot {
     pub local: LocalStatus,
     /// Whether `submit` would be admitted right now.
     pub accepting: bool,
-    /// The committed root is the on-chain root.
+    /// The committed root is the on-chain root, and no newer one was seen.
     pub synced: bool,
 }
 
@@ -429,6 +504,8 @@ pub(crate) enum Msg {
     JobDone {
         generation: u64,
         outcome: JobOutcome,
+        /// L1-blob mode: the job mined at least one blob post.
+        posted: bool,
     },
     FinalizeDone {
         generation: u64,
@@ -440,12 +517,17 @@ pub(crate) enum Msg {
         root: [u8; 32],
         snark: Box<PlonkSnark>,
     },
-    /// Test hook: the refresh-overflow path (the real trigger needs
-    /// hundreds of live exposed slots).
-    ForceRefreshOverflow,
+    /// Test hook: the next `prepare` reports a refresh overflow (an arm a
+    /// sized selection never reaches).
+    ForceSealOverflow,
+    /// Test hook: the next prepared batch trips the blob-cap belt.
+    ForceBlobBelt,
+    /// The monitor saw a reorg: re-read the process at the next tick.
+    Reread,
 }
 
-/// How a finalize attempt failed: permanent latches, transient re-arms.
+/// How a finalize attempt failed: transient re-arms after a short cooldown,
+/// permanent after a longer one (never latched).
 /// `wait` is not a failure: the DKG has not decrypted yet, poll again.
 /// `gate` is not one either: a Council ceremony has not opened decryption.
 /// `dkg_requested` is the request flag the attempt last saw on-chain.
@@ -502,14 +584,32 @@ impl ActorHandle {
         let _ = self.tx.send(Msg::Event(ev)).await;
     }
 
+    /// A Head never waits on a full mailbox (one busy actor must not hold
+    /// up the others' heads): it is dropped, and the next carries a newer
+    /// block. Events, which must not be lost, still wait.
     pub(crate) async fn head(&self, block: u64, time: u64) {
-        let _ = self.tx.send(Msg::Head { block, time }).await;
+        let _ = self.tx.try_send(Msg::Head { block, time });
     }
 
-    /// Test hook: runs the refresh-overflow path directly.
+    pub(crate) async fn reread(&self) {
+        let _ = self.tx.send(Msg::Reread).await;
+    }
+
+    /// Whether the actor's task ended (a panic unwinds only its task).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Test hook: the next `prepare` reports a refresh overflow.
     #[doc(hidden)]
-    pub async fn force_refresh_overflow(&self) {
-        let _ = self.tx.send(Msg::ForceRefreshOverflow).await;
+    pub async fn force_seal_overflow(&self) {
+        let _ = self.tx.send(Msg::ForceSealOverflow).await;
+    }
+
+    /// Test hook: the next prepared batch trips the blob-cap belt.
+    #[doc(hidden)]
+    pub async fn force_blob_belt(&self) {
+        let _ = self.tx.send(Msg::ForceBlobBelt).await;
     }
 }
 
@@ -618,38 +718,6 @@ fn unpack_vote(bytes: &[u8]) -> Result<VerifiedVote, String> {
     })
 }
 
-/// `Committed` as the sequencer persists it (the arbo-side copy is not
-/// readable standalone; this one is written before create and after every
-/// commit/sync, so a restart can always `ProcessState::open`).
-#[derive(Serialize, Deserialize)]
-struct CommittedJson {
-    #[serde(with = "hex::serde")]
-    root: [u8; 32],
-    voters: u64,
-    overwrites: u64,
-    accumulator: Ballot,
-}
-
-fn committed_to_json(c: &Committed) -> Result<Vec<u8>, ActorError> {
-    serde_json::to_vec(&CommittedJson {
-        root: c.root,
-        voters: c.voters,
-        overwrites: c.overwrites,
-        accumulator: c.accumulator,
-    })
-    .map_err(|e| ActorError::Internal(e.to_string()))
-}
-
-fn committed_from_json(bytes: &[u8]) -> Result<Committed, String> {
-    let c: CommittedJson = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    Ok(Committed {
-        root: c.root,
-        voters: c.voters,
-        overwrites: c.overwrites,
-        accumulator: c.accumulator,
-    })
-}
-
 // ------------------------------------------------------------------- actor
 
 pub(crate) enum JobOutcome {
@@ -657,8 +725,13 @@ pub(crate) enum JobOutcome {
     Landed(TxReceipt),
     /// The guest published `ok = 0` with this fail mask.
     Guest(u32),
-    /// Prover failure or a proof that fails our checks; not retried.
+    /// The prover failed the job for good (a `failed` job, a refused
+    /// input, undecodable publics): requeued and bisected.
     Failed(String),
+    /// The node's own checks refused the proof or the L1 settlement (a
+    /// publics or pin mismatch): every batch fails alike, so the votes are
+    /// held pending, never bisected.
+    Held(String),
     /// The settlement reverted with this error name.
     Reverted(String),
     /// The settlement reverted on-chain and no replay names why: a race.
@@ -671,14 +744,55 @@ pub(crate) enum JobOutcome {
 /// before the flight is rolled back (covers a reorg dropping the tx).
 const LANDED_EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Longest an L1-blob job waits for Ethereum and OP's origin when the grace
+/// end is far or unbounded.
+const L1_JOB_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
 /// Consecutive ticks the landing-time read may stay stale (failing, or a
 /// root behind the events) before the node warns and counts a stall; it
 /// warns again every as many ticks.
 const STALE_WARN_TICKS: u32 = 30;
+/// Shortest wait between chain reads that settle nothing, at one Head block.
+const READ_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why a tick reads the chain (each paced on its own).
+#[derive(Clone, Copy)]
+enum Read {
+    Landing,
+    Rebuild,
+    CloseOut,
+}
 
 /// How long a pause read on-chain, but not yet routed as an event, holds
 /// sealing back.
 const PAUSE_HOLD: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// L1-blob mode: consecutive failed cycles (blobs posted on Ethereum, no
+/// landing) before sealing pauses; nothing bounds the spend otherwise.
+const FAILED_CYCLES_BEFORE_PAUSE: u32 = 3;
+/// The first pause; each further failed cycle doubles it, up to [`MAX_PAUSE`].
+const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Longest cooldown between bisection cycles, seconds.
+const BISECT_BACKOFF_MAX: u64 = 30;
+/// Single-vote batches errored in a row before the actor stops erroring
+/// and holds every vote pending (the prover fails every input).
+const ISOLATED_BEFORE_HOLD: u32 = 3;
+/// Results: consecutive failed attempts before the retries slow to
+/// [`RESULTS_HOLD_RETRY`]; until then they back off up to
+/// [`BISECT_BACKOFF_MAX`].
+const RESULTS_FAILS_BEFORE_HOLD: u32 = 3;
+const RESULTS_HOLD_RETRY: u64 = 300;
+
+/// Set after a prover-side `Failed`: the votes of the last failed batch, the
+/// cap of the next seal and the prover's reason. In memory only (a restart
+/// retries at full size).
+struct Bisect {
+    suspect: BTreeSet<u64>,
+    cap: usize,
+    reason: String,
+}
 
 struct Flight {
     generation: u64,
@@ -689,6 +803,12 @@ struct Flight {
     /// Set when the settlement tx landed but the receipt read failed: if the
     /// confirmed chain never shows our root by this instant, roll back.
     landed_deadline: Option<tokio::time::Instant>,
+    /// The proof passed its checks (`Msg::JobProved`): what fails after
+    /// this is the settlement.
+    proved: bool,
+    /// Cancels the job when the flight is dropped (rollback, requeue,
+    /// shutdown), so an L1-blob job stops waiting on Ethereum.
+    _abort: tokio_util::sync::DropGuard,
 }
 
 struct Actor {
@@ -705,6 +825,10 @@ struct Actor {
     flush_horizon: u64,
     /// Landing margin reserved after proving.
     settle_margin: u64,
+    /// `--confirmations`: depth of the head a results read is confirmed at.
+    confirmations: u64,
+    /// L1-blob mode: the Ethereum leg, which runs during the proof.
+    l1_settle_lag: u64,
     slot_depth: usize,
     prove_base: f64,
     /// Seal jitter of the current window, drawn once per window.
@@ -721,6 +845,16 @@ struct Actor {
     last_head_block: u64,
     /// Block of the newest applied transition; lower bound for gap replay.
     last_tx_block: u64,
+    /// Newest block a Head or an event showed: a chain read from an endpoint
+    /// behind it is not used.
+    seen_block: u64,
+    /// Block of the newest merged chain read: what a field event at or
+    /// below it sets is already in the record, with its effects.
+    read_block: u64,
+    /// `new_root` of the newest transition record (genesis before the
+    /// first). Behind the committed root when a record write was lost; the
+    /// resync writes the missing records from the chain.
+    log_root: [u8; 32],
     in_flight: Option<Flight>,
     generation: u64,
     next_index: u64,
@@ -737,8 +871,9 @@ struct Actor {
     resync_after: Option<tokio::time::Instant>,
     resync_backoff_ms: u64,
     finalizing: bool,
-    /// Latched only on a permanent finalize failure (bad proof, revert).
-    finalize_failed: bool,
+    /// Consecutive finalize attempts that failed for good (a failed results
+    /// proof, a refused check, a revert): retried, never latched.
+    results_failures: u32,
     finalize_attempts: u32,
     /// Consecutive attempts that found the Council decryption gate closed.
     gate_polls: u32,
@@ -748,6 +883,28 @@ struct Actor {
     eager: bool,
     /// Eager results: the checked snark and the root it proves.
     held: Option<([u8; 32], Box<PlonkSnark>)>,
+    /// Our results transaction has a receipt, which may be depth 0: no new
+    /// attempt before its event, and past this instant a chain read decides
+    /// (RESULTS finalizes, anything else resubmits).
+    results_sent: Option<tokio::time::Instant>,
+    /// The Head block of the last results confirmation read.
+    confirm_block: Option<u64>,
+    /// After a chain read that failed or settled nothing (the landing time
+    /// still stale, a close-out not yet due): the Head block it ran at and
+    /// when the next may run. The next waits for a new Head or
+    /// [`READ_RETRY`], not the next message.
+    /// One per [`Read`] purpose, so one path's reads never starve another's.
+    read_gate: [Option<(u64, tokio::time::Instant)>; 3],
+    /// The cancel is confirmed (its event, or a read at the confirmed
+    /// head): only then does it close out. A depth-0 read may be reorged.
+    cancel_confirmed: bool,
+    /// The Head block of the last confirmed-head read of a cancel.
+    cancel_confirm_block: Option<u64>,
+    /// A cycle posted and failed: retries are proof-first until our own
+    /// landing (a peer's landing lowers `failed_cycles`, not this).
+    proof_first_until_landing: bool,
+    /// Why the last landing-time read left the record stale.
+    stale_why: String,
     /// A transition landed since `last_vote_at` was last read from the chain;
     /// the grace end may have moved, so nothing closes on it until re-read.
     vote_at_stale: bool,
@@ -768,6 +925,46 @@ struct Actor {
     /// Set when a settlement met a pause the events have not shown yet: no
     /// seal before this instant or the next status event.
     pause_hold: Option<tokio::time::Instant>,
+    /// L1-blob mode: consecutive cycles that posted blobs but did not land.
+    /// Our landing resets it, a synced one takes one off; both end the
+    /// pause. In memory only, so a restart resets it too.
+    failed_cycles: u32,
+    /// No seal before this instant after [`FAILED_CYCLES_BEFORE_PAUSE`]
+    /// failed cycles.
+    failed_pause: Option<tokio::time::Instant>,
+    /// A `DurationChanged` since the last head. An END emits it before its
+    /// `StatusChanged`, at a time no head shows yet: no seal until a head
+    /// does, so the budget never sees the new end with a stale clock.
+    end_moved: bool,
+    /// Bisection of a batch the prover failed for good; `None` otherwise.
+    bisect: Option<Bisect>,
+    /// Single-vote batches the prover failed and the actor errored since our
+    /// last landing; at [`ISOLATED_BEFORE_HOLD`] it sets `prover_hold`. Only
+    /// our own landing (or a restart) clears both: another sequencer's says
+    /// nothing about our prover.
+    isolated: u32,
+    /// The prover fails every input: retry full batches, error nothing.
+    /// Holds the prover's latest reason, which the close reason names.
+    prover_hold: Option<String>,
+    /// The last node-side check failure that held votes pending, named in
+    /// their close reason. Our landing clears it.
+    held_reason: Option<String>,
+    /// The chain left our log at transition `.0`: it sits at that
+    /// transition's old root, or forked from it (since `.1`). If that holds
+    /// for [`LANDED_EVENT_WAIT`], a reorg took transitions we committed and
+    /// the process is rebuilt from the chain.
+    diverged: Option<(u64, tokio::time::Instant)>,
+    /// The state must be reopened at its committed record (a rebuild whose
+    /// genesis write failed, a tree reset that failed): retried before
+    /// anything touches the state.
+    state_lost: bool,
+    /// A rebuild kept votes Settled that its replay may not bring back:
+    /// check them once the replay converges (`Db::rebuild_check`).
+    rebuild_check: bool,
+    /// Test hook: the next `prepare` reports a refresh overflow.
+    force_overflow: bool,
+    /// Test hook: the next prepared batch trips the blob-cap belt.
+    force_belt: bool,
     tx: mpsc::Sender<Msg>,
 }
 
@@ -777,7 +974,7 @@ pub fn seal_jitter(rng: &mut impl rand::Rng) -> f64 {
     rng.gen_range(0.9..=1.1)
 }
 
-fn pid31_of(pid: &Fr) -> [u8; 31] {
+pub(crate) fn pid31_of(pid: &Fr) -> [u8; 31] {
     let be = fr_to_be(pid);
     let mut out = [0u8; 31];
     out.copy_from_slice(&be[1..]);
@@ -801,36 +998,45 @@ fn cpu<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Opens the process state: reopen from the persisted committed record, or
-/// create at genesis (persisting the record first, so a crash between the
-/// two is recoverable either way).
+/// Opens the process state at the committed record its tree storage holds
+/// (written with the slot store in one batch, so no crash can split them),
+/// or creates it at genesis on the first start.
 fn open_state(
     db: &Db,
     pid: &Fr,
     cfg: &ProcessConfig,
 ) -> Result<ProcessState<crate::storage::ArboStore>, ActorError> {
     let storage = db.arbo_storage(pid).map_err(ierr)?;
-    if let Some(bytes) = db.committed(pid).map_err(ierr)? {
-        let committed = committed_from_json(&bytes).map_err(ActorError::Internal)?;
-        match ProcessState::open(cfg.clone(), storage, &committed) {
-            Ok(s) => return Ok(s),
-            // Crashed after writing the record but before `create`.
-            Err(StateError::Invalid(m)) if m.contains("no process") => {
-                let storage = db.arbo_storage(pid).map_err(ierr)?;
-                return ProcessState::create(cfg.clone(), storage).map_err(ierr);
-            }
-            Err(e) => return Err(ierr(e)),
+    match ProcessState::open_stored(cfg.clone(), storage) {
+        Ok(s) => Ok(s),
+        Err(StateError::Invalid(m)) if m.contains("no process") => {
+            let storage = db.arbo_storage(pid).map_err(ierr)?;
+            ProcessState::create(cfg.clone(), storage).map_err(ierr)
         }
+        Err(e) => Err(ierr(e)),
     }
-    let genesis = Committed {
-        root: genesis_root(cfg).map_err(ierr)?,
-        voters: 0,
-        overwrites: 0,
-        accumulator: Ballot::identity(),
-    };
-    db.put_committed(pid, &committed_to_json(&genesis)?)
-        .map_err(ierr)?;
-    ProcessState::create(cfg.clone(), storage).map_err(ierr)
+}
+
+/// Copies a `getProcess` read over the stored record: every field the
+/// events move, except the pin (`state_root`, moved only by applied
+/// transitions) and the counters, which follow the chain only at the pin.
+/// `last_vote_at` only grows.
+pub(crate) fn merge_onchain(o: &mut OnchainProcess, p: &OnchainProcess) {
+    o.status = p.status;
+    o.duration = p.duration;
+    o.grace = p.grace;
+    o.max_voters = p.max_voters;
+    o.metadata_uri.clone_from(&p.metadata_uri);
+    o.metadata_hash = p.metadata_hash;
+    o.census.root = p.census.root;
+    o.census.uri.clone_from(&p.census.uri);
+    o.dkg = p.dkg;
+    o.results.clone_from(&p.results);
+    o.last_vote_at = o.last_vote_at.max(p.last_vote_at);
+    if p.state_root == o.state_root {
+        o.voters_count = p.voters_count;
+        o.overwritten_count = p.overwritten_count;
+    }
 }
 
 /// Spawns the actor of one process and returns its handle. `chain_time` is
@@ -849,12 +1055,19 @@ pub(crate) fn spawn_actor(
 ) -> Result<ActorHandle, ActorError> {
     let pid = pcfg.process_id;
     let mut state = open_state(&deps.db, &pid, &pcfg)?;
-    if let Some(cap) = cfg.max_blobs_per_tx {
-        state.set_blob_cap(cap).map_err(ierr)?;
-    }
+    state
+        .set_blob_cap(crate::l1da::batch_blob_cap(
+            deps.l1.is_some(),
+            cfg.max_blobs_per_tx,
+        ))
+        .map_err(ierr)?;
     let transitions = deps.db.transitions(&pid).map_err(ierr)?;
     let next_index = transitions.last().map(|t| t.index + 1).unwrap_or(0);
     let last_tx_block = transitions.last().map(|t| t.block).unwrap_or(0);
+    let log_root = match transitions.last() {
+        Some(t) => t.new_root,
+        None => genesis_root(&pcfg).map_err(ierr)?,
+    };
     let (tx, rx) = mpsc::channel(1024);
     let mut actor = Actor {
         pid,
@@ -869,6 +1082,8 @@ pub(crate) fn spawn_actor(
         solo_wait: cfg.solo_wait.as_secs(),
         flush_horizon: cfg.flush_horizon.as_secs(),
         settle_margin: cfg.settle_margin.as_secs(),
+        confirmations: cfg.confirmations,
+        l1_settle_lag: cfg.l1_settle_lag.as_secs(),
         slot_depth: cfg.slot_depth as usize,
         prove_base: cfg.prove_base.as_secs_f64(),
         jitter: None,
@@ -880,6 +1095,15 @@ pub(crate) fn spawn_actor(
         chain_time,
         last_head_block: 0,
         last_tx_block,
+        // Events up to the monitor's cursor reached the previous run.
+        seen_block: deps
+            .db
+            .meta_u64(crate::monitor::LAST_BLOCK_KEY)
+            .map_err(ierr)?
+            .unwrap_or(0)
+            .max(last_tx_block),
+        read_block: 0,
+        log_root,
         in_flight: None,
         generation: 0,
         next_index,
@@ -890,12 +1114,19 @@ pub(crate) fn spawn_actor(
         resync_after: None,
         resync_backoff_ms: 0,
         finalizing: false,
-        finalize_failed: false,
+        results_failures: 0,
         finalize_attempts: 0,
         gate_polls: 0,
         finalize_after: None,
         eager: cfg.eager_results,
         held: None,
+        results_sent: None,
+        confirm_block: None,
+        read_gate: [None; 3],
+        cancel_confirmed: false,
+        cancel_confirm_block: None,
+        proof_first_until_landing: false,
+        stale_why: String::new(),
         // The record may predate the last landing: re-read before closing.
         vote_at_stale: true,
         stale_ticks: 0,
@@ -905,6 +1136,18 @@ pub(crate) fn spawn_actor(
         census_recheck: false,
         census_reverts: ([0u8; 32], 0),
         pause_hold: None,
+        failed_cycles: 0,
+        failed_pause: None,
+        end_moved: false,
+        bisect: None,
+        isolated: 0,
+        prover_hold: None,
+        held_reason: None,
+        diverged: None,
+        state_lost: false,
+        rebuild_check: deps.db.rebuild_check(&pid).map_err(ierr)?,
+        force_overflow: false,
+        force_belt: false,
         tx: tx.clone(),
     };
     actor.recover()?;
@@ -926,13 +1169,9 @@ impl Actor {
             self.exposed = r.slots.iter().copied().collect();
             self.exposed_vids = r.vote_ids.iter().copied().collect();
         }
-        let stale: Vec<u64> = db
-            .votes(&self.pid)
-            .map_err(ierr)?
-            .iter()
-            .filter(|v| matches!(v.status, VoteStatus::Aggregated | VoteStatus::Processed))
-            .map(|v| v.vote_id)
-            .collect();
+        let stale = db
+            .vote_ids_with_status(&self.pid, &[VoteStatus::Aggregated, VoteStatus::Processed])
+            .map_err(ierr)?;
         if !stale.is_empty() {
             db.requeue(&self.pid, &stale).map_err(ierr)?;
         }
@@ -982,6 +1221,9 @@ impl Actor {
 
     async fn run(&mut self, mut rx: mpsc::Receiver<Msg>, shutdown: CancellationToken) {
         loop {
+            // No tree snapshot outlives a message: an idle actor's would pin
+            // every later commit's pages in the shared file.
+            self.state.release_reads();
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 msg = rx.recv() => match msg {
@@ -1031,29 +1273,40 @@ impl Actor {
                     status: self.record.onchain.status,
                     local: self.record.local,
                     accepting: self.accepting(),
-                    synced: c.root == self.record.onchain.state_root,
+                    // Finalized: the final root needs a chain read; the
+                    // events may never have shown the transitions before it.
+                    synced: c.root == self.record.onchain.state_root
+                        && !self.await_sync
+                        && (self.record.local != LocalStatus::Finalized || !self.vote_at_stale),
                 });
             }
-            Msg::Event(ev) => self.on_event(ev).await,
+            Msg::Event(ev) => {
+                self.seen_block = self.seen_block.max(ev.block);
+                self.on_event(ev).await
+            }
             Msg::Head { block, time } => {
                 self.chain_time = time;
                 self.last_head_block = block;
+                self.seen_block = self.seen_block.max(block);
+                self.end_moved = false;
             }
             Msg::JobProved { generation } => {
-                if self
-                    .in_flight
-                    .as_ref()
-                    .is_some_and(|f| f.generation == generation)
+                if let Some(f) = self.in_flight.as_mut()
+                    && f.generation == generation
                 {
-                    let vids = self.in_flight.as_ref().unwrap().prepared.vote_ids.clone();
+                    f.proved = true;
+                    let vids = f.prepared.vote_ids.clone();
                     self.set_status(&vids, VoteStatus::Processed, None);
                 }
             }
             Msg::JobDone {
                 generation,
                 outcome,
-            } => self.on_job_done(generation, outcome).await,
-            Msg::ForceRefreshOverflow => self.refresh_overflow(),
+                posted,
+            } => self.on_job_done(generation, outcome, posted).await,
+            Msg::ForceSealOverflow => self.force_overflow = true,
+            Msg::ForceBlobBelt => self.force_belt = true,
+            Msg::Reread => self.vote_at_stale = true,
             Msg::ResultsHeld {
                 generation,
                 root,
@@ -1062,6 +1315,7 @@ impl Actor {
                 if generation == self.generation {
                     self.finalizing = false;
                     self.finalize_attempts = 0;
+                    self.results_failures = 0;
                     self.held = Some((root, snark));
                 }
             }
@@ -1083,11 +1337,17 @@ impl Actor {
                     self.put_record();
                 }
                 match result {
-                    Ok(()) => self.mark_finalized(),
-                    Err(f) if f.permanent => {
-                        self.finalize_failed = true;
-                        error!(pid = %hex::encode(self.pid31), e = ?f.msg, "finalize failed");
+                    // Commit at the event, like an L1 landing: the receipt
+                    // may be depth 0 and reorg out.
+                    Ok(()) => {
+                        self.finalize_attempts = 0;
+                        self.results_failures = 0;
+                        if self.record.local == LocalStatus::Active {
+                            self.results_sent =
+                                Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+                        }
                     }
+                    Err(f) if f.permanent => self.results_failed(&f.msg),
                     Err(f) if f.gate => {
                         // A Council ceremony opens decryption on its own
                         // schedule, possibly months after the end: back off
@@ -1120,12 +1380,13 @@ impl Actor {
                         debug!(pid = %hex::encode(self.pid31), e = ?f.msg, "waiting for the DKG");
                     }
                     Err(f) => {
-                        // A moved root: drop the held proof and re-read the
-                        // chain, so the retry proves at the root it has.
+                        // A moved root: drop the held proof. Re-read the chain
+                        // on any failure: one that names another root (or none:
+                        // a DKG request off ours) may be a reorg we are past.
                         if f.msg.contains("InvalidStateRoot") {
                             self.held = None;
-                            self.vote_at_stale = true;
                         }
+                        self.vote_at_stale = true;
                         // Transient trouble re-arms after a cooldown.
                         self.finalize_attempts += 1;
                         let secs = (1u64 << self.finalize_attempts.min(6)).min(60);
@@ -1181,7 +1442,7 @@ impl Actor {
             .map(|v| v.slot)
             .collect::<std::collections::HashSet<_>>()
             .len();
-        let due = if self.pending.len() >= self.batch_max {
+        let due = if self.pending.len() >= self.seal_max() {
             now
         } else if distinct < self.min_mix {
             oldest + (self.solo_wait as f64 * 0.9).ceil() as u64
@@ -1189,13 +1450,76 @@ impl Actor {
             oldest + (self.batch_time as f64 * 0.9).ceil() as u64
         };
         let flush_at = self.end_time().saturating_sub(self.flush_horizon);
-        Some(due.min(flush_at))
+        // Paused after failed L1 cycles, or cooling down after a transient
+        // failure: not before the pause ends.
+        let paused = self.failed_pause.max(self.prove_after).map_or(0, |t| {
+            let left = t.saturating_duration_since(tokio::time::Instant::now());
+            now.saturating_add(left.as_secs())
+        });
+        Some(due.min(flush_at).max(paused))
     }
 
+    /// Most votes the next seal takes: `--batch-max`, or less while a
+    /// bisection halves a failing batch. While held nothing can land, so
+    /// only the pending exposed votes ride the cycles: fresh ones would just
+    /// widen the exposed set.
+    fn seal_max(&self) -> usize {
+        let mut max = self.batch_max;
+        if let Some(b) = &self.bisect
+            && self.prover_hold.is_none()
+        {
+            max = max.min(b.cap);
+        }
+        if self.prover_hold.is_some() || self.held_reason.is_some() {
+            let exposed = self
+                .pending
+                .iter()
+                .filter(|v| self.exposed_vids.contains(&v.pkg.vote_id))
+                .count();
+            max = max.min(exposed.max(1));
+        }
+        max
+    }
+
+    /// A vote whose own coverage history no transition can refresh: errored
+    /// to recast (a new vote id is a fresh transition). Only this vote.
+    fn recast_overflow(&mut self, vid: u64) {
+        error!(pid = %hex::encode(self.pid31), "a vote's coverage history is too large to refresh; it must recast");
+        self.set_status(
+            &[vid],
+            VoteStatus::Error,
+            Some("exposed refresh set too large, recast"),
+        );
+        if let Err(e) = self.deps.db.remove_pending(&self.pid, &[vid]) {
+            error!(pid = %hex::encode(self.pid31), %e, "remove_pending");
+        }
+        self.drop_pending(&[vid]);
+    }
+
+    /// While held nothing can land, so only the pending exposed votes ride
+    /// the cycles, picked by membership: a vote skipped by an earlier
+    /// selection must not take an exposed one's place. `None` (the whole
+    /// queue) when not held, or when none is pending (one vote probes).
+    fn held_votes(&self) -> Option<Vec<VerifiedVote>> {
+        if self.prover_hold.is_none() && self.held_reason.is_none() {
+            return None;
+        }
+        let v: Vec<VerifiedVote> = self
+            .pending
+            .iter()
+            .filter(|v| self.exposed_vids.contains(&v.pkg.vote_id))
+            .cloned()
+            .collect();
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// The end check also follows the local clock: a Head can be dropped
+    /// (a full mailbox), and a stale `chain_time` must not keep admission
+    /// open past the end.
     fn accepting(&self) -> bool {
         self.not_closed()
             && self.chain_time >= self.record.onchain.start_time
-            && self.chain_time < self.end_time()
+            && self.chain_time.max(self.deps.clock.now()) < self.end_time()
     }
 
     /// Active, Ready or Paused, and the head time known.
@@ -1324,66 +1648,95 @@ impl Actor {
         Ok(n)
     }
 
-    /// Runs after every message: close out a closed grace window, seal a
-    /// due batch, kick finalization. The monitor's Head messages are the
-    /// heartbeat that drives this.
+    /// Runs after every message: reconcile with the chain (resync), close
+    /// out a closed window, seal a due batch, kick finalization. The
+    /// monitor's Head messages are the heartbeat that drives this.
     async fn tick(&mut self) {
-        // A Finalized (or Ignored) actor is read-only: it serves proofs
-        // from the committed tree and must not resync, seal or finalize.
-        if self.record.local != LocalStatus::Active {
+        // An Ignored actor never runs. A Finalized one never seals or
+        // finalizes, but follows the chain to its final root (resync, then
+        // the close-out of what is left).
+        if self.record.local == LocalStatus::Ignored || !self.reopen_state() {
             return;
+        }
+        // Our results receipt saw no event in time: a chain read decides.
+        let results_due = self
+            .results_sent
+            .is_some_and(|t| tokio::time::Instant::now() >= t);
+        if results_due {
+            self.vote_at_stale = true;
         }
         // Events carry no block time: read the landing time the grace end
         // runs from. Stale until the read shows the tip the events reached.
         // Close-out and results wait on it, so a read that keeps failing
         // (or an endpoint stuck behind the events) is logged and counted.
-        if self.vote_at_stale {
-            let why = match self.deps.contracts.process(&self.pid31).await {
-                Ok(p) => {
-                    let o = &mut self.record.onchain;
-                    if p.last_vote_at > o.last_vote_at {
-                        o.last_vote_at = p.last_vote_at;
-                        self.put_record();
-                    }
-                    self.vote_at_stale = p.state_root != self.record.onchain.state_root;
+        // One try per Head (or READ_RETRY) while it stays stale: a failing
+        // or lagging endpoint is not asked again on every message.
+        if self.vote_at_stale && !self.read_gated(Read::Landing) {
+            self.stale_why = match self.gated_read(Read::Landing).await {
+                Ok((block, _, p)) => {
+                    self.vote_at_stale = !self.apply_read(&p, block);
                     format!(
-                        "chain root 0x{} behind the events",
+                        "chain root 0x{} is not the pinned one",
                         hex::encode(p.state_root)
                     )
                 }
-                Err(e) => e.to_string(),
+                Err(e) => e,
             };
             if self.vote_at_stale {
-                self.stale_ticks += 1;
-                if self.stale_ticks.is_multiple_of(STALE_WARN_TICKS) {
-                    self.metrics.stalled_reads.fetch_add(1, Ordering::SeqCst);
-                    warn!(
-                        pid = %hex::encode(self.pid31),
-                        ticks = self.stale_ticks,
-                        %why,
-                        "cannot read the latest landing time; close-out and results wait"
-                    );
-                }
-            } else {
-                self.stale_ticks = 0;
+                self.gate_reads(Read::Landing);
             }
         }
-        if !self.vote_at_stale && self.chain_time != 0 && self.chain_time >= self.grace_end() {
-            self.close_out("process closed");
+        if self.vote_at_stale {
+            self.stale_ticks += 1;
+            if self.stale_ticks.is_multiple_of(STALE_WARN_TICKS) {
+                self.metrics.stalled_reads.fetch_add(1, Ordering::SeqCst);
+                warn!(
+                    pid = %hex::encode(self.pid31),
+                    ticks = self.stale_ticks,
+                    why = %self.stale_why,
+                    "cannot read the latest landing time; close-out and results wait"
+                );
+            }
+        } else {
+            self.stale_ticks = 0;
+        }
+        if results_due && !self.vote_at_stale {
+            self.results_sent = None;
+            if self.record.local == LocalStatus::Active
+                && self.record.onchain.status != ProcessStatus::Results
+            {
+                warn!(pid = %hex::encode(self.pid31), "results transaction never confirmed; resubmitting");
+            }
+        }
+        self.maybe_rebuild().await;
+        if self.state_lost {
+            return;
         }
         // Landed-but-unconfirmed flight: if the chain never showed our root
         // by the deadline (the tx reorged out), roll back and requeue.
         if self.in_flight.as_ref().is_some_and(|f| {
             f.landed_deadline
                 .is_some_and(|d| tokio::time::Instant::now() >= d)
-        }) && let Some(f) = self.in_flight.take()
+        }) && let Some(mut f) = self.in_flight.take()
         {
-            warn!(
-                pid = %hex::encode(self.pid31),
-                "landed settlement never confirmed; rolling back and requeueing"
-            );
-            self.rollback_flight(&f);
-            self.requeue_flight(f);
+            // L1-blob mode commits every landing at its event: a late page
+            // of events is not a lost settlement while the chain still
+            // shows our root. Keep waiting on it.
+            if self.deps.l1.is_some()
+                && let Ok(p) = self.deps.contracts.process(&self.pid31).await
+                && p.state_root == f.prepared.new_root
+            {
+                debug!(pid = %hex::encode(self.pid31), "settlement on-chain, its event still pending");
+                f.landed_deadline = Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+                self.in_flight = Some(f);
+            } else {
+                warn!(
+                    pid = %hex::encode(self.pid31),
+                    "landed settlement never confirmed; rolling back and requeueing"
+                );
+                self.rollback_flight(&f);
+                self.requeue_flight(f);
+            }
         }
         // A pinned-but-unconfirmed root (commit failure on a shallow
         // receipt): if the chain still does not show it, re-read the real
@@ -1399,32 +1752,543 @@ impl Actor {
             {
                 warn!(pid = %hex::encode(self.pid31), "pinned root never confirmed; re-pinning from chain");
                 self.record.onchain.state_root = p.state_root;
+                self.record.onchain.voters_count = p.voters_count;
+                self.record.onchain.overwritten_count = p.overwritten_count;
                 self.put_record();
             }
+        }
+        // Reconcile before anything closes: a vote a synced transition
+        // settled must never be errored.
+        self.maybe_resync().await;
+        // An unconfirmed cancel is reconciled whether or not votes wait.
+        if self.unconfirmed_cancel() {
+            self.confirm_cancel().await;
+        }
+        self.maybe_close_out().await;
+        self.confirm_results().await;
+        if self.record.local != LocalStatus::Active {
+            return;
         }
         self.maybe_clear_exposed();
         self.maybe_register_census().await;
         self.maybe_recheck_census().await;
-        self.maybe_resync().await;
         self.maybe_seal().await;
         self.maybe_finalize();
     }
 
-    /// Repairs falling behind the chain (lost race, failed blob sync): on
-    /// every heartbeat, if the committed root is not the on-chain root,
-    /// replay the gap, with capped exponential backoff between attempts.
-    /// The target root lives in `record.onchain.state_root` and is never
-    /// dropped on a failed attempt.
+    /// [`Self::fresh_read`] at most once per Head after one that failed or
+    /// settled nothing: a failing or lagging endpoint is not asked again on
+    /// every message.
+    async fn gated_read(&mut self, why: Read) -> Result<(u64, u64, OnchainProcess), String> {
+        if self.read_gated(why) {
+            return Err("waiting for the next head".into());
+        }
+        let r = self.fresh_read().await;
+        if r.is_err() {
+            self.gate_reads(why);
+        }
+        r
+    }
+
+    fn read_gated(&self, why: Read) -> bool {
+        self.read_gate[why as usize].is_some_and(|(block, until)| {
+            block == self.last_head_block && tokio::time::Instant::now() < until
+        })
+    }
+
+    fn gate_reads(&mut self, why: Read) {
+        self.read_gate[why as usize] = Some((
+            self.last_head_block,
+            tokio::time::Instant::now() + READ_RETRY,
+        ));
+    }
+
+    /// The head block and time, and `getProcess` at that head, which has every block
+    /// this actor acted on: a lagging endpoint could rewind what the events
+    /// moved, and pinning the read to the head keeps a backend behind it (a
+    /// load-balanced URL) from answering.
+    async fn fresh_read(&self) -> Result<(u64, u64, OnchainProcess), String> {
+        let (block, time) = self
+            .deps
+            .contracts
+            .head()
+            .await
+            .map_err(|e| e.to_string())?;
+        if block < self.seen_block {
+            return Err(format!(
+                "endpoint head {block} behind block {}",
+                self.seen_block
+            ));
+        }
+        let p = self
+            .deps
+            .contracts
+            .process_at(&self.pid31, block)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((block, time, p))
+    }
+
+    /// Applies a fresh chain read: heals a pin left behind the committed
+    /// tree, latches an unknown chain root, and merges every field the
+    /// events move, with their handlers' side effects (an event lost in the
+    /// mailbox at a crash is never routed again). Whether the read shows the
+    /// pinned root.
+    fn apply_read(&mut self, p: &OnchainProcess, block: u64) -> bool {
+        self.read_block = self.read_block.max(block);
+        let committed = self.state.committed().root;
+        let before = self.record.onchain.clone();
+        let passed = self.passed_index(&p.state_root);
+        // At a root we passed: lag, or a reorg took our later transitions.
+        // Back at our root (or our flight's), the chain came back.
+        match passed {
+            Some(i) => self.diverge(i, true),
+            None if p.state_root == committed
+                || self
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|f| f.prepared.new_root == p.state_root) =>
+            {
+                self.diverged = None
+            }
+            None => {}
+        }
+        // The chain is at our tree's root and the pin is not: the record
+        // write after a commit was lost.
+        if p.state_root == committed && before.state_root != committed {
+            warn!(pid = %hex::encode(self.pid31), "pin behind the committed tree; re-pinning at the chain root");
+            self.record.onchain.state_root = committed;
+        }
+        // Canceled and RESULTS freeze the root: the read's root is the final
+        // target, even when the events never showed the transitions before
+        // it. A root we passed would be a reorg, not a target.
+        if matches!(p.status, ProcessStatus::Canceled | ProcessStatus::Results)
+            && p.state_root != self.record.onchain.state_root
+            && passed.is_none()
+        {
+            info!(pid = %hex::encode(self.pid31), root = %format!("0x{}", hex::encode(p.state_root)), "process closed at a root not reached yet; syncing to it");
+            self.record.onchain.state_root = p.state_root;
+        }
+        let pinned = p.state_root == self.record.onchain.state_root;
+        // A root that is not ours, not one we passed and not our flight's:
+        // the chain went ahead with a transition the events have not shown
+        // (or lost). Sync before sealing on a root that can only revert.
+        if !pinned
+            && p.state_root != committed
+            && !self.await_sync
+            && self
+                .in_flight
+                .as_ref()
+                .is_none_or(|f| f.prepared.new_root != p.state_root)
+            && passed.is_none()
+        {
+            info!(pid = %hex::encode(self.pid31), root = %format!("0x{}", hex::encode(p.state_root)), "chain at an unknown root; syncing before the next seal");
+            self.await_sync = true;
+        }
+        // Finalized, and a fresh read at the head shows no results (nor a
+        // cancel): a reorg took them. Active again, so the results go in
+        // again, or confirm_results finalizes their re-inclusion.
+        let reopened = self.record.local == LocalStatus::Finalized
+            && !matches!(p.status, ProcessStatus::Results | ProcessStatus::Canceled);
+        if reopened {
+            warn!(pid = %hex::encode(self.pid31), status = ?p.status, "results gone from the chain; finalizing again");
+            self.record.local = LocalStatus::Active;
+            self.held = None;
+            self.results_sent = None;
+            self.confirm_block = None;
+            self.cancel_confirmed = false;
+            self.cancel_confirm_block = None;
+        }
+        merge_onchain(&mut self.record.onchain, p);
+        let o = self.record.onchain.clone();
+        if o == before {
+            if reopened {
+                self.put_record();
+            }
+            return pinned;
+        }
+        if o.duration != before.duration {
+            self.end_moved = true;
+        }
+        if o.max_voters != before.max_voters {
+            self.error_new_slots_if_full();
+        }
+        if o.census.root != before.census.root {
+            self.census_moved();
+            // Its event, which queues the download, may be lost.
+            if self.state.config().census_origin == CensusOrigin::MerkleOffchainDynamic
+                && let Ok(root) = fr_from_be(&o.census.root)
+            {
+                self.census
+                    .queue
+                    .queue(self.pid, o.census.uri.clone(), root);
+            }
+        }
+        if o.status != before.status {
+            if o.status == ProcessStatus::Results && self.record.local == LocalStatus::Active {
+                // A read is at the head, depth 0: finalize only once the
+                // confirmed head shows the results (confirm_results).
+                self.pause_hold = None;
+            } else {
+                self.status_moved(o.status);
+            }
+        }
+        self.put_record();
+        pinned
+    }
+
+    /// The index of the transition in our log leaving `root`, a root we
+    /// passed: a chain read showing it lags or lost our later transitions.
+    /// The log's last root counts too while the tree is past it (a landing
+    /// whose record was never written): index `next_index`. A failed read
+    /// counts as not passed.
+    fn passed_index(&self, root: &[u8; 32]) -> Option<u64> {
+        if *root == self.log_root && self.state.committed().root != self.log_root {
+            return Some(self.next_index);
+        }
+        match self.deps.db.transitions(&self.pid) {
+            Ok(ts) => ts.iter().find(|t| t.old_root == *root).map(|t| t.index),
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "transitions read");
+                None
+            }
+        }
+    }
+
+    /// The chain left our log at transition `index`: it sits at that
+    /// transition's old root (`at_root`), or forked from it. A read further
+    /// along our log restarts the wait (the chain is taking it back).
+    fn diverge(&mut self, index: u64, at_root: bool) {
+        let now = tokio::time::Instant::now();
+        self.diverged = match self.diverged {
+            Some((d, _)) if at_root && index > d => Some((index, now)),
+            Some((d, t)) => Some((d.min(index), t)),
+            None => {
+                warn!(pid = %hex::encode(self.pid31), index, at_root, "the chain left our transition log; rebuilding from it unless it comes back");
+                Some((index, now))
+            }
+        };
+    }
+
+    /// The chain left our log for [`LANDED_EVENT_WAIT`]: a fresh read still
+    /// off our root rebuilds the process from the chain.
+    async fn maybe_rebuild(&mut self) {
+        let Some((d, since)) = self.diverged else {
+            return;
+        };
+        if tokio::time::Instant::now() < since + LANDED_EVENT_WAIT {
+            return;
+        }
+        let p = match self.gated_read(Read::Rebuild).await {
+            Ok((_, _, p)) => p,
+            Err(e) => {
+                debug!(pid = %hex::encode(self.pid31), %e, "divergence read; retrying");
+                return;
+            }
+        };
+        if p.state_root == self.state.committed().root
+            || self
+                .in_flight
+                .as_ref()
+                .is_some_and(|f| f.prepared.new_root == p.state_root)
+        {
+            self.diverged = None;
+            return;
+        }
+        let d = match self.passed_index(&p.state_root) {
+            Some(i) if i > d => return self.diverge(i, true),
+            Some(i) => i,
+            None => d,
+        };
+        self.rebuild_from_chain(d, &p);
+        // Failed (storage): wait as long again before the next try.
+        if let Some((d, _)) = self.diverged {
+            self.diverged = Some((d, tokio::time::Instant::now()));
+        }
+    }
+
+    /// Settled votes whose id is not in the tree at `root`: those the
+    /// transitions after it settled. Every past root stays readable (tree
+    /// nodes are never deleted).
+    fn settled_after(&self, root: &[u8; 32]) -> Result<Vec<u64>, String> {
+        let e = |e: &dyn std::fmt::Display| e.to_string();
+        let ids = self
+            .deps
+            .db
+            .vote_ids_with_status(&self.pid, &[VoteStatus::Settled])
+            .map_err(|x| e(&x))?;
+        let storage = self.deps.db.arbo_storage(&self.pid).map_err(|x| e(&x))?;
+        let tree = arbo::Tree::new(storage, davinci_zkvm_sdk::limits::SMT_LEVELS, arbo::Sha256)
+            .map_err(|x| e(&x))?;
+        let mut out = Vec::new();
+        for vid in ids {
+            // The state tree's vote-id key: 8 bytes little-endian.
+            if !tree
+                .gen_proof_at(root, &vid.to_le_bytes())
+                .map_err(|x| e(&x))?
+                .exists
+            {
+                out.push(vid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// A reorg took transitions from index `d` on, which we committed. In
+    /// one write: drop the tree and the log, put the votes those transitions
+    /// settled back in the queue (the close-out errors them after the
+    /// resync if the window closed), pin the chain's root. Then
+    /// re-create the genesis and replay the chain from its blobs.
+    fn rebuild_from_chain(&mut self, d: u64, p: &OnchainProcess) {
+        let pid = hex::encode(self.pid31);
+        let log = match self.deps.db.transitions(&self.pid) {
+            Ok(l) => l,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: transitions read");
+                return;
+            }
+        };
+        // Past the log's end: the tree's unrecorded landing left its last root.
+        let fork = match d == self.next_index {
+            true => Some(self.log_root),
+            false => log.iter().find(|t| t.index == d).map(|t| t.old_root),
+        };
+        let Some(fork) = fork else {
+            error!(%pid, d, "rebuild: no transition at the divergence");
+            self.diverged = None;
+            return;
+        };
+        let genesis = match genesis_root(self.state.config()) {
+            Ok(g) => g,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: genesis root");
+                return;
+            }
+        };
+        // A flight on our root can never land now.
+        if let Some(f) = self.in_flight.take() {
+            self.rollback_flight(&f);
+            self.requeue_flight(f);
+        }
+        let unsettle = match cpu(|| self.settled_after(&fork)) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(%pid, %e, "rebuild: settled votes");
+                return;
+            }
+        };
+        let mut back: Vec<(u64, VerifiedVote)> = Vec::new();
+        for vid in &unsettle {
+            match self.deps.db.vote(&self.pid, *vid) {
+                Ok(Some(sv)) => match unpack_vote(&sv.package) {
+                    Ok(v) => back.push((sv.created_at, v)),
+                    // Pending in storage: recover() errors it at a restart.
+                    Err(e) => warn!(%pid, vid, %e, "unreadable stored vote"),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    error!(%pid, %e, "rebuild: vote read");
+                    return;
+                }
+            }
+        }
+        back.sort_by_key(|(at, _)| *at);
+        // Votes the rebuild keeps Settled (in the tree at the fork root) are
+        // checked once the replay converges. Any requeued vote's reseal
+        // covers every batch that carried it through the coverage history.
+        let keep = log.iter().any(|t| t.index < d);
+        let mut vids = self.exposed_vids.clone();
+        vids.extend(back.iter().map(|(_, v)| v.pkg.vote_id));
+        let exposed = crate::storage::ExposedRecord {
+            slots: self.exposed.iter().copied().collect(),
+            vote_ids: vids.iter().copied().collect(),
+        };
+        // The tree's unrecorded landing is lost too.
+        let lost = log.iter().filter(|t| t.index >= d).count();
+        let depth = lost + usize::from(self.state.committed().root != self.log_root);
+        let mut record = self.record.clone();
+        record.onchain.state_root = p.state_root;
+        record.onchain.voters_count = p.voters_count;
+        record.onchain.overwritten_count = p.overwritten_count;
+        record.note = Some(format!(
+            "rebuilt from the chain: a reorg took {depth} committed transitions"
+        ));
+        let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
+        self.state.release_reads();
+        if let Err(e) = self
+            .deps
+            .db
+            .reset_process(&self.pid, &order, &exposed, keep, &record)
+        {
+            error!(%pid, %e, "rebuild write failed; retrying");
+            return;
+        }
+        error!(
+            %pid,
+            depth,
+            index = d,
+            unsettled = order.len(),
+            root = %format!("0x{}", hex::encode(p.state_root)),
+            "a reorg took transitions we committed; rebuilt the process from the chain"
+        );
+        self.metrics.rebuilds.fetch_add(1, Ordering::SeqCst);
+        self.record = record;
+        self.exposed_vids = vids;
+        for (at, v) in back {
+            self.pending.push(v);
+            self.pending_at.push(at);
+        }
+        self.sort_pending();
+        self.next_index = 0;
+        self.last_tx_block = 0;
+        self.log_root = genesis;
+        self.await_sync = true;
+        self.resync_after = None;
+        self.resync_backoff_ms = 0;
+        self.pin_deadline = None;
+        self.diverged = None;
+        self.cap_est = None;
+        self.held = None;
+        self.vote_at_stale = true;
+        self.rebuild_check = keep;
+        self.state_lost = true;
+        self.reopen_state();
+    }
+
+    /// After a rebuild's replay converged (the tree at the chain's root, the
+    /// log complete): a vote still Settled but not in the tree was kept by
+    /// the rebuild and then lost with its transition. Back to pending (its
+    /// re-seal covers the batches that carried it through the history), and
+    /// the check marker dropped, in one write. Whether the check is done.
+    fn check_kept_settled(&mut self) -> bool {
+        let pid = hex::encode(self.pid31);
+        // A scan of the process's votes and a tree walk per Settled one.
+        let missing: Result<Vec<u64>, String> = cpu(|| {
+            let settled = self
+                .deps
+                .db
+                .vote_ids_with_status(&self.pid, &[VoteStatus::Settled])
+                .map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            for vid in settled {
+                if !self.state.has_vote_id(vid).map_err(|e| e.to_string())? {
+                    out.push(vid);
+                }
+            }
+            Ok(out)
+        });
+        let missing = match missing {
+            Ok(m) => m,
+            Err(e) => {
+                error!(%pid, %e, "settled votes check");
+                return false;
+            }
+        };
+        let mut back: Vec<(u64, VerifiedVote)> = Vec::new();
+        for vid in &missing {
+            match self.deps.db.vote(&self.pid, *vid) {
+                Ok(Some(sv)) => match unpack_vote(&sv.package) {
+                    Ok(v) => back.push((sv.created_at, v)),
+                    // Pending in storage: recover() errors it at a restart.
+                    Err(e) => warn!(%pid, vid, %e, "unreadable stored vote"),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    error!(%pid, %e, "vote read");
+                    return false;
+                }
+            }
+        }
+        back.sort_by_key(|(at, _)| *at);
+        let order: Vec<u64> = back.iter().map(|(_, v)| v.pkg.vote_id).collect();
+        if let Err(e) = self.deps.db.finish_rebuild_check(&self.pid, &order) {
+            error!(%pid, %e, "rebuild check write");
+            return false;
+        }
+        if !order.is_empty() {
+            warn!(%pid, votes = order.len(), "votes the rebuild kept settled are gone from the chain; re-sealing them");
+            for (at, v) in back {
+                self.pending.push(v);
+                self.pending_at.push(at);
+            }
+            self.sort_pending();
+        }
+        self.rebuild_check = false;
+        true
+    }
+
+    /// Reopens the state at its committed record (re-creating the genesis a
+    /// rebuild left to do); false while that fails.
+    fn reopen_state(&mut self) -> bool {
+        if !self.state_lost {
+            return true;
+        }
+        let cfg = self.state.config().clone();
+        let cap = self.state.blob_cap();
+        match open_state(&self.deps.db, &self.pid, &cfg)
+            .and_then(|mut s| s.set_blob_cap(cap).map(|()| s).map_err(ierr))
+        {
+            Ok(s) => {
+                self.state = s;
+                self.state_lost = false;
+                // Events may have been dropped meanwhile: re-read the chain.
+                self.vote_at_stale = true;
+                true
+            }
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "re-creating the rebuilt process failed; retrying");
+                false
+            }
+        }
+    }
+
+    /// Repairs falling behind the chain (lost race, failed blob sync, a lost
+    /// transition record): on every heartbeat, if the committed root is not
+    /// the on-chain root or the log is behind the tree, replay the gap, with
+    /// capped exponential backoff between attempts. The target root lives in
+    /// `record.onchain.state_root` and is never dropped on a failed attempt.
     async fn maybe_resync(&mut self) {
-        let behind =
-            |a: &Self| a.await_sync || a.state.committed().root != a.record.onchain.state_root;
+        let behind = |a: &Self| {
+            let root = a.state.committed().root;
+            a.await_sync || root != a.record.onchain.state_root || a.log_root != root
+        };
         if !behind(self) {
+            // Converged after a rebuild: check the votes it kept Settled,
+            // once; a failed check retries under the resync backoff.
+            if self.rebuild_check && self.diverged.is_none() {
+                // A failed check waits out its backoff, which only a
+                // successful one resets.
+                if self
+                    .resync_after
+                    .is_some_and(|t| tokio::time::Instant::now() < t)
+                {
+                    return;
+                }
+                if !self.check_kept_settled() {
+                    let ms = (self.resync_backoff_ms * 2).clamp(100, 60_000);
+                    self.resync_backoff_ms = ms;
+                    self.resync_after =
+                        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
+                    return;
+                }
+            }
             self.resync_after = None;
             self.resync_backoff_ms = 0;
             return;
         }
         if self.in_flight.is_some() {
-            return; // an own settlement or its event will resolve first
+            if self.record.local != LocalStatus::Finalized {
+                return; // an own settlement or its event will resolve first
+            }
+            // Past RESULTS a flight can only revert: drop it so the tree can
+            // follow the chain (its votes settle from the sync or close).
+            if let Some(f) = self.in_flight.take() {
+                self.rollback_flight(&f);
+                self.requeue_flight(f);
+            }
+            if self.state_lost {
+                return;
+            }
         }
         if let Some(t) = self.resync_after
             && tokio::time::Instant::now() < t
@@ -1444,6 +2308,10 @@ impl Actor {
             self.await_sync = false;
         }
         if behind(self) {
+            // Re-read the chain too: the target may be gone (a pinned
+            // transition reorged out before it applied), which only a read
+            // shows and heals.
+            self.vote_at_stale = true;
             let ms = (self.resync_backoff_ms * 2).clamp(100, 60_000);
             self.resync_backoff_ms = ms;
             self.resync_after =
@@ -1454,8 +2322,135 @@ impl Actor {
         }
     }
 
+    /// Results a head read showed (not yet an event): finalize once the
+    /// confirmed head shows them too. Until then the results deadline is
+    /// armed, so a reorg that drops them is re-read and resubmitted.
+    async fn confirm_results(&mut self) {
+        if self.record.local != LocalStatus::Active
+            || self.record.onchain.status != ProcessStatus::Results
+        {
+            return;
+        }
+        if self.results_sent.is_none() {
+            self.results_sent = Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+        }
+        // The confirmed head moves only with a Head: one try per Head block.
+        if self.confirm_block == Some(self.last_head_block) {
+            return;
+        }
+        self.confirm_block = Some(self.last_head_block);
+        let confirmed = match self.deps.contracts.confirmed_head(self.confirmations).await {
+            Ok(block) => self.deps.contracts.process_at(&self.pid31, block).await,
+            Err(e) => Err(e),
+        };
+        match confirmed {
+            Ok(p) if p.status == ProcessStatus::Results => self.mark_finalized(),
+            Ok(_) => {}
+            Err(e) => debug!(pid = %hex::encode(self.pid31), %e, "results confirmation read"),
+        }
+    }
+
+    /// A cancel seen only in a head read (depth 0) closes out once the
+    /// confirmed head shows it too; one try per Head block.
+    async fn confirm_cancel(&mut self) -> bool {
+        if self.cancel_confirmed {
+            return true;
+        }
+        if self.cancel_confirm_block == Some(self.last_head_block) {
+            return false;
+        }
+        self.cancel_confirm_block = Some(self.last_head_block);
+        let confirmed = match self.deps.contracts.confirmed_head(self.confirmations).await {
+            Ok(block) => self.deps.contracts.process_at(&self.pid31, block).await,
+            Err(e) => Err(e),
+        };
+        match confirmed {
+            Ok(p) if p.status == ProcessStatus::Canceled => self.cancel_confirmed = true,
+            // Not (yet) confirmed: its block may have been reorged out. A
+            // fresh head read (paced by the landing gate) merges the truth;
+            // the older confirmed snapshot is not merged.
+            Ok(_) => self.vote_at_stale = true,
+            Err(e) => debug!(pid = %hex::encode(self.pid31), %e, "cancel confirmation read"),
+        }
+        self.cancel_confirmed
+    }
+
+    /// The record says Canceled, from a read the confirmed head has not
+    /// shown yet.
+    fn unconfirmed_cancel(&self) -> bool {
+        self.record.onchain.status == ProcessStatus::Canceled && !self.cancel_confirmed
+    }
+
+    /// A cancel or the results closed the process for good: no grace end
+    /// to wait for.
+    fn close_requested(&self) -> bool {
+        self.record.local == LocalStatus::Finalized
+            || matches!(
+                self.record.onchain.status,
+                ProcessStatus::Canceled | ProcessStatus::Results
+            )
+    }
+
+    /// Errors the pending votes once the chain closed the window: nothing in
+    /// flight, the tree at the pinned root, and a fresh read (head first,
+    /// then the process) at that root with the head past its grace end, or
+    /// the process canceled or with results. A landing in a block up to the
+    /// head is in the read; a later one is past the grace end, which the
+    /// registry refuses. Anything else waits for the next heartbeat.
+    async fn maybe_close_out(&mut self) {
+        let committed = self.state.committed().root;
+        if self.pending.is_empty()
+            || self.in_flight.is_some()
+            || self.await_sync
+            || committed != self.record.onchain.state_root
+            || !(self.close_requested()
+                || (self.chain_time != 0 && self.chain_time >= self.grace_end()))
+        {
+            return;
+        }
+        let grace_passed = self.chain_time != 0 && self.chain_time >= self.grace_end();
+        if self.unconfirmed_cancel() && !grace_passed {
+            return;
+        }
+        let (block, time, p) = match self.gated_read(Read::CloseOut).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(pid = %hex::encode(self.pid31), %e, "close-out read; retrying");
+                return;
+            }
+        };
+        // Not closing on this read: the next one waits for a new Head.
+        self.gate_reads(Read::CloseOut);
+        // The read is also the refresh: a moved grace end, status or root
+        // lands in the record (and latches a sync) before the decision.
+        self.vote_at_stale = !self.apply_read(&p, block);
+        // The refreshed record decides: a cancel this read brought in closes
+        // nothing until confirmed.
+        let requested = self.close_requested() && !self.unconfirmed_cancel();
+        if p.state_root != committed
+            || self.await_sync
+            || committed != self.record.onchain.state_root
+            || !(requested || time >= p.grace_end(self.deps.grace.grace_max_total))
+        {
+            return;
+        }
+        self.settle_pending_in_tree();
+        let reason = self.closed_reason();
+        self.close_out(&reason);
+    }
+
+    /// The close reason of a pending vote: held votes name why (a node-side
+    /// check, else the prover's reason under a hold).
+    fn closed_reason(&self) -> String {
+        match self.held_reason.as_ref().or(self.prover_hold.as_ref()) {
+            Some(m) => format!("process closed (held: {m})"),
+            None => "process closed".into(),
+        }
+    }
+
     /// Errors out every pending vote; they can never settle now.
     fn close_out(&mut self, reason: &str) {
+        self.bisect = None;
         if self.pending.is_empty() {
             return;
         }
@@ -1500,7 +2495,7 @@ impl Actor {
 
     /// Smallest selection that could fill a transaction, taking every vote
     /// as an overwrite and the whole exposed set as live. A shorter queue
-    /// can never trip the blob cap, so its trial is skipped. In memory only.
+    /// can never trip the blob cap, so its selection is skipped. In memory only.
     fn capacity_estimate(&mut self) -> usize {
         let key = (self.state.occupied(), self.exposed.len());
         if let Some((k, n)) = self.cap_est
@@ -1528,12 +2523,21 @@ impl Actor {
         if self.in_flight.is_some()
             || self.finalizing
             || self.await_sync
+            || self.end_moved
             || self.pending.is_empty()
             || self.record.local != LocalStatus::Active
             || self.deps.contracts.signer().is_none()
+            // The chain left our log: our root may never land.
+            || self.diverged.is_some()
+            // Votes a rebuild kept Settled are not checked yet: one gone
+            // from the chain goes back to pending first.
+            || self.rebuild_check
             // Never seal off a stale root: wait until the committed tree
             // matches the pinned on-chain root (resync closes the gap).
             || self.state.committed().root != self.record.onchain.state_root
+            // Nor before the log has the tree's last transition: the next
+            // landing would take its index and it would never be recorded.
+            || self.log_root != self.state.committed().root
         {
             return;
         }
@@ -1546,9 +2550,9 @@ impl Actor {
             ProcessStatus::Paused if self.chain_time >= self.end_time() => {}
             _ => return,
         }
-        // Cooling down after transient prover/RPC trouble, or holding for
-        // a pause the events have not shown yet?
-        if let Some(t) = self.prove_after.max(self.pause_hold)
+        // Cooling down after transient prover/RPC trouble, holding for a
+        // pause the events have not shown yet, or after failed L1 cycles?
+        if let Some(t) = self.prove_after.max(self.pause_hold).max(self.failed_pause)
             && tokio::time::Instant::now() < t
         {
             return;
@@ -1558,7 +2562,7 @@ impl Actor {
         if self.chain_time < self.record.onchain.start_time {
             return;
         }
-        // Triggers. The trial selection reads storage, so it runs only when
+        // Triggers. The selection reads storage, so it runs only when
         // a trigger can fire: the queue could fill a transaction, a
         // deadline passed, or flush mode.
         let j = *self.jitter.get_or_insert_with(|| seal_jitter(&mut OsRng));
@@ -1570,7 +2574,7 @@ impl Actor {
             as f64;
         let timer_due = age >= self.batch_time as f64 * j;
         let solo_due = age >= self.solo_wait as f64 * j;
-        let at_max = self.pending.len() >= self.batch_max;
+        let at_max = self.pending.len() >= self.seal_max();
         if !(at_max || timer_due || flush || self.pending.len() >= self.capacity_estimate()) {
             return;
         }
@@ -1578,6 +2582,8 @@ impl Actor {
         if self.pending.is_empty() {
             return;
         }
+        // Without the votes that just settled.
+        let at_max = self.pending.len() >= self.seal_max();
         // The batch census root (guest register 20), by origin.
         let Some(census_root) = self.batch_census_root() else {
             return;
@@ -1586,99 +2592,163 @@ impl Actor {
             self.state.set_census_root(census_root);
         }
         let max_voters = self.record.onchain.max_voters;
-        let (k, reason) =
-            match self
-                .state
-                .select_batch(&self.pending, max_voters, &self.exposed, usize::MAX)
-            {
-                Ok((refs, blocked)) => {
-                    let k = refs.len();
-                    // Company is the trial size (distinct admissible slots),
-                    // not the queue length.
-                    let seal = k >= 1
-                        && (blocked
-                            || at_max
-                            || (k >= self.min_mix && timer_due)
-                            || (k < self.min_mix && solo_due)
-                            || flush);
-                    if !seal {
-                        return;
-                    }
-                    // Several can hold at once; log the dominant one.
-                    let reason = if flush {
-                        "flush"
-                    } else if at_max {
-                        "at_max"
-                    } else if blocked {
-                        "blocked"
-                    } else if k >= self.min_mix {
-                        "timer"
-                    } else {
-                        "solo"
-                    };
-                    debug!(
-                        pid = %hex::encode(self.pid31),
-                        k,
-                        queued = self.pending.len(),
-                        reason = %reason,
-                        age,
-                        "seal attempt"
-                    );
-                    (k, reason)
-                }
-                Err(StateError::RefreshOverflow { .. }) => {
-                    self.refresh_overflow();
-                    return;
-                }
+        let held = self.held_votes();
+        // Each candidate's coverage history, read once for this attempt: a
+        // vote is charged the histories of the votes its batch carries,
+        // never those of votes left out.
+        let cov = {
+            let cands = held.as_deref().unwrap_or(&self.pending);
+            let ids: Vec<u64> = cands.iter().map(|v| v.pkg.vote_id).collect();
+            // One index scan per candidate: off the async worker.
+            match cpu(|| self.deps.db.coverage(&self.pid, &ids)) {
+                Ok(c) => c,
                 Err(e) => {
-                    error!(pid = %hex::encode(self.pid31), %e, "select_batch");
+                    let secs = self.prove_backoff();
+                    error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "coverage history read");
                     return;
                 }
-            };
+            }
+        };
+        let none = BTreeSet::new();
         // Time budget: the largest batch whose estimated proof plus the
         // landing margin ends before the window closes. While open, the
         // earliest legal close is an END now under a grace lowered to the
         // floor; past the end neither is possible and the grace end binds.
+        // `Ended` is past the end even before a head shows the END block's
+        // time (a shortened end stays `Ready` until it).
         let nf = self.state.config().ballot_mode.num_fields;
         let now = self.chain_time.max(self.deps.clock.now());
         let mut deadline = self.grace_end();
-        if self.chain_time < self.end_time() {
+        if self.chain_time < self.end_time() && self.record.onchain.status != ProcessStatus::Ended {
             deadline = deadline.min(now.saturating_add(self.deps.grace.grace_floor));
         }
-        let left = deadline as f64 - now as f64 - self.prove_base - self.settle_margin as f64;
-        let n_max = (left / self.metrics.prove.spv(nf)).floor();
-        if n_max < 1.0 {
-            return; // nothing fits; the window closes on these votes
-        }
-        let cap = k
-            .min(self.batch_max)
-            .min(n_max.min(MAX_BATCH_SIZE as f64) as usize);
-        // Selection and seal-time re-proof. prepare must only ever see a
-        // set select_batch sized: shedding a vote after sizing can put an
-        // overwritten exposed slot back into the must-include refreshes
-        // unaccounted. So the batch_max and budget caps go into the
-        // selection, and a re-proof drop re-runs it over what is left.
-        let selected: Vec<VerifiedVote> = loop {
-            let sized: Vec<VerifiedVote> =
-                match self
-                    .state
-                    .select_batch(&self.pending, max_voters, &self.exposed, cap)
-                {
-                    Ok((refs, _)) => refs.into_iter().cloned().collect(),
-                    Err(StateError::RefreshOverflow { .. }) => {
-                        self.refresh_overflow();
-                        return;
+        let window = deadline.saturating_sub(now);
+        let spv = self.metrics.prove.spv(nf);
+        // L1-blob mode posts a batch in chunks of `l1.chunk` blobs. The leg
+        // normally runs during the proof and must fit the window on its
+        // own. While bisecting or holding, and after any cycle that posted
+        // and failed (until our next landing), the job is proof-first: a
+        // flaky prover spends no post per cycle, the leg follows the proof
+        // and each chunk takes proof time.
+        let proof_first = self.deps.l1.is_some()
+            && (self.bisect.is_some()
+                || self.prover_hold.is_some()
+                || self.proof_first_until_landing);
+        let chunk = self.deps.l1.as_ref().map(|l1| l1.chunk);
+        let blob_cap = self.state.blob_cap();
+        let max_chunks = chunk.map_or(1, |c| blob_cap.div_ceil(c.max(1)));
+        let seal_max = self.seal_max();
+        // (cap, max_blobs) for a batch posted in `chunks` chunks; `None`:
+        // no batch fits (nor does one of more chunks).
+        let budget = |chunks: usize| -> Option<(usize, usize)> {
+            let extra = crate::l1da::POST_TIME.saturating_mul(chunks as u64 - 1);
+            let leg = self.l1_settle_lag.saturating_add(extra);
+            let serial = match chunk {
+                None => 0,
+                Some(_) if proof_first => leg,
+                Some(_) => {
+                    if window < leg.saturating_add(self.settle_margin) {
+                        return None;
                     }
-                    Err(e) => {
-                        error!(pid = %hex::encode(self.pid31), %e, "select_batch");
-                        return;
-                    }
-                };
-            if sized.is_empty() {
+                    0
+                }
+            };
+            let left = window as f64 - self.prove_base - self.settle_margin as f64 - serial as f64;
+            let n_max = (left / spv).floor();
+            if n_max < 1.0 {
+                return None;
+            }
+            let cap = seal_max
+                .min(n_max.min(MAX_BATCH_SIZE as f64) as usize)
+                .max(1);
+            Some((cap, chunk.map_or(blob_cap, |c| (chunks * c).min(blob_cap))))
+        };
+        // One selection per feasible chunk count: the largest batch wins,
+        // the fewest chunks on a tie. A vote is charged only the histories
+        // its batch carries, and a vote that does not fit is skipped, so a
+        // vote no budget can carry holds up nothing else.
+        let chosen = cpu(|| {
+            choose_chunks(
+                max_chunks,
+                |chunks| {
+                    let (cap, max_blobs) = budget(chunks)?;
+                    Some(
+                        self.state
+                            .select_covered(
+                                held.as_deref().unwrap_or(&self.pending),
+                                max_voters,
+                                &none,
+                                &cov,
+                                cap,
+                                max_blobs,
+                            )
+                            .map(|sel| (cap, max_blobs, sel)),
+                    )
+                },
+                |(cap, _, sel)| (sel.votes.len(), sel.full && sel.votes.len() == *cap),
+            )
+        });
+        let (cap, max_blobs, k, full, mut sized) = match chosen {
+            Ok(Some((_, (cap, max_blobs, sel)))) => (
+                cap,
+                max_blobs,
+                sel.votes.len(),
+                sel.full,
+                sel.votes
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<VerifiedVote>>(),
+            ),
+            Ok(None) => {
+                debug!(pid = %hex::encode(self.pid31), window, "no batch fits before the window closes");
+                return; // the window closes on these votes
+            }
+            // This vote's own history fits no transition: it recasts.
+            Err(StateError::CoverageOverflow { vote_id, .. }) => {
+                self.recast_overflow(vote_id);
                 return;
             }
-            // Seal-time re-proof at the batch root (origins 2/3): changed
-            // voters are errored, the rest carry fresh witnesses.
+            Err(e) => {
+                let secs = self.prove_backoff();
+                error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "select_batch; votes stay pending");
+                return;
+            }
+        };
+        // Company is the batch size (distinct admissible slots), not the
+        // queue length. A vote kept out by its own history does not make
+        // the batch full: it waits for the timer.
+        let seal = k >= 1
+            && (full
+                || at_max
+                || (k >= self.min_mix && timer_due)
+                || (k < self.min_mix && solo_due)
+                || flush);
+        if !seal {
+            return;
+        }
+        // Several can hold at once; log the dominant one.
+        let reason = if flush {
+            "flush"
+        } else if at_max {
+            "at_max"
+        } else if full {
+            "full"
+        } else if k >= self.min_mix {
+            "timer"
+        } else {
+            "solo"
+        };
+        debug!(
+            pid = %hex::encode(self.pid31),
+            k,
+            queued = self.pending.len(),
+            reason = %reason,
+            age,
+            "seal attempt"
+        );
+        // Seal-time re-proof (origins 2/3) under the chosen budget: changed
+        // voters are errored, and what is left is selected again.
+        let selected: Vec<VerifiedVote> = loop {
             let n_sized = sized.len();
             let Some(keep) = self.reproof(census_root, sized).await else {
                 return; // census layer trouble; retry next tick
@@ -1686,40 +2756,78 @@ impl Actor {
             if keep.len() == n_sized {
                 break keep; // nothing dropped, sizing holds
             }
-        };
-        let vids: Vec<u64> = selected.iter().map(|v| v.pkg.vote_id).collect();
-        let prepared = match cpu(|| self.state.prepare(&selected, &mut OsRng, &self.exposed)) {
-            Ok(p) => p,
-            Err(StateError::RefreshOverflow { .. }) => {
-                self.refresh_overflow();
+            let now_held = self.held_votes();
+            // The re-proof errored the last held vote: the queue is not the
+            // set the coverage was read for. The next tick reads it afresh.
+            if now_held.is_some() != held.is_some() {
+                debug!(pid = %hex::encode(self.pid31), "the held votes are gone; reselecting next tick");
                 return;
             }
-            Err(e) => {
-                error!(pid = %hex::encode(self.pid31), %e, "prepare failed");
-                self.set_status(&vids, VoteStatus::Error, Some(&format!("prepare: {e}")));
-                if let Err(e) = self.deps.db.remove_pending(&self.pid, &vids) {
-                    error!(pid = %hex::encode(self.pid31), %e, "remove_pending");
+            let cands = now_held.as_deref().unwrap_or(&self.pending);
+            debug_assert!(cands.iter().all(|v| cov.covers(v.pkg.vote_id)));
+            sized = match cpu(|| {
+                self.state
+                    .select_covered(cands, max_voters, &none, &cov, cap, max_blobs)
+            }) {
+                Ok(sel) if !sel.votes.is_empty() => sel.votes.into_iter().cloned().collect(),
+                Ok(_) => return,
+                // Unreachable after the passes; never errors votes.
+                Err(e) => {
+                    let secs = self.prove_backoff();
+                    error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "select_batch; votes stay pending");
+                    return;
                 }
-                self.drop_pending(&vids);
+            };
+        };
+        let vids: Vec<u64> = selected.iter().map(|v| v.pkg.vote_id).collect();
+        // Exactly what these votes' seal must refresh: the cover the
+        // selection sized.
+        let must = cov.union(&vids);
+        let prepared = if std::mem::take(&mut self.force_overflow) {
+            Err(StateError::RefreshOverflow {
+                exposed: must.len(),
+                votes: selected.len(),
+            })
+        } else {
+            cpu(|| self.state.prepare(&selected, &mut OsRng, &must))
+        };
+        let prepared = match prepared {
+            Ok(p) => p,
+            // select_batch sized the batch, so this is a node fault (a tree
+            // write; a refresh overflow is unreachable): the votes stay
+            // pending, never errored here, and the grace end closes them if
+            // it never clears.
+            Err(e) => {
+                let secs = self.prove_backoff();
+                error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "prepare failed; votes stay pending");
+                // prepare's own reset of the root is best-effort. If ours
+                // fails too, reopen at the committed record before any more
+                // state work.
+                if let Err(e) = self.state.reset_to_committed() {
+                    error!(pid = %hex::encode(self.pid31), %e, "tree reset after a failed prepare; reopening");
+                    self.state_lost = true;
+                }
                 return;
             }
         };
         // Belt: select_batch sized the batch for the cap, so this never
         // fires; a batch above it could never land.
-        if prepared.blobs.blobs.len() > self.state.blob_cap() {
+        if prepared.blobs.blobs.len() > max_blobs || std::mem::take(&mut self.force_belt) {
+            let secs = self.prove_backoff();
             error!(
                 pid = %hex::encode(self.pid31),
                 blobs = prepared.blobs.blobs.len(),
-                cap = self.state.blob_cap(),
+                cap = max_blobs,
+                retry_in = secs,
                 "prepared batch exceeds the blob cap; not sealing"
             );
-            if let Err(e) = self.state.rollback(&prepared) {
-                error!(pid = %hex::encode(self.pid31), %e, "rollback");
-            }
+            self.rollback_prepared(&prepared);
             return;
         }
-        // Persist the widened exposed set before the batch can reach
-        // the chain — a re-seal after a lost race must cover these slots.
+        // One commit before the batch can reach the chain: the votes go
+        // aggregated, the widened exposed set is stored, and the batch joins
+        // the coverage history (a reseal of any of its votes refreshes its
+        // slots, whatever happens to this batch).
         let mut slots = self.exposed.clone();
         slots.extend(prepared.updated_slots());
         let mut evids = self.exposed_vids.clone();
@@ -1728,22 +2836,22 @@ impl Actor {
             slots: slots.iter().copied().collect(),
             vote_ids: evids.iter().copied().collect(),
         };
-        if let Err(e) = self.deps.db.put_exposed(&self.pid, &rec) {
-            error!(pid = %hex::encode(self.pid31), %e, "persist exposed set");
-            if let Err(e) = self.state.rollback(&prepared) {
-                error!(pid = %hex::encode(self.pid31), %e, "rollback");
-            }
+        let entry = crate::storage::ExposedRecord {
+            slots: prepared.updated_slots(),
+            vote_ids: vids.clone(),
+        };
+        if let Err(e) =
+            self.deps
+                .db
+                .seal_batch_covered(&self.pid, &vids, &rec, &prepared.new_root, &entry)
+        {
+            let secs = self.prove_backoff();
+            error!(pid = %hex::encode(self.pid31), %e, retry_in = secs, "seal_batch");
+            self.rollback_prepared(&prepared);
             return;
         }
         self.exposed = slots;
         self.exposed_vids = evids;
-        if let Err(e) = self.deps.db.seal_batch(&self.pid, &vids) {
-            error!(pid = %hex::encode(self.pid31), %e, "seal_batch");
-            if let Err(e) = self.state.rollback(&prepared) {
-                error!(pid = %hex::encode(self.pid31), %e, "rollback");
-            }
-            return;
-        }
         let at: std::collections::HashMap<u64, u64> = self
             .pending
             .iter()
@@ -1764,10 +2872,13 @@ impl Actor {
             reason = %reason,
             "batch sealed"
         );
+        let cancel = CancellationToken::new();
+        // The grace end known now; it only moves later.
+        let left = std::time::Duration::from_secs(self.grace_end().saturating_sub(now));
         let job = JobInput {
             generation: self.generation,
             pid31: self.pid31,
-            request: prepared.request.clone(),
+            request: Arc::clone(&prepared.request),
             expected: prepared.expected,
             blobs: prepared.blobs.clone(),
             prover: self.deps.prover.clone(),
@@ -1778,6 +2889,11 @@ impl Actor {
             nf,
             n: vids.len(),
             prove_base: self.prove_base,
+            l1: self.deps.l1.clone(),
+            proof_first,
+            deadline: tokio::time::Instant::now() + left.min(L1_JOB_CAP),
+            cancel: cancel.clone(),
+            posted: Default::default(),
         };
         self.in_flight = Some(Flight {
             generation: self.generation,
@@ -1785,6 +2901,8 @@ impl Actor {
             votes: selected,
             votes_at,
             landed_deadline: None,
+            proved: false,
+            _abort: cancel.drop_guard(),
         });
         tokio::spawn(run_job(job));
     }
@@ -1965,43 +3083,6 @@ impl Actor {
         self.drop_pending(&changed);
     }
 
-    /// Refresh overflow: the exposed set no longer fits any transition. Error the
-    /// still-pending votes it records, clear it, log counts only (slot
-    /// ids stay secret).
-    fn refresh_overflow(&mut self) {
-        // No flight exists here (maybe_seal gates on it), so recorded
-        // vote ids are pending or already final.
-        let vids: Vec<u64> = self
-            .pending
-            .iter()
-            .map(|v| v.pkg.vote_id)
-            .filter(|vid| self.exposed_vids.contains(vid))
-            .collect();
-        if !vids.is_empty() {
-            self.set_status(
-                &vids,
-                VoteStatus::Error,
-                Some("exposed refresh set too large, recast"),
-            );
-            if let Err(e) = self.deps.db.remove_pending(&self.pid, &vids) {
-                error!(pid = %hex::encode(self.pid31), %e, "remove_pending");
-            }
-            self.drop_pending(&vids);
-        }
-        if let Err(e) = self.deps.db.clear_exposed(&self.pid) {
-            error!(pid = %hex::encode(self.pid31), %e, "clear exposed set");
-            return; // keep the in-memory set; retried on the next seal
-        }
-        error!(
-            pid = %hex::encode(self.pid31),
-            slots = self.exposed.len(),
-            votes = vids.len(),
-            "exposed refresh set too large; cleared, its votes must recast"
-        );
-        self.exposed.clear();
-        self.exposed_vids.clear();
-    }
-
     /// Drops the exposed set once every recorded vote is settled or
     /// errored — no later re-seal needs to cover those slots any more.
     /// An errored exposed vote recast later is a fresh transition, like any
@@ -2023,6 +3104,7 @@ impl Actor {
                 }
             }
         }
+        // The coverage history keeps every batch's slots for a later reseal.
         if let Err(e) = self.deps.db.clear_exposed(&self.pid) {
             error!(pid = %hex::encode(self.pid31), %e, "clear exposed set");
             return;
@@ -2045,29 +3127,147 @@ impl Actor {
     }
 
     fn rollback_flight(&mut self, f: &Flight) {
-        if let Err(e) = self.state.rollback(&f.prepared) {
-            error!(pid = %hex::encode(self.pid31), %e, "rollback failed");
+        self.rollback_prepared(&f.prepared);
+    }
+
+    /// A failed rollback leaves the tree at the prepared root: reopen at
+    /// the committed record before any more state work.
+    fn rollback_prepared(&mut self, p: &davinci_state::PreparedBatch) {
+        if let Err(e) = self.state.rollback(p) {
+            error!(pid = %hex::encode(self.pid31), %e, "rollback failed; reopening");
+            self.state_lost = true;
         }
     }
 
     /// Extends the transient-failure streak; returns the cooldown in seconds.
     fn prove_backoff(&mut self) -> u64 {
+        self.prove_backoff_upto(300)
+    }
+
+    /// [`Self::prove_backoff`] with a ceiling of `max` seconds.
+    fn prove_backoff_upto(&mut self, max: u64) -> u64 {
         self.prove_attempts += 1;
-        let secs = (1u64 << self.prove_attempts.min(8)).min(300);
+        let secs = (1u64 << self.prove_attempts.min(8)).min(max);
         self.prove_after = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
         secs
+    }
+
+    /// Counts a cycle that posted blobs but did not land; from the
+    /// [`FAILED_CYCLES_BEFORE_PAUSE`]th in a row, pauses sealing: 10 min,
+    /// doubling per further failure, at most 1 h. The votes stay pending.
+    fn failed_cycle(&mut self, error: &str) {
+        self.failed_cycles = self.failed_cycles.saturating_add(1);
+        self.proof_first_until_landing = true;
+        let Some(extra) = self.failed_cycles.checked_sub(FAILED_CYCLES_BEFORE_PAUSE) else {
+            return;
+        };
+        let pause = FIRST_PAUSE.saturating_mul(1 << extra.min(8)).min(MAX_PAUSE);
+        self.failed_pause = Some(tokio::time::Instant::now() + pause);
+        error!(
+            pid = %hex::encode(self.pid31),
+            pause_secs = pause.as_secs(),
+            failed_cycles = self.failed_cycles,
+            %error,
+            "L1 cycles keep posting blobs without landing; pausing this process's sealing (votes stay pending)"
+        );
     }
 
     /// Puts a flight's votes back in the queue with their original age,
     /// ahead of the later votes of their slots.
     fn requeue_flight(&mut self, f: Flight) {
-        let vids = f.prepared.vote_ids.clone();
-        if let Err(e) = self.deps.db.requeue(&self.pid, &vids) {
+        if let Err(e) = self.deps.db.requeue(&self.pid, &f.prepared.vote_ids) {
             error!(pid = %hex::encode(self.pid31), %e, "requeue");
         }
         self.pending.splice(0..0, f.votes);
         self.pending_at.splice(0..0, f.votes_at);
         self.sort_pending();
+    }
+
+    /// A batch the prover failed for good: requeue it and bisect. The first
+    /// failure retries at full size; each later one halves the next seal,
+    /// until a single vote fails and is errored alone. After
+    /// [`ISOLATED_BEFORE_HOLD`] of those the prover fails everything: hold,
+    /// erroring nothing more.
+    fn prover_failed(&mut self, f: Flight, reason: String) {
+        let n = f.votes.len();
+        let vids: BTreeSet<u64> = f.prepared.vote_ids.iter().copied().collect();
+        self.metrics.bisections.fetch_add(1, Ordering::SeqCst);
+        let secs = self.prove_backoff_upto(BISECT_BACKOFF_MAX);
+        if self.prover_hold.is_some() {
+            error!(
+                pid = %hex::encode(self.pid31),
+                votes = n,
+                retry_in = secs,
+                %reason,
+                "batch proof failed; holding its votes pending"
+            );
+            self.prover_hold = Some(reason);
+            self.requeue_flight(f);
+            return;
+        }
+        let mut isolate = false;
+        let mut b = match self.bisect.take() {
+            None => Bisect {
+                suspect: vids,
+                cap: n,
+                reason,
+            },
+            Some(mut b) => {
+                b.suspect = vids;
+                b.cap = n.div_ceil(2).max(1);
+                b.reason = reason;
+                isolate = n == 1;
+                b
+            }
+        };
+        if isolate {
+            let msg = format!("{} (isolated by bisection)", b.reason);
+            error!(pid = %hex::encode(self.pid31), vids = ?f.prepared.vote_ids, %msg, "vote isolated by bisection; errored");
+            self.set_status(&f.prepared.vote_ids, VoteStatus::Error, Some(&msg));
+            for vid in &f.prepared.vote_ids {
+                b.suspect.remove(vid);
+            }
+            self.isolated += 1;
+            self.metrics.isolated_votes.fetch_add(1, Ordering::SeqCst);
+            if self.isolated >= ISOLATED_BEFORE_HOLD {
+                self.prover_hold = Some(b.reason.clone());
+                error!(pid = %hex::encode(self.pid31), "prover fails every batch; holding votes pending");
+            }
+        } else {
+            error!(
+                pid = %hex::encode(self.pid31),
+                votes = n,
+                cap = b.cap,
+                retry_in = secs,
+                reason = %b.reason,
+                "batch proof failed; requeued for bisection"
+            );
+            self.requeue_flight(f);
+        }
+        self.bisect = Some(b);
+    }
+
+    /// A landing: suspects no longer pending are settled (or closed). None
+    /// left ends the bisection; else the rest seals whole, up to the
+    /// current cap. Only our own
+    /// landing (`own`) clears the isolated count and the hold.
+    fn bisect_landed(&mut self, own: bool) {
+        if own {
+            self.isolated = 0;
+            self.prover_hold = None;
+        }
+        let Some(b) = self.bisect.as_mut() else {
+            return;
+        };
+        let pending: std::collections::HashSet<u64> =
+            self.pending.iter().map(|v| v.pkg.vote_id).collect();
+        b.suspect.retain(|v| pending.contains(v));
+        // A landing that settled none of them must not undo the halving.
+        if b.suspect.is_empty() {
+            self.bisect = None;
+        } else {
+            b.cap = b.cap.min(b.suspect.len()).max(1);
+        }
     }
 
     /// maxVoters reached: queued new-slot votes can never settle, so they
@@ -2102,35 +3302,62 @@ impl Actor {
         self.drop_pending(&full);
     }
 
-    fn persist_committed(&self) {
-        match committed_to_json(&self.state.committed()) {
-            Ok(b) => {
-                if let Err(e) = self.deps.db.put_committed(&self.pid, &b) {
-                    error!(pid = %hex::encode(self.pid31), %e, "put_committed");
-                }
-            }
-            Err(e) => error!(pid = %hex::encode(self.pid31), %e, "encode committed"),
-        }
-    }
-
-    async fn on_job_done(&mut self, generation: u64, outcome: JobOutcome) {
+    async fn on_job_done(&mut self, generation: u64, outcome: JobOutcome, posted: bool) {
         let Some(mut f) = self.in_flight.take_if(|f| f.generation == generation) else {
             return; // a stale job of an aborted flight
         };
         let vids = f.prepared.vote_ids.clone();
+        // Blobs went out and the batch failed: a failed cycle. A settle
+        // `Transient` counts in its arm (it may have landed after all), an
+        // unhandled revert in the generic `Reverted` arm.
+        if posted {
+            match &outcome {
+                JobOutcome::Guest(mask) => self.failed_cycle(&format!("guest mask {mask:#x}")),
+                JobOutcome::Failed(e) | JobOutcome::Held(e) => self.failed_cycle(e),
+                JobOutcome::Transient(e) if !f.proved => self.failed_cycle(e),
+                _ => {}
+            }
+        }
         match outcome {
+            JobOutcome::Landed(rc) if self.deps.l1.is_some() => {
+                // L1-blob mode: OP's unsafe blocks reorg with Ethereum, so the
+                // settlement commits at its confirmed event; one that never
+                // shows is rolled back by tick() and requeued.
+                info!(pid = %hex::encode(self.pid31), tx = %rc.tx_hash, block = rc.block,
+                    "settlement mined; committing at its event");
+                f.landed_deadline = Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
+                self.in_flight = Some(f);
+            }
             JobOutcome::Landed(rc) => self.commit_flight(f, rc.tx_hash.0, rc.block),
             JobOutcome::Guest(mask) => {
                 self.rollback_flight(&f);
                 let bits = fail_bits(mask).join(", ");
                 let msg = format!("guest rejected the batch: {bits} (mask {mask:#x})");
                 error!(pid = %hex::encode(self.pid31), %msg, "batch failed in the guest");
+                self.metrics.guest_rejections.fetch_add(1, Ordering::SeqCst);
                 self.set_status(&vids, VoteStatus::Error, Some(&msg));
             }
-            JobOutcome::Failed(msg) => {
+            JobOutcome::Failed(reason) => {
                 self.rollback_flight(&f);
-                error!(pid = %hex::encode(self.pid31), ?msg, "batch proof failed");
-                self.set_status(&vids, VoteStatus::Error, Some(&msg));
+                self.prover_failed(f, reason);
+                return; // the backoff streak continues
+            }
+            JobOutcome::Held(msg) => {
+                // Every batch fails this way until the node or the prover is
+                // fixed: hold the votes pending, the close errors them.
+                self.rollback_flight(&f);
+                self.metrics.held_batches.fetch_add(1, Ordering::SeqCst);
+                let secs = self.prove_backoff();
+                error!(
+                    pid = %hex::encode(self.pid31),
+                    votes = vids.len(),
+                    retry_in = secs,
+                    %msg,
+                    "batch failed a node-side check; votes held pending"
+                );
+                self.held_reason = Some(msg);
+                self.requeue_flight(f);
+                return; // the backoff streak continues
             }
             JobOutcome::Reverted(name) if name == "InvalidStateRoot" => {
                 if self.race_lost(f).await {
@@ -2162,6 +3389,20 @@ impl Actor {
                 self.requeue_flight(f);
                 return;
             }
+            JobOutcome::Reverted(name) if name == "MaxVotersReached" => {
+                // The organizer lowered maxVoters under the flight. Requeue
+                // (never error the batch): the read merges the new cap, and
+                // only new-slot votes that can never fit are errored.
+                self.rollback_flight(&f);
+                self.vote_at_stale = true;
+                let secs = self.prove_backoff();
+                warn!(pid = %hex::encode(self.pid31), retry_in = secs, "settlement reverted MaxVotersReached; requeueing");
+                self.requeue_flight(f);
+                // A cap lowered under the flight (its event cleaned only the
+                // queue): its new-slot votes meet the current cap now.
+                self.error_new_slots_if_full();
+                return;
+            }
             JobOutcome::Reverted(name)
                 if name == "InvalidStatus" || name == "InvalidTimeBounds" =>
             {
@@ -2182,12 +3423,18 @@ impl Actor {
                     self.requeue_flight(f);
                     return;
                 }
-                warn!(pid = %hex::encode(self.pid31), "window closed while the batch was in flight");
-                self.set_status(&vids, VoteStatus::Error, Some("process closed"));
+                // The close-out errors what is left, once the tree is at the
+                // chain's root: a peer may have settled these votes.
+                warn!(pid = %hex::encode(self.pid31), "window closed while the batch was in flight; requeueing for the close-out");
+                self.requeue_flight(f);
+                return;
             }
             JobOutcome::Reverted(name) => {
                 self.rollback_flight(&f);
                 let msg = format!("settlement reverted: {name}");
+                if posted {
+                    self.failed_cycle(&msg);
+                }
                 error!(pid = %hex::encode(self.pid31), ?msg, "settlement reverted");
                 self.set_status(&vids, VoteStatus::Error, Some(&msg));
             }
@@ -2207,6 +3454,10 @@ impl Actor {
                     return;
                 }
                 self.rollback_flight(&f);
+                // The settlement gave up after posting: a failed cycle.
+                if posted && f.proved {
+                    self.failed_cycle(&e);
+                }
                 // Hold the votes pending under a saturating cooldown (~4 min
                 // cap) rather than re-sealing hot against a down prover or
                 // RPC; the window close errors them out if it never returns.
@@ -2222,7 +3473,7 @@ impl Actor {
                 return; // the failure streak continues
             }
         }
-        // Only a conclusive outcome (settled, permanent failure, closed
+        // Only a conclusive outcome (settled, guest rejection, closed
         // window) ends the transient-failure streak; the Transient arm
         // above returns early so its backoff keeps growing.
         self.prove_attempts = 0;
@@ -2246,6 +3497,8 @@ impl Actor {
         }
         self.metrics.lost_races.fetch_add(1, Ordering::SeqCst);
         self.await_sync = true;
+        // Re-read: a chain at a root we passed is a reorg, not a race.
+        self.vote_at_stale = true;
         warn!(pid = %hex::encode(self.pid31), "lost the settlement race, waiting for sync");
         self.requeue_flight(f);
         false
@@ -2275,6 +3528,20 @@ impl Actor {
     }
 
     fn commit_flight(&mut self, f: Flight, tx_hash: [u8; 32], block: u64) {
+        // A read from below the landing's block could not show it.
+        self.seen_block = self.seen_block.max(block);
+        // The registry's counters after this landing, from the publics it
+        // checked: occupied_before is its votersCount and an overwrite is
+        // no new voter. The landing's event raises them again (idempotent).
+        let e = &f.prepared.expected;
+        let voters =
+            u64::from(e.occupied_before) + u64::from(e.voters.saturating_sub(e.overwrites));
+        let overwrites = self
+            .record
+            .onchain
+            .overwritten_count
+            .saturating_add(u64::from(e.overwrites));
+        self.follow_counts(voters, overwrites);
         if let Err(e) = self.state.commit(&f.prepared) {
             // The transition IS on-chain; record the target root so resync
             // repairs the local state from our own blobs, and requeue the
@@ -2293,7 +3560,6 @@ impl Actor {
             return;
         }
         let p = &f.prepared;
-        self.persist_committed();
         let rec = crate::storage::TransitionRecord {
             index: self.next_index,
             old_root: p.old_root,
@@ -2311,19 +3577,16 @@ impl Actor {
             n_blobs: p.blobs.blobs.len() as u64,
             by_self: true,
         };
-        if let Err(e) = self
-            .deps
-            .db
-            .settle(&self.pid, &p.vote_ids, &rec, &p.blobs.blobs)
-        {
-            error!(pid = %hex::encode(self.pid31), %e, "settle");
-        }
-        self.next_index += 1;
-        self.last_tx_block = self.last_tx_block.max(block);
+        // Votes, transition, pin and counts in one write after the tree's.
         self.record.onchain.state_root = p.new_root;
+        self.write_transition(&p.vote_ids, &rec, &p.blobs.blobs);
         self.vote_at_stale = true;
-        self.put_record();
         self.await_sync = false;
+        self.failed_cycles = 0;
+        self.proof_first_until_landing = false;
+        self.failed_pause = None;
+        self.held_reason = None;
+        self.bisect_landed(true);
         self.metrics.settled_by_self.fetch_add(1, Ordering::SeqCst);
         info!(
             pid = %hex::encode(self.pid31),
@@ -2336,24 +3599,32 @@ impl Actor {
     }
 
     async fn on_event(&mut self, ev: RegistryEvent) {
+        // No tree to apply it to: dropped, and the chain re-read once the
+        // state is back (the resync replays transitions, the read merges
+        // the fields).
+        if !self.reopen_state() {
+            self.vote_at_stale = true;
+            return;
+        }
+        // A backlog event older than a merged chain read would rewind the
+        // record (an older duration closing the window early). Transitions
+        // still apply: the read does not move the tree.
+        if ev.block <= self.read_block && !matches!(ev.kind, EventKind::StateTransitioned { .. }) {
+            return;
+        }
         match ev.kind {
             EventKind::ProcessCreated { .. } => {}
             EventKind::StatusChanged { new, .. } => {
-                self.record.onchain.status = new;
-                self.pause_hold = None;
-                // Ended flushes through the grace; the tick closes out at its end.
-                if new == ProcessStatus::Canceled {
-                    self.close_out("process closed");
-                }
-                if new == ProcessStatus::Results {
-                    self.mark_finalized();
-                }
+                // Events come from confirmed blocks.
+                self.cancel_confirmed = new == ProcessStatus::Canceled;
+                self.status_moved(new);
                 self.put_record();
             }
             // Shortened or extended: admission, flush mode, the budget and
             // the grace end all read it.
             EventKind::DurationChanged { duration, .. } => {
                 self.record.onchain.duration = duration;
+                self.end_moved = true;
                 self.put_record();
             }
             EventKind::GraceChanged { grace, .. } => {
@@ -2389,9 +3660,7 @@ impl Actor {
             }
             EventKind::ResultsSet { results, .. } => {
                 self.record.onchain.results = results;
-                self.record.onchain.status = ProcessStatus::Results;
-                self.mark_finalized();
-                self.close_out("process closed");
+                self.status_moved(ProcessStatus::Results);
                 // StatusChanged(→RESULTS) precedes this in the same tx, so
                 // mark_finalized's early return must not swallow the
                 // results: persist unconditionally (idempotent).
@@ -2401,31 +3670,80 @@ impl Actor {
                 sender,
                 old_root,
                 new_root,
+                voters,
+                overwrites,
                 n_blobs,
+                l1,
                 ..
             } => {
-                self.on_transition(ev.block, ev.tx_hash.0, sender, old_root, new_root, n_blobs)
-                    .await;
+                self.on_transition(
+                    ev.block,
+                    ev.tx_hash.0,
+                    sender,
+                    old_root,
+                    new_root,
+                    (voters, overwrites),
+                    n_blobs,
+                    l1,
+                )
+                .await;
             }
             EventKind::CensusUpdated { root, uri, .. } => {
                 let moved = root != self.record.onchain.census.root;
                 self.record.onchain.census.root = root;
                 self.record.onchain.census.uri = uri;
                 self.put_record();
-                if self.state.config().census_origin == CensusOrigin::MerkleOffchainDynamic && moved
-                {
-                    // A flight built on the old root can only revert; taking
-                    // it also stales its JobDone via the generation guard.
-                    if let Some(f) = self.in_flight.take() {
-                        warn!(pid = %hex::encode(self.pid31), "census re-rooted under a flight; requeueing");
-                        self.rollback_flight(&f);
-                        self.requeue_flight(f);
-                    }
-                    // Pending votes are re-checked once the new tree loads.
-                    self.census_recheck = true;
+                if moved {
+                    self.census_moved();
                 }
             }
         }
+    }
+
+    /// The process status moved (its event, or a chain read showing it).
+    fn status_moved(&mut self, new: ProcessStatus) {
+        self.record.onchain.status = new;
+        // A confirmation never outlives its cancel.
+        if new != ProcessStatus::Canceled {
+            self.cancel_confirmed = false;
+            self.cancel_confirm_block = None;
+        }
+        self.pause_hold = None;
+        // Ended flushes through the grace; the tick closes out at its end.
+        // Canceled and RESULTS close out from the tick too, once a read
+        // shows the tree at the chain's final root.
+        if matches!(new, ProcessStatus::Canceled | ProcessStatus::Results) {
+            self.vote_at_stale = true;
+        }
+        if new == ProcessStatus::Results {
+            self.mark_finalized();
+        }
+    }
+
+    /// The census root moved (its event, or a chain read showing it).
+    fn census_moved(&mut self) {
+        if self.state.config().census_origin != CensusOrigin::MerkleOffchainDynamic {
+            return;
+        }
+        // A flight built on the old root can only revert; taking it also
+        // stales its JobDone via the generation guard.
+        if let Some(f) = self.in_flight.take() {
+            warn!(pid = %hex::encode(self.pid31), "census re-rooted under a flight; requeueing");
+            self.rollback_flight(&f);
+            self.requeue_flight(f);
+        }
+        // Pending votes are re-checked once the new tree loads.
+        self.census_recheck = true;
+    }
+
+    /// Raises the stored registry counters to a landing's totals. Both only
+    /// grow on-chain, so a replayed older event cannot rewind them.
+    fn follow_counts(&mut self, voters: u64, overwrites: u64) -> bool {
+        let o = &mut self.record.onchain;
+        let moved = voters > o.voters_count || overwrites > o.overwritten_count;
+        o.voters_count = o.voters_count.max(voters);
+        o.overwritten_count = o.overwritten_count.max(overwrites);
+        moved
     }
 
     fn put_record(&self) {
@@ -2434,16 +3752,153 @@ impl Actor {
         }
     }
 
+    /// Records a transition the tree just applied: its settled votes, the
+    /// record with its blobs, and the process record (pin, counts), in one
+    /// write. A failure leaves the log behind the tree; the resync writes
+    /// the record again from the chain.
+    fn write_transition(
+        &mut self,
+        vids: &[u64],
+        rec: &crate::storage::TransitionRecord,
+        blobs: &[davinci_zkvm_sdk::blob::Blob],
+    ) {
+        match self
+            .deps
+            .db
+            .settle(&self.pid, vids, rec, blobs, &self.record)
+        {
+            Ok(()) => {
+                self.next_index = rec.index + 1;
+                self.last_tx_block = self.last_tx_block.max(rec.block);
+                self.log_root = rec.new_root;
+            }
+            Err(e) => {
+                error!(pid = %hex::encode(self.pid31), %e, "transition write failed; resyncing the log")
+            }
+        }
+    }
+
+    /// The record of a transition the tree applied but whose record write
+    /// was lost (a crash between the two, or a failed write): the next one
+    /// after the log, met again as its event or in a gap replay. It waits
+    /// for its blobs, its counts come from the event's totals, and batch
+    /// votes the lost write left unsettled settle with it.
+    #[allow(clippy::too_many_arguments)] // the event's fields, as routed
+    async fn record_missing(
+        &mut self,
+        block: u64,
+        tx_hash: [u8; 32],
+        sender: Address,
+        old_root: [u8; 32],
+        new_root: [u8; 32],
+        (voters, overwrites): (u64, u64),
+        n_blobs: u64,
+        l1: Option<L1Blobs>,
+    ) {
+        // Not ours: our tree never reached its root.
+        if !matches!(self.state.has_root(&new_root), Ok(true)) {
+            return;
+        }
+        let fetched = match &l1 {
+            None => {
+                self.deps
+                    .blobs
+                    .blobs_for_tx(alloy::primitives::B256::from(tx_hash), block, n_blobs)
+                    .await
+            }
+            Some(l) => self.deps.blobs.blobs_for_l1(&l.blocks, &l.vhs).await,
+        };
+        // No record without its archive: a rebuild after a reorg replays
+        // from it. The resync retries.
+        let blobs = match fetched {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(pid = %hex::encode(self.pid31), ?e, "blobs of an unrecorded transition unavailable; retrying");
+                return;
+            }
+        };
+        let (log, vids) = match (
+            self.deps.db.transitions(&self.pid),
+            self.deps
+                .db
+                .vote_ids_with_status(&self.pid, &[VoteStatus::Aggregated, VoteStatus::Processed]),
+        ) {
+            (Ok(log), Ok(vids)) => (log, vids),
+            (Err(e), _) | (_, Err(e)) => {
+                error!(pid = %hex::encode(self.pid31), %e, "log repair read");
+                return;
+            }
+        };
+        // Callers hold no flight, so every vote id in the tree is settled.
+        let vids: Vec<u64> = vids
+            .into_iter()
+            .filter(|v| matches!(self.state.has_vote_id(*v), Ok(true)))
+            .collect();
+        // The log's totals before it: distinct voters and overwrites.
+        let (n_before, w_before) = log.iter().fold((0u64, 0u64), |(n, w), t| {
+            (
+                n.saturating_add(t.n_votes.saturating_sub(t.n_overwrites)),
+                w.saturating_add(t.n_overwrites),
+            )
+        });
+        let n_overwrites = overwrites.saturating_sub(w_before);
+        let rec = crate::storage::TransitionRecord {
+            index: self.next_index,
+            old_root,
+            new_root,
+            tx_hash,
+            block,
+            sender: sender.into_array(),
+            n_votes: voters.saturating_sub(n_before).saturating_add(n_overwrites),
+            n_overwrites,
+            // The registry's count, whether or not the blobs were fetched.
+            n_blobs,
+            by_self: self.deps.contracts.signer() == Some(sender),
+        };
+        warn!(pid = %hex::encode(self.pid31), index = rec.index, "writing a transition record lost at a crash");
+        // As apply_sync: we were at its old root, so it is the target now.
+        if self.record.onchain.state_root == old_root {
+            self.record.onchain.state_root = new_root;
+        }
+        self.write_transition(&vids, &rec, &blobs);
+    }
+
+    /// A finalize attempt that failed for good (a failed results proof or
+    /// check, a revert): retried after a cooldown, never latched, and from
+    /// the [`RESULTS_FAILS_BEFORE_HOLD`]th in a row held to one attempt per
+    /// [`RESULTS_HOLD_RETRY`] seconds.
+    fn results_failed(&mut self, msg: &str) {
+        self.results_failures = self.results_failures.saturating_add(1);
+        let n = self.results_failures;
+        let secs = if n >= RESULTS_FAILS_BEFORE_HOLD {
+            RESULTS_HOLD_RETRY
+        } else {
+            (1u64 << n).min(BISECT_BACKOFF_MAX)
+        };
+        self.finalize_after =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        error!(
+            pid = %hex::encode(self.pid31),
+            %msg,
+            failures = n,
+            retry_in = secs,
+            "results failed; retrying"
+        );
+    }
+
     fn mark_finalized(&mut self) {
+        self.results_failures = 0;
         if self.record.local == LocalStatus::Finalized {
             return;
         }
         self.record.local = LocalStatus::Finalized;
         self.held = None;
+        self.results_sent = None;
         self.put_record();
         info!(pid = %hex::encode(self.pid31), "process finalized");
     }
 
+    #[allow(clippy::too_many_arguments)] // the event's fields, as routed
     async fn on_transition(
         &mut self,
         block: u64,
@@ -2451,7 +3906,9 @@ impl Actor {
         sender: Address,
         old_root: [u8; 32],
         new_root: [u8; 32],
+        (voters, overwrites): (u64, u64),
         n_blobs: u64,
+        l1: Option<L1Blobs>,
     ) {
         // Every landing (replays included, harmlessly) moves the grace end.
         self.vote_at_stale = true;
@@ -2461,8 +3918,11 @@ impl Actor {
         if new_root == committed {
             // Already applied (our own settled transition echoing back).
             // Forward-only pin: never let a replayed event rewind the target.
+            let moved = self.follow_counts(voters, overwrites);
             if self.record.onchain.state_root == old_root {
                 self.record.onchain.state_root = new_root;
+                self.put_record();
+            } else if moved {
                 self.put_record();
             }
             // Clear the sync latch only at the pinned tip: a replayed old
@@ -2470,9 +3930,23 @@ impl Actor {
             if self.record.onchain.state_root == new_root {
                 self.await_sync = false;
             }
+            // Its record was lost at a crash: write it now.
+            if self.log_root == old_root && self.in_flight.is_none() {
+                self.record_missing(
+                    block,
+                    tx_hash,
+                    sender,
+                    old_root,
+                    new_root,
+                    (voters, overwrites),
+                    n_blobs,
+                    l1,
+                )
+                .await;
+            }
             return;
         }
-        if self.seen_tx(block, &tx_hash) {
+        if self.seen_tx(&old_root, &new_root) {
             return; // replayed event of a transition already in the log
         }
         // Our own in-flight batch landing: its receipt handler commits.
@@ -2480,6 +3954,9 @@ impl Actor {
             if f.prepared.new_root == new_root {
                 let f = self.in_flight.take().unwrap();
                 self.commit_flight(f, tx_hash, block);
+                if self.follow_counts(voters, overwrites) {
+                    self.put_record();
+                }
                 return;
             }
             // A foreign transition while ours is in flight: we lost.
@@ -2493,9 +3970,11 @@ impl Actor {
         // The chain tip moved: pin the target root now (and persist it),
         // so a failed sync below is retried instead of forgotten.
         self.record.onchain.state_root = new_root;
+        self.follow_counts(voters, overwrites);
         self.put_record();
-        if old_root == committed {
-            self.apply_sync(block, tx_hash, sender, old_root, new_root, n_blobs)
+        // With a record missing, the gap replay keeps block order.
+        if old_root == committed && self.log_root == committed {
+            self.apply_sync(block, tx_hash, sender, old_root, new_root, n_blobs, l1)
                 .await;
             return;
         }
@@ -2503,13 +3982,24 @@ impl Actor {
         self.replay_gap(block).await;
     }
 
-    /// Whether this transition is already in the local log (a replay).
-    fn seen_tx(&self, block: u64, tx_hash: &[u8; 32]) -> bool {
-        if block > self.last_tx_block {
+    /// Whether this transition is already in the local log (a replay), by
+    /// its roots: a reorg branch can re-include the same transaction in a
+    /// later block. Roots never repeat, so one leaving the committed root
+    /// is new; one leaving a root we passed for another is the chain
+    /// forking there.
+    fn seen_tx(&mut self, old_root: &[u8; 32], new_root: &[u8; 32]) -> bool {
+        if *old_root == self.state.committed().root {
             return false;
         }
         match self.deps.db.transitions(&self.pid) {
-            Ok(ts) => ts.iter().any(|t| t.tx_hash == *tx_hash),
+            Ok(ts) => match ts.iter().find(|t| t.old_root == *old_root) {
+                Some(t) if t.new_root == *new_root => true,
+                Some(t) => {
+                    self.diverge(t.index, false);
+                    false
+                }
+                None => false,
+            },
             Err(e) => {
                 error!(pid = %hex::encode(self.pid31), %e, "transitions read");
                 false
@@ -2519,6 +4009,7 @@ impl Actor {
 
     /// Applies a foreign transition from its DA blobs. Returns whether it
     /// applied; failures leave the target root in place for `maybe_resync`.
+    #[allow(clippy::too_many_arguments)] // the event's fields, as routed
     async fn apply_sync(
         &mut self,
         block: u64,
@@ -2527,15 +4018,21 @@ impl Actor {
         old_root: [u8; 32],
         new_root: [u8; 32],
         n_blobs: u64,
+        l1: Option<L1Blobs>,
     ) -> bool {
         // Only the first n_blobs blobs: the count the registry checked. An
-        // appended junk blob would otherwise fail every decode forever.
-        let blobs = match self
-            .deps
-            .blobs
-            .blobs_for_tx(alloy::primitives::B256::from(tx_hash), block, n_blobs)
-            .await
-        {
+        // appended junk blob would otherwise fail every decode forever. In
+        // L1-blob mode the event names the Ethereum blobs themselves.
+        let fetched = match &l1 {
+            None => {
+                self.deps
+                    .blobs
+                    .blobs_for_tx(alloy::primitives::B256::from(tx_hash), block, n_blobs)
+                    .await
+            }
+            Some(l) => self.deps.blobs.blobs_for_l1(&l.blocks, &l.vhs).await,
+        };
+        let blobs = match fetched {
             Ok(b) => b,
             Err(e) => {
                 error!(pid = %hex::encode(self.pid31), ?e, "blob fetch failed");
@@ -2550,12 +4047,30 @@ impl Actor {
                 return false;
             }
         };
+        // Every vote this public batch carries, stored here or not yet (a
+        // voter may retry the same package here after a reorg takes it):
+        // any re-seal of one must cover its slots. In the coverage history
+        // before the transition becomes authoritative.
+        if !td.vote_ids.is_empty() {
+            let rec = crate::storage::ExposedRecord {
+                slots: td.updates.iter().map(|(s, _)| *s).collect(),
+                vote_ids: td.vote_ids.clone(),
+            };
+            if let Err(e) = self.deps.db.put_coverage(&self.pid, &new_root, &rec) {
+                error!(pid = %hex::encode(self.pid31), %e, "persist the synced batch's coverage");
+                return false;
+            }
+        }
         let before = self.state.committed();
         if let Err(e) = cpu(|| self.state.apply_synced(&td, new_root)) {
             error!(pid = %hex::encode(self.pid31), %e, "apply_synced failed");
+            // Its own reset of the root is best-effort.
+            if let Err(e) = self.state.reset_to_committed() {
+                error!(pid = %hex::encode(self.pid31), %e, "tree reset after a failed sync; reopening");
+                self.state_lost = true;
+            }
             return false;
         }
-        self.persist_committed();
         let after = self.state.committed();
         let rec = crate::storage::TransitionRecord {
             index: self.next_index,
@@ -2569,24 +4084,25 @@ impl Actor {
             n_blobs: blobs.len() as u64,
             by_self: false,
         };
-        if let Err(e) = self.deps.db.put_transition(&self.pid, &rec, &blobs) {
-            error!(pid = %hex::encode(self.pid31), %e, "put_transition");
-        }
-        self.next_index += 1;
-        self.last_tx_block = self.last_tx_block.max(block);
         if self.record.onchain.state_root == old_root {
             // We were at the tip: advance it. A gap replay keeps the newer
             // target the events already told us about.
             self.record.onchain.state_root = new_root;
         }
-        self.put_record();
+        self.write_transition(&[], &rec, &blobs);
         self.metrics
             .synced_from_others
             .fetch_add(1, Ordering::SeqCst);
         self.await_sync = false;
+        // Another sequencer landing says nothing about our own cycles: it
+        // ends the pause but takes only one off the streak, so a broken node
+        // in a busy election still pauses.
+        self.failed_cycles = self.failed_cycles.saturating_sub(1);
+        self.failed_pause = None;
         // Pending votes another sequencer settled for us are done. Votes
         // whose slot got overwritten stay pending: their id is not in the tree.
         self.settle_pending_in_tree();
+        self.bisect_landed(false);
         self.error_new_slots_if_full();
         info!(
             pid = %hex::encode(self.pid31),
@@ -2612,31 +4128,99 @@ impl Actor {
                 return;
             }
         };
+        let mut log: Option<Vec<crate::storage::TransitionRecord>> = None;
         for ev in events {
             if *ev.kind.pid() != self.pid31 {
                 continue;
             }
-            if let EventKind::StateTransitioned {
+            let EventKind::StateTransitioned {
                 sender,
                 old_root,
                 new_root,
+                voters,
+                overwrites,
                 n_blobs,
+                l1,
                 ..
             } = ev.kind
-                && old_root == self.state.committed().root
-                && !self
-                    .apply_sync(ev.block, ev.tx_hash.0, sender, old_root, new_root, n_blobs)
+            else {
+                continue;
+            };
+            if self.follow_counts(voters, overwrites) {
+                self.put_record();
+            }
+            let committed = self.state.committed().root;
+            // The log first catches up with the tree (records lost at a
+            // crash), then the tree with the chain. A transition leaving the
+            // log's last root for a root our tree reached is a missing
+            // record; for any other root it forks there (ours was reorged
+            // out): rebuild from there.
+            if old_root == self.log_root && self.log_root != committed {
+                if !matches!(self.state.has_root(&new_root), Ok(true)) {
+                    self.diverge(self.next_index, false);
+                    continue;
+                }
+                self.record_missing(
+                    ev.block,
+                    ev.tx_hash.0,
+                    sender,
+                    old_root,
+                    new_root,
+                    (voters, overwrites),
+                    n_blobs,
+                    l1,
+                )
+                .await;
+                // Still waiting (its blobs): later records keep block order.
+                if self.log_root != new_root {
+                    return;
+                }
+                continue;
+            }
+            if old_root == committed {
+                // Never record past a missing record.
+                if self.log_root != committed {
+                    return;
+                }
+                if !self
+                    .apply_sync(
+                        ev.block,
+                        ev.tx_hash.0,
+                        sender,
+                        old_root,
+                        new_root,
+                        n_blobs,
+                        l1,
+                    )
                     .await
+                {
+                    return;
+                }
+                continue;
+            }
+            // Leaving a root we passed for another: the chain forked there.
+            let ts = log.get_or_insert_with(|| {
+                self.deps.db.transitions(&self.pid).unwrap_or_else(|e| {
+                    error!(pid = %hex::encode(self.pid31), %e, "transitions read");
+                    Vec::new()
+                })
+            });
+            if let Some(i) = ts
+                .iter()
+                .find(|t| t.old_root == old_root && t.new_root != new_root)
+                .map(|t| t.index)
             {
-                return;
+                self.diverge(i, false);
             }
         }
     }
 
     fn maybe_finalize(&mut self) {
         if self.finalizing
-            || self.finalize_failed
+            // Our results transaction awaits its event.
+            || self.results_sent.is_some()
             || self.in_flight.is_some()
+            || self.diverged.is_some()
             || self.record.local != LocalStatus::Active
             // Observers never settle, even when they hold the election key.
             || self.deps.contracts.signer().is_none()
@@ -2694,14 +4278,18 @@ impl Actor {
             self.finalizing = true;
             self.finalize_after = None;
             info!(pid = %hex::encode(self.pid31), "finalizing: submitting held results");
-            tokio::spawn(crate::finalize::run_submit_held(
-                self.deps.contracts.clone(),
-                self.pid31,
-                snark,
-                self.deps.grace.grace_max_total,
-                self.generation,
+            spawn_finalize(
                 self.tx.clone(),
-            ));
+                self.generation,
+                crate::finalize::run_submit_held(
+                    self.deps.contracts.clone(),
+                    self.pid31,
+                    snark,
+                    self.deps.grace.grace_max_total,
+                    self.generation,
+                    self.tx.clone(),
+                ),
+            );
             return;
         }
         // Proved at a root that has moved since: prove again.
@@ -2718,8 +4306,7 @@ impl Actor {
         let (request, tally) = match cpu(|| self.state.results_request(&sk, &mut OsRng)) {
             Ok(r) => r,
             Err(e) => {
-                self.finalize_failed = true;
-                error!(pid = %hex::encode(self.pid31), %e, "results_request failed");
+                self.results_failed(&format!("results request: {e}"));
                 return;
             }
         };
@@ -2727,18 +4314,22 @@ impl Actor {
         self.finalizing = true;
         self.finalize_after = None;
         info!(pid = %hex::encode(self.pid31), hold, "finalizing: proving results");
-        tokio::spawn(crate::finalize::run_finalize(
-            self.deps.prover.clone(),
-            self.deps.contracts.clone(),
-            self.pid31,
-            request,
-            root,
-            tally,
-            self.deps.grace.grace_max_total,
-            hold,
-            self.generation,
+        spawn_finalize(
             self.tx.clone(),
-        ));
+            self.generation,
+            crate::finalize::run_finalize(
+                self.deps.prover.clone(),
+                self.deps.contracts.clone(),
+                self.pid31,
+                request,
+                root,
+                tally,
+                self.deps.grace.grace_max_total,
+                hold,
+                self.generation,
+                self.tx.clone(),
+            ),
+        );
     }
 
     /// DKG modes: nobody holds the key. Any signing node binds the committed
@@ -2759,8 +4350,7 @@ impl Actor {
                     sibs,
                 )),
                 Err(e) => {
-                    self.finalize_failed = true;
-                    error!(pid = %hex::encode(self.pid31), %e, "dkg_results_inputs failed");
+                    self.results_failed(&format!("DKG results inputs: {e}"));
                     self.record.note = Some(format!("DKG results request: {e}"));
                     self.put_record();
                     return;
@@ -2770,15 +4360,19 @@ impl Actor {
         self.generation += 1;
         self.finalizing = true;
         self.finalize_after = None;
-        tokio::spawn(crate::finalize::run_finalize_dkg(
-            self.deps.contracts.clone(),
-            self.pid31,
-            inputs,
-            self.state.committed().root,
-            self.deps.grace.grace_max_total,
-            self.generation,
+        spawn_finalize(
             self.tx.clone(),
-        ));
+            self.generation,
+            crate::finalize::run_finalize_dkg(
+                self.deps.contracts.clone(),
+                self.pid31,
+                inputs,
+                self.state.committed().root,
+                self.deps.grace.grace_max_total,
+                self.generation,
+                self.tx.clone(),
+            ),
+        );
     }
 }
 
@@ -2787,7 +4381,7 @@ impl Actor {
 struct JobInput {
     generation: u64,
     pid31: [u8; 31],
-    request: ProveRequest,
+    request: Arc<ProveRequest>,
     expected: BatchPublics,
     blobs: TransitionBlobs,
     prover: Arc<dyn Prover>,
@@ -2798,21 +4392,143 @@ struct JobInput {
     nf: u8,
     n: usize,
     prove_base: f64,
+    /// L1-blob mode: the Ethereum side; `None` in blob mode.
+    l1: Option<Arc<crate::l1da::L1Da>>,
+    /// L1-blob mode, bisecting: no blob post before the proof passed its
+    /// checks, so a failing retry spends nothing on Ethereum.
+    proof_first: bool,
+    /// L1-blob mode: no settlement after this.
+    deadline: tokio::time::Instant,
+    /// Fired when the actor drops the flight.
+    cancel: CancellationToken,
+    /// L1-blob mode: set once a post of this job is mined.
+    posted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Sends `msg` to the actor when dropped still armed: a task that ends
+/// without its own report (a panic, which tokio swallows) does not strand
+/// the flight or the finalize waiting on it.
+struct ReportOnDrop {
+    tx: mpsc::Sender<Msg>,
+    msg: Option<Msg>,
+    /// A job's L1 post flag, read when the report goes out.
+    posted: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for ReportOnDrop {
+    fn drop(&mut self) {
+        let Some(mut m) = self.msg.take() else {
+            return;
+        };
+        if let (Msg::JobDone { posted, .. }, Some(flag)) = (&mut m, &self.posted) {
+            *posted = flag.load(Ordering::Relaxed);
+        }
+        // A full mailbox must not lose it: wait for room on the runtime.
+        if let Err(mpsc::error::TrySendError::Full(m)) = self.tx.try_send(m)
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let tx = self.tx.clone();
+            rt.spawn(async move {
+                let _ = tx.send(m).await;
+            });
+        }
+    }
+}
+
+/// Spawns a finalize task that reports a transient failure if it dies.
+fn spawn_finalize(
+    tx: mpsc::Sender<Msg>,
+    generation: u64,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let mut guard = ReportOnDrop {
+            tx,
+            msg: Some(Msg::FinalizeDone {
+                generation,
+                result: Err(FinalizeFail {
+                    permanent: false,
+                    wait: false,
+                    gate: false,
+                    msg: "finalize task ended without a result".into(),
+                    dkg_requested: None,
+                }),
+            }),
+            posted: None,
+        };
+        task.await;
+        guard.msg = None;
+    });
 }
 
 async fn run_job(job: JobInput) {
     let generation = job.generation;
     let tx = job.tx.clone();
-    let outcome = job_inner(job).await;
+    let mut guard = ReportOnDrop {
+        tx: tx.clone(),
+        msg: Some(Msg::JobDone {
+            generation,
+            outcome: JobOutcome::Transient("job task ended without a result".into()),
+            posted: false,
+        }),
+        posted: Some(job.posted.clone()),
+    };
+    let (outcome, posted) = job_inner(job).await;
+    guard.msg = None;
     let _ = tx
         .send(Msg::JobDone {
             generation,
             outcome,
+            posted,
         })
         .await;
 }
 
-async fn job_inner(job: JobInput) -> JobOutcome {
+/// The outcome, and whether the job mined any blob post on Ethereum
+/// (L1-blob mode only).
+async fn job_inner(job: JobInput) -> (JobOutcome, bool) {
+    let Some(l1) = job.l1.clone() else {
+        let snark = match proved(&job).await {
+            Ok(s) => s,
+            Err(o) => return (o, false),
+        };
+        return (settle_blobs(&job, &snark).await, false);
+    };
+    // L1-blob mode: the blobs go to Ethereum while the batch is proved (after
+    // it, while bisecting); the flight's end (rollback, shutdown) cancels
+    // the job.
+    let lj = crate::l1da::L1Job {
+        pid: job.pid31,
+        root_before: job.expected.root_before,
+        blobs: &job.blobs,
+        deadline: job.deadline,
+        cancel: job.cancel.clone(),
+        posted: job.posted.clone(),
+    };
+    let work = async {
+        let (proved, posting) = if job.proof_first {
+            (proved(&job).await, crate::l1da::Posting::default())
+        } else {
+            crate::l1da::with_post(&l1, &*job.chain, &lj, proved(&job)).await
+        };
+        let snark = match proved {
+            Ok(s) => s,
+            Err(o) => return o,
+        };
+        crate::l1da::settle(&l1, &*job.chain, &lj, &snark, posting)
+            .await
+            .into()
+    };
+    let outcome = tokio::select! {
+        _ = job.cancel.cancelled() => JobOutcome::Transient("flight aborted".into()),
+        o = work => o,
+    };
+    (outcome, lj.posted.load(Ordering::Relaxed))
+}
+
+/// Proves the batch and checks the proof against the prepared batch and the
+/// release pins.
+async fn proved(job: &JobInput) -> Result<PlonkSnark, JobOutcome> {
     let t0 = job.clock.now();
     let (got, snark) = match job.prover.prove_batch(&job.request, &job.expected).await {
         Ok((got, snark, proving)) => {
@@ -2823,25 +4539,35 @@ async fn job_inner(job: JobInput) -> JobOutcome {
                 .observe(job.nf, job.n, secs, job.prove_base);
             (got, snark)
         }
-        // Transport/queue trouble is retried; a failed job never is.
-        Err(e) if !e.permanent => return JobOutcome::Transient(e.to_string()),
-        Err(e) => return JobOutcome::Failed(e.to_string()),
+        // Transport/queue trouble is retried as is; a failed job is bisected.
+        Err(e) if !e.permanent => return Err(JobOutcome::Transient(e.to_string())),
+        Err(e) => return Err(JobOutcome::Failed(e.to_string())),
     };
     if !got.ok || got.fail_mask != 0 {
-        return JobOutcome::Guest(got.fail_mask);
+        return Err(JobOutcome::Guest(got.fail_mask));
     }
     if got != job.expected {
-        return JobOutcome::Failed("proved publics do not match the prepared batch".into());
+        return Err(JobOutcome::Held(
+            "proved publics do not match the prepared batch".into(),
+        ));
     }
     match BatchPublics::from_public_values(&snark.public_values) {
         Ok(pv) if pv == job.expected => {}
-        _ => return JobOutcome::Failed("snark public values do not match the batch".into()),
+        _ => {
+            return Err(JobOutcome::Held(
+                "snark public values do not match the batch".into(),
+            ));
+        }
     }
     if snark.program_vk != release::BATCH_PROGRAM_VK {
-        return JobOutcome::Failed("program vk is not the pinned batch circuit vk".into());
+        return Err(JobOutcome::Held(
+            "program vk is not the pinned batch circuit vk".into(),
+        ));
     }
     if snark.root_c_vadcop_final != release::ROOT_C_VADCOP_FINAL {
-        return JobOutcome::Failed("root_c_vadcop_final is not the pinned setup".into());
+        return Err(JobOutcome::Held(
+            "root_c_vadcop_final is not the pinned setup".into(),
+        ));
     }
     let _ = job
         .tx
@@ -2849,9 +4575,14 @@ async fn job_inner(job: JobInput) -> JobOutcome {
             generation: job.generation,
         })
         .await;
+    Ok(snark)
+}
+
+/// Blob mode: the pre-flight `eth_call`, then the blob transaction.
+async fn settle_blobs(job: &JobInput, snark: &PlonkSnark) -> JobOutcome {
     if let Err(r) = job
         .chain
-        .simulate_transition(&job.pid31, &snark, &job.blobs)
+        .simulate_transition(&job.pid31, snark, &job.blobs)
         .await
     {
         return match r {
@@ -2861,23 +4592,120 @@ async fn job_inner(job: JobInput) -> JobOutcome {
     }
     match job
         .chain
-        .submit_transition(&job.pid31, &snark, &job.blobs)
+        .submit_transition(&job.pid31, snark, &job.blobs)
         .await
     {
         Ok(rc) => JobOutcome::Landed(rc),
         Err(Web3Error::Revert(r)) => JobOutcome::Reverted(r.name().unwrap_or("revert").to_string()),
         Err(e @ Web3Error::Lost { .. }) => JobOutcome::Lost(e.to_string()),
+        Err(e @ Web3Error::FeeCap { .. }) => JobOutcome::Transient(e.to_string()),
         Err(e) => JobOutcome::Transient(e.to_string()),
     }
 }
 
+impl From<crate::l1da::Settled> for JobOutcome {
+    fn from(s: crate::l1da::Settled) -> Self {
+        use crate::l1da::Settled as S;
+        match s {
+            S::Landed(rc) => JobOutcome::Landed(rc),
+            S::Reverted(name) => JobOutcome::Reverted(name),
+            S::Lost(e) => JobOutcome::Lost(e),
+            S::Transient(e) => JobOutcome::Transient(e),
+            S::Failed(e) => JobOutcome::Held(e),
+        }
+    }
+}
+
+/// Runs `pass` for 1, 2, … `max_chunks` chunks while it finds a budget
+/// (`None`: neither this count nor a larger one fits) and keeps the largest
+/// selection, the fewest chunks on a tie. A pass full at its cap ends the
+/// scan: a larger count never raises the cap, so it cannot select more. A
+/// pass error ends the scan with it. `size`: (votes, full at its cap).
+fn choose_chunks<S, E>(
+    max_chunks: usize,
+    mut pass: impl FnMut(usize) -> Option<Result<S, E>>,
+    size: impl Fn(&S) -> (usize, bool),
+) -> Result<Option<(usize, S)>, E> {
+    let mut best: Option<(usize, S)> = None;
+    for chunks in 1..=max_chunks {
+        let Some(r) = pass(chunks) else { break };
+        let s = r?;
+        let (n, saturated) = size(&s);
+        if n > best.as_ref().map_or(0, |(_, b)| size(b).0) {
+            best = Some((chunks, s));
+        }
+        if saturated {
+            break;
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProverService, WAIT_WINDOWS, serr};
+    use super::{ProverService, WAIT_WINDOWS, choose_chunks, serr};
     use davinci_zkvm_sdk::Error as E;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    // A full mailbox never holds up the heartbeat: a Head is dropped (the
+    // next one carries the newer block), never awaited.
+    #[tokio::test]
+    async fn a_head_to_a_full_mailbox_does_not_wait() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let h = super::ActorHandle { tx };
+        h.head(1, 1).await;
+        let sent = tokio::time::timeout(Duration::from_millis(200), h.head(2, 2)).await;
+        assert!(sent.is_ok(), "a head waited on a full mailbox");
+    }
+
+    // (votes, cap) per chunk count; `None` from the first infeasible count.
+    fn choose(passes: &[Option<(usize, usize)>]) -> Option<(usize, usize)> {
+        let r: Result<_, ()> = choose_chunks(
+            passes.len(),
+            |c| passes[c - 1].map(Ok),
+            |&(n, cap)| (n, n == cap),
+        );
+        r.unwrap().map(|(c, (n, _))| (c, n))
+    }
+
+    // The largest batch wins, ties to the fewest chunks; an infeasible
+    // count ends the scan; an empty pass is never chosen.
+    #[test]
+    fn chunk_choice_rule() {
+        assert_eq!(choose(&[Some((3, 9)), Some((5, 9))]), Some((2, 5)));
+        assert_eq!(choose(&[Some((4, 9)), Some((4, 8))]), Some((1, 4)));
+        assert_eq!(choose(&[Some((0, 9)), Some((2, 9))]), Some((2, 2)));
+        assert_eq!(choose(&[Some((0, 9)), Some((0, 9))]), None);
+        assert_eq!(choose(&[Some((1, 9)), None, Some((7, 9))]), Some((1, 1)));
+        // Full at its cap: no later pass is looked at.
+        assert_eq!(choose(&[Some((9, 9)), Some((8, 9))]), Some((1, 9)));
+    }
+
+    // Over random inputs with caps that never grow (a larger chunk count
+    // never raises the cap) the early stop equals the full scan.
+    #[test]
+    fn chunk_choice_early_stop_never_discards_a_larger_pass() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        for _ in 0..10_000 {
+            let k = rng.gen_range(1..6);
+            let mut cap = rng.gen_range(1..8);
+            let mut passes = Vec::new();
+            for _ in 0..k {
+                cap = rng.gen_range(1..=cap);
+                passes.push(Some((rng.gen_range(0..=cap), cap)));
+            }
+            let mut want: Option<(usize, usize)> = None;
+            for (i, (n, _)) in passes.iter().flatten().enumerate() {
+                if *n > want.map_or(0, |(_, m)| m) {
+                    want = Some((i + 1, *n));
+                }
+            }
+            assert_eq!(choose(&passes), want, "{passes:?}");
+        }
+    }
 
     // A 4xx on submit is a refusal of this input; server trouble is not,
     // and neither are 408/429, which describe the moment, not the input.

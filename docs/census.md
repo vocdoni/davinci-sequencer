@@ -30,6 +30,10 @@ file whose tree does not match it is refused.
 Downloads are restricted, because the URI comes from on-chain data:
 
 - only `http(s)` by default, to public hosts only, with no redirects, no proxy and a 256 MiB cap;
+- a download that brings less than 16 KiB in a 30 s window after its first byte is cut off and
+  retried later. At most 4 downloads and 2 tree builds run at once, so slow servers cannot hold
+  up every other census. A downloaded census keeps its download slot until a build takes it, so
+  at most 6 documents (up to 1.5 GiB) are in memory;
 - loopback and private hosts need `--census-allow-private`;
 - `file://` needs `--census-dir`, and the path must resolve to a regular file under that
   directory;

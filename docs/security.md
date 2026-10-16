@@ -25,15 +25,21 @@ proofs that match what it computed itself.
   sample that nothing public determines, so an observer cannot tell an overwrite from a routine
   refresh. Participation is not hidden: a refresh only touches an occupied slot, so a slot's first
   write is a new vote, and with a Merkle census the slot follows from the voter's address.
-- **Re-sealing a batch reveals nothing.** A sealed batch may reach the chain even if the node later
-  drops it (a lost race, a prover failure, a restart). Once a batch is sealed, every slot it
-  changed joins a persisted per-process exposed set, and every later batch refreshes each of those
-  slots it does not write. Otherwise two attempts with different refresh draws could be compared,
-  and a vote dropped between them would stand out as an overwrite. The set holds exactly the slot
-  keys the blob already publishes, without marking which were writes, so persisting it leaks
-  nothing new. It is cleared once every exposed vote has settled or errored. If it no longer fits
-  one transition, the node errors the exposed pending votes and clears it rather than publish a
-  transition that covers only part of it.
+- **Re-sealing a batch reveals nothing.** A batch may reach the chain even if the node later
+  drops it (a lost race, a prover failure, a restart, a reorg). Every batch carrying votes joins a
+  persisted, append-only per-process coverage history (its changed slots and its votes): the
+  node's own in the commit that seals it, before anything can publish it; every batch of another
+  sequencer the node fetches, with all its vote ids (a voter may later send the same package
+  here), before its sync applies. A batch that carries one of those votes again refreshes every
+  slot of every such batch it does not write. Otherwise two batches with different refresh draws
+  could be compared, and a vote dropped between them would stand out as an overwrite. The history
+  holds exactly the slot keys and vote ids the blobs already publish, without marking which slots
+  were writes, so persisting it leaks nothing new. It is not pruned during an election (a full
+  peer batch adds about 100 KB). If a vote's own history no longer fits one transition, the node
+  errors that vote alone (`exposed refresh set too large, recast`) rather than publish a
+  transition that covers only part of it. One case is inherent: another sequencer's batch that a
+  reorg takes before this node fetched its blobs was never seen here, so a later re-seal of a vote
+  it carried cannot cover it.
 - **Election keys are derived, not stored.** A sequencer key is
   `HMAC-SHA256(master, "davinci-election-key-v1" ‖ chainId ‖ registry ‖ processId)`, expanded and
   reduced into `[1, l)`. `POST /processes/keys` writes nothing, so key requests cannot fill the
@@ -101,13 +107,35 @@ a DKG mode when no single node should hold the key.
   about 18 days on Ethereum mainnet. A node started after an election's blobs were pruned cannot
   rebuild that election. Nodes archive and serve the blobs they saw, but no node fetches from
   another node's archive yet. Keep a node, or a blob archiver, running for the whole election.
+  A node whose transition record was lost at a crash waits for that transition's blobs to write
+  it again: until then the process seals nothing and applies no later transition, until the
+  blobs are served again or the operator removes the process's state, while another node with
+  the archive keeps serving the election. The close-out and the results still run once the tree
+  is at the chain's root.
 - **Reorgs.** Other sequencers' transitions are applied only once they are `--confirmations`
-  blocks deep, but the node's own commits follow the transaction receipt. An own transaction
-  whose event never confirms is rolled back after 90 s and its votes requeued. If a fully
-  committed own transition is reorged out, the node's copy of that process stays ahead of the
-  chain and stops following it.
+  blocks deep (1 on OP Mainnet), but in blob mode the node's own commits follow the transaction
+  receipt. Deeper reorgs are detected and recovered (see
+  [lifecycle.md](lifecycle.md#reorgs)):
+  - the monitor compares the hash of the block at its event cursor each poll, and on a mismatch
+    rewinds 128 blocks and routes them again. After 5 failed block reads in a row it routes on
+    without the check until a read succeeds, so a reorg in that window goes unseen until then;
+  - an own transaction whose event never confirms is rolled back after 90 s and its votes
+    requeued;
+  - a process left ahead of the chain (a read at a root its log passed, or a transition forking
+    from one, for 90 s) is rebuilt from the chain: the lost transitions' votes go back to the
+    queue and re-seal on the chain's root. The rebuild replays the process from its blobs, so it
+    needs them (see Blob retention). A reorg the cursor check misses (its fail-open window) is
+    noticed only at the process's next chain read, which an idle process makes when it next has
+    work.
+
+  Results a reorg drops after the node finalized are submitted again once a chain read shows
+  them gone (the cursor check's re-read, a transition event, or the first read after a restart);
+  a reorg in the cursor check's fail-open window is seen only at the process's next read. A reorg
+  deeper than the 128-block rewind can leave events of the dropped range unrouted.
 - **Scalar bias.** Re-encryption scalars are SHA-256 digests reduced modulo the BN254 scalar
   field, which leaves them 2^-7.6 from uniform modulo the subgroup order. Closing the gap needs a
   512-bit reduction, which changes the batch circuit and its program key.
 - **Not supported:** key resharing across epochs, fees against pool draining, and the chained
   (folded) proof mode of davinci-zkvm with dynamic censuses or DKG keys.
+  `--op-max-tx-fee` bounds the node's own spend per transaction (execution gas, not OP's L1 data
+  fee), not the pool: a fee spike past it withholds settlement instead of draining the key.

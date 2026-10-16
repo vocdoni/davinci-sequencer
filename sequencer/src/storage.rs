@@ -6,7 +6,7 @@
 //! Keys are big-endian so redb's byte order is the natural order: `pid` is the
 //! process id as BE32, followed by BE8 vote ids / sequence numbers / indexes.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -22,10 +22,12 @@ use serde::{Deserialize, Serialize};
 use crate::web3::OnchainProcess;
 
 /// Bump on any incompatible change to a table layout or record encoding.
-pub const SCHEMA_VERSION: u64 = 8;
+pub const SCHEMA_VERSION: u64 = 11;
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The database file inside its directory.
 pub const DB_FILE: &str = "sequencer.redb";
+/// The redb page cache when the caller names none (`--db-cache-mb`).
+pub const DEFAULT_CACHE_MB: usize = 256;
 /// `meta_bytes` key naming the deployment a database belongs to.
 const DEPLOYMENT_KEY: &str = "deployment";
 
@@ -40,8 +42,6 @@ const PENDING: Bytes = TableDefinition::new("pending");
 // pid‖vid -> seq: makes pushes idempotent and removals direct.
 const PENDING_IDX: Bytes = TableDefinition::new("pending_idx");
 const TRANSITIONS: Bytes = TableDefinition::new("transitions");
-// pid -> the actor's committed-state record (JSON, actor-owned format).
-const COMMITTED: Bytes = TableDefinition::new("committed");
 const BLOBS: Bytes = TableDefinition::new("blobs");
 // One row: the master secret election keys are derived from (`keys.rs`).
 const ENC_KEYS: Bytes = TableDefinition::new("enc_keys");
@@ -53,6 +53,22 @@ const VOTE_ADDR: Bytes = TableDefinition::new("vote_addr");
 // pid -> `ExposedRecord`: slots a sealed batch exposed, until every
 // recorded vote settles or errors.
 const EXPOSED: Bytes = TableDefinition::new("exposed");
+// nonce (BE8) -> `L1PostRecord`: blob transactions of the node's Ethereum
+// account not yet seen mined (L1-blob mode).
+const L1_POSTS: Bytes = TableDefinition::new("l1_posts");
+// pid -> []: a rebuild kept votes Settled that its replay may not bring
+// back; the check after the replay converges drops it.
+const REBUILD_CHECK: Bytes = TableDefinition::new("rebuild_check");
+// pid‖root -> `ExposedRecord`: the coverage history. One entry per batch
+// carrying votes (our own sealed batches, written in the seal commit before
+// anything can publish them; every peer batch we fetch, with all its vote
+// ids, before its sync applies): its updated slots and those votes.
+// Append-only: a reseal of a vote refreshes the slots of every entry naming
+// it. A full peer batch costs one entry (2560 slots and 512 vote ids as
+// JSON, about 60 KB) and 512 index keys of 72 bytes (about 37 KB).
+const COVERAGE_HISTORY: Bytes = TableDefinition::new("coverage_history");
+// pid‖vid‖root -> []: the history's index by vote.
+const COVERAGE_BY_VOTE: Bytes = TableDefinition::new("coverage_by_vote");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -64,6 +80,13 @@ pub enum StorageError {
          is the source of truth); keep the old file, it holds the master secret"
     )]
     Schema { found: u64, expected: u64 },
+    /// No upgrade: the batches it sealed or synced have no coverage history,
+    /// so their votes' reseals would leave slots out.
+    #[error(
+        "this datadir predates the coverage history; start this node with a fresh datadir \
+         (move the old one aside and keep it: it holds the master secret)"
+    )]
+    PredatesHistory,
     #[error("corrupt {table} row: {reason}")]
     Corrupt { table: &'static str, reason: String },
     #[error("not found: {0}")]
@@ -176,14 +199,61 @@ pub struct ExposedRecord {
     pub vote_ids: Vec<u64>,
 }
 
+/// A blob transaction the node signed on Ethereum (L1-blob mode), written
+/// before it is sent and dropped once mined, so a restart replaces it at its
+/// nonce instead of queueing behind it. Holds nothing secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct L1PostRecord {
+    #[serde(with = "hex::serde")]
+    pub pid: [u8; 31],
+    #[serde(with = "hex::serde")]
+    pub root_before: [u8; 32],
+    pub nonce: u64,
+    pub tx_hash: alloy::primitives::B256,
+    pub fees: crate::web3::L1Fees,
+    pub vhs: Vec<alloy::primitives::B256>,
+    /// Unix seconds.
+    pub posted_at: u64,
+    /// The L1 account that sent the post.
+    #[serde(with = "hex::serde")]
+    pub from: [u8; 20],
+}
+
 /// Shared handle to the node's database. Cloning is cheap.
 #[derive(Clone)]
 pub struct Db {
     db: Arc<Database>,
-    /// Scripted arbo write failures (tests only; always 0 in production).
+    /// Scripted arbo write failures (tests only; always 0 in production),
+    /// after skipping `arbo_skip` writes.
     arbo_faults: Arc<std::sync::atomic::AtomicU32>,
+    arbo_skip: Arc<std::sync::atomic::AtomicU32>,
     /// Arbo reads (any process), counted in test builds only.
     arbo_reads: Arc<std::sync::atomic::AtomicU64>,
+    /// Every arbo handle handed out, so tests can see open snapshots.
+    #[cfg(any(test, feature = "test-hooks"))]
+    arbo_handles: Arc<std::sync::Mutex<Vec<arbo::RedbStorage>>>,
+    /// Scripted failures of the node's own write transactions (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    write_faults: Arc<std::sync::atomic::AtomicU32>,
+    /// Scripted failures of process-record reads (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    process_read_faults: Arc<std::sync::atomic::AtomicU32>,
+    /// While set, reads of this `meta_bytes` key fail (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    meta_read_fault: Arc<std::sync::Mutex<Option<String>>>,
+    /// While set, transition-record writes fail after `transition_skip`
+    /// more go through (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    transition_faults: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    transition_skip: Arc<std::sync::atomic::AtomicU32>,
+    /// While set, the write after a rebuild's check fails (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    check_faults: Arc<std::sync::atomic::AtomicBool>,
+    /// Armed: the next history write (a seal commit or a synced batch's
+    /// entry) is followed by a crash (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    history_crash: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Db {
@@ -256,6 +326,11 @@ impl Db {
     /// Opens or creates the database file, created with mode 0600 (an
     /// existing file is tightened to 0600). Refuses a different schema version.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, DEFAULT_CACHE_MB)
+    }
+
+    /// [`Db::open`] with a redb page cache of `cache_mb` MiB.
+    pub fn open_with(path: &Path, cache_mb: usize) -> Result<Self> {
         if !path.exists() {
             OpenOptions::new()
                 .write(true)
@@ -264,11 +339,31 @@ impl Db {
                 .open(path)?;
         }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        let db = Database::create(path).map_err(db_err)?;
+        let db = redb::Builder::new()
+            .set_cache_size(cache_mb.saturating_mul(1 << 20))
+            .create(path)
+            .map_err(db_err)?;
         let this = Db {
             db: Arc::new(db),
             arbo_faults: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            arbo_skip: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             arbo_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-hooks"))]
+            arbo_handles: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            write_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            process_read_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            meta_read_fault: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            transition_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            transition_skip: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            check_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            history_crash: Default::default(),
         };
         this.init()?;
         Ok(this)
@@ -283,13 +378,20 @@ impl Db {
     /// Opens the database of one deployment, [`deployment_dir`] under
     /// `datadir`, created on first use: another registry starts from an
     /// empty store and leaves this one alone. A database of the flat layout
-    /// (`<datadir>/sequencer.redb`) moves in once if its processes carry this
-    /// deployment's id prefix; otherwise it stays where it is.
-    pub fn open_deployment(datadir: &Path, chain_id: u64, registry: &[u8; 20]) -> Result<Self> {
+    /// (`<datadir>/sequencer.redb`) predates the coverage history: refused.
+    pub fn open_deployment(
+        datadir: &Path,
+        chain_id: u64,
+        registry: &[u8; 20],
+        cache_mb: usize,
+    ) -> Result<Self> {
         private_dir(datadir)?;
         let dir = deployment_dir(datadir, chain_id, registry);
-        adopt_flat(datadir, &dir, chain_id, registry)?;
-        let db = Self::open_in(&dir)?;
+        if datadir.join(DB_FILE).exists() {
+            return Err(StorageError::PredatesHistory);
+        }
+        private_dir(&dir)?;
+        let db = Self::open_with(&dir.join(DB_FILE), cache_mb)?;
         db.bind_deployment(&deployment_name(chain_id, registry))?;
         Ok(db)
     }
@@ -320,6 +422,7 @@ impl Db {
                         .map_err(db_err)?;
                 }
                 Some(v) if v == SCHEMA_VERSION => {}
+                Some(v) if v < SCHEMA_VERSION => return Err(StorageError::PredatesHistory),
                 Some(v) => {
                     return Err(StorageError::Schema {
                         found: v,
@@ -333,7 +436,6 @@ impl Db {
                 PENDING,
                 PENDING_IDX,
                 TRANSITIONS,
-                COMMITTED,
                 BLOBS,
                 ENC_KEYS,
                 CENSUS,
@@ -341,6 +443,10 @@ impl Db {
                 VOTE_ADDR,
                 META_BYTES,
                 EXPOSED,
+                L1_POSTS,
+                REBUILD_CHECK,
+                COVERAGE_HISTORY,
+                COVERAGE_BY_VOTE,
             ] {
                 tx.open_table(t).map_err(db_err)?;
             }
@@ -362,9 +468,15 @@ impl Db {
     pub fn arbo_storage(&self, pid: &Fr) -> Result<ArboStore> {
         let inner =
             arbo::RedbStorage::new(self.db.clone(), &Self::arbo_table(pid)).map_err(db_err)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.arbo_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(inner.clone());
         Ok(ArboStore {
             inner,
             faults: self.arbo_faults.clone(),
+            skip: self.arbo_skip.clone(),
             reads: self.arbo_reads.clone(),
         })
     }
@@ -374,8 +486,92 @@ impl Db {
     /// Compiled only for tests (`test-hooks` covers integration tests).
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_arbo_writes(&self, n: u32) {
-        self.arbo_faults
+        self.fail_arbo_writes_after(0, n);
+    }
+
+    /// Lets the next `skip` arbo writes through, then fails `n` (a crash
+    /// part way through a run of writes). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_arbo_writes_after(&self, skip: u32, n: u32) {
+        use std::sync::atomic::Ordering;
+        self.arbo_skip.store(skip, Ordering::SeqCst);
+        self.arbo_faults.store(n, Ordering::SeqCst);
+    }
+
+    /// Makes the next `n` record writes (processes, votes, queue,
+    /// transitions) fail while arbo writes go through; `u32::MAX` stands for
+    /// a crash right after a tree commit. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_writes(&self, n: u32) {
+        self.write_faults
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `on`, every transition-record write fails and every other write
+    /// goes through (a crash right before the record). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_transition_writes(&self, on: bool) {
+        self.fail_transition_writes_after(0);
+        self.transition_faults
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `on`, [`Db::finish_rebuild_check`] fails. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_rebuild_check_writes(&self, on: bool) {
+        self.check_faults
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every record write after the next history write (a seal commit or
+    /// a synced batch's entry) fails, from the very next one on (a crash
+    /// right after it). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_writes_after_history(&self) {
+        self.history_crash
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lets the next `skip` transition-record writes through, then fails
+    /// every one. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_transition_writes_after(&self, skip: u32) {
+        use std::sync::atomic::Ordering;
+        self.transition_skip.store(skip, Ordering::SeqCst);
+        self.transition_faults.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the next `n` [`Db::process`] reads fail. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_process_reads(&self, n: u32) {
+        self.process_read_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `Some(k)`, every [`Db::meta_bytes`] read of `k` fails. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_meta_reads(&self, k: Option<&str>) {
+        *self
+            .meta_read_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = k.map(str::to_string);
+    }
+
+    /// Arbo handles (any process) holding an open read snapshot. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn arbo_snapshots_open(&self) -> usize {
+        self.arbo_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|h| h.snapshot_open())
+            .count()
+    }
+
+    /// Scripted record-write failures not yet used. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn write_faults_left(&self) -> u32 {
+        self.write_faults.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Arbo tree and slot-store reads so far (any process). Test hook.
@@ -392,12 +588,11 @@ impl Db {
     }
 
     fn put(&self, table: Bytes, key: &[u8], value: &[u8]) -> Result<()> {
-        let tx = self.db.begin_write().map_err(db_err)?;
-        {
+        self.write(|tx| {
             let mut t = tx.open_table(table).map_err(db_err)?;
             t.insert(key, value).map_err(db_err)?;
-        }
-        tx.commit().map_err(db_err)
+            Ok(())
+        })
     }
 
     // Rows whose key starts with `prefix`, all keys `len` bytes long.
@@ -414,10 +609,22 @@ impl Db {
     }
 
     pub fn put_process(&self, p: &ProcessRecord) -> Result<()> {
-        self.put(PROCESSES, &pid_key(&p.pid), &encode(p)?)
+        self.write(|tx| tx_put_process(tx, p))
     }
 
     pub fn process(&self, pid: &Fr) -> Result<Option<ProcessRecord>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .process_read_faults
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(StorageError::Db("scripted read failure".into()));
+        }
         self.get(PROCESSES, &pid_key(pid))?
             .map(|v| decode("processes", &v))
             .transpose()
@@ -452,13 +659,26 @@ impl Db {
             .collect()
     }
 
-    /// Stores the actor's committed-state record for a process.
-    pub fn put_committed(&self, pid: &Fr, v: &[u8]) -> Result<()> {
-        self.put(COMMITTED, &pid_key(pid), v)
-    }
-
-    pub fn committed(&self, pid: &Fr) -> Result<Option<Vec<u8>>> {
-        self.get(COMMITTED, &pid_key(pid))
+    /// Ids of a process's votes in one of `statuses`, without loading the
+    /// rest: only the id and status of each record are decoded.
+    pub fn vote_ids_with_status(&self, pid: &Fr, statuses: &[VoteStatus]) -> Result<Vec<u64>> {
+        #[derive(Deserialize)]
+        struct Head {
+            vote_id: u64,
+            status: VoteStatus,
+        }
+        let (lo, hi) = prefix_range(&pid_key(pid), 40);
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let t = tx.open_table(VOTES).map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in t.range(lo.as_slice()..=hi.as_slice()).map_err(db_err)? {
+            let (_, v) = row.map_err(db_err)?;
+            let h: Head = decode("votes", v.value())?;
+            if statuses.contains(&h.status) {
+                out.push(h.vote_id);
+            }
+        }
+        Ok(out)
     }
 
     /// Persists the exposed set before a batch can broadcast. One
@@ -474,10 +694,77 @@ impl Db {
             .transpose()
     }
 
+    /// Whether a rebuild's kept-vote check is pending.
+    pub fn rebuild_check(&self, pid: &Fr) -> Result<bool> {
+        Ok(self.get(REBUILD_CHECK, &pid_key(pid))?.is_some())
+    }
+
+    /// The check after a rebuild's replay: `vids` (settled, but not on the
+    /// chain the replay reached) go back to pending at the queue head and
+    /// the marker is dropped, in one commit.
+    pub fn finish_rebuild_check(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.check_faults.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StorageError::Db("scripted rebuild check failure".into()));
+        }
+        self.write(|tx| {
+            tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_prepend(tx, pid, vids)?;
+            tx.open_table(REBUILD_CHECK)
+                .map_err(db_err)?
+                .remove(pid_key(pid).as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
     pub fn clear_exposed(&self, pid: &Fr) -> Result<()> {
         self.write(|tx| {
-            let mut t = tx.open_table(EXPOSED).map_err(db_err)?;
-            t.remove(pid_key(pid).as_slice()).map_err(db_err)?;
+            tx.open_table(EXPOSED)
+                .map_err(db_err)?
+                .remove(pid_key(pid).as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Records a blob transaction before it is sent; a replacement at the
+    /// same nonce overwrites the record.
+    pub fn put_l1_post(&self, r: &L1PostRecord) -> Result<()> {
+        self.put(L1_POSTS, &r.nonce.to_be_bytes(), &encode(r)?)
+    }
+
+    /// Every recorded blob transaction, by nonce.
+    pub fn l1_posts(&self) -> Result<Vec<L1PostRecord>> {
+        self.scan(L1_POSTS, &[], 8)?
+            .iter()
+            .map(|(_, v)| decode("l1_posts", v))
+            .collect()
+    }
+
+    /// Drops the record at `nonce`.
+    pub fn remove_l1_post(&self, nonce: u64) -> Result<()> {
+        self.write(|tx| {
+            let mut t = tx.open_table(L1_POSTS).map_err(db_err)?;
+            t.remove(nonce.to_be_bytes().as_slice()).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Drops the records at or below `nonce`: mined.
+    pub fn remove_l1_posts_upto(&self, nonce: u64) -> Result<()> {
+        self.write(|tx| {
+            let mut t = tx.open_table(L1_POSTS).map_err(db_err)?;
+            let (lo, hi) = ([0u8; 8], nonce.to_be_bytes());
+            let keys: Vec<Vec<u8>> = t
+                .range(lo.as_slice()..=hi.as_slice())
+                .map_err(db_err)?
+                .map(|r| r.map(|(k, _)| k.value().to_vec()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?;
+            for k in keys {
+                t.remove(k.as_slice()).map_err(db_err)?;
+            }
             Ok(())
         })
     }
@@ -485,6 +772,18 @@ impl Db {
     // One write transaction: `f` runs inside it, the commit happens only if
     // it succeeds (dropping an uncommitted transaction aborts it).
     fn write(&self, f: impl FnOnce(&WriteTransaction) -> Result<()>) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .write_faults
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(StorageError::Db("scripted write failure".into()));
+        }
         let tx = self.db.begin_write().map_err(db_err)?;
         f(&tx)?;
         tx.commit().map_err(db_err)
@@ -550,6 +849,94 @@ impl Db {
             .transpose()
     }
 
+    /// Records the coverage of the batch reaching `root` (idempotent: the
+    /// same root overwrites itself), in its own commit.
+    pub fn put_coverage(&self, pid: &Fr, root: &[u8; 32], entry: &ExposedRecord) -> Result<()> {
+        let r = self.write(|tx| tx_put_coverage(tx, pid, root, entry));
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.crash_after_history(&r);
+        r
+    }
+
+    /// Every slot of every history entry naming one of `vids`.
+    pub fn coverage_for(&self, pid: &Fr, vids: &[u64]) -> Result<BTreeSet<u64>> {
+        Ok(self.coverage(pid, vids)?.union(vids))
+    }
+
+    /// The history entries naming any of `vids`, each read once, in one
+    /// read transaction: one index scan per vote, one fetch per entry.
+    pub fn coverage(&self, pid: &Fr, vids: &[u64]) -> Result<davinci_state::Coverage> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let index = tx.open_table(COVERAGE_BY_VOTE).map_err(db_err)?;
+        let mut roots: BTreeMap<[u8; 32], Vec<u64>> = BTreeMap::new();
+        for vid in vids {
+            let (lo, hi) = prefix_range(&key_u64(pid, *vid), 72);
+            for row in index.range(lo.as_slice()..=hi.as_slice()).map_err(db_err)? {
+                let (k, _) = row.map_err(db_err)?;
+                if let Ok(r) = <[u8; 32]>::try_from(&k.value()[40..]) {
+                    roots.entry(r).or_default().push(*vid);
+                }
+            }
+        }
+        let history = tx.open_table(COVERAGE_HISTORY).map_err(db_err)?;
+        let mut out = davinci_state::Coverage::for_votes(vids);
+        for (r, named) in roots {
+            if let Some(v) = history.get(root_key(pid, &r).as_slice()).map_err(db_err)? {
+                let e: ExposedRecord = decode("coverage_history", v.value())?;
+                out.add(e.slots.into_iter().collect(), &named);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every history entry of the process, by root. Test hook and diagnostics.
+    pub fn coverage_history(&self, pid: &Fr) -> Result<Vec<([u8; 32], ExposedRecord)>> {
+        self.scan(COVERAGE_HISTORY, &pid_key(pid), 64)?
+            .iter()
+            .map(|(k, v)| {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(&k[32..]);
+                Ok((r, decode("coverage_history", v)?))
+            })
+            .collect()
+    }
+
+    /// A seal, in one commit before anything can publish the batch: its
+    /// votes go `aggregated` and leave the queue, the exposed set is stored,
+    /// and the batch (reaching `root`) joins the coverage history.
+    pub fn seal_batch_covered(
+        &self,
+        pid: &Fr,
+        vids: &[u64],
+        exposed: &ExposedRecord,
+        root: &[u8; 32],
+        entry: &ExposedRecord,
+    ) -> Result<()> {
+        let r = self.write(|tx| {
+            tx_status(tx, pid, vids, VoteStatus::Aggregated, None)?;
+            tx_remove(tx, pid, vids)?;
+            tx.open_table(EXPOSED)
+                .map_err(db_err)?
+                .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
+                .map_err(db_err)?;
+            tx_put_coverage(tx, pid, root, entry)
+        });
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.crash_after_history(&r);
+        r
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn crash_after_history(&self, r: &Result<()>) {
+        if r.is_ok()
+            && self
+                .history_crash
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.fail_next_writes(u32::MAX);
+        }
+    }
+
     /// Votes enter a batch: `aggregated`, out of the pending queue.
     pub fn seal_batch(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
         self.write(|tx| {
@@ -568,19 +955,82 @@ impl Db {
         })
     }
 
-    /// A transition landed: its votes are `settled` and leave the queue, and
-    /// the transition and its blobs are stored, all in one commit.
+    /// A transition landed (ours or synced): its votes, if any, are `settled`
+    /// and leave the queue, and the transition, its blobs and the process
+    /// record (pin and counts) are stored, all in one commit.
     pub fn settle(
         &self,
         pid: &Fr,
         vids: &[u64],
         t: &TransitionRecord,
         blobs: &[Blob],
+        process: &ProcessRecord,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            use std::sync::atomic::Ordering;
+            if self.transition_faults.load(Ordering::SeqCst)
+                && self
+                    .transition_skip
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_err()
+            {
+                return Err(StorageError::Db("scripted transition write failure".into()));
+            }
+        }
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;
             tx_remove(tx, pid, vids)?;
-            tx_put_transition(tx, pid, t, blobs)
+            tx_put_transition(tx, pid, t, blobs)?;
+            tx_put_process(tx, process)
+        })
+    }
+
+    /// A reorg took transitions the process committed: drops its tree
+    /// table, every transition and blob, puts `vids` back in the queue
+    /// (pending, at its head in this order), and stores the exposed set, the
+    /// kept-vote check marker (`check`) and the process record, in one
+    /// commit. The coverage history stays. The tree is re-created at genesis
+    /// after it; a crash in between reopens at genesis (no stored tree).
+    pub fn reset_process(
+        &self,
+        pid: &Fr,
+        vids: &[u64],
+        exposed: &ExposedRecord,
+        check: bool,
+        process: &ProcessRecord,
+    ) -> Result<()> {
+        self.write(|tx| {
+            let mut marker = tx.open_table(REBUILD_CHECK).map_err(db_err)?;
+            match check {
+                true => drop(
+                    marker
+                        .insert(pid_key(pid).as_slice(), &[][..])
+                        .map_err(db_err)?,
+                ),
+                false => drop(marker.remove(pid_key(pid).as_slice()).map_err(db_err)?),
+            }
+            drop(marker);
+            let name = Self::arbo_table(pid);
+            tx.delete_table(TableDefinition::<&[u8], &[u8]>::new(&name))
+                .map_err(db_err)?;
+            let (lo, hi) = prefix_range(&pid_key(pid), 40);
+            tx.open_table(TRANSITIONS)
+                .map_err(db_err)?
+                .retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
+                .map_err(db_err)?;
+            let (lo, hi) = prefix_range(&pid_key(pid), 42);
+            tx.open_table(BLOBS)
+                .map_err(db_err)?
+                .retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
+                .map_err(db_err)?;
+            tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_prepend(tx, pid, vids)?;
+            tx.open_table(EXPOSED)
+                .map_err(db_err)?
+                .insert(pid_key(pid).as_slice(), encode(exposed)?.as_slice())
+                .map_err(db_err)?;
+            tx_put_process(tx, process)
         })
     }
 
@@ -615,6 +1065,16 @@ impl Db {
     }
 
     pub fn meta_bytes(&self, k: &str) -> Result<Option<Vec<u8>>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self
+            .meta_read_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            == Some(k)
+        {
+            return Err(StorageError::Db("scripted read failure".into()));
+        }
         self.get(META_BYTES, k.as_bytes())
     }
 
@@ -633,6 +1093,28 @@ impl Db {
         {
             let mut t = tx.open_table(META).map_err(db_err)?;
             t.insert(k, v).map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    /// Sets `k` and, in the same transaction, the bytes under `kb` (`None`
+    /// removes them), so the two never disagree after a crash.
+    pub fn set_meta_u64_and_bytes(
+        &self,
+        k: &str,
+        v: u64,
+        kb: &str,
+        vb: Option<&[u8]>,
+    ) -> Result<()> {
+        let tx = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut t = tx.open_table(META).map_err(db_err)?;
+            t.insert(k, v).map_err(db_err)?;
+            let mut b = tx.open_table(META_BYTES).map_err(db_err)?;
+            match vb {
+                Some(vb) => drop(b.insert(kb.as_bytes(), vb).map_err(db_err)?),
+                None => drop(b.remove(kb.as_bytes()).map_err(db_err)?),
+            }
         }
         tx.commit().map_err(db_err)
     }
@@ -797,93 +1279,32 @@ fn private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-// Moves `<datadir>/sequencer.redb` (the flat layout) to `dir` when every
-// process it holds is this deployment's. Anything else stays in place.
-fn adopt_flat(datadir: &Path, dir: &Path, chain_id: u64, registry: &[u8; 20]) -> Result<()> {
-    let flat = datadir.join(DB_FILE);
-    if !flat.exists() {
-        return Ok(());
+// A history entry and its index rows.
+fn tx_put_coverage(
+    tx: &WriteTransaction,
+    pid: &Fr,
+    root: &[u8; 32],
+    entry: &ExposedRecord,
+) -> Result<()> {
+    tx.open_table(COVERAGE_HISTORY)
+        .map_err(db_err)?
+        .insert(root_key(pid, root).as_slice(), encode(entry)?.as_slice())
+        .map_err(db_err)?;
+    let mut index = tx.open_table(COVERAGE_BY_VOTE).map_err(db_err)?;
+    for vid in &entry.vote_ids {
+        let mut k = [0u8; 72];
+        k[..40].copy_from_slice(&key_u64(pid, *vid));
+        k[40..].copy_from_slice(root);
+        index.insert(k.as_slice(), &[][..]).map_err(db_err)?;
     }
-    let target = dir.join(DB_FILE);
-    if target.exists() {
-        tracing::info!(
-            path = %flat.display(),
-            "database of the flat datadir layout left in place: this deployment has its own"
-        );
-        return Ok(());
-    }
-    let (schema, prefixes) = match inspect_flat(&flat) {
-        Ok(v) => v,
-        Err(redb::Error::DatabaseAlreadyOpen) => {
-            return Err(StorageError::Db(format!(
-                "{} is open in another process",
-                flat.display()
-            )));
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %flat.display(),
-                error = %e,
-                "database of the flat datadir layout is unreadable: left in place"
-            );
-            return Ok(());
-        }
-    };
-    let ours = pid_prefix(chain_id, registry);
-    let why = if prefixes.is_empty() || ours.is_none() {
-        "its deployment is unknown (no process to tell it by)"
-    } else if prefixes.iter().any(|p| Some(*p) != ours) {
-        "it belongs to another deployment"
-    } else if schema != Some(SCHEMA_VERSION) {
-        "its schema version is not this build's"
-    } else {
-        ""
-    };
-    if !why.is_empty() {
-        tracing::warn!(
-            path = %flat.display(),
-            deployment = %dir.display(),
-            "database of the flat datadir layout left in place, {why}; this deployment starts empty"
-        );
-        return Ok(());
-    }
-    private_dir(dir)?;
-    std::fs::rename(&flat, &target)?;
-    tracing::info!(
-        from = %flat.display(),
-        to = %target.display(),
-        "moved the flat datadir layout into its deployment directory"
-    );
     Ok(())
 }
 
-// The schema version of a database file and the distinct id prefixes of its
-// processes, read from the keys only, so records of any shape do.
-fn inspect_flat(path: &Path) -> Result<(Option<u64>, HashSet<[u8; 4]>), redb::Error> {
-    let db = Database::open(path)?;
-    let tx = db.begin_read()?;
-    let schema = match tx.open_table(META) {
-        Ok(t) => t.get(SCHEMA_VERSION_KEY)?.map(|v| v.value()),
-        Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(e) => return Err(e.into()),
-    };
-    let t = match tx.open_table(PROCESSES) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((schema, HashSet::new())),
-        Err(e) => return Err(e.into()),
-    };
-    let mut out = HashSet::new();
-    for row in t.iter()? {
-        let (k, _) = row?;
-        if let Some(p) = k
-            .value()
-            .get(21..25)
-            .and_then(|p| <[u8; 4]>::try_from(p).ok())
-        {
-            out.insert(p);
-        }
-    }
-    Ok((schema, out))
+fn root_key(pid: &Fr, root: &[u8; 32]) -> [u8; 64] {
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(&pid_key(pid));
+    k[32..].copy_from_slice(root);
+    k
 }
 
 fn tx_push(tx: &WriteTransaction, pid: &Fr, vid: u64) -> Result<()> {
@@ -984,6 +1405,14 @@ fn tx_status(
     Ok(())
 }
 
+fn tx_put_process(tx: &WriteTransaction, p: &ProcessRecord) -> Result<()> {
+    tx.open_table(PROCESSES)
+        .map_err(db_err)?
+        .insert(pid_key(&p.pid).as_slice(), encode(p)?.as_slice())
+        .map_err(db_err)?;
+    Ok(())
+}
+
 fn tx_put_transition(
     tx: &WriteTransaction,
     pid: &Fr,
@@ -1014,6 +1443,7 @@ fn tx_put_transition(
 pub struct ArboStore {
     inner: arbo::RedbStorage,
     faults: Arc<std::sync::atomic::AtomicU32>,
+    skip: Arc<std::sync::atomic::AtomicU32>,
     #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     reads: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -1028,15 +1458,26 @@ impl arbo::Storage for ArboStore {
 
     fn write(&self, batch: arbo::WriteBatch) -> Result<(), arbo::Error> {
         use std::sync::atomic::Ordering;
-        if self.faults.load(Ordering::SeqCst) > 0
-            && self
-                .faults
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        let take = |c: &std::sync::atomic::AtomicU32| {
+            c.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
-        {
+        };
+        if self.faults.load(Ordering::SeqCst) > 0 && !take(&self.skip) && take(&self.faults) {
             return Err(arbo::Error::Storage("scripted write failure".into()));
         }
         arbo::Storage::write(&self.inner, batch)
+    }
+
+    fn release_snapshot(&self) {
+        arbo::Storage::release_snapshot(&self.inner)
+    }
+}
+
+// The snapshot is shared with the handle's clones (the test-hooks registry
+// keeps one): an actor dropped mid-message must not leave it pinned.
+impl Drop for ArboStore {
+    fn drop(&mut self) {
+        arbo::Storage::release_snapshot(&self.inner)
     }
 }
 

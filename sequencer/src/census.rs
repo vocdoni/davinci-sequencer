@@ -4,7 +4,7 @@
 //!
 //! The census URI comes from on-chain data, so any organizer picks it:
 //! - `http(s)://`: no redirects, public addresses only (unless
-//!   `allow_private`), timeouts and a byte cap;
+//!   `allow_private`), timeouts, a throughput floor and a byte cap;
 //! - `file://`: refused unless a census directory is configured, and then only
 //!   regular files inside it (after resolving symlinks), read through a cap.
 //!
@@ -39,8 +39,18 @@ pub mod onchain;
 pub const MAX_CENSUS_BYTES: u64 = 256 << 20;
 /// Census trees kept in memory.
 const TREE_CACHE: usize = 8;
-/// Concurrent census downloads and builds.
+/// Concurrent census builds (parse, tree, store).
 const BUILD_PERMITS: usize = 2;
+/// Concurrent census downloads: apart from the builds, so a few slow
+/// servers (any organizer picks the URI) cannot hold up every bootstrap.
+/// A downloaded body keeps its permit until it gets a build permit, so at
+/// most this many plus `BUILD_PERMITS` bodies of `max_bytes` are held.
+const DOWNLOAD_PERMITS: usize = 4;
+/// From the first body byte, a download bringing fewer than this many
+/// bytes in a window is cut off (transient): a trickle that stays inside
+/// the read timeout would hold its permit for the whole 300 s.
+const MIN_RATE_BYTES: u64 = 16 << 10;
+const MIN_RATE_WINDOW: Duration = Duration::from_secs(30);
 /// First retry delay after a failed census; doubles per failure up to `MAX_BACKOFF`.
 const BASE_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
@@ -456,6 +466,9 @@ pub struct CensusStore {
     http: reqwest::Client,
     cache: Mutex<TreeCache>,
     builds: Semaphore,
+    downloads: Semaphore,
+    /// From the first body byte, each window must bring this many bytes.
+    min_rate: (u64, Duration),
     failures: Mutex<HashMap<FailKey, (Instant, u32)>>,
     /// Per-root single-flight gates for cache-miss rebuilds.
     rebuilds: tokio::sync::Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
@@ -528,6 +541,8 @@ impl CensusStore {
             http,
             cache: Mutex::new(TreeCache::default()),
             builds: Semaphore::new(BUILD_PERMITS),
+            downloads: Semaphore::new(DOWNLOAD_PERMITS),
+            min_rate: (MIN_RATE_BYTES, MIN_RATE_WINDOW),
             failures: Mutex::new(HashMap::new()),
             rebuilds: tokio::sync::Mutex::new(HashMap::new()),
             bad: Mutex::new(bad.into_iter().map(|(p, r, w)| (p, (r, w))).collect()),
@@ -616,12 +631,21 @@ impl CensusStore {
             }
         }
         let res = async {
-            let _permit = self
+            let dl = self
+                .downloads
+                .acquire()
+                .await
+                .map_err(|e| CensusError::Fetch(e.to_string()))?;
+            let (body, format) = self.download(uri).await?;
+            // The body waits for a build holding its download permit: at most
+            // DOWNLOAD_PERMITS + BUILD_PERMITS bodies in memory.
+            let _build = self
                 .builds
                 .acquire()
                 .await
                 .map_err(|e| CensusError::Fetch(e.to_string()))?;
-            self.fetch_and_store(uri, expected_root).await
+            drop(dl);
+            self.build_and_store(body, format, expected_root).await
         }
         .await;
         if let Ok(mut f) = self.failures.lock() {
@@ -652,8 +676,12 @@ impl CensusStore {
         res
     }
 
-    async fn fetch_and_store(&self, uri: &str, expected_root: &Fr) -> Result<()> {
-        let (body, format) = self.download(uri).await?;
+    async fn build_and_store(
+        &self,
+        body: Vec<u8>,
+        format: DocFormat,
+        expected_root: &Fr,
+    ) -> Result<()> {
         let want = *expected_root;
         let max = self.opts.max_participants;
         let (leaves, index, tree) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -730,16 +758,37 @@ impl CensusStore {
                         .get(reqwest::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok()),
                 );
+                let (floor, span) = self.min_rate;
                 let mut body = Vec::new();
-                while let Some(chunk) = resp
-                    .chunk()
-                    .await
-                    .map_err(|e| CensusError::Fetch(e.to_string()))?
-                {
+                // The current window's end and its bytes, from the first chunk.
+                let mut win: Option<(tokio::time::Instant, u64)> = None;
+                loop {
+                    let read = match win {
+                        None => resp.chunk().await,
+                        Some((end, got)) => {
+                            match tokio::time::timeout_at(end, resp.chunk()).await {
+                                Ok(r) => r,
+                                Err(_) if got < floor => {
+                                    return Err(CensusError::Fetch(format!(
+                                        "census download slower than {floor} bytes per {span:?}"
+                                    )));
+                                }
+                                Err(_) => {
+                                    win = Some((end + span, 0));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    let Some(chunk) = read.map_err(|e| CensusError::Fetch(e.to_string()))? else {
+                        break;
+                    };
                     if (body.len() + chunk.len()) as u64 > max {
                         return Err(CensusError::Refused("census document too large".into()));
                     }
                     body.extend_from_slice(&chunk);
+                    let (end, got) = win.unwrap_or_else(|| (tokio::time::Instant::now() + span, 0));
+                    win = Some((end, got.saturating_add(chunk.len() as u64)));
                 }
                 Ok((body, format))
             }
@@ -1292,6 +1341,144 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         addr
+    }
+
+    // An HTTP server answering 200 and then `step` body bytes every
+    // `every`, without end.
+    async fn trickle(step: usize, every: Duration) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 2048];
+                    let _ = s.read(&mut req).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                        content-length: 100000000\r\n\r\n";
+                    if s.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![b' '; step];
+                    while s.write_all(&chunk).await.is_ok() {
+                        tokio::time::sleep(every).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn private_store(dir: &tempfile::TempDir) -> CensusStore {
+        let opts = CensusOptions {
+            allow_private: true,
+            ..CensusOptions::default()
+        };
+        CensusStore::with_options(db(dir), opts).unwrap()
+    }
+
+    // A server that keeps the body trickling (each byte inside the read
+    // timeout) is cut off by the throughput floor, as a transient failure.
+    #[tokio::test]
+    async fn a_trickling_census_server_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cs = private_store(&dir);
+        cs.min_rate = (4096, Duration::from_millis(500));
+        let addr = trickle(64, Duration::from_millis(100)).await;
+        // The error names the floor; the timeout only stops a hang.
+        let e = tokio::time::timeout(
+            Duration::from_secs(25),
+            cs.fetch(&format!("http://{addr}/c.json"), &Fr::from(1u64)),
+        )
+        .await
+        .expect("cut off")
+        .unwrap_err();
+        assert!(matches!(e, CensusError::Fetch(_)), "{e}");
+        assert!(e.to_string().contains("slower than"), "{e}");
+    }
+
+    // A downloaded body waits for a build permit holding its download
+    // permit: with the builds busy, at most DOWNLOAD_PERMITS bodies sit in
+    // memory however many fetches are queued.
+    #[tokio::test]
+    async fn bodies_waiting_for_a_build_keep_their_download_permit() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (parts, root) = vector();
+        let body = census_json(&parts);
+        let served = Arc::new(AtomicUsize::new(0));
+        let n = served.clone();
+        let app = Router::new().route(
+            "/:k",
+            get(move || {
+                let (body, n) = (body.clone(), n.clone());
+                async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            }),
+        );
+        let addr = serve(app).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cs = Arc::new(private_store(&dir));
+        let builds = cs.builds.acquire_many(BUILD_PERMITS as u32).await.unwrap();
+        let fetches: Vec<_> = (0..8u64)
+            .map(|k| {
+                let cs = cs.clone();
+                tokio::spawn(
+                    async move { cs.fetch(&format!("http://{addr}/{k}.json"), &root).await },
+                )
+            })
+            .collect();
+        // Wait for the permitted downloads, then check no other one follows.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while served.load(Ordering::SeqCst) < DOWNLOAD_PERMITS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the permitted downloads ran");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(served.load(Ordering::SeqCst), DOWNLOAD_PERMITS);
+        drop(builds);
+        for f in fetches {
+            f.await.unwrap().unwrap();
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 8);
+        assert!(cs.has(&root).unwrap());
+    }
+
+    // Slow downloads hold download permits only: two of them do not hold up
+    // a third, honest one (builds had both permits for the whole download).
+    #[tokio::test]
+    async fn trickling_servers_do_not_block_an_honest_download() {
+        use axum::{Router, routing::get};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cs = private_store(&dir);
+        // No floor: this is about the permits.
+        cs.min_rate = (0, MIN_RATE_WINDOW);
+        let cs = Arc::new(cs);
+        let slow = trickle(1, Duration::from_millis(500)).await;
+        for k in 0..2u64 {
+            let cs = cs.clone();
+            tokio::spawn(async move {
+                let _ = cs
+                    .fetch(&format!("http://{slow}/{k}.json"), &Fr::from(k))
+                    .await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (parts, root) = vector();
+        let body = census_json(&parts);
+        let honest = serve(Router::new().route("/c.json", get(move || async move { body }))).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cs.fetch(&format!("http://{honest}/c.json"), &root),
+        )
+        .await
+        .expect("the honest download waited behind the slow ones")
+        .unwrap();
+        assert!(cs.has(&root).unwrap());
     }
 
     #[tokio::test]

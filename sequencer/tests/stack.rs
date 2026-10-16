@@ -23,7 +23,6 @@ fn multi_blob() -> (Vec<Blob>, Vec<B256>) {
         updates: (0..500)
             .map(|i| (BALLOT_MIN + i, Ballot::identity()))
             .collect(),
-        accumulator: Ballot::identity(),
         num_fields: 4,
     };
     let b = build_blobs(&t, &Fr::from(7u64), &[1u8; 32]).unwrap();

@@ -25,8 +25,9 @@
 //! to the scope. The vk fail-fast compares against the SDK release pins; the
 //! prover's `/health` carries no vks.
 //!
-//! `DAVINCI_E2E_LIVE=1` runs the same scenario on an existing deployment
-//! (Gnosis by default, see `davinci_e2e::net`): the registry pins are checked
+//! `DAVINCI_E2E_LIVE=1` runs the same scenario on an existing blob-mode
+//! deployment (`DAVINCI_E2E_NETWORK`, see `davinci_e2e::net`; the L1-blob
+//! default has its compact `op_live` run instead): the registry pins are checked
 //! first, the accounts must hold 0.05 native each, nodes read blobs from the
 //! beacon API, and timeouts scale by `DAVINCI_E2E_TIMEOUT_SCALE`. Opt-in
 //! extras: `DAVINCI_E2E_RESILIENCE=1` (full RPC, prover and beacon outages
@@ -38,7 +39,10 @@
 //! the registry; live the committee of the registry adapter's manager
 //! (`DAVINCI_E2E_DKG_MANAGER` overrides it). Then, after the sequencer-key
 //! processes, an automatic, a locked and a zero-vote DKG process and the
-//! eth_call negatives around their requests.
+//! eth_call negatives around their requests; after each request the
+//! observer's archive (in L1-blob mode, rebuilt from Ethereum blobs) replays
+//! to the same `requestResultsDecryption` inputs. In both DA modes. There is
+//! no Council e2e.
 //!
 //! Every process closes after the registry's grace window, and the last
 //! phase exercises it (`grace`): an AGM END with batches in flight, a
@@ -52,6 +56,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use alloy::primitives::{Bytes, FixedBytes};
+use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, bail, ensure};
 use davinci_client::Error as ClientError;
 use davinci_client::api::{
@@ -59,7 +65,7 @@ use davinci_client::api::{
 };
 use davinci_client::organizer::{
     CreatedProcess, KeyMode, NewProcess, OnchainProcess, Organizer, OrganizerSecret,
-    RegistryReader, merkle_census,
+    ProcessRegistry, RegistryReader, merkle_census,
 };
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::Voter;
@@ -68,6 +74,7 @@ use davinci_e2e::chain;
 use davinci_e2e::cost::{self, TxCost};
 use davinci_e2e::dkg::{self, DkgWiring};
 use davinci_e2e::fixture as fx;
+use davinci_e2e::l1;
 use davinci_e2e::negative;
 use davinci_e2e::net::{self, Net};
 use davinci_e2e::node::{self, Metrics, Node, NodeConfig, WorkDir};
@@ -143,6 +150,10 @@ macro_rules! say {
 
 #[path = "e2e/grace.rs"]
 mod grace;
+#[path = "e2e/l1_restart.rs"]
+mod l1_restart;
+#[path = "e2e/op_live.rs"]
+mod op_live;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e() -> Result<()> {
@@ -157,7 +168,29 @@ async fn e2e() -> Result<()> {
     let r = scenario(&dir).await;
     match &r {
         Ok(()) => say!("PASSED in {:.1} min", t0().elapsed().as_secs_f64() / 60.0),
-        Err(e) => say!("FAILED: {e:#}"),
+        Err(e) => say!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}"))),
+    }
+    art.ok = r.is_ok();
+    r
+}
+
+/// The compact live run on an L1-blob deployment (`e2e/op_live.rs`), gated
+/// by `DAVINCI_E2E_OP_LIVE=1`; it needs `DAVINCI_E2E_LIVE=1` and the
+/// `DAVINCI_E2E_L1_*` keys and endpoints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn op_live() -> Result<()> {
+    if !flag("DAVINCI_E2E_OP_LIVE") {
+        eprintln!("DAVINCI_E2E_OP_LIVE not set, skipping");
+        return Ok(());
+    }
+    t0();
+    let mut art = WorkDir::new("davinci-op-live-")?;
+    let dir = art.path().to_path_buf();
+    say!("working directory {}", dir.display());
+    let r = op_live::run(&dir).await;
+    match &r {
+        Ok(()) => say!("PASSED in {:.1} min", t0().elapsed().as_secs_f64() / 60.0),
+        Err(e) => say!("FAILED: {}", davinci_e2e::redact_urls(&format!("{e:#}"))),
     }
     art.ok = r.is_ok();
     r
@@ -401,6 +434,32 @@ async fn setup_checks(
     say!("dynamic census setup ok");
     bill.extend(c.receipts().iter().map(|(l, r)| TxCost::of(l.clone(), r)));
 
+    // L1-blob mode: OP's origin follows Ethereum, and blob mode's entry
+    // point is refused before anything else is read.
+    if let Some(l1) = &net.l1 {
+        let origin = l1::check_origin(&net.rpc, l1).await?;
+        let blob_call = ProcessRegistry::submitStateTransitionCall {
+            processId: FixedBytes(p1.id),
+            publicValues: Bytes::new(),
+            proofBytes: Bytes::new(),
+            commitments: Vec::new(),
+            ys: Vec::new(),
+            kzgProofs: Vec::new(),
+        };
+        let got = negative::simulate(
+            &net.rpc,
+            org.address(),
+            net.registry,
+            blob_call.abi_encode(),
+        )
+        .await?;
+        ensure!(
+            got == negative::Outcome::Reverted("WrongDAMode".into()),
+            "submitStateTransition on an L1-mode registry: {got}"
+        );
+        say!("L1-blob setup ok: OP origin at Ethereum block {origin}, blob entry point refused");
+    }
+
     // DKG: both modes take the committee's key (the locked one through the
     // real PoP check), and registration stays open to any account.
     if let Some(w) = &net.dkg {
@@ -498,10 +557,23 @@ async fn costs(net: &Net, org: &Organizer, mut extra: Vec<TxCost>) -> Result<Str
         let label = format!("results {}", ProcessId(t.pid));
         all.push(cost::fetch(&net.rpc, label, t.tx).await?);
     }
-    Ok(cost::report(
-        &format!("gas bill, chain {}", net.chain_id),
-        &all,
-    ))
+    // L1-blob mode: the Ethereum blob transactions behind the settlements
+    // (not the replaced or lost ones), paid in ETH on Ethereum.
+    let mut title = format!("gas bill, chain {}", net.chain_id);
+    if let Some(l1) = &net.l1 {
+        title.push_str(" and Ethereum");
+        for p in l1::posts(&net.rpc, l1.read_rpc(), net.registry, from)
+            .await?
+            .into_iter()
+            .filter(|p| created.contains(&p.pid))
+        {
+            for tx in p.l1_txs {
+                let label = format!("L1 blobs {}", ProcessId(p.pid));
+                all.push(cost::fetch(l1.read_rpc(), label, tx).await?);
+            }
+        }
+    }
+    Ok(cost::report(&title, &all))
 }
 
 /// A vote expected to settle on `node`.
@@ -875,6 +947,10 @@ async fn scenario(dir: &Path) -> Result<()> {
     let ballot_prover = tokio::task::spawn_blocking(fx::load_prover);
 
     let net = Net::open(dir).await?;
+    ensure!(
+        !(net.live && net.l1.is_some()),
+        "the full scenario does not run live in L1-blob mode: use DAVINCI_E2E_OP_LIVE=1"
+    );
     net.check_balances(OBS).await?;
     let dep_chain_id = net.chain_id;
     let registry = net.registry;
@@ -947,10 +1023,9 @@ async fn scenario(dir: &Path) -> Result<()> {
             n.log.display()
         );
     }
-    // The nodes size transitions from eth_config: 2 blobs on Gnosis.
+    // The nodes size transitions from eth_config.
     for n in &nodes {
         match n.logged_blob_cap() {
-            Some(c) if net.live => ensure!(c == 2, "{}: blob cap {c}, want 2", n.name),
             Some(c) => say!("{}: blob cap {c}", n.name),
             None => say!("{}: no blob cap in its log", n.name),
         }
@@ -1341,6 +1416,22 @@ async fn scenario(dir: &Path) -> Result<()> {
             "all nodes and the observer report the results; {t1} transitions p1, {t2} p2; {}",
             show_metrics(&nodes, &all_metrics(&nodes).await?)
         );
+
+        // L1-blob mode: a node killed with its blob post pending on Ethereum.
+        if net.l1.is_some() {
+            l1_restart::kill_after_post(
+                &mut nodes,
+                &seq_cfgs,
+                &bin,
+                &net,
+                &org,
+                &reader,
+                (&p1, &tree),
+                &prover,
+            )
+            .await
+            .context("L1 restart with a pending post")?;
+        }
 
         // Dynamic censuses on the same chain, prover and nodes.
         onchain_census(
@@ -2132,6 +2223,64 @@ async fn dkg_request(
     .await
 }
 
+/// The observer, which never settles (in L1-blob mode it rebuilt every
+/// transition from Ethereum blobs), confirms `req`: once at the chain's final
+/// root, its archive replays to the very accumulator and siblings the
+/// sequencer sent in `requestResultsDecryption`.
+async fn follower_confirms(
+    nodes: &[Node],
+    net: &Net,
+    reader: &RegistryReader,
+    p: &OnchainProcess,
+    req: &chain::RegistryTx,
+) -> Result<()> {
+    let obs = &nodes[OBS];
+    ensure!(
+        obs.address.is_none(),
+        "node {} is not an observer",
+        obs.name
+    );
+    let root = reader.process(&p.id).await?.state_root;
+    wait::until(
+        &format!("the observer at {}'s final root", ProcessId(p.id)),
+        sync_timeout(),
+        Duration::from_secs(2),
+        || async {
+            alive(nodes)?;
+            let v = obs.api.process(&p.id).await?;
+            Ok((v.local_state_root == Some(root)).then_some(()))
+        },
+    )
+    .await?;
+    let (got_root, acc, siblings) = dkg::follower_inputs(&obs.api, p).await?;
+    ensure!(
+        got_root == root,
+        "the observer's archive replays to another root"
+    );
+    let provider = alloy::providers::ProviderBuilder::new().connect_client(chain::rpc(&net.rpc)?);
+    let tx = alloy::providers::Provider::get_transaction_by_hash(&provider, req.tx)
+        .await?
+        .context("request tx not found")?;
+    let call = ProcessRegistry::requestResultsDecryptionCall::abi_decode(
+        alloy::consensus::Transaction::input(tx.inner.inner()),
+    )
+    .context("decode the request")?;
+    ensure!(
+        call.accumulator == acc.map(alloy::primitives::U256::from_be_bytes),
+        "the observer's accumulator differs from the request's"
+    );
+    ensure!(
+        call.siblings == siblings.iter().map(|s| FixedBytes(*s)).collect::<Vec<_>>(),
+        "the observer's siblings differ from the request's"
+    );
+    say!(
+        "{}: the observer's archive confirms the decryption request ({} transitions replayed)",
+        ProcessId(p.id),
+        obs.api.transitions(&p.id).await?.len()
+    );
+    Ok(())
+}
+
 /// Block of `pid`'s `ProcessResultsSet`.
 async fn results_block(net: &Net, pid: &[u8; 31]) -> Result<u64> {
     let from = net.start_block.unwrap_or(net.from_block);
@@ -2276,6 +2425,9 @@ async fn dkg_processes(
         .await
         .context("automatic")?;
     let req_a = dkg_request(net, nodes, &pa.id, sync_timeout()).await?;
+    follower_confirms(nodes, net, reader, &pa, &req_a)
+        .await
+        .context("automatic")?;
     grace::closed_after_grace(net, reader, &pa.id).await?;
     let res_a = results_block(net, &pa.id).await?;
     let a = reader.process(&pa.id).await?.dkg.context("dkg")?;
@@ -2338,6 +2490,9 @@ async fn dkg_processes(
     .await?;
     let wait_end = Duration::from_secs(locked_duration) + results_timeout();
     let req_l = dkg_request(net, nodes, &pl.id, wait_end).await?;
+    follower_confirms(nodes, net, reader, &pl, &req_l)
+        .await
+        .context("locked")?;
     let p = reader.process(&pl.id).await?;
     let l = p.dkg.context("dkg")?;
     ensure!(

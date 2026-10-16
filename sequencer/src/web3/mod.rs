@@ -4,6 +4,9 @@
 mod blobs;
 mod contracts;
 mod failover;
+mod l1;
+mod l1op;
+pub mod l1proof;
 mod release;
 mod tx;
 
@@ -20,9 +23,16 @@ pub use blobs::{
 pub use contracts::{
     Contracts, MAX_LOG_RANGE, endpoints_chain_id as rpc_chain_id, probe_osaka, resolve_blob_cap,
 };
+pub use davinci_client::organizer::RegistryDa;
 use failover::Failover;
 pub(crate) use failover::host;
+pub use l1::{
+    BLOB_TX_GAS, GAS_PER_BLOB, L1Chain, L1Fees, L1Market, L1Receipt, L1Rpc, L1SendError, MIN_TIP,
+    SignedBlobTx,
+};
+pub use l1op::revert_message;
 pub use release::{DeployedRelease, Mismatch};
+pub use tx::DEFAULT_MAX_TX_FEE;
 
 /// `User-Agent` of every outgoing HTTP request: some public RPCs answer 403
 /// without one.
@@ -101,6 +111,31 @@ pub(crate) mod council {
         CouncilAdapter,
         "abi/CouncilAdapter.json"
     );
+}
+
+/// Own module: the verifier ABI declares its own `IL1BlobVerifier` structs.
+pub(crate) mod l1v {
+    alloy::sol!(
+        #[allow(missing_docs)]
+        #[derive(Debug)]
+        L1BlobVerifier,
+        "abi/L1BlobVerifier.json"
+    );
+}
+
+/// OP's L1 origin: `L1Block.number()` and `hash()`, read at one OP block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct L1Origin {
+    pub number: u64,
+    pub hash: B256,
+}
+
+/// Where a transition's blobs are on Ethereum (`ProcessStateTransitionedL1`):
+/// the block of each versioned hash, in blob order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct L1Blobs {
+    pub blocks: Vec<u64>,
+    pub vhs: Vec<B256>,
 }
 
 /// Where a process's election key comes from (`DAVINCITypes.KeyMode`).
@@ -292,6 +327,7 @@ pub enum EventKind {
         max_voters: u64,
     },
     /// `voters` and `overwrites` are the process totals after the transition.
+    /// `l1` is set in L1-blob mode, from the paired `ProcessStateTransitionedL1`.
     StateTransitioned {
         pid: [u8; 31],
         sender: Address,
@@ -300,6 +336,7 @@ pub enum EventKind {
         voters: u64,
         overwrites: u64,
         n_blobs: u64,
+        l1: Option<L1Blobs>,
     },
     ResultsSet {
         pid: [u8; 31],
@@ -420,6 +457,10 @@ pub enum Web3Error {
     /// send replaces it at the same nonce.
     #[error("tx at nonce {nonce} not mined after {attempts} attempts")]
     Stuck { nonce: u64, attempts: u32 },
+    /// Withheld before signing: the tx would cost `want` wei in execution
+    /// gas, over `--op-max-tx-fee`. Nothing was sent; retry later.
+    #[error("fee {want} wei over the --op-max-tx-fee cap of {cap} wei: not sent")]
+    FeeCap { want: u128, cap: u128 },
     #[error("no signing key: the node is an observer")]
     NoSigner,
     #[error("unexpected chain data: {0}")]

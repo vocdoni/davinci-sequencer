@@ -6,13 +6,15 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::*;
-use davinci_state::{CensusOrigin, Error, ProcessConfig, ProcessState, VerifiedVote, genesis_root};
+use davinci_state::{
+    CensusOrigin, Coverage, Error, ProcessConfig, ProcessState, VerifiedVote, genesis_root,
+};
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::blob::blob_count;
 use davinci_zkvm_sdk::census::slot_key_address;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_from_dec, fr_to_le};
-use davinci_zkvm_sdk::limits::{MAX_REFRESH, TX_BLOB_CAP, required_refresh};
+use davinci_zkvm_sdk::limits::{MAX_BLOBS, MAX_REFRESH, TX_BLOB_CAP, required_refresh};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde_json::Value;
@@ -215,6 +217,117 @@ fn create_prepare_commit_and_rollback() {
     assert_eq!(&tally[2..], &[0u64; 14]);
 }
 
+/// `open_stored` reopens at the committed record the storage holds (the
+/// one written with the slot store), rewinding a prepared batch; an empty
+/// storage holds no process, and `open` still refuses another record.
+#[test]
+fn open_stored_reopens_at_the_stored_record() {
+    let env = env(2, 8);
+    let store = arbo::MemoryStorage::new();
+    let err = ProcessState::open_stored(env.cfg.clone(), store.clone())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, Error::Invalid(m) if m.contains("no process")),
+        "{err:?}"
+    );
+
+    let mut st = ProcessState::create(env.cfg.clone(), store.clone()).unwrap();
+    let mut rng = StdRng::seed_from_u64(5);
+    let votes: Vec<_> = (0..3)
+        .map(|i| fake_vote(&env, i, &[1, 2], 300 + i as u64))
+        .collect();
+    let b = st.prepare(&votes, &mut rng, &none()).unwrap();
+    st.commit(&b).unwrap();
+    let committed = st.committed();
+    // A second batch prepared but never committed: the tree moved on.
+    let more = vec![fake_vote(&env, 4, &[0, 1], 310)];
+    let b2 = st.prepare(&more, &mut rng, &none()).unwrap();
+    assert_eq!(st.root(), b2.new_root);
+    drop(st);
+
+    let st = ProcessState::open_stored(env.cfg.clone(), store.clone()).unwrap();
+    assert_eq!(st.committed(), committed);
+    assert_eq!(st.root(), committed.root);
+    assert_eq!(st.occupied(), 3);
+    assert!(st.has_vote_id(votes[0].pkg.vote_id).unwrap());
+    assert!(!st.has_vote_id(more[0].pkg.vote_id).unwrap());
+    drop(st);
+
+    let mut stale = committed.clone();
+    stale.root = genesis_root(&env.cfg).unwrap();
+    assert!(ProcessState::open(env.cfg.clone(), store.clone(), &stale).is_err());
+    ProcessState::open(env.cfg.clone(), store, &committed).unwrap();
+}
+
+/// Membership is the committed tree's: a prepared batch's vote ids are
+/// not in it until the commit, though the tree's root already moved.
+#[test]
+fn has_vote_id_reads_the_committed_root() {
+    let env = env(2, 8);
+    let mut st = new_state(&env);
+    let votes = vec![fake_vote(&env, 0, &[1, 2], 330)];
+    let b = st
+        .prepare(&votes, &mut StdRng::seed_from_u64(4), &none())
+        .unwrap();
+    assert_eq!(st.root(), b.new_root);
+    assert!(!st.has_vote_id(votes[0].pkg.vote_id).unwrap());
+    st.commit(&b).unwrap();
+    assert!(st.has_vote_id(votes[0].pkg.vote_id).unwrap());
+}
+
+/// Shared storage whose `n`-th write from now fails (a crash there).
+#[derive(Clone)]
+struct CrashAt {
+    inner: arbo::MemoryStorage,
+    left: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl arbo::Storage for CrashAt {
+    fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, arbo::Error> {
+        self.inner.get(k)
+    }
+    fn write(&self, b: arbo::WriteBatch) -> Result<(), arbo::Error> {
+        if self.left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(arbo::Error::Storage("crash".into()));
+        }
+        self.inner.write(b)
+    }
+    fn release_snapshot(&self) {}
+}
+
+/// A crash at any write of `create` (the genesis leaves go in one by one,
+/// the record last) leaves a storage the next `create` finishes.
+#[test]
+fn create_recovers_from_a_crash_mid_genesis() {
+    let env = env(2, 8);
+    let genesis = genesis_root(&env.cfg).unwrap();
+    for at in 0..10 {
+        let s = CrashAt {
+            inner: arbo::MemoryStorage::new(),
+            left: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(at)),
+        };
+        let crashed = ProcessState::create(env.cfg.clone(), s.clone()).is_err();
+        let st = match ProcessState::open_stored(env.cfg.clone(), s.clone()) {
+            Ok(st) => {
+                assert!(!crashed, "crash at write {at} left a record");
+                st
+            }
+            Err(_) => ProcessState::create(env.cfg.clone(), s.clone())
+                .unwrap_or_else(|e| panic!("crash at write {at}: {e}")),
+        };
+        assert_eq!(st.root(), genesis, "crash at write {at}");
+        assert_eq!(st.committed().root, genesis);
+        drop(st);
+        assert_eq!(
+            ProcessState::open_stored(env.cfg.clone(), s)
+                .unwrap()
+                .root(),
+            genesis
+        );
+    }
+}
+
 #[test]
 fn check_publics_bites_on_tampering() {
     let env = env(2, 4);
@@ -366,16 +479,19 @@ fn select_batch_respects_blob_cap() {
 
 #[test]
 fn select_batch_respects_a_lower_blob_cap() {
-    // Gnosis takes two blobs per block: 400 new 16-field votes fit six
-    // blobs, not two.
+    // A chain that takes two blobs per transaction: 400 new 16-field votes
+    // fit six blobs, not two. The cap goes up to the guest's MAX_BLOBS.
     let env = env(16, 400);
     let mut st = new_state(&env);
     assert_eq!(st.blob_cap(), TX_BLOB_CAP);
-    for bad in [0, TX_BLOB_CAP + 1] {
+    for bad in [0, MAX_BLOBS + 1] {
         let err = st.set_blob_cap(bad).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)), "{err}");
     }
     assert_eq!(st.blob_cap(), TX_BLOB_CAP);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    assert_eq!(st.blob_cap(), MAX_BLOBS);
+    st.set_blob_cap(TX_BLOB_CAP).unwrap();
 
     let pending: Vec<VerifiedVote> = (0..400)
         .map(|i| fake_vote(&env, i, &[1], 30_000 + i as u64))
@@ -407,12 +523,12 @@ fn select_batch_respects_a_lower_blob_cap() {
 
 #[test]
 fn exposed_refreshes_above_a_lower_blob_cap_are_refused() {
-    // 250 exposed 16-field slots fit next to one vote in six blobs, not two.
+    // 260 exposed 16-field slots fit next to one vote in six blobs, not two.
     let env = env(16, 301);
     let mut st = committed_state(&env, 300);
     let vote = vec![fake_vote(&env, 300, &[1], 910_000)];
-    let must = slots_of(0..250);
-    assert!(blob_count(1, 251, 16) <= TX_BLOB_CAP && blob_count(1, 251, 16) > 2);
+    let must = slots_of(0..260);
+    assert!(blob_count(1, 261, 16) <= TX_BLOB_CAP && blob_count(1, 261, 16) > 2);
     let b = st
         .prepare(&vote, &mut StdRng::seed_from_u64(15), &must)
         .unwrap();
@@ -575,7 +691,7 @@ fn refresh_top_up_is_uniform() {
 #[test]
 fn select_batch_shrinks_for_exposed_refreshes() {
     // 900 occupied 16-field slots, 400 new voters waiting. One update is
-    // 33 cells, so six blobs carry about 743 updates.
+    // 32 cells and a quarter of an integer cell, so six blobs carry about 760.
     let env = env(16, 1300);
     let mut st = committed_state(&env, 900);
     let pending: Vec<VerifiedVote> = (900..1300)
@@ -620,6 +736,94 @@ fn select_batch_shrinks_for_exposed_refreshes() {
         .unwrap_err();
     assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
     assert_eq!(st.root(), g);
+}
+
+#[test]
+fn select_covered_takes_only_votes_whose_history_it_read() {
+    let env = env(2, 40);
+    let st = committed_state(&env, 24);
+    let a = fake_vote(&env, 30, &[1], 32_000);
+    let b = fake_vote(&env, 31, &[1], 32_001);
+    let cov = Coverage::for_votes(&[a.pkg.vote_id]);
+    let pending = [b, a.clone()];
+    let sel = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
+        .unwrap();
+    let ids: Vec<u64> = sel.votes.iter().map(|v| v.pkg.vote_id).collect();
+    assert_eq!(ids, vec![a.pkg.vote_id]);
+}
+
+#[test]
+fn select_covered_charges_each_vote_its_own_history() {
+    // 900 occupied 16-field slots; six blobs carry about 760 updates.
+    let env = env(16, 1300);
+    let mut st = committed_state(&env, 900);
+    let fresh: Vec<VerifiedVote> = (900..1000)
+        .map(|i| fake_vote(&env, i, &[1], 30_000 + i as u64))
+        .collect();
+    // A revote of slot 0 whose history is 700 live slots, queued last, and
+    // a later revote of the same slot with no history.
+    let heavy = fake_vote(&env, 0, &[2], 31_000);
+    let later = fake_vote(&env, 0, &[3], 31_001);
+    let hist = slots_of(0..700);
+    let mut cov = Coverage::default();
+    cov.add(hist.clone(), &[heavy.pkg.vote_id]);
+    let mut pending = fresh.clone();
+    pending.push(heavy.clone());
+    pending.push(later.clone());
+    let sel = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
+        .unwrap();
+    // The fresh votes are not charged the heavy history; it waits, and the
+    // later vote of its slot waits behind it. The batch is not full: only
+    // the heavy vote's own history kept it out.
+    assert_eq!(sel.votes.len(), 100);
+    assert!(sel.blocked && !sel.full);
+    assert!(sel.cover.is_empty());
+    // A cap reached is full.
+    let sel = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, 50, TX_BLOB_CAP)
+        .unwrap();
+    assert!(sel.full && sel.votes.len() == 50);
+    // As before: the history as one set shrinks the fresh batch.
+    let legacy = st
+        .select_batch(&pending, u64::MAX, &hist, usize::MAX)
+        .unwrap()
+        .0
+        .len();
+    assert!(legacy < 100, "{legacy}");
+    // Alone, the heavy vote fits and its cover is exactly its history.
+    let sel = st
+        .select_covered(
+            &pending[100..],
+            u64::MAX,
+            &none(),
+            &cov,
+            usize::MAX,
+            TX_BLOB_CAP,
+        )
+        .unwrap();
+    let cover = sel.cover;
+    let sel = sel.votes;
+    assert_eq!(sel.len(), 1);
+    assert_eq!(sel[0].pkg.vote_id, heavy.pkg.vote_id);
+    assert_eq!(cover, hist);
+    let votes: Vec<VerifiedVote> = sel.into_iter().cloned().collect();
+    let b = st
+        .prepare(&votes, &mut StdRng::seed_from_u64(14), &cover)
+        .unwrap();
+    assert!(hist.iter().all(|s| b.updated_slots().contains(s)));
+    st.rollback(&b).unwrap();
+    // A history no transition can carry names its vote.
+    let mut cov = Coverage::default();
+    cov.add(slots_of(0..900), &[heavy.pkg.vote_id]);
+    let err = st
+        .select_covered(&pending, u64::MAX, &none(), &cov, usize::MAX, TX_BLOB_CAP)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::CoverageOverflow { vote_id, .. } if vote_id == heavy.pkg.vote_id),
+        "{err}"
+    );
 }
 
 #[test]
@@ -768,4 +972,113 @@ fn dkg_results_inputs_verify_like_the_registry() {
         st.commit(&b).unwrap();
         check(&st);
     }
+}
+
+#[test]
+fn a_512_vote_queue_at_sixteen_fields_seals_what_six_blobs_hold() {
+    // The node's default --batch-max is 512. At 16 fields a steady batch
+    // (one refresh per new vote) fits six blobs only up to 379 votes, so the
+    // selection stops there and reports the transaction full.
+    let env = env(16, 1024);
+    let mut st = committed_state(&env, 512);
+    let pending: Vec<VerifiedVote> = (512..1024)
+        .map(|i| fake_vote(&env, i, &[1], 50_000 + i as u64))
+        .collect();
+    let (sel, blocked) = st.select_batch(&pending, u64::MAX, &none(), 512).unwrap();
+    assert_eq!((sel.len(), blocked), (379, true));
+    let sel: Vec<VerifiedVote> = sel.into_iter().cloned().collect();
+    let b = st
+        .prepare(&sel, &mut StdRng::seed_from_u64(17), &none())
+        .unwrap();
+    assert_eq!(b.blobs.blobs.len(), TX_BLOB_CAP);
+}
+
+#[test]
+fn a_512_vote_steady_batch_at_sixteen_fields_takes_nine_blobs_in_l1_mode() {
+    // In L1-blob mode the per-batch cap is MAX_BLOBS: the node posts the
+    // blobs in several transactions. A steady 512 x 16 batch (one refresh per
+    // new vote) is nine blobs, all revotes thirteen: --batch-max 512 stays
+    // under MAX_BLOBS at any field count.
+    assert_eq!(blob_count(512, 512 + 512, 16), 9);
+    assert_eq!(blob_count(512, 512 + 1024, 16), 13);
+    let env = env(16, 1024);
+    let mut st = committed_state(&env, 512);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    let pending: Vec<VerifiedVote> = (512..1024)
+        .map(|i| fake_vote(&env, i, &[1], 60_000 + i as u64))
+        .collect();
+    let (sel, blocked) = st.select_batch(&pending, u64::MAX, &none(), 512).unwrap();
+    assert_eq!((sel.len(), blocked), (512, false));
+    // A landing window that fits one six-blob transaction sizes it down to
+    // what six blobs hold, as a one-transaction chain does.
+    let (six, blocked) = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, TX_BLOB_CAP)
+        .unwrap();
+    assert_eq!((six.len(), blocked), (379, true));
+    // Never above the blob cap.
+    let (all, _) = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, MAX_BLOBS + 10)
+        .unwrap();
+    assert_eq!(all.len(), 512);
+    let sel: Vec<VerifiedVote> = sel.into_iter().cloned().collect();
+    let b = st
+        .prepare(&sel, &mut StdRng::seed_from_u64(18), &none())
+        .unwrap();
+    assert_eq!(b.blobs.blobs.len(), 9);
+    assert_eq!(b.expected.n_blobs, 9);
+}
+
+#[test]
+fn a_window_shortfall_is_not_a_refresh_overflow() {
+    // 800 exposed 16-field slots overflow six blobs but fit 32: with a
+    // six-blob window nothing fits for now, which is not a permanent error.
+    let env = env(16, 1300);
+    let mut st = committed_state(&env, 900);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    let pending: Vec<VerifiedVote> = (900..910)
+        .map(|i| fake_vote(&env, i, &[1], 70_000 + i as u64))
+        .collect();
+    let must = slots_of(0..800);
+    assert!(blob_count(1, 801, 16) > TX_BLOB_CAP && blob_count(1, 801, 16) <= MAX_BLOBS);
+    let (sel, blocked) = st
+        .select_batch_within(&pending, u64::MAX, &must, usize::MAX, TX_BLOB_CAP)
+        .unwrap();
+    assert!(sel.is_empty() && blocked);
+    let (sel, _) = st
+        .select_batch(&pending, u64::MAX, &must, usize::MAX)
+        .unwrap();
+    assert!(!sel.is_empty());
+}
+
+#[test]
+fn select_batch_within_clamps_to_the_blob_cap_and_rejects_zero() {
+    let env = env(16, 1024);
+    let st = committed_state(&env, 512);
+    assert_eq!(st.blob_cap(), TX_BLOB_CAP);
+    let pending: Vec<VerifiedVote> = (512..1024)
+        .map(|i| fake_vote(&env, i, &[1], 80_000 + i as u64))
+        .collect();
+    let (sel, blocked) = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, MAX_BLOBS)
+        .unwrap();
+    assert_eq!((sel.len(), blocked), (379, true));
+    let err = st
+        .select_batch_within(&pending, u64::MAX, &none(), 512, 0)
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "{err}");
+}
+
+#[test]
+fn a_refresh_set_over_the_cap_still_overflows_in_a_short_window() {
+    // MAX_REFRESH binds whatever the window, so a short window must not
+    // turn the permanent overflow into a wait.
+    let env = env(1, 2100);
+    let mut st = committed_state(&env, MAX_REFRESH + 2);
+    st.set_blob_cap(MAX_BLOBS).unwrap();
+    let vote = vec![fake_vote(&env, MAX_REFRESH + 2, &[1], 900_001)];
+    let must = slots_of(0..MAX_REFRESH + 1);
+    let err = st
+        .select_batch_within(&vote, u64::MAX, &must, usize::MAX, TX_BLOB_CAP)
+        .unwrap_err();
+    assert!(matches!(err, Error::RefreshOverflow { .. }), "{err}");
 }

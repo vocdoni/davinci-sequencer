@@ -5,16 +5,20 @@
 # - gpu:       Sequencer and a davinci-zkvm GPU prover on this host, no TLS.
 #
 # Configuration goes in .env (see .env.example). The node follows the
-# DAVINCI_NETWORK deployment (default gnosis), so a Gnosis node needs only the
-# key and a prover. The signing key is read from the file SEQUENCER_KEY_FILE
-# (default ./sequencer.key) and mounted as a secret; it never goes in .env.
-# The image runs as uid 10001, which must be able to read that file. An empty
-# file runs the node as an observer.
+# DAVINCI_NETWORK deployment (default optimism: OP Mainnet, blobs on
+# Ethereum), so it needs only its keys and a prover. The OP signing key is
+# read from the file SEQUENCER_KEY_FILE (default ./sequencer.key), the
+# dedicated Ethereum key that posts the blobs from SEQUENCER_L1_KEY_FILE
+# (default ./sequencer-l1.key); both are mounted as secrets and never go in
+# .env. The image runs as uid 10001, which must be able to read them. Empty
+# files run the node as an observer.
 #
 # Both images default to the published :latest, the newest release, which
 # Watchtower follows. A release that moves the network to a new registry
 # needs no action: the node opens a fresh database for it in the datadir
-# volume and leaves the old one there.
+# volume and leaves the old one there. A production node pins instead:
+# DAVINCI_SEQUENCER_TAG=v0.6.0 plus DAVINCI_REGISTRY and DAVINCI_START_BLOCK
+# in .env (see docs/configuration.md, "Pinning a production node").
 #
 # To build locally instead, with davinci-zkvm/ checked out next to this
 # directory, use a tag Watchtower cannot find upstream:
@@ -31,6 +35,7 @@ x-sequencer-common: &sequencer-common
   env_file: .env
   secrets:
     - sequencer_key
+    - sequencer_l1_key
   volumes:
     - data:/data
   ports:
@@ -51,9 +56,10 @@ x-sequencer-common: &sequencer-common
     - "com.centurylinklabs.watchtower.enable=true"
 
 x-sequencer-env: &sequencer-env
-  DAVINCI_NETWORK: ${DAVINCI_NETWORK:-gnosis}
+  DAVINCI_NETWORK: ${DAVINCI_NETWORK:-optimism}
   DAVINCI_DATADIR: /data
   DAVINCI_PRIVKEY_FILE: /run/secrets/sequencer_key
+  DAVINCI_L1_PRIVKEY_FILE: /run/secrets/sequencer_l1_key
 
 x-traefik-common: &traefik-common
   image: "traefik:${TRAEFIK_TAG:-v3}"
@@ -176,6 +182,8 @@ services:
 secrets:
   sequencer_key:
     file: ${SEQUENCER_KEY_FILE:-./sequencer.key}
+  sequencer_l1_key:
+    file: ${SEQUENCER_L1_KEY_FILE:-./sequencer-l1.key}
 
 volumes:
   data:

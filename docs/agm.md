@@ -17,7 +17,7 @@ How the end, the flush and the grace window interact is described in
 
 ## Planning figures
 
-The figures below are for one RTX 5090 prover and a Gnosis-style chain with 2 blobs per
+The figures below are for one RTX 5090 prover and a chain with 2 blobs per
 transaction, in steady state (as many refreshes as votes). `nf` is the number of ballot fields.
 Transitions of one election serialize on its state root, so the ceiling holds whatever the number
 of nodes.
@@ -30,11 +30,15 @@ of nodes.
 | 16 | ~122 | ~64 s | ~115 |
 
 Before the end, the time budget can cap batches below the transaction capacity: it leaves
-`graceFloor − prove_base − settle_margin` for the per-vote cost, which is 75 votes at nf = 16 on
-the cold estimate with a 150 s floor and the default margins. The estimate follows the prover's
+`graceFloor − prove_base − settle_margin` for the per-vote cost, which is 225 votes at nf = 16 on
+the cold estimate with a 240 s floor and the default margins. The estimate follows the prover's
 real cost after a few batches, and past the end the whole grace window counts.
 
 Time from pressing END to results on-chain, with a 150 s grace and a sequencer key:
+
+Those times were measured in blob mode on a registry with a 150 s grace. On the OP preset
+(L1-blob mode, floor 240 s, default 300 s), each row is longer by the extra grace plus the
+Ethereum leg of each landing (about 110 s); the OP figures will come from new benchmarks.
 
 | Backlog at the end | Last landing | Grace end | Results |
 |---|---|---|---|

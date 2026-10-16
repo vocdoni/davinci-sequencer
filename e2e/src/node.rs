@@ -123,6 +123,16 @@ pub struct NodeConfig {
     /// First block the monitor scans on a fresh datadir
     /// (`DAVINCI_START_BLOCK`; ignored by nodes that lack it).
     pub start_block: Option<u64>,
+    /// L1-blob mode, `None` in blob mode: Ethereum RPCs (`DAVINCI_L1_RPC_URL`,
+    /// a `,` list), send-only endpoints, the file with the node's dedicated
+    /// Ethereum key (an observer has none) and the post fee cap.
+    pub l1_rpc_url: Option<String>,
+    pub l1_send_rpc_url: Option<String>,
+    pub l1_privkey_file: Option<PathBuf>,
+    pub l1_max_post_fee: Option<String>,
+    /// `DAVINCI_L1_SETTLE_LAG`: the Ethereum leg the node reserves; `None`
+    /// keeps the node's default (Ethereum mainnet timing).
+    pub l1_settle_lag: Option<String>,
 }
 
 impl NodeConfig {
@@ -161,6 +171,11 @@ impl NodeConfig {
             prove_base: Some("15s".into()),
             max_blobs_per_tx: None,
             start_block: None,
+            l1_rpc_url: None,
+            l1_send_rpc_url: None,
+            l1_privkey_file: None,
+            l1_max_post_fee: None,
+            l1_settle_lag: None,
         }
     }
 }
@@ -214,6 +229,9 @@ impl Node {
         if let Some(k) = &cfg.privkey_file {
             cmd.env("DAVINCI_PRIVKEY_FILE", k);
         }
+        if let Some(k) = &cfg.l1_privkey_file {
+            cmd.env("DAVINCI_L1_PRIVKEY_FILE", k);
+        }
         if let Some(b) = cfg.start_block {
             cmd.env("DAVINCI_START_BLOCK", b.to_string());
         }
@@ -226,6 +244,10 @@ impl Node {
                 "DAVINCI_MAX_BLOBS_PER_TX",
                 cfg.max_blobs_per_tx.map(|n| n.to_string()),
             ),
+            ("DAVINCI_L1_RPC_URL", cfg.l1_rpc_url.clone()),
+            ("DAVINCI_L1_SEND_RPC_URL", cfg.l1_send_rpc_url.clone()),
+            ("DAVINCI_L1_MAX_POST_FEE", cfg.l1_max_post_fee.clone()),
+            ("DAVINCI_L1_SETTLE_LAG", cfg.l1_settle_lag.clone()),
         ];
         for (k, v) in knobs {
             if let Some(v) = v {

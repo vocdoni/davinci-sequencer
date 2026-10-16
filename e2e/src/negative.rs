@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use davinci_client::organizer::{DAVINCITypes, ProcessRegistry as PR, RegistryReader, revert_name};
 
 use crate::chain;
+use crate::l1::L1BlobVerifier;
 
 /// Byte of word 10 in the 512-byte publics: the batch guest's root after,
 /// the results guest's first tally word. Only the verifier reads it.
@@ -122,7 +123,7 @@ impl<P: Provider> Sim<P> {
             Ok(_) => Outcome::Ok,
             Err(e) => match e.as_error_resp() {
                 Some(p) => match p.as_revert_data() {
-                    Some(d) => Outcome::Reverted(revert_name(&d)),
+                    Some(d) => Outcome::Reverted(revert_label(&d)),
                     None if p.message.contains("revert") => Outcome::Opaque(p.message.to_string()),
                     None => Outcome::Rpc(p.message.to_string()),
                 },
@@ -130,6 +131,29 @@ impl<P: Provider> Sim<P> {
             },
         }
     }
+}
+
+/// A revert's name: the registry's and its adapters' errors (the client's
+/// `revert_name`), else the `L1BlobVerifier`'s, else an `Error(string)`
+/// reason (the vendored `MerkleTrie` reverts with strings).
+pub fn revert_label(data: &[u8]) -> String {
+    use alloy::sol_types::{Revert, SolError, SolInterface};
+    let name = revert_name(data);
+    if !name.starts_with("0x") {
+        return name;
+    }
+    if let Ok(e) = L1BlobVerifier::L1BlobVerifierErrors::abi_decode(data) {
+        let d = format!("{e:?}");
+        return d
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+    }
+    if let Ok(r) = Revert::abi_decode(data) {
+        return r.reason;
+    }
+    name
 }
 
 /// `input` from `from` to `to`, simulated at the latest block.
@@ -186,90 +210,17 @@ pub async fn run(
         .context("transition tx not found")?;
     let from_tr = tx.inner.signer();
     let input = tx.inner.input().to_vec();
-    let hashes = tx
-        .inner
-        .blob_versioned_hashes()
-        .unwrap_or_default()
-        .to_vec();
-    let fee = tx.inner.max_fee_per_blob_gas().unwrap_or(1_000_000_000);
-    let mut blobs = Some((hashes.clone(), fee));
     let (before, at) = (BlockId::number(tr.block - 1), BlockId::number(tr.block));
-    let call = PR::submitStateTransitionCall::abi_decode(&input).context("decode transition")?;
-
-    // Whether this RPC simulates blob hashes. Refused fields: retry without
-    // them. MissingBlob: it ignores them. Either way the rest runs without
-    // blob fields (the flips reach the verifier before the openings) and the
-    // extra-hash check is INCONCLUSIVE.
-    let mut got = sim
-        .call(from_tr, input.clone(), blobs.clone(), before)
-        .await;
-    if matches!(got, Outcome::Rpc(_)) {
-        blobs = None;
-        got = sim.call(from_tr, input.clone(), None, before).await;
-    }
-    let mut chk = control("transition control at N-1", got);
-    if matches!(&chk.got, Outcome::Reverted(n) if n == "MissingBlob") {
-        blobs = None;
-        chk.inconclusive = true;
-        chk.problem = Some("the RPC does not simulate blob hashes".into());
-    }
-    let blob_sim = chk.got == Outcome::Ok && blobs.is_some();
-    out.push(chk);
-    let replay = sim.call(from_tr, input.clone(), blobs.clone(), at).await;
-    out.push(judge("replay at N", replay, &["InvalidStateRoot"]));
-
-    let mut c = call.clone();
-    let mut proof = c.proofBytes.to_vec();
-    let mid = proof.len() / 2;
-    proof[mid] ^= 1;
-    c.proofBytes = proof.into();
-    let got = sim
-        .call(from_tr, c.abi_encode(), blobs.clone(), before)
-        .await;
-    out.push(judge("proof byte flipped at N-1", got, &["InvalidProof"]));
-
-    let mut c = call.clone();
-    let mut pubs = c.publicValues.to_vec();
-    pubs[FLIP_AT] ^= 1;
-    c.publicValues = pubs.into();
-    let got = sim
-        .call(from_tr, c.abi_encode(), blobs.clone(), before)
-        .await;
-    out.push(judge(
-        "root-after byte flipped at N-1",
-        got,
-        &["InvalidProof"],
-    ));
-
-    let mut c = call.clone();
-    c.commitments.push(c.commitments[0].clone());
-    c.ys.push(c.ys[0]);
-    c.kzgProofs.push(c.kzgProofs[0].clone());
-    let got = sim
-        .call(from_tr, c.abi_encode(), blobs.clone(), before)
-        .await;
-    out.push(judge(
-        "extra blob in the arrays at N-1",
-        got,
-        &["BlobCountMismatch"],
-    ));
-
-    let mut more = hashes.clone();
-    let mut extra = B256::with_last_byte(1);
-    extra.0[0] = 1; // the KZG version byte
-    more.push(extra);
-    if blob_sim {
-        let got = sim
-            .call(from_tr, input.clone(), Some((more, fee)), before)
-            .await;
-        out.push(judge("extra blob hash at N-1", got, &["BlobCountMismatch"]));
+    if input.starts_with(&PR::submitStateTransitionL1Call::SELECTOR) {
+        out.extend(l1_transition(&sim, from_tr, &input, (before, at)).await?);
     } else {
-        out.push(Check {
-            name: "extra blob hash at N-1",
-            got: Outcome::Rpc("skipped".into()),
-            problem: Some("the RPC does not simulate blob hashes".into()),
-            inconclusive: true,
-        });
+        let hashes = tx
+            .inner
+            .blob_versioned_hashes()
+            .unwrap_or_default()
+            .to_vec();
+        let fee = tx.inner.max_fee_per_blob_gas().unwrap_or(1_000_000_000);
+        out.extend(blob_transition(&sim, from_tr, &input, (hashes, fee), (before, at)).await?);
     }
 
     // The results.
@@ -334,6 +285,206 @@ pub async fn run(
         res.block
     );
     verdict(out)
+}
+
+/// A blob-mode transition replayed and tampered with at the block before it
+/// (`before`) and replayed at its own (`at`), with its blob hashes and fee
+/// when the RPC simulates them.
+async fn blob_transition<P: Provider>(
+    sim: &Sim<P>,
+    from_tr: Address,
+    input: &[u8],
+    (hashes, fee): (Vec<B256>, u128),
+    (before, at): (BlockId, BlockId),
+) -> Result<Vec<Check>> {
+    let mut out = Vec::new();
+    let mut blobs = Some((hashes.clone(), fee));
+    let call = PR::submitStateTransitionCall::abi_decode(input).context("decode transition")?;
+
+    // Whether this RPC simulates blob hashes. Refused fields: retry without
+    // them. MissingBlob: it ignores them. Either way the rest runs without
+    // blob fields (the flips reach the verifier before the openings) and the
+    // extra-hash check is INCONCLUSIVE.
+    let mut got = sim
+        .call(from_tr, input.to_vec(), blobs.clone(), before)
+        .await;
+    if matches!(got, Outcome::Rpc(_)) {
+        blobs = None;
+        got = sim.call(from_tr, input.to_vec(), None, before).await;
+    }
+    let mut chk = control("transition control at N-1", got);
+    if matches!(&chk.got, Outcome::Reverted(n) if n == "MissingBlob") {
+        blobs = None;
+        chk.inconclusive = true;
+        chk.problem = Some("the RPC does not simulate blob hashes".into());
+    }
+    let blob_sim = chk.got == Outcome::Ok && blobs.is_some();
+    out.push(chk);
+    let replay = sim.call(from_tr, input.to_vec(), blobs.clone(), at).await;
+    out.push(judge("replay at N", replay, &["InvalidStateRoot"]));
+
+    let mut c = call.clone();
+    let mut proof = c.proofBytes.to_vec();
+    let mid = proof.len() / 2;
+    proof[mid] ^= 1;
+    c.proofBytes = proof.into();
+    let got = sim
+        .call(from_tr, c.abi_encode(), blobs.clone(), before)
+        .await;
+    out.push(judge("proof byte flipped at N-1", got, &["InvalidProof"]));
+
+    let mut c = call.clone();
+    let mut pubs = c.publicValues.to_vec();
+    pubs[FLIP_AT] ^= 1;
+    c.publicValues = pubs.into();
+    let got = sim
+        .call(from_tr, c.abi_encode(), blobs.clone(), before)
+        .await;
+    out.push(judge(
+        "root-after byte flipped at N-1",
+        got,
+        &["InvalidProof"],
+    ));
+
+    let mut c = call.clone();
+    c.commitments.push(c.commitments[0].clone());
+    c.ys.push(c.ys[0]);
+    c.kzgProofs.push(c.kzgProofs[0].clone());
+    let got = sim
+        .call(from_tr, c.abi_encode(), blobs.clone(), before)
+        .await;
+    out.push(judge(
+        "extra blob in the arrays at N-1",
+        got,
+        &["BlobCountMismatch"],
+    ));
+
+    let mut more = hashes.clone();
+    let mut extra = B256::with_last_byte(1);
+    extra.0[0] = 1; // the KZG version byte
+    more.push(extra);
+    if blob_sim {
+        let got = sim
+            .call(from_tr, input.to_vec(), Some((more, fee)), before)
+            .await;
+        out.push(judge("extra blob hash at N-1", got, &["BlobCountMismatch"]));
+    } else {
+        out.push(Check {
+            name: "extra blob hash at N-1",
+            got: Outcome::Rpc("skipped".into()),
+            problem: Some("the RPC does not simulate blob hashes".into()),
+            inconclusive: true,
+        });
+    }
+    Ok(out)
+}
+
+/// An L1-blob transition (`submitStateTransitionL1`) replayed at its own
+/// block and, tampered with, at the block before it; no blob fields: its
+/// blobs are on Ethereum.
+async fn l1_transition<P: Provider>(
+    sim: &Sim<P>,
+    from_tr: Address,
+    input: &[u8],
+    (before, at): (BlockId, BlockId),
+) -> Result<Vec<Check>> {
+    let call =
+        PR::submitStateTransitionL1Call::abi_decode(input).context("decode L1 transition")?;
+    let mut out = Vec::new();
+    let got = sim.call(from_tr, input.to_vec(), None, before).await;
+    out.push(control("L1 transition control at N-1", got));
+    let got = sim.call(from_tr, input.to_vec(), None, at).await;
+    out.push(judge("L1 replay at N", got, &["InvalidStateRoot"]));
+    for (name, data, want) in l1_tampered(&call) {
+        let got = sim.call(from_tr, data, None, before).await;
+        out.push(judge(name, got, want));
+    }
+    Ok(out)
+}
+
+/// The tampered L1-mode calls: check name, calldata and the reverts that
+/// pass it.
+pub fn l1_tampered(
+    call: &PR::submitStateTransitionL1Call,
+) -> Vec<(&'static str, Vec<u8>, &'static [&'static str])> {
+    let mut out: Vec<(&'static str, Vec<u8>, &'static [&'static str])> = Vec::new();
+    // Blob mode's entry point, on a registry in L1-blob mode.
+    let blob = PR::submitStateTransitionCall {
+        processId: call.processId,
+        publicValues: call.publicValues.clone(),
+        proofBytes: call.proofBytes.clone(),
+        commitments: call.commitments.clone(),
+        ys: call.ys.clone(),
+        kzgProofs: call.kzgProofs.clone(),
+    };
+    out.push(("blob-mode entry point", blob.abi_encode(), &["WrongDAMode"]));
+    let mut c = call.clone();
+    let mut proof = c.proofBytes.to_vec();
+    let mid = proof.len() / 2;
+    proof[mid] ^= 1;
+    c.proofBytes = proof.into();
+    out.push((
+        "L1 proof byte flipped at N-1",
+        c.abi_encode(),
+        &["InvalidProof"],
+    ));
+    // The newest header twice: the second is not the first one's parent.
+    let mut c = call.clone();
+    if let Some(h) = c.l1.headers.first().cloned() {
+        c.l1.headers.insert(0, h);
+    }
+    out.push((
+        "L1 header chain broken at N-1",
+        c.abi_encode(),
+        &["BrokenHeaderChain"],
+    ));
+    // A trie proof whose root node (an empty RLP list) is not the block's
+    // transactions root.
+    let mut c = call.clone();
+    if let Some(n) = c.l1.txs.first_mut().and_then(|t| t.proof.first_mut()) {
+        *n = Bytes::from_static(&[0xc0]);
+    }
+    out.push((
+        "L1 tx proof of another trie at N-1",
+        c.abi_encode(),
+        &["MerkleTrie: invalid root hash"],
+    ));
+    // Commitments out of the order the guest's digest fixes; with one blob,
+    // another commitment.
+    let mut c = call.clone();
+    if c.commitments.len() >= 2 {
+        c.commitments.swap(0, 1);
+        c.ys.swap(0, 1);
+        c.kzgProofs.swap(0, 1);
+    } else if let Some(cm) = c.commitments.first_mut() {
+        let mut b = cm.to_vec();
+        if let Some(x) = b.last_mut() {
+            *x ^= 1;
+        }
+        *cm = b.into();
+    }
+    out.push((
+        "L1 commitment swapped at N-1",
+        c.abi_encode(),
+        &["InvalidBlobsDigest"],
+    ));
+    // One (commitment, y, proof) more than the guest published.
+    let mut c = call.clone();
+    if let (Some(cm), Some(y), Some(k)) = (
+        c.commitments.first().cloned(),
+        c.ys.first().copied(),
+        c.kzgProofs.first().cloned(),
+    ) {
+        c.commitments.push(cm);
+        c.ys.push(y);
+        c.kzgProofs.push(k);
+    }
+    out.push((
+        "L1 extra blob in the arrays at N-1",
+        c.abi_encode(),
+        &["BlobCountMismatch"],
+    ));
+    out
 }
 
 /// Bytes of words 18 and 19 in the 512-byte publics: the batch's new voters
@@ -420,12 +571,22 @@ pub async fn grace(rpc: &str, registry: Address, pid: [u8; 31], from: u64) -> Re
             inconclusive: true,
         });
     }
-    let mut c = PR::submitStateTransitionCall::abi_decode(&tin).context("decode transition")?;
-    let mut pubs = c.publicValues.to_vec();
-    pubs[COUNTS].fill(0);
-    c.publicValues = pubs.into();
+    let empty = if tin.starts_with(&PR::submitStateTransitionL1Call::SELECTOR) {
+        let mut c =
+            PR::submitStateTransitionL1Call::abi_decode(&tin).context("decode L1 transition")?;
+        let mut pubs = c.publicValues.to_vec();
+        pubs[COUNTS].fill(0);
+        c.publicValues = pubs.into();
+        c.abi_encode()
+    } else {
+        let mut c = PR::submitStateTransitionCall::abi_decode(&tin).context("decode transition")?;
+        let mut pubs = c.publicValues.to_vec();
+        pubs[COUNTS].fill(0);
+        c.publicValues = pubs.into();
+        c.abi_encode()
+    };
     let got = sim
-        .call(tfrom, c.abi_encode(), None, BlockId::number(tr.block - 1))
+        .call(tfrom, empty, None, BlockId::number(tr.block - 1))
         .await;
     out.push(judge(
         "transition without votes at N-1",
@@ -610,5 +771,71 @@ mod tests {
         assert!(control("x", Outcome::Ok).problem.is_none());
         let c = control("x", r("InvalidStateRoot"));
         assert!(c.problem.is_some() && !c.inconclusive);
+    }
+
+    #[test]
+    fn revert_labels() {
+        use alloy::sol_types::{Revert, SolError};
+        let broken = L1BlobVerifier::BrokenHeaderChain {
+            index: U256::from(1),
+        };
+        assert_eq!(revert_label(&broken.abi_encode()), "BrokenHeaderChain");
+        let trie = Revert::from("MerkleTrie: invalid root hash");
+        assert_eq!(
+            revert_label(&trie.abi_encode()),
+            "MerkleTrie: invalid root hash"
+        );
+        let mode = PR::WrongDAMode {};
+        assert_eq!(revert_label(&mode.abi_encode()), "WrongDAMode");
+        assert_eq!(revert_label(&[1, 2, 3, 4, 5]), "0x01020304");
+    }
+
+    #[test]
+    fn l1_tampering() {
+        use davinci_client::organizer::IL1BlobVerifier::{L1BlobProof, L1TxProof};
+        let call = PR::submitStateTransitionL1Call {
+            processId: FixedBytes([7; 31]),
+            publicValues: vec![0u8; 512].into(),
+            proofBytes: vec![9u8; 64].into(),
+            commitments: vec![vec![0xaa; 48].into()],
+            ys: vec![B256::repeat_byte(1)],
+            kzgProofs: vec![vec![0xbb; 48].into()],
+            l1: L1BlobProof {
+                headers: vec![vec![0xf9, 1].into(), vec![0xf9, 2].into()],
+                txs: vec![L1TxProof {
+                    headerIndex: U256::from(1),
+                    key: vec![0x80].into(),
+                    proof: vec![vec![0xf8, 3].into(), vec![0xf8, 4].into()],
+                }],
+            },
+        };
+        let t = l1_tampered(&call);
+        let names: Vec<_> = t.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names.len(), 6, "{names:?}");
+        let decode = |i: usize| PR::submitStateTransitionL1Call::abi_decode(&t[i].1).unwrap();
+        assert!(t[0].1.starts_with(&PR::submitStateTransitionCall::SELECTOR));
+        assert_ne!(decode(1).proofBytes, call.proofBytes);
+        let h = decode(2).l1.headers;
+        assert_eq!(
+            (h.len(), &h[0], &h[1]),
+            (3, &call.l1.headers[0], &call.l1.headers[0])
+        );
+        assert_eq!(decode(3).l1.txs[0].proof[0].as_ref(), &[0xc0]);
+        assert_eq!(decode(3).l1.txs[0].proof[1], call.l1.txs[0].proof[1]);
+        let c = decode(4).commitments;
+        assert!(c.len() == 1 && c[0] != call.commitments[0] && c[0].len() == 48);
+        let e = decode(5);
+        assert_eq!(
+            (e.commitments.len(), e.ys.len(), e.kzgProofs.len()),
+            (2, 2, 2)
+        );
+        // Every tampered call keeps the pid and the publics.
+        for i in 1..6 {
+            let d = decode(i);
+            assert_eq!(
+                (d.processId, &d.publicValues),
+                (call.processId, &call.publicValues)
+            );
+        }
     }
 }

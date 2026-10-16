@@ -97,8 +97,8 @@ refreshes the circuit will demand.
 **Release pins.** `rust-sdk/src/release.rs` in davinci-zkvm pins `BATCH_PROGRAM_VK`,
 `RESULTS_PROGRAM_VK` and `ROOT_C_VADCOP_FINAL`. They must equal the programs the prover runs, the
 registry's immutables and davinci-zkvm's go-sdk `CircuitRelease`, and the node refuses any proof
-that differs (the votes end in `error`
-mentioning the pin). Rebuilding a zkVM program or changing the ZisK setup means refreezing the
+that differs (the votes stay pending, and those left at the close end in `process closed (held:
+…)` naming the pin). Rebuilding a zkVM program or changing the ZisK setup means refreezing the
 pins and redeploying the registry. The ballot VK is the SDK's embedded
 `assets/ballot_proof_vkey.json`; its hash is state leaf `0x07` and the registry's `ballotVKHash`.
 
@@ -109,8 +109,9 @@ leaves the chain settings unset, so tests build configs with `--network custom`.
 
 **Storage.** Records are JSON in redb. Bump `storage.rs::SCHEMA_VERSION` on any record-shape
 change; the node refuses a database with another version. redb holds a file lock, so restart tests
-reopen with a retry loop. The fault-injection hook `Db::fail_next_arbo_writes` exists only with
-feature `test-hooks`, which the crate enables for its own tests through a self dev-dependency.
+reopen with a retry loop. The fault-injection hooks `Db::fail_next_arbo_writes` and
+`Db::fail_next_writes` exist only with feature `test-hooks`, which the crate enables for its own
+tests through a self dev-dependency.
 
 **Blobs are 128 KiB.** Never deserialize or pass one by value through serde or deep call chains:
 a by-value blob overflows the 2 MiB tokio worker stack in debug builds. `AnvilBlobs` deserializes

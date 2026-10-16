@@ -1,0 +1,13 @@
+[profile.default]
+solc_version = "0.8.28"
+evm_version = "cancun"
+src = "src"
+out = "out"
+test = "test"
+libs = []
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+cache_path = "cache_forge"
+remappings = ["forge-std/=/home/p4u/davinci-contracts/lib/forge-std/src/"]
+fs_permissions = [{ access = "read", path = "../fixtures" }]

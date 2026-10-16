@@ -286,11 +286,15 @@ async fn guest_failure_errors_votes_no_retry() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(prover.calls(), 1);
     assert_eq!(s.chain.voters(), 0);
+    assert_eq!(node.metrics.guest_rejections.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 0);
     shutdown.cancel();
 }
 
+/// A proof our own checks refuse (here the program vk pin) holds the votes
+/// pending: requeued, never errored, settled once a proof passes.
 #[tokio::test]
-async fn tampered_program_vk_rejected() {
+async fn tampered_program_vk_holds_the_votes() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
@@ -311,13 +315,14 @@ async fn tampered_program_vk_rejected() {
     let v = fake_vote(&s.env, 0, &[1, 2], 5);
     let vid = v.pkg.vote_id;
     h.submit(v).await.unwrap();
-    wait_until("vote errored", async || {
-        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    wait_until("vote settled on the retry", async || {
+        all_settled(&h, &[vid]).await
     })
     .await;
-    let sv = h.status(vid).await.unwrap().unwrap();
-    assert!(sv.error.unwrap().contains("vk"), "vk pin named");
-    assert_eq!(s.chain.voters(), 0);
+    assert_eq!(prover.calls(), 2);
+    assert_eq!(node.metrics.held_batches.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 0);
+    assert_eq!(s.chain.voters(), 1);
     shutdown.cancel();
 }
 
@@ -866,12 +871,7 @@ async fn metadata_update_reaches_the_record() {
     )
     .await;
     let _h = handle(&node).await;
-    s.chain.advance_time(0);
-    s.chain.push_event(EventKind::MetadataUpdated {
-        pid: pid31(),
-        uri: "ipfs://metadata-2".into(),
-        hash: [0x5a; 32],
-    });
+    s.chain.set_metadata("ipfs://metadata-2", [0x5a; 32]);
     wait_until("metadata stored", async || {
         node.db.process(&pid_fr()).unwrap().is_some_and(|r| {
             r.onchain.metadata_uri == "ipfs://metadata-2" && r.onchain.metadata_hash == [0x5a; 32]
@@ -1507,8 +1507,9 @@ async fn replayed_events_do_not_abort_flights() {
 
 /// A commit-persist failure rolls the tree back before requeueing, so
 /// the follow-up resync from our own blobs applies and the votes settle.
-#[tokio::test]
-async fn commit_failure_rolls_back_and_resyncs() {
+/// With the rollback failing too (`faults == 2`) the actor reopens its
+/// state at the committed record, in-run.
+async fn commit_failure_rolls_back_and_resyncs_with(faults: u32) {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
@@ -1530,8 +1531,8 @@ async fn commit_failure_rolls_back_and_resyncs() {
     let vid = v.pkg.vote_id;
     h.submit(v).await.unwrap();
     wait_until("proof running", async || prover.calls() >= 1).await;
-    // The next arbo write is the commit's persist: it fails once.
-    db.fail_next_arbo_writes(1);
+    // The next arbo writes are the commit's persist, then the rollback.
+    db.fail_next_arbo_writes(faults);
     prover.release(1);
     wait_until("vote settled after resync", async || {
         vote_status(&h, vid).await == Some(VoteStatus::Settled)
@@ -1539,9 +1540,75 @@ async fn commit_failure_rolls_back_and_resyncs() {
     .await;
     let snap = h.snapshot().await.unwrap();
     assert_eq!(snap.root, s.chain.root());
+    let (p, root) = h.vote_id_proof(vid).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
     // The repair went through the blob-sync path.
     assert_eq!(node.metrics.synced_from_others.load(Ordering::SeqCst), 1);
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn commit_failure_rolls_back_and_resyncs() {
+    commit_failure_rolls_back_and_resyncs_with(1).await;
+}
+
+#[tokio::test]
+async fn commit_and_rollback_failure_reopens_and_resyncs() {
+    commit_failure_rolls_back_and_resyncs_with(2).await;
+}
+
+/// A peer sync whose tree writes fail part way: the first insert lands,
+/// the next one and apply's own reset fail, and with `faults == 3` the
+/// actor's reset too. The node points its tree back at the committed root
+/// (or reopens), so once the faults clear the resync applies, in-run.
+async fn partial_peer_sync_recovers_with(faults: u32) {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let peer = fake_vote(&s.env, 0, &[1, 2], 510);
+    db.fail_arbo_writes_after(1, faults);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&peer)));
+    wait_until("synced the peer", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    let (p, root) = h.vote_id_proof(peer.pkg.vote_id).await.unwrap();
+    assert!(p.exists);
+    assert_eq!(root, s.chain.root());
+    let v = fake_vote(&s.env, 1, &[1, 2], 511);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("ours settled on top", async || {
+        all_settled(&h, &[vid]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn partial_peer_sync_resets_the_tree() {
+    partial_peer_sync_recovers_with(2).await;
+}
+
+#[tokio::test]
+async fn partial_peer_sync_with_a_failed_reset_reopens() {
+    partial_peer_sync_recovers_with(3).await;
 }
 
 /// Restart with a sealed-but-unproved batch: recover() puts the aggregated
@@ -1695,14 +1762,15 @@ async fn transient_prover_failure_backs_off_and_recovers() {
     shutdown.cancel();
 }
 
-/// A prover 4xx (refused input) errors the votes once — no retry.
+/// A prover 4xx (refused input) on a lone vote: one full-size retry, then
+/// the vote is isolated and errored with the prover's reason.
 #[tokio::test]
-async fn permanent_prover_refusal_errors_votes_once() {
+async fn permanent_prover_refusal_isolates_a_lone_vote() {
     let s = setup(2, 8, None);
     let dir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
     let prover = FakeProver::open();
-    *prover.fail_batches_permanent.lock().unwrap() = 1;
+    *prover.fail_batches_permanent.lock().unwrap() = 2;
     let node = start_node(
         Db::open_in(dir.path()).unwrap(),
         dir.path(),
@@ -1722,11 +1790,14 @@ async fn permanent_prover_refusal_errors_votes_once() {
         vote_status(&h, vid).await == Some(VoteStatus::Error)
     })
     .await;
-    let sv = h.status(vid).await.unwrap().unwrap();
-    assert!(sv.error.unwrap().contains("400"), "reason recorded");
+    let e = h.status(vid).await.unwrap().unwrap().error.unwrap();
+    assert!(e.contains("400"), "reason recorded: {e}");
+    assert!(e.contains("isolated by bisection"), "{e}");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(prover.calls(), 1, "a refused input must not be resubmitted");
+    assert_eq!(prover.calls(), 2, "one retry, then isolated");
     assert_eq!(s.chain.submit_count(), 0);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 2);
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 1);
     shutdown.cancel();
 }
 
@@ -1926,6 +1997,7 @@ async fn foreign_first_transition_is_ignored_immediately() {
         voters: 1,
         overwrites: 0,
         n_blobs: 1,
+        l1: None,
     });
     let dir = TempDir::new().unwrap();
     let db = Db::open_in(dir.path()).unwrap();
@@ -1994,12 +2066,7 @@ fn update_census(s: &TestSetup, sub: &str, voters: &[usize]) -> Fr {
     let dir = s.census_dir.join(sub);
     std::fs::create_dir(&dir).unwrap();
     let uri = write_census_of(&dir, voters.iter().copied());
-    s.chain.advance_time(0);
-    s.chain.push_event(EventKind::CensusUpdated {
-        pid: pid31(),
-        root: fr_to_be(&root),
-        uri,
-    });
+    s.chain.set_census(fr_to_be(&root), uri);
     root
 }
 
@@ -2420,108 +2487,140 @@ async fn onchain_census_growth_respects_max_voters() {
     shutdown.cancel();
 }
 
-// --------------------------------- refresh overflow and census indexing
-
-use davinci_sequencer::census::onchain::UsableError;
-use davinci_sequencer::storage::ExposedRecord;
-
-/// Refresh overflow, unit path: only the pending votes the exposed set records are
-/// errored, the set clears everywhere, and later seals start a fresh set.
+/// R17 on anvil (origin 3): X, the only exposed vote, is held (the node
+/// refuses the prover's key); Y waits outside the hold with a history over
+/// all 24 occupied slots. A census reorg drops X's enrollment, so the
+/// re-proof errors X: the attempt ends there, and Y's seal (read with its
+/// own history) covers all 24 slots.
 #[tokio::test]
-async fn refresh_overflow_errors_only_exposed_votes() {
-    let s = setup(2, 8, None);
-    let dir = TempDir::new().unwrap();
-
-    // Phase 1: three pending votes, no seal (batch_max 5, batch_time 1h).
+async fn a_hold_emptied_by_the_reproof_seals_the_queue_covered() {
+    if !common::anvil::enabled() {
+        return;
+    }
+    use alloy::primitives::U256;
+    use alloy::providers::Provider;
+    let ch = common::anvil::CensusChain::start().await;
+    let enrolled: Vec<([u8; 20], u128)> = (0..26).map(|i| (voter_address(i), 1)).collect();
+    ch.add(&enrolled).await;
+    let (recorded, _) = ch.state().await;
+    let mut e = env(2, 30, None);
+    e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
+    e.cfg.census_root = fr_from_be(&recorded).unwrap();
+    let census_dir = TempDir::new().unwrap();
+    let chain = FakeChain::new(&e, String::new());
+    let c = ch.census.into_array();
+    chain.set_census_contract(c);
+    chain.set_max_voters(100);
+    // The registry and the census share one chain: keep their heads level.
+    let follow = async |chain: &FakeChain| {
+        let behind = chain.head_block().saturating_sub(ch.head().await);
+        if behind > 0 {
+            let () = ch
+                .reader
+                .raw_request("anvil_mine".into(), (U256::from(behind),))
+                .await
+                .unwrap();
+        }
+        while chain.head_block() < ch.head().await {
+            chain.advance_time(0);
+        }
+    };
+    follow(&chain).await;
+    let dir = census_dir.path().to_path_buf();
+    let s = TestSetup {
+        env: e,
+        chain,
+        _census_dir: census_dir,
+        census_dir: dir,
+    };
+    let dbdir = TempDir::new().unwrap();
     let shutdown = CancellationToken::new();
-    let node = start_node(
-        Db::open_in(dir.path()).unwrap(),
-        dir.path(),
-        &s,
+    let url = ch.anvil.endpoint();
+    let cfg = test_config_with(dbdir.path(), &s.census_dir, 1, "0s", &["--rpc-url", &url]);
+    let db = Db::open_in(dbdir.path()).unwrap();
+    let prover = FakeProver::open();
+    let node = start_node_cfg(
+        db.clone(),
         s.chain.clone(),
-        FakeProver::open(),
-        5,
-        "0s",
+        prover.clone(),
+        cfg,
         shutdown.clone(),
     )
     .await;
     let h = handle(&node).await;
-    let votes: Vec<VerifiedVote> = (0..3)
-        .map(|i| fake_vote(&s.env, i, &[1, 2], 60 + i as u64))
-        .collect();
-    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
-    for v in &votes {
-        h.submit(v.clone()).await.unwrap();
-    }
-    shutdown.cancel();
-    drop(node);
+    let first = submit_n(&h, &s, 24, 9900).await;
+    wait_long("24 settled", async || all_settled(&h, &first).await).await;
 
-    // Phase 2: seed an exposed record naming votes 0 and 1.
-    let db = reopen_db(dir.path()).await;
-    db.put_exposed(
+    // X's voter enrolls in a block a reorg will take.
+    let snap: U256 = ch
+        .reader
+        .raw_request("evm_snapshot".into(), ())
+        .await
+        .unwrap();
+    ch.add(&[(voter_address(26), 1)]).await;
+    follow(&s.chain).await;
+    wait_long("index at 27", async || {
+        node.onchain.latest(&c).is_some_and(|(_, n, _)| n == 27)
+    })
+    .await;
+    *prover.wrong_vk.lock().unwrap() = true;
+    let x = fake_vote(&s.env, 26, &[1, 2], 9950);
+    let xid = x.pkg.vote_id;
+    h.submit(x).await.unwrap();
+    wait_long("X held", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+            && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    // Y: unexposed, its history over every occupied slot.
+    let y = fake_vote(&s.env, 25, &[1, 2], 9951);
+    let yid = y.pkg.vote_id;
+    let all: Vec<u64> = (0..24)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+        .collect();
+    db.put_coverage(
         &pid_fr(),
-        &ExposedRecord {
-            slots: vec![1_000_001, 1_000_002],
-            vote_ids: vec![vids[0], vids[1]],
+        &[9; 32],
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: all.clone(),
+            vote_ids: vec![yid],
         },
     )
     .unwrap();
-
-    // Phase 3: force the overflow path.
-    let shutdown2 = CancellationToken::new();
-    let prover = FakeProver::gated();
-    let node2 = start_node(
-        db,
-        dir.path(),
-        &s,
-        s.chain.clone(),
-        prover.clone(),
-        5,
-        "0s",
-        shutdown2.clone(),
-    )
-    .await;
-    let h2 = handle(&node2).await;
-    h2.force_refresh_overflow().await;
-    wait_until("recorded votes errored", async || {
-        vote_status(&h2, vids[0]).await == Some(VoteStatus::Error)
-            && vote_status(&h2, vids[1]).await == Some(VoteStatus::Error)
+    h.submit(y).await.unwrap();
+    // The reorg drops X's enrollment; the prover recovers.
+    let reverted: bool = ch
+        .reader
+        .raw_request("evm_revert".into(), (snap,))
+        .await
+        .unwrap();
+    assert!(reverted);
+    follow(&s.chain).await;
+    wait_long("index back at 26", async || {
+        node.onchain.latest(&c).is_some_and(|(_, n, _)| n == 26)
     })
     .await;
-    for vid in &vids[..2] {
-        let rec = h2.status(*vid).await.unwrap().unwrap();
-        assert_eq!(
-            rec.error.as_deref(),
-            Some("exposed refresh set too large, recast")
-        );
+    *prover.wrong_vk.lock().unwrap() = false;
+    wait_long("Y settled", async || all_settled(&h, &[yid]).await).await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Error));
+    // Every seal of Y (its history entries) covers the 24 slots.
+    let mut seals = 0;
+    for (root, entry) in db.coverage_history(&pid_fr()).unwrap() {
+        if root != [9; 32] && entry.vote_ids.contains(&yid) {
+            seals += 1;
+            assert!(
+                all.iter().all(|s| entry.slots.contains(s)),
+                "a seal of Y left out its history"
+            );
+        }
     }
-    // The unrecorded vote is untouched and the set is gone from the db.
-    assert_eq!(vote_status(&h2, vids[2]).await, Some(VoteStatus::Pending));
-    assert!(node2.db.exposed(&pid_fr()).unwrap().is_none());
-
-    // The in-memory set cleared too: the next seal records a fresh one.
-    let mut more: Vec<u64> = Vec::new();
-    for i in 3..7 {
-        let v = fake_vote(&s.env, i, &[1, 2], 60 + i as u64);
-        more.push(v.pkg.vote_id);
-        h2.submit(v).await.unwrap();
-    }
-    wait_until("sealed", async || prover.calls() >= 1).await;
-    let e2 = node2
-        .db
-        .exposed(&pid_fr())
-        .unwrap()
-        .expect("fresh exposed set at seal");
-    assert!(!e2.slots.contains(&1_000_001) && !e2.slots.contains(&1_000_002));
-    assert!(!e2.vote_ids.contains(&vids[0]) && !e2.vote_ids.contains(&vids[1]));
-    let mut want = vec![vids[2]];
-    want.extend(&more);
-    want.sort_unstable();
-    assert_eq!(e2.vote_ids, want);
-    prover.release(100);
-    wait_until("survivors settled", async || all_settled(&h2, &want).await).await;
-    shutdown2.cancel();
+    assert!(seals >= 1);
+    shutdown.cancel();
 }
+
+// --------------------------------- refresh overflow and census indexing
+
+use davinci_sequencer::census::onchain::UsableError;
 
 /// Exposed-set sizing: a batch_max trim that sheds an overwrite of a live exposed
 /// slot errors nothing — the shed votes stay pending and settle later.
@@ -3814,6 +3913,44 @@ async fn budget_past_end_uses_grace_end() {
     shutdown.cancel();
 }
 
+/// The END events arrive before a head shows the END block's time: the
+/// registry's `Ended` status already says the end passed, so the first
+/// flush is sized by the 600 s grace (all 15 votes), not by the open
+/// window's now + 150 s floor (12).
+#[tokio::test]
+async fn first_flush_after_an_end_uses_the_grace() {
+    let s = setup(2, 16, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        20,
+        // Only the flush seals.
+        &["--batch-time", "1000000s", "--solo-wait", "3000000s"],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.set_grace(600);
+    beats().await;
+    let votes: Vec<VerifiedVote> = (0..15)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 100 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in votes {
+        h.submit(v).await.unwrap();
+    }
+    slow(&node);
+    s.chain.end_ahead_of_head(5);
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(prover.sizes(), vec![15]);
+    shutdown.cancel();
+}
+
 /// Far from the end a batch is still sized to survive the earliest legal
 /// close, an END now under the floor grace: 150 − 30 s fits 12 votes, and
 /// the END right after sealing still lands them.
@@ -4803,4 +4940,3983 @@ async fn shorten_enters_flush_and_closes_admission() {
     let late = fake_vote(&s.env, 2, &[1, 1], 7);
     assert!(matches!(h.submit(late).await, Err(ActorError::Closed(_))));
     shutdown.cancel();
+}
+
+// ------------------------------------------------------- failed batches
+
+// Votes `0..n` of the election, submitted in order.
+async fn submit_n(h: &ActorHandle, s: &TestSetup, n: usize, kseed: u64) -> Vec<u64> {
+    let mut vids = Vec::new();
+    for i in 0..n {
+        let v = fake_vote(&s.env, i, &[1, 2], kseed + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    vids
+}
+
+async fn vote_error(h: &ActorHandle, vid: u64) -> String {
+    h.status(vid)
+        .await
+        .unwrap()
+        .unwrap()
+        .error
+        .unwrap_or_default()
+}
+
+/// A prover that fails every batch holding vote X: one full-size retry,
+/// then halvings down to X alone, which is errored with the prover's
+/// reason; every other vote settles. 8 votes: 1 + 1 + log2(8) = 5 failed
+/// batches (8, 8, 4, 2, 1).
+#[tokio::test(start_paused = true)]
+async fn bisection_isolates_the_failing_vote() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        8,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let x = fake_vote(&s.env, 5, &[1, 2], 305).pkg.vote_id;
+    *prover.fail_vid.lock().unwrap() = Some(x);
+    let vids = submit_n(&h, &s, 8, 300).await;
+    assert_eq!(vids[5], x);
+    // The batch timer releases the leftovers once the bisection is over.
+    s.chain.advance_time(400);
+    let others: Vec<u64> = vids.iter().copied().filter(|v| *v != x).collect();
+    wait_long("X errored, the rest settled", async || {
+        vote_status(&h, x).await == Some(VoteStatus::Error) && all_settled(&h, &others).await
+    })
+    .await;
+    let e = vote_error(&h, x).await;
+    assert!(
+        e.contains("guest panicked") && e.contains("isolated by bisection"),
+        "{e}"
+    );
+    assert_eq!(prover.sizes(), vec![8, 8, 4, 4, 2, 1, 1, 1, 1]);
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 5);
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 1);
+    assert_eq!(s.chain.voters(), 7);
+    // The landings ended the bisection: later votes seal whole again.
+    let mut more = Vec::new();
+    for i in 0..3 {
+        let v = fake_vote(&s.env, i, &[2, 1], 350 + i as u64);
+        more.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    s.chain.advance_time(400);
+    wait_long("revotes settled", async || all_settled(&h, &more).await).await;
+    assert_eq!(*prover.sizes().last().unwrap(), 3);
+    shutdown.cancel();
+}
+
+/// A prover that fails every batch: three votes are isolated and errored,
+/// then the actor holds; no further vote errors, and the held votes settle
+/// once the prover recovers.
+#[tokio::test(start_paused = true)]
+async fn prover_failing_every_batch_holds_after_three_isolations() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        5,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, &s, 5, 400).await;
+    s.chain.advance_time(400);
+    wait_long("three isolated", async || {
+        node.metrics.isolated_votes.load(Ordering::SeqCst) == 3
+    })
+    .await;
+    // Holding: retries go on at full size, nothing more errors.
+    let calls = prover.calls();
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert!(prover.calls() > calls, "still retrying");
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 3);
+    for vid in &vids[..3] {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Error));
+    }
+    for vid in &vids[3..] {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    assert_eq!(
+        *prover.sizes().last().unwrap(),
+        2,
+        "held batches are full size"
+    );
+    *prover.fail_batches_permanent.lock().unwrap() = 0;
+    wait_long("held votes settled", async || {
+        all_settled(&h, &vids[3..]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+/// A close during a bisection errors the pending suspects with the plain
+/// close reason.
+#[tokio::test(start_paused = true)]
+async fn close_during_bisection_reads_process_closed() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 4, 500).await;
+    // Two failures (full size, then the retry): requeued, cap now 2.
+    wait_long("bisecting, nothing in flight", async || {
+        prover.calls() == 2 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    s.chain.set_status(ProcessStatus::Canceled);
+    for vid in &vids {
+        wait_long("errored", async || {
+            vote_status(&h, *vid).await == Some(VoteStatus::Error)
+        })
+        .await;
+        assert_eq!(vote_error(&h, *vid).await, "process closed");
+    }
+    assert_eq!(node.metrics.isolated_votes.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
+/// A node-side check failure (the program vk pin) on every proof holds the
+/// votes: requeued with the usual backoff, never bisected, never errored,
+/// and settled once the proofs pass.
+#[tokio::test(start_paused = true)]
+async fn held_check_failure_settles_after_the_fix() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.wrong_vk.lock().unwrap() = true;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 3, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 3, 600).await;
+    wait_long("held three times", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 3
+    })
+    .await;
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    assert!(prover.sizes().iter().all(|n| *n == 3), "never bisected");
+    assert_eq!(node.metrics.bisections.load(Ordering::SeqCst), 0);
+    *prover.wrong_vk.lock().unwrap() = false;
+    wait_long("settled", async || all_settled(&h, &vids).await).await;
+    shutdown.cancel();
+}
+
+/// Held votes still pending at the close carry the held reason.
+#[tokio::test(start_paused = true)]
+async fn held_votes_close_with_the_held_reason() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.wrong_vk.lock().unwrap() = true;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 2, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 2, 700).await;
+    wait_long("held, nothing in flight", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+            && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Canceled);
+    for vid in &vids {
+        wait_long("errored", async || {
+            vote_status(&h, *vid).await == Some(VoteStatus::Error)
+        })
+        .await;
+        let e = vote_error(&h, *vid).await;
+        assert!(e.starts_with("process closed (held: "), "{e}");
+        assert!(e.contains("program vk"), "{e}");
+    }
+    shutdown.cancel();
+}
+
+/// Bisection state is in memory: after a restart the next seal is full size.
+#[tokio::test(start_paused = true)]
+async fn restart_mid_bisection_seals_full_size() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    let vids = submit_n(&h, &s, 4, 800).await;
+    wait_long("bisecting, nothing in flight", async || {
+        prover.calls() == 2 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    let db = reopen_db(dir.path()).await;
+    let shutdown2 = CancellationToken::new();
+    let prover2 = FakeProver::open();
+    let (_node2, h2) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover2.clone(),
+        4,
+        &[],
+        shutdown2.clone(),
+    )
+    .await;
+    wait_long("settled", async || all_settled(&h2, &vids).await).await;
+    assert_eq!(prover2.sizes(), vec![4]);
+    shutdown2.cancel();
+}
+
+/// A results proof that fails for good once is retried after a cooldown,
+/// not latched: the results land without a restart.
+#[tokio::test]
+async fn failed_results_proof_is_retried_not_latched() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_results_permanent.lock().unwrap() = 1;
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 40);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
+    wait_until("results on chain", async || !s.chain.results().is_empty()).await;
+    assert_eq!(prover.results_calls(), 2);
+    wait_until("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// Ruling 22: with node A's prover failing every batch, foreign landings
+/// (B's, synced by A) never clear A's hold or its isolated count, so no
+/// fourth vote errors; A's own landing after the prover recovers does, and
+/// a later failing vote is isolated again.
+#[tokio::test(start_paused = true)]
+async fn foreign_landings_do_not_clear_a_bisection_hold() {
+    let s = setup(2, 8, None);
+    let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let shutdown = CancellationToken::new();
+    let prover_a = FakeProver::open();
+    *prover_a.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let node_a = start_node_cfg(
+        Db::open_in(dir_a.path()).unwrap(),
+        s.chain.with_signer(0xa1),
+        prover_a.clone(),
+        test_config_with(dir_a.path(), &s.census_dir, 5, "0s", TIMERS),
+        shutdown.clone(),
+    )
+    .await;
+    let node_b = start_node(
+        Db::open_in(dir_b.path()).unwrap(),
+        dir_b.path(),
+        &s,
+        s.chain.with_signer(0xb2),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let (ha, hb) = (handle(&node_a).await, handle(&node_b).await);
+    let isolated = || node_a.metrics.isolated_votes.load(Ordering::SeqCst);
+    let vids_a = submit_n(&ha, &s, 5, 900).await;
+    s.chain.advance_time(400);
+    wait_long("three isolated on A", async || isolated() == 3).await;
+    // Two foreign landings, each followed by enough of A's attempts to
+    // isolate another vote if the hold had been cleared.
+    for (k, i) in [5usize, 6].into_iter().enumerate() {
+        let calls = prover_a.calls();
+        let v = fake_vote(&s.env, i, &[1, 2], 950 + i as u64);
+        let vid = v.pkg.vote_id;
+        hb.submit(v).await.unwrap();
+        wait_long("B landed, A synced", async || {
+            all_settled(&hb, &[vid]).await
+                && node_a.metrics.synced_from_others.load(Ordering::SeqCst) == k as u64 + 1
+        })
+        .await;
+        s.chain.advance_time(400);
+        wait_long("A retried after the sync", async || {
+            prover_a.calls() >= calls + 3
+        })
+        .await;
+        assert_eq!(isolated(), 3, "a foreign landing cleared the hold");
+    }
+    for vid in &vids_a[3..] {
+        assert_eq!(vote_status(&ha, *vid).await, Some(VoteStatus::Pending));
+    }
+    // The prover recovers: A's own landing clears the hold.
+    *prover_a.fail_batches_permanent.lock().unwrap() = 0;
+    wait_long("A's held votes landed", async || {
+        all_settled(&ha, &vids_a[3..]).await
+    })
+    .await;
+    let x = fake_vote(&s.env, 0, &[2, 1], 990);
+    let y = fake_vote(&s.env, 1, &[2, 1], 991);
+    let (vx, vy) = (x.pkg.vote_id, y.pkg.vote_id);
+    *prover_a.fail_vid.lock().unwrap() = Some(vx);
+    ha.submit(x).await.unwrap();
+    ha.submit(y).await.unwrap();
+    s.chain.advance_time(400);
+    wait_long("x isolated, y settled", async || {
+        vote_status(&ha, vx).await == Some(VoteStatus::Error) && all_settled(&ha, &[vy]).await
+    })
+    .await;
+    assert_eq!(isolated(), 4);
+    shutdown.cancel();
+}
+
+/// A foreign landing between bisection cycles keeps the halved cap: 4
+/// votes fail twice (cap now 2), another sequencer lands two unrelated
+/// votes, and the next seal is still 2, not the failed batch's 4.
+#[tokio::test(start_paused = true)]
+async fn foreign_landing_keeps_the_halved_bisection_cap() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_vid.lock().unwrap() = Some(fake_vote(&s.env, 3, &[1, 2], 1003).pkg.vote_id);
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    submit_n(&h, &s, 4, 1000).await;
+    wait_long("two failures, nothing in flight", async || {
+        prover.calls() == 2 && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.settle_externally(&foreign_batch(&s, 6, 7));
+    wait_long("synced", async || {
+        node.metrics.synced_from_others.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("third attempt", async || prover.calls() >= 3).await;
+    assert_eq!(prover.sizes()[..3], [4, 4, 2]);
+    shutdown.cancel();
+}
+
+/// A lost race (`InvalidStateRoot`) on a halved bisection batch keeps the
+/// halved cap once the winner is synced.
+#[tokio::test(start_paused = true)]
+async fn lost_race_keeps_the_halved_bisection_cap() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    *prover.fail_vid.lock().unwrap() = Some(fake_vote(&s.env, 3, &[1, 2], 1103).pkg.vote_id);
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) =
+        batching_node(db, dir.path(), &s, prover.clone(), 4, &[], shutdown.clone()).await;
+    submit_n(&h, &s, 4, 1100).await;
+    for k in 1..=2 {
+        wait_long("attempt", async || prover.calls() == k).await;
+        prover.release(1);
+    }
+    // The halved batch [0, 1] proves, but another sequencer lands first and
+    // its event is not seen yet: the settlement reverts InvalidStateRoot.
+    wait_long("halved attempt", async || prover.calls() == 3).await;
+    assert_eq!(prover.sizes(), [4, 4, 2]);
+    let block = s.chain.settle_externally(&foreign_batch(&s, 6, 7));
+    s.chain.hide_block(Some(block));
+    prover.release(1);
+    wait_long("lost the race", async || {
+        node.metrics.lost_races.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    s.chain.hide_block(None);
+    wait_long("synced", async || {
+        node.metrics.synced_from_others.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("next attempt", async || prover.calls() == 4).await;
+    assert_eq!(prover.sizes(), [4, 4, 2, 2]);
+    shutdown.cancel();
+}
+
+/// While held (a node-side check failure, or a prover failing everything)
+/// nothing can land, so fresh votes must not join the cycles: their slots
+/// would ratchet into the exposed set. Overwrites arriving cycle after
+/// cycle leave the exposed set as it was, and nothing errors.
+async fn hold_seals_only_exposed_votes(prover_hold: bool) {
+    let s = setup(2, 40, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        40,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let first = submit_n(&h, &s, 40, 100).await;
+    wait_long("40 settled", async || all_settled(&h, &first).await).await;
+    // Overwrites that end up held.
+    let n_held = if prover_hold { 5 } else { 2 };
+    if prover_hold {
+        *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    } else {
+        *prover.wrong_vk.lock().unwrap() = true;
+    }
+    let mut vids = Vec::new();
+    // Held by a node-side check (a bisection errors votes one by one):
+    // two votes of one slot ahead of the rest. The first selection takes
+    // x1 and skips x2 on the slot clash, so x2 is pending but not exposed.
+    let clash = (!prover_hold).then(|| {
+        (
+            fake_vote(&s.env, 39, &[2, 1], 150),
+            fake_vote(&s.env, 39, &[2, 1], 151),
+        )
+    });
+    if let Some((x1, x2)) = &clash {
+        h.submit(x1.clone()).await.unwrap();
+        h.submit(x2.clone()).await.unwrap();
+        vids.push(x2.pkg.vote_id);
+        // Older than the rest, so it sorts ahead of them after a requeue.
+        s.chain.advance_time(1);
+    }
+    for i in 0..n_held {
+        let v = fake_vote(&s.env, i, &[2, 1], 200 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    s.chain.advance_time(400);
+    wait_long("holding", async || {
+        let held = if prover_hold {
+            node.metrics.isolated_votes.load(Ordering::SeqCst) == 3
+        } else {
+            node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+        };
+        held && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    let exposed = || node.db.exposed(&pid_fr()).unwrap().unwrap().slots.len();
+    let slots: std::collections::BTreeSet<u64> = node
+        .db
+        .exposed(&pid_fr())
+        .unwrap()
+        .unwrap()
+        .slots
+        .into_iter()
+        .collect();
+    let e0 = slots.len();
+    if let Some((x1, x2)) = &clash {
+        // A peer settles x1: x2, admitted before the exposed votes, is free.
+        // The next held batch takes only exposed votes, never x2 in their
+        // place.
+        let b = peer_batch_of(&node.db, &s, std::slice::from_ref(x1));
+        s.chain.settle_externally(&b);
+        wait_long("x1 settled by the peer", async || {
+            vote_status(&h, x1.pkg.vote_id).await == Some(VoteStatus::Settled)
+        })
+        .await;
+        let calls = prover.calls();
+        s.chain.advance_time(400);
+        wait_long("a held cycle after the sync", async || {
+            prover.calls() > calls && !h.snapshot().await.unwrap().in_flight
+        })
+        .await;
+        let rec = node.db.exposed(&pid_fr()).unwrap().unwrap();
+        assert!(
+            !rec.vote_ids.contains(&x2.pkg.vote_id),
+            "a non-exposed vote took an exposed vote's place"
+        );
+        assert_eq!(prover.sizes().last(), Some(&n_held));
+        // The peer's batch carried a vote of ours: its slots go to the
+        // coverage history, not to the live set.
+        assert_eq!(exposed(), e0, "the peer's batch widened the exposed set");
+        let nf = s.env.cfg.ballot_mode.num_fields;
+        let kept = node.db.coverage_for(&pid_fr(), &[x1.pkg.vote_id]).unwrap();
+        for (slot, _) in decode_blobs(&b.blobs.blobs, nf).unwrap().updates {
+            assert!(
+                kept.contains(&slot),
+                "the peer's batch is not in the history"
+            );
+        }
+    }
+    let fresh: Vec<usize> = (n_held..40)
+        .filter(|i| !slots.contains(&fake_vote(&s.env, *i, &[1, 2], 1).slot))
+        .take(3)
+        .collect();
+    assert_eq!(fresh.len(), 3);
+    for i in fresh {
+        let calls = prover.calls();
+        let v = fake_vote(&s.env, i, &[2, 1], 300 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        s.chain.advance_time(400);
+        wait_long("another held cycle", async || {
+            prover.calls() > calls && !h.snapshot().await.unwrap().in_flight
+        })
+        .await;
+        assert_eq!(exposed(), e0, "a fresh vote widened the exposed set");
+    }
+    let mut held = Vec::new();
+    for vid in &vids {
+        let st = vote_status(&h, *vid).await;
+        if st == Some(VoteStatus::Error) {
+            let e = vote_error(&h, *vid).await;
+            assert!(prover_hold && e.contains("isolated by bisection"), "{e}");
+        } else {
+            held.push(*vid);
+        }
+    }
+    *prover.fail_batches_permanent.lock().unwrap() = 0;
+    *prover.wrong_vk.lock().unwrap() = false;
+    for _ in 0..3 {
+        s.chain.advance_time(400);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+    wait_long("held votes settled", async || all_settled(&h, &held).await).await;
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_process_seals_only_its_exposed_votes() {
+    hold_seals_only_exposed_votes(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn prover_hold_seals_only_its_exposed_votes() {
+    hold_seals_only_exposed_votes(true).await;
+}
+
+/// Votes closed under a prover hold name it: the close reason carries the
+/// prover's error, not the plain `process closed` of an expected close.
+#[tokio::test(start_paused = true)]
+async fn cancel_under_a_prover_hold_names_the_hold() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.fail_batches_permanent.lock().unwrap() = u32::MAX;
+    let db = Db::open_in(dir.path()).unwrap();
+    let (node, h) = batching_node(
+        db,
+        dir.path(),
+        &s,
+        prover.clone(),
+        5,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, &s, 5, 1200).await;
+    s.chain.advance_time(400);
+    wait_long("holding, nothing in flight", async || {
+        node.metrics.isolated_votes.load(Ordering::SeqCst) == 3
+            && !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Canceled);
+    for vid in &vids[3..] {
+        wait_long("errored", async || {
+            vote_status(&h, *vid).await == Some(VoteStatus::Error)
+        })
+        .await;
+        let e = vote_error(&h, *vid).await;
+        assert!(e.starts_with("process closed (held: prover: "), "{e}");
+        assert!(e.contains("bad input"), "{e}");
+    }
+    shutdown.cancel();
+}
+
+// The node's stored (votersCount, overwrittenVotesCount), as the API serves them.
+fn stored_counts(db: &Db) -> (u64, u64) {
+    let r = db.process(&pid_fr()).unwrap().unwrap();
+    (r.onchain.voters_count, r.onchain.overwritten_count)
+}
+
+/// The registry counters follow two own landings and one synced transition,
+/// overwrites included, without re-reading getProcess; a node bootstrapped
+/// mid-election and a restarted one report them too.
+#[tokio::test]
+async fn onchain_counts_follow_own_and_synced_transitions() {
+    let s = setup(2, 8, None);
+    let (dir_a, dir_b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (stop_a, stop_b) = (CancellationToken::new(), CancellationToken::new());
+    let node_a = start_node(
+        Db::open_in(dir_a.path()).unwrap(),
+        dir_a.path(),
+        &s,
+        s.chain.with_signer(0xa1),
+        FakeProver::open(),
+        2,
+        "0s",
+        stop_a.clone(),
+    )
+    .await;
+    let ha = handle(&node_a).await;
+    assert_eq!(stored_counts(&node_a.db), (0, 0));
+    // From here the counters come from the landings alone.
+    s.chain.fail_process(u32::MAX);
+
+    // Own landing 1: two new voters, its event hidden, so the receipt alone counts.
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    for (i, k) in [(0, 10), (1, 11)] {
+        ha.submit(fake_vote(&s.env, i, &[1, 2], k)).await.unwrap();
+    }
+    wait_until("own landing 1", async || {
+        stored_counts(&node_a.db) == (2, 0)
+    })
+    .await;
+    s.chain.hide_block(None);
+    // Own landing 2: voter 0 overwrites, voter 2 is new.
+    for (i, k) in [(0, 12), (2, 13)] {
+        ha.submit(fake_vote(&s.env, i, &[2, 1], k)).await.unwrap();
+    }
+    wait_until("own landing 2", async || {
+        stored_counts(&node_a.db) == (3, 1)
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 3);
+
+    // B bootstraps mid-election and replays both landings from blobs.
+    s.chain.fail_process(0);
+    let node_b = start_node(
+        Db::open_in(dir_b.path()).unwrap(),
+        dir_b.path(),
+        &s,
+        s.chain.with_signer(0xb2),
+        FakeProver::open(),
+        2,
+        "0s",
+        stop_b.clone(),
+    )
+    .await;
+    let hb = handle(&node_b).await;
+    wait_until("B synced", async || {
+        hb.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(stored_counts(&node_b.db), (3, 1));
+    s.chain.fail_process(u32::MAX);
+
+    // B lands voter 1's overwrite and new voter 3; A syncs it.
+    for (i, k) in [(1, 14), (3, 15)] {
+        hb.submit(fake_vote(&s.env, i, &[1, 1], k)).await.unwrap();
+    }
+    wait_until("synced landing", async || {
+        stored_counts(&node_a.db) == (4, 2) && stored_counts(&node_b.db) == (4, 2)
+    })
+    .await;
+    assert_eq!(node_a.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    assert_eq!(node_a.metrics.settled_by_self.load(Ordering::SeqCst), 2);
+    assert_eq!(node_b.metrics.settled_by_self.load(Ordering::SeqCst), 1);
+    s.chain.fail_process(0);
+    let chain = s.chain.process(&pid31()).await.unwrap();
+    assert_eq!((chain.voters_count, chain.overwritten_count), (4, 2));
+
+    // A restart keeps them.
+    stop_a.cancel();
+    drop(ha);
+    drop(node_a);
+    let db = reopen_db(dir_a.path()).await;
+    assert_eq!(stored_counts(&db), (4, 2));
+    stop_b.cancel();
+}
+
+/// A gap replay of older transitions never rewinds the counters the newer
+/// event already pinned.
+#[tokio::test]
+async fn gap_replay_keeps_the_newer_counts() {
+    let s = setup(2, 8, None);
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover_a = FakeProver::gated();
+    let node_a = start_node(
+        Db::open_in(dir_a.path()).unwrap(),
+        dir_a.path(),
+        &s,
+        s.chain.with_signer(0xa1),
+        prover_a.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let node_b = start_node(
+        Db::open_in(dir_b.path()).unwrap(),
+        dir_b.path(),
+        &s,
+        s.chain.with_signer(0xb2),
+        FakeProver::open(),
+        10,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let ha = handle(&node_a).await;
+    let hb = handle(&node_b).await;
+
+    // T1 lands in a block hidden from B's monitor.
+    ha.submit(fake_vote(&s.env, 0, &[1, 2], 71)).await.unwrap();
+    wait_until("A proving", async || prover_a.calls() >= 1).await;
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    prover_a.release(100);
+    wait_until("T1 landed", async || s.chain.voters() == 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // B polls past T1
+    s.chain.hide_block(None);
+    // T2 reaches B as a gap; the replay from its event and the first resync
+    // fail at the blobs, the third attempt waits out a backoff. No getProcess
+    // read heals the counts meanwhile.
+    s.chain.fail_process(u32::MAX);
+    s.chain.fail_blobs(3);
+    ha.submit(fake_vote(&s.env, 1, &[2, 1], 72)).await.unwrap();
+    prover_a.release(100);
+    wait_until("T2 landed", async || s.chain.voters() == 2).await;
+    wait_until("B's replays failed", async || {
+        s.chain.fail_blobs_left() <= 1
+    })
+    .await;
+    assert_ne!(hb.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(stored_counts(&node_b.db), (2, 0));
+    s.chain.fail_process(0);
+    wait_until("B replayed the gap", async || {
+        hb.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(stored_counts(&node_b.db), (2, 0));
+    shutdown.cancel();
+}
+
+/// A node restarted on a record with stale counters heals them from the
+/// chain on its first tick, with no landing.
+#[tokio::test]
+async fn stale_stored_counts_heal_on_the_first_tick() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let stop = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        stop.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    for (i, k) in [(0, 80), (1, 81), (0, 82)] {
+        h.submit(fake_vote(&s.env, i, &[1, 2], k)).await.unwrap();
+        wait_until("landed", async || h.snapshot().await.unwrap().pending == 0).await;
+    }
+    wait_until("counted", async || stored_counts(&node.db) == (2, 1)).await;
+    stop.cancel();
+    drop(h);
+    drop(node);
+
+    // A datadir from before the counters followed the landings.
+    let db = reopen_db(dir.path()).await;
+    let mut rec = db.process(&pid_fr()).unwrap().unwrap();
+    (rec.onchain.voters_count, rec.onchain.overwritten_count) = (0, 0);
+    db.put_process(&rec).unwrap();
+    let submits = s.chain.submit_count();
+    let stop = CancellationToken::new();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        stop.clone(),
+    )
+    .await;
+    handle(&node).await;
+    wait_until("healed", async || stored_counts(&node.db) == (2, 1)).await;
+    assert_eq!(s.chain.submit_count(), submits);
+    stop.cancel();
+}
+
+// ------------------------------------------------ events lost at a crash
+
+/// Events the monitor had routed into the actor's mailbox die with the
+/// process: here an extension of the voting window. The restart reads the
+/// process from the chain (at boot, or on the first tick when that read
+/// fails), so the pending vote settles inside the new window instead of
+/// being closed out at the old grace end.
+#[tokio::test]
+async fn restart_heals_a_stale_record_from_the_chain() {
+    for boot_read_fails in [false, true] {
+        let s = setup(2, 8, None);
+        let dir = TempDir::new().unwrap();
+        let shutdown = CancellationToken::new();
+        let (node, h) = batching_node(
+            Db::open_in(dir.path()).unwrap(),
+            dir.path(),
+            &s,
+            FakeProver::open(),
+            2,
+            &[],
+            shutdown.clone(),
+        )
+        .await;
+        let v = fake_vote(&s.env, 0, &[1, 2], 1_100);
+        let vid = v.pkg.vote_id;
+        h.submit(v).await.unwrap();
+        shutdown.cancel();
+        drop((h, node));
+
+        // While it is down the organizer extends the window, and the clock
+        // passes the old grace end; the event never reaches the actor.
+        s.chain.extend_duration(5_000);
+        s.chain.advance_time(DURATION + GRACE.default_grace + 10);
+        assert!(s.chain.time() < s.chain.end_time());
+        let db = reopen_db(dir.path()).await;
+        db.set_meta_u64("monitor_last_block", s.chain.head_block())
+            .unwrap();
+        if boot_read_fails {
+            s.chain.fail_process(1);
+        }
+        let shutdown = CancellationToken::new();
+        let prover = FakeProver::open();
+        let (node, h) =
+            batching_node(db, dir.path(), &s, prover.clone(), 2, &[], shutdown.clone()).await;
+        wait_until("vote settled in the extended window", async || {
+            let st = vote_status(&h, vid).await;
+            assert_ne!(
+                st,
+                Some(VoteStatus::Error),
+                "boot_read_fails={boot_read_fails}: closed at the old grace end"
+            );
+            st == Some(VoteStatus::Settled)
+        })
+        .await;
+        assert!(h.snapshot().await.unwrap().accepting);
+        let rec = node.db.process(&pid_fr()).unwrap().unwrap();
+        assert_eq!(rec.onchain.end_time(), s.chain.end_time());
+        shutdown.cancel();
+    }
+}
+
+/// A foreign transition whose event was lost (its block is never routed):
+/// the boot read shows an unknown root, so the node waits for the sync
+/// instead of sealing on the stale root and wasting a cycle on the revert.
+#[tokio::test]
+async fn restart_behind_an_unseen_transition_resyncs_before_sealing() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    shutdown.cancel();
+    drop((h, node));
+
+    let block = s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    s.chain.hide_block(Some(block));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 2, &[1, 0], 1_200);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    beats().await;
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0, "sealed on a root the chain has left");
+    assert!(!snap.synced);
+    assert_ne!(snap.root, s.chain.root());
+
+    s.chain.hide_block(None);
+    wait_until("vote settled after the sync", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Settled)
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(node.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 0);
+    assert_eq!(prover.calls(), 1);
+    shutdown.cancel();
+}
+
+/// Origin 2: a `CensusUpdated` lost at a crash. The restart's chain read
+/// (at boot, or on the first tick when that read fails) moves the census
+/// root and queues its download, so the votes seal at the root the
+/// contract now expects.
+#[tokio::test]
+async fn lost_census_update_loads_after_a_restart() {
+    for boot_read_fails in [false, true] {
+        let s = offchain_setup(4);
+        let dir = TempDir::new().unwrap();
+        let shutdown = CancellationToken::new();
+        let (node, h) = batching_node(
+            Db::open_in(dir.path()).unwrap(),
+            dir.path(),
+            &s,
+            FakeProver::open(),
+            2,
+            &[],
+            shutdown.clone(),
+        )
+        .await;
+        let v0 = fake_vote(&s.env, 0, &[1, 2], 1_300);
+        h.submit(v0.clone()).await.unwrap();
+        shutdown.cancel();
+        drop((h, node));
+
+        let root1 = update_census(&s, "v2", &[0, 1, 2, 3, 4]);
+        s.chain.set_census_root_check(Some(fr_to_le(&root1)));
+        let db = reopen_db(dir.path()).await;
+        db.set_meta_u64("monitor_last_block", s.chain.head_block())
+            .unwrap();
+        if boot_read_fails {
+            s.chain.fail_process(1);
+        }
+        let shutdown = CancellationToken::new();
+        let (_node, h) = batching_node(
+            db,
+            dir.path(),
+            &s,
+            FakeProver::open(),
+            2,
+            &[],
+            shutdown.clone(),
+        )
+        .await;
+        let v1 = fake_vote(&s.env, 1, &[2, 1], 1_301);
+        h.submit(v1.clone()).await.unwrap();
+        wait_until("settled at the new census root", async || {
+            all_settled(&h, &[v0.pkg.vote_id, v1.pkg.vote_id]).await
+        })
+        .await;
+        assert_eq!(
+            s.chain.last_census_root(),
+            Some(fr_to_le(&root1)),
+            "boot_read_fails={boot_read_fails}"
+        );
+        shutdown.cancel();
+    }
+}
+
+/// A chain read from an endpoint behind the events (its head below the
+/// newest block seen, or below the monitor's cursor at boot) is not merged:
+/// it would rewind the extension the events delivered.
+#[tokio::test]
+async fn lagging_read_does_not_rewind_the_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let end = s.chain.end_time();
+    s.chain.freeze_view(true);
+    s.chain.extend_duration(5_000);
+    // A landing makes the actor re-read the chain.
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    wait_until("synced", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    beats().await;
+    let stored = |db: &Db| db.process(&pid_fr()).unwrap().unwrap().onchain.end_time();
+    assert_eq!(stored(&node.db), end + 5_000, "rewound by a lagging read");
+    shutdown.cancel();
+    drop((h, node));
+
+    // At boot the cursor bounds the endpoint.
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    beats().await;
+    assert_eq!(stored(&node.db), end + 5_000, "rewound at boot");
+    s.chain.freeze_view(false);
+    beats().await;
+    assert!(h.snapshot().await.unwrap().synced);
+    assert_eq!(stored(&node.db), end + 5_000);
+    shutdown.cancel();
+}
+
+// ------------------------------------------- close-out from chain truth
+
+/// Another sequencer's landing extends the grace while its event is not
+/// routed yet: a heartbeat past the old grace end must not error a vote the
+/// extended window still settles. Once the event shows, the in-flight vote
+/// is requeued by the lost race and both settle in the extension.
+#[tokio::test]
+async fn close_out_waits_for_a_landing_the_events_have_not_shown() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let end = s.chain.end_time();
+    s.chain.advance_time(DURATION - 10);
+    beats().await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 1_400);
+    let b = fake_vote(&s.env, 1, &[1, 2], 1_401);
+    let vids = [a.pkg.vote_id, b.pkg.vote_id];
+    h.submit(a).await.unwrap();
+    h.submit(b).await.unwrap();
+    // A seals (flush) and sits in the prover; B waits.
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.advance_time(110);
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.settle_externally(&foreign_batch_of(
+        &s,
+        &[
+            fake_vote(&s.env, 2, &[1, 2], 70),
+            fake_vote(&s.env, 3, &[2, 3], 71),
+        ],
+    ));
+    assert_eq!(s.chain.grace_end(), end + 100 + GRACE.default_grace);
+    // Past the old grace end, inside the new one.
+    s.chain.advance_time(60);
+    beats().await;
+    assert!(s.chain.time() < s.chain.grace_end());
+    assert_eq!(
+        vote_status(&h, vids[1]).await,
+        Some(VoteStatus::Pending),
+        "closed at the stale grace end"
+    );
+    s.chain.hide_block(None);
+    prover.release(10);
+    wait_until("both settled in the extended window", async || {
+        for vid in vids {
+            assert_ne!(vote_status(&h, vid).await, Some(VoteStatus::Error));
+        }
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// A pending vote another sequencer settled, whose sync lags (blob fetches
+/// fail) when the grace ends: it settles from the sync, never errors.
+#[tokio::test]
+async fn close_out_settles_synced_votes_before_erroring() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    // Below every seal trigger: it waits.
+    let x = fake_vote(&s.env, 0, &[1, 2], 1_450);
+    let vid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    s.chain.fail_blobs(3);
+    s.chain.settle_externally(&foreign_batch_of(&s, &[x]));
+    wait_until("first sync attempt failed", async || {
+        s.chain.fail_blobs_left() < 3
+    })
+    .await;
+    s.chain.pass_grace();
+    wait_until("settled from the sync", async || {
+        let st = vote_status(&h, vid).await;
+        assert_ne!(st, Some(VoteStatus::Error), "closed out before the sync");
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// The close-out takes the chain's word, not the record's: an extension
+/// whose event is not routed yet keeps the window open past the old grace
+/// end, and at the real one a read from an endpoint behind the chain (an
+/// unknown root) closes nothing until a good read confirms it.
+#[tokio::test]
+async fn close_out_refuses_a_lagging_read() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    // An observer never seals: the vote waits for the close.
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.observer(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1_500);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.extend_duration(500);
+    s.chain.advance_time(DURATION + GRACE.default_grace + 10);
+    beats().await;
+    assert!(s.chain.time() < s.chain.end_time());
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed at the old grace end"
+    );
+
+    s.chain.hide_block(None);
+    s.chain.lag_process(u32::MAX);
+    s.chain.pass_grace();
+    beats().await;
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed on a lagging read"
+    );
+    s.chain.lag_process(0);
+    wait_until("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    let sv = h.status(vid).await.unwrap().unwrap();
+    assert_eq!(sv.error.as_deref(), Some("process closed"));
+    shutdown.cancel();
+}
+
+/// Results land while the node is behind: a foreign transition that
+/// settled pending X is not applied yet. The node resyncs first (X settles,
+/// the tree reaches the chain's final root) and only then closes out the
+/// rest; until then it does not report itself synced.
+#[tokio::test]
+async fn results_while_behind_resync_first_then_close_out() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.advance_time(DURATION - 10);
+    beats().await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 1_600);
+    let x = fake_vote(&s.env, 1, &[1, 2], 1_601);
+    let (vid_a, vid_x) = (a.pkg.vote_id, x.pkg.vote_id);
+    h.submit(a.clone()).await.unwrap();
+    h.submit(x.clone()).await.unwrap();
+    wait_until("sealed", async || prover.calls() == 1).await;
+    // Another sequencer settles X; its event is not routed yet.
+    s.chain.advance_time(20);
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    let fb = foreign_batch_of(&s, &[x.clone(), fake_vote(&s.env, 3, &[2, 3], 71)]);
+    s.chain.settle_externally(&fb);
+    s.chain.pass_grace();
+    s.chain.set_results_externally(vec![3, 4]);
+    wait_until("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    beats().await;
+    assert_ne!(
+        vote_status(&h, vid_x).await,
+        Some(VoteStatus::Error),
+        "closed out while behind"
+    );
+    assert!(
+        !h.snapshot().await.unwrap().synced,
+        "synced against the pin alone"
+    );
+
+    // A's proof is still out: past RESULTS it can only revert, so the
+    // resync does not wait for it.
+    s.chain.hide_block(None);
+    wait_until("X settled", async || {
+        let st = vote_status(&h, vid_x).await;
+        assert_ne!(st, Some(VoteStatus::Error), "closed out while behind");
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    // A can never settle now: closed once the tree is at the final root.
+    wait_until("A closed", async || {
+        vote_status(&h, vid_a).await == Some(VoteStatus::Error)
+    })
+    .await;
+    prover.release(10);
+    beats().await;
+    assert_eq!(vote_status(&h, vid_a).await, Some(VoteStatus::Error));
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(snap.root, s.chain.root());
+    assert!(snap.synced);
+    let (p, root) = h.vote_id_proof(vid_x).await.unwrap();
+    let tp = davinci_client::api::TrackerProof {
+        process_id: davinci_client::api::ProcessId(pid31()),
+        vote_id: vid_x,
+        root,
+        siblings: p.siblings,
+    };
+    assert!(davinci_client::api::verify_tracker(&tp, &s.chain.root()));
+    assert!(h.slot_ballot(x.slot).await.unwrap().is_some());
+    assert!(h.slot_ballot(a.slot).await.unwrap().is_none());
+    shutdown.cancel();
+}
+
+/// A Finalized process restarted behind the chain (the transition before
+/// the results never reached it) catches up to the final root, without
+/// sealing anything.
+#[tokio::test]
+async fn finalized_actor_keeps_following_the_chain() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    beats().await;
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    s.chain.fail_process(u32::MAX);
+    s.chain.pass_grace();
+    s.chain.set_results_externally(vec![3, 5]);
+    wait_until("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    beats().await;
+    // No read has shown the final root yet.
+    assert!(
+        !h.snapshot().await.unwrap().synced,
+        "synced against the pin alone"
+    );
+    // The first read makes the final root the target, persisted.
+    s.chain.fail_process(0);
+    wait_until("final root pinned", async || {
+        node.db
+            .process(&pid_fr())
+            .unwrap()
+            .unwrap()
+            .onchain
+            .state_root
+            == s.chain.root()
+    })
+    .await;
+    assert!(!h.snapshot().await.unwrap().synced);
+    shutdown.cancel();
+    drop((h, node));
+
+    s.chain.hide_block(None);
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    wait_until("caught up with the final root", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.root == s.chain.root() && snap.synced
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().local, LocalStatus::Finalized);
+    assert_eq!(node.metrics.synced_from_others.load(Ordering::SeqCst), 1);
+    assert_eq!(prover.calls(), 0);
+    shutdown.cancel();
+}
+
+/// A results receipt is not a landing: an OP reorg can drop it. The node
+/// stays Active until the results event; when none comes within the
+/// landing wait it resubmits the held proof (no re-proof), and finalizes
+/// at the event.
+#[tokio::test(start_paused = true)]
+async fn results_receipt_without_event_is_resubmitted() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 40);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    // Eager results: proved in the grace and held.
+    s.chain.advance_time(DURATION + 1);
+    wait_until("eager proof", async || prover.results_calls() == 1).await;
+    s.chain.vanish_next_results();
+    s.chain.pass_grace();
+    wait_until("first submit", async || s.chain.results_submits() == 1).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(s.chain.results_submits(), 1, "resubmitted before the wait");
+    assert_eq!(
+        h.snapshot().await.unwrap().local,
+        LocalStatus::Active,
+        "finalized on a receipt"
+    );
+    wait_long("results on chain", async || !s.chain.results().is_empty()).await;
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results_submits(), 2);
+    assert_eq!(prover.results_calls(), 1, "the held proof was not reused");
+    shutdown.cancel();
+}
+
+/// A landing whose record write failed in-run (the tree committed it), then
+/// a new vote: the log catches up before the next seal, so both transitions
+/// are recorded and the first vote settles in the db.
+#[tokio::test]
+async fn failed_settle_then_new_landing_keeps_the_first_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 1_000);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    wait_until("batch sealed", async || prover.calls() >= 1).await;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_until("landed and committed in the tree", async || {
+        s.chain.voters() == 1 && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    // The echo arrives and the repair attempts fail; the backoff grows.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    db.fail_next_writes(0);
+    let v1 = fake_vote(&s.env, 1, &[2, 1], 1_001);
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v1).await.unwrap();
+    wait_until("second batch sealed", async || prover.calls() >= 2).await;
+    prover.release(1);
+    wait_until("both settled", async || {
+        all_settled(&h, &[vid0, vid1]).await
+    })
+    .await;
+    let ts = node.db.transitions(&pid_fr()).unwrap();
+    assert_eq!(ts.len(), 2, "the first transition was never recorded");
+    assert_eq!(ts.iter().map(|t| t.index).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(ts[0].old_root, genesis_root(&s.env.cfg).unwrap());
+    assert_eq!(ts[0].new_root, ts[1].old_root);
+    assert_eq!(ts[1].new_root, s.chain.root());
+    assert!(h.snapshot().await.unwrap().synced);
+    shutdown.cancel();
+}
+
+/// The refresh read is pinned to the head it read first: a backend whose
+/// `getProcess` lags the head (a load-balanced URL) cannot rewind what the
+/// events moved; the read fails there and is retried.
+#[tokio::test]
+async fn process_read_behind_the_head_does_not_rewind_the_record() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    beats().await;
+    let end = s.chain.end_time();
+    s.chain.split_view(true);
+    s.chain.extend_duration(5_000);
+    // A landing makes the actor re-read the chain.
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    wait_until("synced", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    beats().await;
+    let stored = |db: &Db| db.process(&pid_fr()).unwrap().unwrap().onchain.end_time();
+    assert_eq!(stored(&node.db), end + 5_000, "rewound by a lagging read");
+    s.chain.split_view(false);
+    beats().await;
+    assert!(h.snapshot().await.unwrap().synced);
+    assert_eq!(stored(&node.db), end + 5_000);
+    shutdown.cancel();
+}
+
+/// A landing whose record write was lost at a crash, restarted while every
+/// `getProcess` fails: the log repair moves the pin with the record (as a
+/// sync does), so sealing resumes without waiting for a chain read.
+#[tokio::test]
+async fn log_repair_moves_the_pin_without_a_chain_read() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 1_700);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    wait_until("batch sealed", async || prover.calls() >= 1).await;
+    db.fail_next_writes(u32::MAX);
+    prover.release(1);
+    wait_until("committed in the tree", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node, db));
+
+    // The echo was routed before the crash: only the gap replay finds it.
+    let db = reopen_db(dir.path()).await;
+    db.set_meta_u64("monitor_last_block", s.chain.head_block())
+        .unwrap();
+    s.chain.fail_process(u32::MAX);
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v1 = fake_vote(&s.env, 1, &[2, 1], 1_701);
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v1).await.unwrap();
+    wait_until("both settled", async || {
+        all_settled(&h, &[vid0, vid1]).await
+    })
+    .await;
+    assert_eq!(node.db.transitions(&pid_fr()).unwrap().len(), 2);
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// Two extensions past the cursor at a restart, the second not routed yet:
+/// the first chain read merges the newest end, and the older event routed
+/// after it must not rewind the record (admission closing early, a
+/// close-out at the old grace end). The vote waits and flushes.
+#[tokio::test]
+async fn restart_backlog_of_extensions_does_not_rewind_the_end() {
+    const WAITS: &[&str] = &["--solo-wait", "48h"];
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        WAITS,
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1_800);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    beats().await;
+    shutdown.cancel();
+    drop((h, node));
+
+    let e0 = s.chain.end_time();
+    s.chain.extend_duration(500);
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.extend_duration(500);
+    let last = s.chain.head_block();
+    // Past the first extension's end, inside its grace.
+    s.chain.advance_time(DURATION + 550);
+    // The first chain read comes before the backlog is paged.
+    s.chain.events_delay(Duration::from_millis(300));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        WAITS,
+        shutdown.clone(),
+    )
+    .await;
+    wait_until("backlog routed", async || {
+        node.db.meta_u64("monitor_last_block").unwrap().unwrap_or(0) >= last
+    })
+    .await;
+    beats().await;
+    let end = |db: &Db| db.process(&pid_fr()).unwrap().unwrap().onchain.end_time();
+    assert_eq!(end(&node.db), e0 + 1_000, "rewound by an older event");
+    assert!(h.snapshot().await.unwrap().accepting);
+    assert_eq!(prover.calls(), 0, "flushed at an older end");
+    // Past the first extension's grace end: still open on-chain.
+    s.chain.advance_time(150);
+    beats().await;
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    // Within the flush horizon of the real end.
+    prover.release(10);
+    s.chain.advance_time(200);
+    wait_until("flushed", async || {
+        let st = vote_status(&h, vid).await;
+        assert_ne!(st, Some(VoteStatus::Error), "closed at an older end");
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    assert_eq!(end(&node.db), e0 + 1_000);
+    shutdown.cancel();
+}
+
+/// A flight whose votes a peer settled (its event not routed yet) reverts
+/// on the closed window: the votes go back to the queue for the close-out,
+/// which reconciles first, so they settle from the sync instead of erroring.
+#[tokio::test]
+async fn time_revert_of_a_flight_a_peer_settled_does_not_error_it() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.advance_time(DURATION - 10);
+    beats().await;
+    let x = fake_vote(&s.env, 0, &[1, 2], 1_900);
+    let vid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    wait_until("sealed", async || prover.calls() == 1).await;
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.settle_externally(&foreign_batch_of(
+        &s,
+        &[x.clone(), fake_vote(&s.env, 3, &[2, 3], 71)],
+    ));
+    s.chain.pass_grace();
+    beats().await;
+    // The proof lands on a closed window: InvalidTimeBounds.
+    prover.release(10);
+    wait_until("flight resolved", async || {
+        !h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    assert_ne!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Error),
+        "errored on the revert while a peer holds it"
+    );
+    s.chain.hide_block(None);
+    s.chain.set_results_externally(vec![3, 4]);
+    wait_until("followed to the final root", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.root == s.chain.root() && snap.synced
+    })
+    .await;
+    wait_until("settled from the sync", async || {
+        let st = vote_status(&h, vid).await;
+        assert_ne!(
+            st,
+            Some(VoteStatus::Error),
+            "errored while the chain holds it"
+        );
+        st == Some(VoteStatus::Settled)
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// RESULTS seen by a read at the head is depth 0: the node does not
+/// finalize on it until the confirmed head shows them. When the block
+/// carrying them reorgs out, the deadline re-reads the chain and the key
+/// holder submits its own results, finalizing at their event.
+#[tokio::test(start_paused = true)]
+async fn results_read_at_the_head_does_not_finalize_until_confirmed() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 41);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[vid]).await).await;
+    shutdown.cancel();
+    drop((h, node));
+
+    // A peer's results land in the newest block, not confirmed yet; their
+    // events are not routed.
+    s.chain.pass_grace();
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.set_results_externally(vec![3, 4]);
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        1,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        reopen_db(dir.path()).await,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_until("the head read merged the results", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Results
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        h.snapshot().await.unwrap().local,
+        LocalStatus::Active,
+        "finalized on a depth-0 read"
+    );
+    // The confirmed head moves only with a head: voter polls (each runs a
+    // tick) add no confirmation reads.
+    let reads = s.chain.process_at_calls();
+    for _ in 0..20 {
+        h.status(vid).await.unwrap();
+    }
+    assert!(
+        s.chain.process_at_calls() <= reads + 1,
+        "{} confirmation reads for 20 polls",
+        s.chain.process_at_calls() - reads
+    );
+    // That block reorgs out: Ended again, no results, no event ever.
+    s.chain.reorg_results();
+    wait_long("our results on chain", async || {
+        s.chain.results_submits() == 1 && !s.chain.results().is_empty()
+    })
+    .await;
+    let mut want = vec![0u64; 16];
+    want[0] = 1;
+    want[1] = 2;
+    assert_eq!(s.chain.results(), want);
+    // A new block confirms the results event.
+    s.chain.advance_time(1);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results_submits(), 1);
+    shutdown.cancel();
+}
+
+/// M1: a cancel only a depth-0 read shows (its block not confirmed, its
+/// event not routed) does not close out the pending votes; once a new
+/// block confirms it, they close.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_read_at_the_head_closes_out_only_when_confirmed() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vid = submit_n(&h, &s, 1, 40).await[0];
+    shutdown.cancel();
+    drop((h, node));
+
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.set_status(ProcessStatus::Canceled);
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        reopen_db(dir.path()).await,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_long("the head read merged the cancel", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed out on a depth-0 read"
+    );
+    // A new block confirms the cancel (its event stays hidden: the
+    // confirmed-head read decides).
+    s.chain.drop_checkpoints();
+    s.chain.advance_time(1);
+    wait_long("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    assert_eq!(vote_error(&h, vid).await, "process closed");
+    shutdown.cancel();
+}
+
+/// A node whose stored record holds `pending` votes (none sealed: a 1 h
+/// timer) restarts with one confirmation while a cancel sits in the newest
+/// block, its event hidden. Returns the node once a head read merged it.
+async fn unconfirmed_cancel(
+    s: &TestSetup,
+    dir: &TempDir,
+    pending: usize,
+) -> (Node, ActorHandle, Vec<u64>, CancellationToken) {
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, s, pending, 40).await;
+    shutdown.cancel();
+    drop((h, node));
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.set_status(ProcessStatus::Canceled);
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        reopen_db(dir.path()).await,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    wait_long("the head read merged the cancel", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    (node, h, vids, shutdown)
+}
+
+/// N1: the block of an unconfirmed cancel is reorged out (no event ever
+/// shows either change). The confirmed head never shows the cancel, so a
+/// fresh head read reconciles: the process accepts votes again and the
+/// retained and new votes settle, with or without votes pending at the
+/// cancel.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_reorged_out_before_confirmation_reopens_the_process() {
+    for pending in [1, 0] {
+        let s = setup(2, 8, None);
+        let dir = TempDir::new().unwrap();
+        let (_node, h, mut vids, shutdown) = unconfirmed_cancel(&s, &dir, pending).await;
+        // The cancel's block is replaced: Ready again, no event.
+        s.chain.mutate_process(|p| p.status = ProcessStatus::Ready);
+        s.chain.drop_checkpoints();
+        s.chain.advance_time(1);
+        wait_long("accepting again", async || {
+            s.chain.advance_time(1);
+            h.snapshot().await.unwrap().accepting
+        })
+        .await;
+        let v = fake_vote(&s.env, 5, &[1, 2], 90);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || {
+            s.chain.advance_time(3700);
+            all_settled(&h, &vids).await
+        })
+        .await;
+        shutdown.cancel();
+    }
+}
+
+/// N2: the close-out's own read is the first sighting of an unconfirmed
+/// cancel (the events are behind, so the stored grace end has passed while
+/// the chain extended the election in the same block). The votes stay
+/// pending; once the cancel is gone they settle.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_first_seen_by_the_close_out_read_waits_for_confirmation() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    // One block confirms the creation.
+    s.chain.advance_time(1);
+    let h = handle(&node).await;
+    let vids = submit_n(&h, &s, 1, 50).await;
+    // In one hidden block: the election is extended far ahead and canceled.
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain.mutate_process(|p| {
+        p.duration += 10 * DURATION;
+        p.status = ProcessStatus::Canceled;
+    });
+    // Heads move past the stored grace end.
+    s.chain.advance_time(DURATION + 2000);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(
+        vote_status(&h, vids[0]).await,
+        Some(VoteStatus::Pending),
+        "closed out on an unconfirmed cancel"
+    );
+    // The cancel's block is replaced; the extension stays.
+    s.chain.mutate_process(|p| p.status = ProcessStatus::Ready);
+    s.chain.drop_checkpoints();
+    wait_long("settled", async || {
+        s.chain.advance_time(3700);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// N1 (c): a cancel confirmed by its event, then a reorg deeper than the
+/// confirmations takes it (a read merges Ready, no event), then a second
+/// cancel shows only at the newest block. The first confirmation must not
+/// authorize the second: the vote waits until that one is confirmed.
+#[tokio::test(start_paused = true)]
+async fn a_confirmation_does_not_outlive_its_cancel() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let cfg = test_config_with(
+        dir.path(),
+        &s.census_dir,
+        10,
+        "0s",
+        &["--confirmations", "1"],
+    );
+    let node = start_node_cfg(
+        Db::open_in(dir.path()).unwrap(),
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.advance_time(1);
+    let h = handle(&node).await;
+    // The first cancel, confirmed by its event.
+    s.chain.set_status(ProcessStatus::Canceled);
+    s.chain.advance_time(1);
+    wait_long("canceled", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    // A deep reorg takes it; a peer landing makes the node read the head.
+    s.chain.mutate_process(|p| p.status = ProcessStatus::Ready);
+    s.chain.drop_checkpoints();
+    let peer = fake_vote(&s.env, 4, &[1, 2], 91);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&peer)));
+    s.chain.advance_time(1);
+    wait_long("ready again", async || {
+        s.chain.advance_time(1);
+        h.snapshot().await.unwrap().accepting
+    })
+    .await;
+    let vid = submit_n(&h, &s, 1, 92).await[0];
+    // A second cancel, at the newest block only; another peer landing
+    // makes the node read it.
+    s.chain.checkpoint();
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain
+        .mutate_process(|p| p.status = ProcessStatus::Canceled);
+    let peer2 = fake_vote(&s.env, 5, &[1, 2], 93);
+    s.chain
+        .settle_externally(&peer_batch_of(&node.db, &s, std::slice::from_ref(&peer2)));
+    s.chain.advance_time(1);
+    wait_long("the second cancel merged", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        vote_status(&h, vid).await,
+        Some(VoteStatus::Pending),
+        "closed out on an unconfirmed cancel"
+    );
+    // Confirmed: now it closes.
+    s.chain.drop_checkpoints();
+    s.chain.advance_time(1);
+    wait_long("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// N4: the organizer lowers `maxVoters` (its event arrives) while a batch of
+/// new voters only is in flight, and the settlement reverts
+/// `MaxVotersReached`: the requeued votes are checked against the current
+/// cap at once and end `max voters reached`.
+#[tokio::test(start_paused = true)]
+async fn a_requeued_flight_of_new_voters_meets_the_lowered_cap() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let first = submit_n(&h, &s, 2, 60).await;
+    prover.release(1);
+    wait_long("first settled", async || all_settled(&h, &first).await).await;
+    let fresh: Vec<u64> = (2..4)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 70 + i as u64))
+        .map(|v| v.pkg.vote_id)
+        .collect();
+    for i in 2..4 {
+        h.submit(fake_vote(&s.env, i, &[1, 2], 70 + i as u64))
+            .await
+            .unwrap();
+    }
+    wait_long("the new voters in flight", async || {
+        prover.calls() == 2 && h.snapshot().await.unwrap().in_flight
+    })
+    .await;
+    s.chain.change_max_voters(2);
+    s.chain.revert_simulates("MaxVotersReached", 1);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    prover.release(1);
+    wait_long("errored", async || {
+        vote_status(&h, fresh[0]).await == Some(VoteStatus::Error)
+            && vote_status(&h, fresh[1]).await == Some(VoteStatus::Error)
+    })
+    .await;
+    for vid in &fresh {
+        assert_eq!(vote_error(&h, *vid).await, "max voters reached");
+    }
+    shutdown.cancel();
+}
+
+/// N5: heads stop reaching the actor (frozen here; a flooded mailbox drops
+/// them) while the election ends. Admission follows the local clock too, so
+/// a vote after the end is refused.
+#[tokio::test(start_paused = true)]
+async fn admission_closes_at_the_end_without_heads() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.freeze_view(true);
+    s.chain.advance_time(DURATION + 10);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let late = fake_vote(&s.env, 0, &[1, 2], 80);
+    assert!(h.submit(late).await.is_err(), "admitted after the end");
+    shutdown.cancel();
+}
+
+/// A node fault inside `prepare` (one failed tree write) is not the votes'
+/// fault: they stay pending, sealing backs off, and the retry settles them.
+/// One fault only, so prepare's best-effort root reset still succeeds.
+#[tokio::test]
+async fn prepare_failure_keeps_the_votes_pending() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 700);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 701);
+    let vids = [v0.pkg.vote_id, v1.pkg.vote_id];
+    h.submit(v0).await.unwrap();
+    // The second vote fills the batch: its tick seals, and the first tree
+    // write inside prepare (a vote-id insert) fails.
+    db.fail_next_arbo_writes(1);
+    h.submit(v1).await.unwrap();
+    let snap = h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0);
+    for vid in vids {
+        assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    }
+    assert_eq!(snap.pending, 2);
+    assert!(
+        snap.next_seal_not_before.unwrap() > s.chain.time(),
+        "the backoff does not show: {:?}",
+        snap.next_seal_not_before
+    );
+    wait_until("both settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(snap.root, genesis_root(&s.env.cfg).unwrap());
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// A hold with no exposed vote left pending (a peer settled them) still
+/// seals one vote of the queue: the probe that lands once the node is fixed
+/// and ends the hold.
+#[tokio::test(start_paused = true)]
+async fn hold_without_pending_exposed_votes_still_probes() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.wrong_vk.lock().unwrap() = true;
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let a = fake_vote(&s.env, 0, &[1, 2], 800);
+    h.submit(a.clone()).await.unwrap();
+    wait_long("held", async || {
+        node.metrics.held_batches.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    s.chain
+        .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&a)));
+    wait_long("a settled by the peer", async || {
+        vote_status(&h, a.pkg.vote_id).await == Some(VoteStatus::Settled)
+    })
+    .await;
+    *prover.wrong_vk.lock().unwrap() = false;
+    let b = fake_vote(&s.env, 1, &[1, 2], 801);
+    h.submit(b.clone()).await.unwrap();
+    wait_long("b settled", async || {
+        all_settled(&h, &[b.pkg.vote_id]).await
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// A transition the new branch of a reorg re-included in a higher block
+/// (the monitor routes it again) is the one in the log: a no-op. It must
+/// neither rewind the pin nor abort the batch in flight. The chain reads
+/// fail throughout, so nothing heals a rewound pin.
+async fn reincluded_transition_is_a_noop(flight: bool) {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 900 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        prover.release(1);
+        wait_until("settled", async || all_settled(&h, &vids).await).await;
+    }
+    if flight {
+        let v = fake_vote(&s.env, 2, &[1, 2], 902);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_until("third proof running", async || prover.calls() == 3).await;
+    }
+    s.chain.fail_process(u32::MAX);
+    let block = s.chain.reinclude_transition(0);
+    wait_until("the re-included event routed", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    let snap = h.snapshot().await.unwrap();
+    assert!(snap.synced, "the pin moved back to a root we passed");
+    assert_eq!(snap.in_flight, flight, "the batch in flight was dropped");
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 0);
+    prover.release(1);
+    wait_until("all settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(
+        prover.calls(),
+        vids.len() as u64,
+        "a batch was proved again"
+    );
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    s.chain.fail_process(0);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn reincluded_transition_is_a_noop_while_idle() {
+    reincluded_transition_is_a_noop(false).await;
+}
+
+#[tokio::test]
+async fn reincluded_transition_does_not_abort_a_flight() {
+    reincluded_transition_is_a_noop(true).await;
+}
+
+// ------------------------------------------- ahead of the chain (reorgs)
+
+/// A reorg takes our committed transition: the node, ahead of the chain,
+/// notices at the next revert, waits for the chain to come back, then
+/// rebuilds from the chain. The batch's votes go back to pending and
+/// re-seal on the chain's root, covering every slot the lost batch exposed
+/// (24 occupied slots: a batch refreshes a random 16 of them); the
+/// transition the chain kept stays settled.
+#[tokio::test(start_paused = true)]
+async fn reorged_out_own_transition_rebuilds_and_reseals() {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        24,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let kept = submit_n(&h, &s, 24, 1000).await;
+    wait_long("24 settled", async || all_settled(&h, &kept).await).await;
+    let lone = |i: usize| fake_vote(&s.env, i, &[1, 2], 1000 + i as u64);
+    let (v24, v25) = (lone(24), lone(25));
+    let vids = [v24.pkg.vote_id, v25.pkg.vote_id];
+    h.submit(v24).await.unwrap();
+    s.chain.advance_time(400);
+    wait_long("v24 settled", async || all_settled(&h, &vids[..1]).await).await;
+    let lost = updated_slots(&db, nf, 1);
+    s.chain.reorg_out_last_transition();
+    // The next batch seals on our root and reverts, which re-reads the chain.
+    h.submit(v25).await.unwrap();
+    s.chain.advance_time(400);
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(all_settled(&h, &kept).await, "a kept vote was touched");
+    wait_long("all settled on the chain's root", async || {
+        all_settled(&h, &vids).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 26);
+    assert!(h.snapshot().await.unwrap().synced);
+    let note = db.process(&pid_fr()).unwrap().unwrap().note.unwrap();
+    assert!(note.contains("reorg"), "{note}");
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, vids[0]));
+    for slot in lost {
+        assert!(
+            reseal.contains(&slot),
+            "the re-seal left out an exposed slot"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
+
+/// A reorg takes a peer's transition and another peer's batch lands from
+/// the same root: the node, holding the first one, sees the chain fork from
+/// a root it passed, rebuilds and follows the new branch. The vote the lost
+/// transition had settled goes back to pending and settles again.
+#[tokio::test(start_paused = true)]
+async fn reorged_out_peer_transition_follows_the_new_branch() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    // Ours waits for company; a peer settles it first.
+    let a = fake_vote(&s.env, 0, &[1, 2], 1100);
+    h.submit(a.clone()).await.unwrap();
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&a)));
+    wait_long("a settled by the peer", async || {
+        all_settled(&h, &[a.pkg.vote_id]).await
+    })
+    .await;
+    s.chain.reorg_out_last_transition();
+    let b = fake_vote(&s.env, 1, &[2, 1], 1101);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&b)));
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("on the new branch", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.root == s.chain.root() && snap.synced
+    })
+    .await;
+    assert!(h.vote_id_proof(b.pkg.vote_id).await.is_ok());
+    assert_eq!(
+        vote_status(&h, a.pkg.vote_id).await,
+        Some(VoteStatus::Pending)
+    );
+    s.chain.advance_time(400);
+    wait_long("a settled again", async || {
+        all_settled(&h, &[a.pkg.vote_id]).await
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 2);
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    // Every exposed vote settled: the widened set is gone.
+    wait_long("exposed set cleared", async || {
+        db.exposed(&pid_fr()).unwrap().is_none()
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// A reorg the new branch undoes within the wait (it re-includes our
+/// transition) rebuilds nothing. Meanwhile nothing seals on our root: the
+/// monitor's rewind routes an old transition again, whose re-read shows
+/// the chain behind us. The read back at our root ends the divergence and
+/// the held vote seals at once.
+#[tokio::test(start_paused = true)]
+async fn reorg_undone_within_the_wait_does_not_rebuild() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1300 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    let ev = s.chain.reorg_out_last_transition();
+    let block = s.chain.reinclude_transition(0);
+    wait_long("the old transition routed again", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    let calls = prover.calls();
+    let v2 = fake_vote(&s.env, 2, &[1, 2], 1302);
+    vids.push(v2.pkg.vote_id);
+    h.submit(v2).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(prover.calls(), calls, "sealed on a root the chain left");
+    s.chain.restore_transition(ev);
+    let mut settled = false;
+    for _ in 0..30 {
+        if all_settled(&h, &vids).await {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(settled, "the held vote waited out the divergence");
+    tokio::time::sleep(Duration::from_secs(200)).await;
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 0);
+    assert_eq!(s.chain.voters(), 3);
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// A reorg takes two of our transitions and the new branch re-includes only
+/// the first: the wait restarts at that progress, then the node rebuilds
+/// from where the chain stopped and re-seals the lost vote.
+#[tokio::test(start_paused = true)]
+async fn reorg_partly_undone_rebuilds_from_where_the_chain_stops() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..3 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1400 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    s.chain.reorg_out_last_transition();
+    let e1 = s.chain.reorg_out_last_transition();
+    let block = s.chain.reinclude_transition(0);
+    wait_long("the old transition routed again", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    s.chain.restore_transition(e1);
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("all settled on the chain's root", async || {
+        all_settled(&h, &vids).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    assert_eq!(s.chain.voters(), 3);
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
+
+/// Faults inside one prepare: a tree write after the first insert, then
+/// prepare's own reset of the root and the actor's. Membership is read at
+/// the committed root, so the half-inserted vote is never taken as settled,
+/// and the actor reopens its state before the retry, so both votes land
+/// without a restart.
+#[tokio::test]
+async fn prepare_double_fault_resets_the_tree_in_run() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 710);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 711);
+    let vids = [v0.pkg.vote_id, v1.pkg.vote_id];
+    h.submit(v0).await.unwrap();
+    // The first vote-id insert lands; the second, prepare's reset and the
+    // actor's reset fail.
+    db.fail_arbo_writes_after(1, 3);
+    h.submit(v1).await.unwrap();
+    h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0);
+    for vid in vids {
+        assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    }
+    // No vote is ever settled ahead of a transition carrying it.
+    wait_until("both settled", async || {
+        for vid in vids {
+            if vote_status(&h, vid).await == Some(VoteStatus::Settled) {
+                assert!(
+                    h.vote_id_proof(vid).await.is_ok(),
+                    "settled without a committed transition"
+                );
+            }
+        }
+        all_settled(&h, &vids).await
+    })
+    .await;
+    // Settled means on the chain: two voters, each id proved under its root.
+    assert_eq!(s.chain.voters(), 2);
+    for vid in vids {
+        let (p, root) = h.vote_id_proof(vid).await.unwrap();
+        assert!(p.exists);
+        assert_eq!(root, s.chain.root());
+    }
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    shutdown.cancel();
+}
+
+/// The DKG flavour of a reorg that took our committed transition, with no
+/// vote left to seal: the results request fails on the chain's root, which
+/// re-reads the chain, so the node rebuilds, closes the lost vote out (the
+/// window has closed) and finalizes at the chain's root.
+#[tokio::test(start_paused = true)]
+async fn reorged_out_own_transition_rebuilds_and_finalizes_in_dkg_mode() {
+    let s = setup(2, 8, None);
+    s.chain.set_key_mode(KeyMode::DkgAutomatic);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1500 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    // The landing's read is done before the reorg: nothing re-reads.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    s.chain.reorg_out_last_transition();
+    s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("requested at the chain's root", async || {
+        s.chain.dkg_calls().0.0 == 1
+    })
+    .await;
+    s.chain.dkg_combine(vec![1, 2]);
+    wait_long("finalized", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(vote_status(&h, vids[0]).await, Some(VoteStatus::Settled));
+    assert_eq!(vote_status(&h, vids[1]).await, Some(VoteStatus::Error));
+    assert_eq!(h.snapshot().await.unwrap().root, s.chain.root());
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+}
+
+/// The same faults, then a peer's transition lands before any retry: the
+/// sync needs the tree at the committed root, which only the reopen after
+/// the failed reset gives back (no seal runs while the pin is ahead).
+#[tokio::test]
+async fn prepare_faults_then_a_peer_landing_syncs() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 720);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 721);
+    let vids = [v0.pkg.vote_id, v1.pkg.vote_id];
+    h.submit(v0).await.unwrap();
+    db.fail_arbo_writes_after(1, 3);
+    h.submit(v1).await.unwrap();
+    let peer = fake_vote(&s.env, 5, &[2, 1], 722);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&peer)));
+    wait_until("synced the peer's transition", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    wait_until("both settled", async || all_settled(&h, &vids).await).await;
+    assert_eq!(s.chain.voters(), 3);
+    shutdown.cancel();
+}
+
+/// The key holder's results land and confirm (Finalized), then a reorg
+/// takes the block carrying them while the ballot root stays. A fresh read
+/// showing the process without them (here after the monitor routes an old
+/// transition again, as its rewind does; or the first read after a restart)
+/// makes it Active again: it proves and submits again and finalizes at the
+/// new event.
+async fn results_reorged_out_after_finalize(restart: bool) {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    // One block on top of the creation: it routes at one confirmation.
+    s.chain.advance_time(0);
+    let cfg = || {
+        test_config_with(
+            dir.path(),
+            &s.census_dir,
+            1,
+            "0s",
+            &["--confirmations", "1"],
+        )
+    };
+    let shutdown = CancellationToken::new();
+    let node = start_node_cfg(
+        db,
+        s.chain.clone(),
+        FakeProver::open(),
+        cfg(),
+        shutdown.clone(),
+    )
+    .await;
+    let mut h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1950);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_long("settled", async || {
+        s.chain.advance_time(1);
+        all_settled(&h, &[vid]).await
+    })
+    .await;
+    s.chain.pass_grace();
+    wait_long("finalized", async || {
+        s.chain.advance_time(0);
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    let results = s.chain.results();
+    assert_eq!(s.chain.results_submits(), 1);
+    s.chain.reorg_results();
+    let _node;
+    if restart {
+        shutdown.cancel();
+        drop((h, node));
+        let shutdown = CancellationToken::new();
+        _node = start_node_cfg(
+            reopen_db(dir.path()).await,
+            s.chain.clone(),
+            FakeProver::open(),
+            cfg(),
+            shutdown.clone(),
+        )
+        .await;
+        h = handle(&_node).await;
+    } else {
+        _node = node;
+        s.chain.reinclude_transition(0);
+    }
+    wait_long("our results again", async || {
+        s.chain.advance_time(0);
+        s.chain.results_submits() == 2 && !s.chain.results().is_empty()
+    })
+    .await;
+    assert_eq!(s.chain.results(), results);
+    wait_long("finalized again", async || {
+        s.chain.advance_time(0);
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert_eq!(s.chain.results_submits(), 2);
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_reorged_out_after_finalize_are_resubmitted() {
+    results_reorged_out_after_finalize(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_reorged_out_after_finalize_are_resubmitted_after_a_restart() {
+    results_reorged_out_after_finalize(true).await;
+}
+
+/// A pause during a proof, then the proof fails and so does the rollback:
+/// the state must be reopened. The resume arrives while the reopen still
+/// fails and is dropped; once storage recovers, the reopened actor re-reads
+/// the chain, sees the process Ready again and settles its votes, with no
+/// restart, no other event and no end.
+#[tokio::test]
+async fn resume_dropped_while_the_state_is_lost_is_read_back() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::gated();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let votes: Vec<VerifiedVote> = (0..2)
+        .map(|i| fake_vote(&s.env, i, &[1, 0], 1330 + i as u64))
+        .collect();
+    let vids: Vec<u64> = votes.iter().map(|v| v.pkg.vote_id).collect();
+    for v in &votes {
+        h.submit(v.clone()).await.unwrap();
+    }
+    wait_until("proving", async || prover.calls() >= 1).await;
+    s.chain.set_status(ProcessStatus::Paused);
+    wait_until("actor sees the pause", async || {
+        h.snapshot().await.unwrap().status == ProcessStatus::Paused
+    })
+    .await;
+    // The proof fails, and every tree write from here on: the rollback,
+    // then every reopen.
+    *prover.fail_batches.lock().unwrap() = 1;
+    db.fail_next_arbo_writes(u32::MAX);
+    prover.release(1);
+    wait_until("flight dropped", async || {
+        let snap = h.snapshot().await.unwrap();
+        !snap.in_flight && snap.pending == 2
+    })
+    .await;
+    s.chain.set_status(ProcessStatus::Ready);
+    let block = s.chain.head_block();
+    wait_until("the resume routed", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    h.snapshot().await.unwrap();
+    db.fail_next_arbo_writes(0);
+    prover.release(1);
+    wait_until("settled after the reopen", async || {
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(h.snapshot().await.unwrap().status, ProcessStatus::Ready);
+    assert_eq!(s.chain.voters(), 2);
+    shutdown.cancel();
+}
+
+// ---------------------------------------------- stranded or hot retries
+
+/// The seal's exposed-set write fails: the prepared batch is dropped and
+/// sealing backs off instead of preparing again on every message; once the
+/// write works the seal lands.
+#[tokio::test(start_paused = true)]
+async fn failed_exposed_write_backs_off_the_seal() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1600);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    db.fail_next_writes(u32::MAX);
+    // Solo-due at the next head: it prepares, and its exposed write fails.
+    s.chain.advance_time(400);
+    wait_long("a seal attempt", async || {
+        db.arbo_reads() > 0 && {
+            let r0 = db.arbo_reads();
+            h.snapshot().await.unwrap();
+            db.arbo_reads() > r0 || h.snapshot().await.unwrap().next_seal_not_before.is_some()
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let reads = db.arbo_reads();
+    for _ in 0..20 {
+        h.status(vid).await.unwrap();
+    }
+    assert_eq!(db.arbo_reads(), reads, "prepared again on every message");
+    assert!(
+        h.snapshot().await.unwrap().next_seal_not_before.unwrap() > s.chain.time(),
+        "the backoff does not show"
+    );
+    assert_eq!(prover.calls(), 0);
+    db.fail_next_writes(0);
+    wait_long("settled", async || all_settled(&h, &[vid]).await).await;
+    shutdown.cancel();
+}
+
+/// A rebuild whose write keeps failing waits before trying again, instead of
+/// a chain read and a write on every message; once storage recovers, the
+/// rebuild lands.
+#[tokio::test(start_paused = true)]
+async fn failed_rebuild_backs_off() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1610 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    s.chain.reorg_out_last_transition();
+    let block = s.chain.reinclude_transition(0);
+    wait_long("rerouted", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    // The rebuild's write (and every other) fails from before its wait ends.
+    db.fail_next_writes(1000);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    assert!(
+        db.write_faults_left() >= 998,
+        "{} rebuild attempts in 30 s",
+        1000 - db.write_faults_left()
+    );
+    db.fail_next_writes(0);
+    wait_long("rebuilt", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    wait_long("all settled on the chain's root", async || {
+        all_settled(&h, &vids).await && h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// A batch job that panics (tokio swallows it) reports anyway: the flight is
+/// rolled back, its votes requeued, and the next cycle settles them.
+#[tokio::test]
+async fn panicking_job_requeues_its_votes() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.panic_batches.lock().unwrap() = 1;
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1620);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    wait_until("settled after the panic", async || {
+        all_settled(&h, &[vid]).await
+    })
+    .await;
+    assert_eq!(prover.calls(), 2);
+    shutdown.cancel();
+}
+
+/// A results task that panics reports anyway: finalization retries and the
+/// results land.
+#[tokio::test]
+async fn panicking_results_task_is_retried() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let pk = node_key(&db);
+    let s = setup(2, 8, Some(pk));
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    *prover.panic_results.lock().unwrap() = 1;
+    let node = start_node(
+        db,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        prover.clone(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 0, &[1, 2], 1630);
+    h.submit(v.clone()).await.unwrap();
+    wait_until("settled", async || all_settled(&h, &[v.pkg.vote_id]).await).await;
+    s.chain.set_status(ProcessStatus::Ended);
+    s.chain.pass_grace();
+    wait_until("finalized after the panic", async || {
+        h.snapshot().await.unwrap().local == LocalStatus::Finalized
+    })
+    .await;
+    assert!(prover.results_calls() >= 2);
+    shutdown.cancel();
+}
+
+/// The coverage of a peer batch carrying our vote is written, but the sync
+/// never commits (every tree write fails) and the peer transition is
+/// reorged out meanwhile: no rebuild is needed (our tree never left the
+/// chain), and our vote seals and lands; the history keeps the peer entry.
+#[tokio::test(start_paused = true)]
+async fn uncommitted_sync_whose_transition_vanishes_needs_no_rebuild() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let x = fake_vote(&s.env, 0, &[1, 2], 1640);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    db.fail_next_arbo_writes(u32::MAX);
+    s.chain
+        .settle_externally(&foreign_batch_of(&s, std::slice::from_ref(&x)));
+    wait_long("coverage kept, sync not applied", async || {
+        db.coverage_history(&pid_fr()).unwrap().len() == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        h.snapshot().await.unwrap().root,
+        genesis_root(&s.env.cfg).unwrap()
+    );
+    s.chain.reorg_out_last_transition();
+    db.fail_next_arbo_writes(0);
+    wait_long("back in sync", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    assert_eq!(vote_status(&h, xid).await, Some(VoteStatus::Pending));
+    s.chain.advance_time(400);
+    wait_long("ours landed", async || all_settled(&h, &[xid]).await).await;
+    assert_eq!(s.chain.voters(), 1);
+    assert_eq!(db.coverage_history(&pid_fr()).unwrap().len(), 2);
+    tokio::time::sleep(Duration::from_secs(200)).await;
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
+/// A peer batch carrying our pending revote X (24 occupied slots) never
+/// applies here (every tree write fails) and a reorg takes it: no rebuild,
+/// our tree never left the chain. X then seals here, and that re-seal must
+/// cover every slot the peer's public batch changed. With `unrelated`, an
+/// unrelated peer batch lands and is recorded first: it must not discard the
+/// orphan's slots.
+async fn orphaned_peer_batch_case(unrelated: bool) {
+    let s = setup(2, 26, None);
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        24,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let first = submit_n(&h, &s, 24, 1700).await;
+    wait_long("24 settled", async || all_settled(&h, &first).await).await;
+    let x = fake_vote(&s.env, 3, &[2, 1], 1750);
+    let xid = x.pkg.vote_id;
+    h.submit(x.clone()).await.unwrap();
+    let b = peer_batch_of(&db, &s, std::slice::from_ref(&x));
+    let peer_slots: Vec<u64> = decode_blobs(&b.blobs.blobs, nf)
+        .unwrap()
+        .updates
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    let ours = h.snapshot().await.unwrap().root;
+    db.fail_next_arbo_writes(u32::MAX);
+    s.chain.settle_externally(&b);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(h.snapshot().await.unwrap().root, ours, "the sync applied");
+    s.chain.reorg_out_last_transition();
+    db.fail_next_arbo_writes(0);
+    wait_long("back in sync", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    if unrelated {
+        let other = fake_vote(&s.env, 25, &[1, 2], 1751);
+        s.chain
+            .settle_externally(&peer_batch_of(&db, &s, std::slice::from_ref(&other)));
+        wait_long("the unrelated batch recorded", async || {
+            db.transitions(&pid_fr()).unwrap().len() == 2
+                && h.snapshot().await.unwrap().root == s.chain.root()
+        })
+        .await;
+    }
+    s.chain.advance_time(400);
+    wait_long("X sealed here", async || all_settled(&h, &[xid]).await).await;
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, xid));
+    for slot in peer_slots {
+        assert!(
+            reseal.contains(&slot),
+            "the seal left out a slot the peer published"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
+#[tokio::test(start_paused = true)]
+async fn orphaned_peer_batch_slots_ride_the_next_seal() {
+    orphaned_peer_batch_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn orphaned_peer_batch_slots_survive_an_unrelated_landing() {
+    orphaned_peer_batch_case(true).await;
+}
+
+/// One blob per batch (nf 16, `--max-blobs-per-tx 1`) fits about 125 slot
+/// updates; 140 slots are occupied. Orphaned peer batches (never applied
+/// here, reorged out) carried our pending X1 and X2 refreshing 70 slots
+/// each, and X3 refreshing all 140; Y is fresh. Each vote is charged only
+/// the histories its batch carries: X3, whose own history fits no
+/// transition, is recast alone; X1 and Y seal together, X2 (which does not
+/// fit next to X1's history) after them, each covering its history.
+#[tokio::test(start_paused = true)]
+async fn history_overflow_recasts_only_the_heavy_vote() {
+    let nf = 16u8;
+    let s = setup(nf, 144, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let mut extra = TIMERS.to_vec();
+    extra.extend(["--max-blobs-per-tx", "1"]);
+    let (node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1024,
+        &extra,
+        shutdown.clone(),
+    )
+    .await;
+    let mut first = Vec::new();
+    for i in 0..140 {
+        let v = fake_vote(&s.env, i, &[1, 2], 9000 + i as u64);
+        first.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    s.chain.advance_time(400);
+    wait_long("140 settled", async || {
+        if !all_settled(&h, &first).await {
+            s.chain.advance_time(400);
+            return false;
+        }
+        true
+    })
+    .await;
+    let slot = |i: usize| fake_vote(&s.env, i, &[1, 2], 1).slot;
+    use std::collections::BTreeSet;
+    let half_a: BTreeSet<u64> = (0..70).map(slot).collect();
+    let half_b: BTreeSet<u64> = (70..140).map(slot).collect();
+    let all: BTreeSet<u64> = (0..140).map(slot).collect();
+    let xs: Vec<VerifiedVote> = (140..144)
+        .map(|i| fake_vote(&s.env, i, &[1, 2], 9200 + i as u64))
+        .collect();
+    let [x1, x2, x3, y] = [0, 1, 2, 3].map(|i| xs[i].pkg.vote_id);
+    for v in &xs {
+        h.submit(v.clone()).await.unwrap();
+    }
+    db.fail_next_arbo_writes(u32::MAX);
+    for (v, must) in [(&xs[0], &half_a), (&xs[1], &half_b), (&xs[2], &all)] {
+        let n = db.coverage_history(&pid_fr()).unwrap().len();
+        s.chain.settle_externally(&peer_batch_refreshing(
+            &db,
+            &s,
+            std::slice::from_ref(v),
+            must,
+        ));
+        wait_long("the peer entry written", async || {
+            db.coverage_history(&pid_fr()).unwrap().len() > n
+        })
+        .await;
+        s.chain.reorg_out_last_transition();
+    }
+    db.fail_next_arbo_writes(0);
+    wait_long("back in sync", async || {
+        let snap = h.snapshot().await.unwrap();
+        snap.synced && snap.root == s.chain.root()
+    })
+    .await;
+    let calls = prover.calls();
+    wait_long("X1, X2 and Y settled, X3 errored", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &[x1, x2, y]).await && vote_status(&h, x3).await == Some(VoteStatus::Error)
+    })
+    .await;
+    assert_eq!(
+        prover.sizes()[calls as usize..],
+        [2, 1],
+        "X1 with Y, then X2"
+    );
+    let err = h.status(x3).await.unwrap().unwrap().error;
+    assert_eq!(
+        err.as_deref(),
+        Some("exposed refresh set too large, recast")
+    );
+    for (vid, must) in [(x1, &half_a), (x2, &half_b)] {
+        let reseal = updated_slots(&db, nf, transition_of(&db, nf, vid));
+        assert!(
+            must.iter().all(|s| reseal.contains(s)),
+            "a seal left out its history"
+        );
+    }
+    assert_eq!(node.metrics.rebuilds.load(Ordering::SeqCst), 0);
+    shutdown.cancel();
+}
+
+const ONE_BLOB: &[&str] = &[
+    "--batch-time",
+    "100s",
+    "--solo-wait",
+    "300s",
+    "--max-blobs-per-tx",
+    "1",
+];
+
+/// A 16-field node of one-blob batches (about 125 slot updates each) with
+/// slots 0..140 occupied; returns its datadir's reopened `Db`.
+async fn one_blob_populated(s: &TestSetup, dir: &TempDir) -> Db {
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        s,
+        FakeProver::open(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    let first = submit_n(&h, s, 140, 9300).await;
+    wait_long("140 settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &first).await
+    })
+    .await;
+    shutdown.cancel();
+    drop((h, node));
+    reopen_db(dir.path()).await
+}
+
+/// S3-1 in blob mode: a revote queued behind 60 fresh votes, its history
+/// 100 live slots. The fresh votes seal in one batch (each is charged only
+/// what the batch carries), the revote alone after them, covering its
+/// history.
+#[tokio::test(start_paused = true)]
+async fn a_revote_history_does_not_shrink_a_batch_of_fresh_votes() {
+    let nf = 16u8;
+    let s = setup(nf, 200, None);
+    let dir = TempDir::new().unwrap();
+    let db = one_blob_populated(&s, &dir).await;
+    let slot = |i: usize| fake_vote(&s.env, i, &[1, 2], 1).slot;
+    let r = fake_vote(&s.env, 0, &[2, 1], 9600);
+    let rid = r.pkg.vote_id;
+    let hist: std::collections::BTreeSet<u64> = (0..100).map(slot).collect();
+    db.put_coverage(
+        &pid_fr(),
+        &[5; 32],
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: hist.iter().copied().collect(),
+            vote_ids: vec![rid],
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    let mut vids = Vec::new();
+    for i in 140..200 {
+        let v = fake_vote(&s.env, i, &[1, 2], 9400 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    h.submit(r).await.unwrap();
+    vids.push(rid);
+    wait_long("all settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(
+        prover.sizes(),
+        vec![60, 1],
+        "the fresh votes paid the revote's history"
+    );
+    let reseal = updated_slots(&db, nf, transition_of(&db, nf, rid));
+    assert!(
+        hist.iter().all(|s| reseal.contains(s)),
+        "the revote left out its history"
+    );
+    shutdown.cancel();
+}
+
+/// I1: the organizer lowers `maxVoters` under a flight carrying a revote
+/// and a new voter, and the settlement reverts `MaxVotersReached`. Nothing
+/// is errored for the revert: the votes are requeued, the read merges the
+/// new cap, the new-slot vote alone ends `max voters reached`, and the
+/// revote settles.
+#[tokio::test(start_paused = true)]
+async fn a_lowered_max_voters_under_a_flight_requeues_the_overwrites() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let first = submit_n(&h, &s, 1, 10).await;
+    let v2 = fake_vote(&s.env, 2, &[1, 2], 13);
+    let mut first = first;
+    first.push(v2.pkg.vote_id);
+    h.submit(v2).await.unwrap();
+    wait_until("first settled", async || all_settled(&h, &first).await).await;
+    s.chain.set_max_voters(2);
+    s.chain.revert_simulates("MaxVotersReached", 1);
+    let revote = fake_vote(&s.env, 0, &[2, 1], 11);
+    let fresh = fake_vote(&s.env, 1, &[1, 2], 12);
+    let (rv, fv) = (revote.pkg.vote_id, fresh.pkg.vote_id);
+    h.submit(revote).await.unwrap();
+    h.submit(fresh).await.unwrap();
+    // The revote alone waits for the batch timer (1 h).
+    wait_long("the revote settled or errored", async || {
+        s.chain.advance_time(600);
+        matches!(
+            vote_status(&h, rv).await,
+            Some(VoteStatus::Settled | VoteStatus::Error)
+        )
+    })
+    .await;
+    assert_eq!(vote_status(&h, rv).await, Some(VoteStatus::Settled));
+    let f = h.status(fv).await.unwrap().unwrap();
+    assert_eq!(f.status, VoteStatus::Error);
+    assert_eq!(f.error.as_deref(), Some("max voters reached"));
+    shutdown.cancel();
+}
+
+/// I2: while the landing-time read fails, it is retried once per Head, not
+/// after every message: 50 status polls with no new Head cost at most one
+/// read. Once reads work again, the next Head clears the stale read.
+#[tokio::test(start_paused = true)]
+async fn a_failing_landing_read_is_retried_once_per_head() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 20);
+    let vid0 = v0.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    wait_until("first settled", async || all_settled(&h, &[vid0]).await).await;
+    // From now on getProcess fails; the next landing arms the stale read.
+    s.chain.fail_process(1_000_000);
+    let v1 = fake_vote(&s.env, 1, &[1, 2], 21);
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v1).await.unwrap();
+    wait_until("second settled", async || all_settled(&h, &[vid1]).await).await;
+    let before = s.chain.process_at_calls();
+    for _ in 0..50 {
+        h.status(vid1).await.unwrap();
+    }
+    let reads = s.chain.process_at_calls() - before;
+    assert!(reads <= 1, "{reads} reads in 50 polls without a new head");
+    // Reads work again: a Head retries, and the read clears the latch.
+    s.chain.fail_process(0);
+    s.chain.advance_time(5);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let before = s.chain.process_at_calls();
+    for _ in 0..50 {
+        h.status(vid1).await.unwrap();
+    }
+    assert_eq!(s.chain.process_at_calls(), before, "still re-reading");
+    shutdown.cancel();
+}
+
+/// I2, the close-out read: past the grace end with a vote pending and
+/// every read failing, status polls without a new Head cost at most one
+/// read per path (the landing time and the close-out), not one per poll.
+#[tokio::test(start_paused = true)]
+async fn a_failing_close_out_read_is_not_retried_per_message() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let vid = submit_n(&h, &s, 1, 30).await[0];
+    s.chain.fail_process(1_000_000);
+    s.chain.pass_grace();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    let before = s.chain.process_at_calls();
+    for _ in 0..50 {
+        h.status(vid).await.unwrap();
+    }
+    let reads = s.chain.process_at_calls() - before;
+    assert!(reads <= 2, "{reads} reads in 50 polls without a new head");
+    s.chain.fail_process(0);
+    wait_long("closed out", async || {
+        vote_status(&h, vid).await == Some(VoteStatus::Error)
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// M4-1: 42 fresh votes (enough to wake the capacity trigger), then a
+/// revote whose 124-slot history fits a blob alone but not next to them.
+/// The batch is not full (only the revote's own history kept it out), so
+/// nothing seals before the timer; then the fresh votes seal together and
+/// the revote alone.
+#[tokio::test(start_paused = true)]
+async fn a_heavy_revote_does_not_seal_the_queue_early() {
+    let nf = 16u8;
+    let s = setup(nf, 190, None);
+    let dir = TempDir::new().unwrap();
+    let db = one_blob_populated(&s, &dir).await;
+    let r = fake_vote(&s.env, 0, &[2, 1], 9990);
+    let rid = r.pkg.vote_id;
+    db.put_coverage(
+        &pid_fr(),
+        &[6; 32],
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: (1..125)
+                .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+                .collect(),
+            vote_ids: vec![rid],
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    let mut vids = Vec::new();
+    for i in 140..182 {
+        let v = fake_vote(&s.env, i, &[1, 2], 9700 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+    }
+    h.submit(r).await.unwrap();
+    vids.push(rid);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(prover.calls(), 0, "sealed before the timer");
+    wait_long("all settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    assert_eq!(prover.sizes(), vec![42, 1]);
+    shutdown.cancel();
+}
+
+/// S3-3: a live exposed set of 140 slots (more than one batch can refresh,
+/// as repeated lost races leave it) holds exposed vote E. Sealing charges
+/// histories only, so E and a fresh vote F settle; nothing is errored.
+#[tokio::test(start_paused = true)]
+async fn an_oversized_live_set_errors_no_vote() {
+    let s = setup(16, 144, None);
+    let dir = TempDir::new().unwrap();
+    let db = one_blob_populated(&s, &dir).await;
+    let e = fake_vote(&s.env, 140, &[1, 2], 9700);
+    let f = fake_vote(&s.env, 141, &[1, 2], 9701);
+    let vids = [e.pkg.vote_id, f.pkg.vote_id];
+    db.put_exposed(
+        &pid_fr(),
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: (0..140)
+                .map(|i| fake_vote(&s.env, i, &[1, 2], 1).slot)
+                .collect(),
+            vote_ids: vec![vids[0]],
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        1024,
+        ONE_BLOB,
+        shutdown.clone(),
+    )
+    .await;
+    h.submit(e).await.unwrap();
+    h.submit(f).await.unwrap();
+    wait_long("both settled or one errored", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await || vote_status(&h, vids[0]).await == Some(VoteStatus::Error)
+    })
+    .await;
+    for vid in vids {
+        assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Settled));
+    }
+    shutdown.cancel();
+}
+
+/// M4-2: a prepared batch over the blob cap (unreachable after a sized
+/// selection, forced here) backs off: the messages that follow run no
+/// selection (no tree reads) until the backoff ends, then the votes settle.
+#[tokio::test(start_paused = true)]
+async fn a_blob_cap_belt_backs_off() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    h.force_blob_belt().await;
+    let vids = submit_n(&h, &s, 3, 9850).await;
+    s.chain.advance_time(400);
+    h.snapshot().await.unwrap();
+    assert_eq!(prover.calls(), 0, "the belt did not fire");
+    let reads = db.arbo_reads();
+    for _ in 0..20 {
+        h.status(vids[0]).await.unwrap();
+    }
+    assert_eq!(
+        db.arbo_reads(),
+        reads,
+        "the seal ran again before its backoff"
+    );
+    wait_long("settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// S3-2: a refresh overflow from `prepare` (unreachable after a sized
+/// selection, forced here) errors nothing, exposed votes included: they
+/// stay pending and settle after the backoff.
+#[tokio::test(start_paused = true)]
+async fn a_seal_overflow_errors_no_vote() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    let vids = submit_n(&h, &s, 3, 9800).await;
+    shutdown.cancel();
+    drop((h, node));
+    // Exposed, as an earlier public attempt leaves them.
+    let db = reopen_db(dir.path()).await;
+    db.put_exposed(
+        &pid_fr(),
+        &davinci_sequencer::storage::ExposedRecord {
+            slots: Vec::new(),
+            vote_ids: vids.clone(),
+        },
+    )
+    .unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        10,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    h.force_seal_overflow().await;
+    s.chain.advance_time(400);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for vid in &vids {
+        assert_eq!(vote_status(&h, *vid).await, Some(VoteStatus::Pending));
+    }
+    assert_eq!(prover.calls(), 0, "the forced overflow did not fire");
+    wait_long("settled", async || {
+        s.chain.advance_time(400);
+        all_settled(&h, &vids).await
+    })
+    .await;
+    shutdown.cancel();
+}
+
+/// The check after a rebuild's replay fails its write: it waits out its
+/// backoff, whatever messages arrive meanwhile (no tree reads), and runs
+/// again once storage recovers.
+#[tokio::test(start_paused = true)]
+async fn failed_rebuild_check_waits_its_backoff() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        1,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let mut vids = Vec::new();
+    for i in 0..2 {
+        let v = fake_vote(&s.env, i, &[1, 2], 1660 + i as u64);
+        vids.push(v.pkg.vote_id);
+        h.submit(v).await.unwrap();
+        wait_long("settled", async || all_settled(&h, &vids).await).await;
+    }
+    s.chain.reorg_out_last_transition();
+    db.fail_rebuild_check_writes(true);
+    let block = s.chain.reinclude_transition(0);
+    wait_long("rerouted", async || {
+        db.meta_u64("monitor_last_block").unwrap() >= Some(block)
+    })
+    .await;
+    wait_long("rebuilt and replayed", async || {
+        node.metrics.rebuilds.load(Ordering::SeqCst) == 1 && h.snapshot().await.unwrap().synced
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(db.rebuild_check(&pid_fr()).unwrap());
+    let reads = db.arbo_reads();
+    for _ in 0..20 {
+        h.status(vids[0]).await.unwrap();
+    }
+    assert_eq!(
+        db.arbo_reads(),
+        reads,
+        "the check ran again before its backoff"
+    );
+    db.fail_rebuild_check_writes(false);
+    wait_long("checked", async || !db.rebuild_check(&pid_fr()).unwrap()).await;
+    shutdown.cancel();
+}
+
+// ----------------------------------------- the coverage invariant, directly
+
+/// Checks every own landing in `sent[from..]`: for each vote it carries,
+/// its updated slots cover every slot, still occupied at the landing's base
+/// root, of every earlier batch carrying that vote that this node learned
+/// of (its own, landed or reverted; a peer's whose blobs it fetched). A slot
+/// empty at that root cannot be refreshed (the batch that filled it is gone)
+/// and, absent from the landing, adds nothing to an intersection. Returns
+/// (landings checked, earlier batches covered).
+fn check_coverage(
+    seed: u64,
+    s: &TestSetup,
+    sent: &[(B256, Vec<Blob>, bool)],
+    fetched: &std::collections::HashSet<B256>,
+    from: usize,
+) -> (usize, usize) {
+    let nf = s.env.cfg.ballot_mode.num_fields;
+    let mut checked = 0;
+    let mut covered = 0;
+    for (idx, (tx, blobs, own)) in sent.iter().enumerate().skip(from) {
+        // Our landings (a reverted send of ours starts with 0x10), while
+        // still on the chain.
+        if !own || tx[0] != 0 {
+            continue;
+        }
+        let Some((base, _)) = s.chain.transition_roots(tx) else {
+            continue;
+        };
+        let td = decode_blobs(blobs, nf).unwrap();
+        let updates: std::collections::HashSet<u64> = td.updates.iter().map(|(s, _)| *s).collect();
+        for vid in &td.vote_ids {
+            for (j, (tx2, blobs2, own2)) in sent[..idx].iter().enumerate() {
+                if !own2 && !fetched.contains(tx2) {
+                    continue;
+                }
+                let earlier = decode_blobs(blobs2, nf).unwrap();
+                if !earlier.vote_ids.contains(vid) {
+                    continue;
+                }
+                let slots: Vec<u64> = earlier.updates.iter().map(|(s, _)| *s).collect();
+                let Some(live) = s.chain.occupied_at(s, &base, &slots) else {
+                    continue;
+                };
+                covered += 1;
+                for (slot, live) in slots.iter().zip(live) {
+                    assert!(
+                        !live || updates.contains(slot),
+                        "seed {seed}: batch {idx} re-sealing {vid:#x} left out slot {slot:#x} of batch {j}"
+                    );
+                }
+            }
+        }
+        checked += 1;
+    }
+    (checked, covered)
+}
+
+/// One random run: own seals, peer batches carrying our pending votes or
+/// votes not submitted here yet (submitted later, the identical package),
+/// lost races, reorgs of the tip, blob-fetch faults and holds (a node-side
+/// check refusing every proof), with the invariant checked after every
+/// step. (A census re-proof under a hold needs origin 3 on anvil; see
+/// `a_hold_emptied_by_the_reproof_seals_the_queue_covered`.)
+async fn coverage_run(seed: u64, steps: usize) -> (usize, usize) {
+    use rand::Rng;
+    let s = setup(2, 40, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let shutdown = CancellationToken::new();
+    let prover = FakeProver::open();
+    let (_node, h) = batching_node(
+        db.clone(),
+        dir.path(),
+        &s,
+        prover.clone(),
+        8,
+        TIMERS,
+        shutdown.clone(),
+    )
+    .await;
+    // 20 occupied slots: a batch refreshes a random 16 of them.
+    let first = submit_n(&h, &s, 20, seed * 10_000 + 1).await;
+    s.chain.advance_time(400);
+    wait_long("20 settled", async || all_settled(&h, &first).await).await;
+    let genesis = genesis_root(&s.env.cfg).unwrap();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut ours: Vec<VerifiedVote> = Vec::new();
+    let mut unsent: Vec<VerifiedVote> = Vec::new();
+    let mut kseed = seed * 10_000 + 100;
+    let mut from = 0;
+    let (mut checked, mut covered) = (0, 0);
+    let pending_vote = async |ours: &[VerifiedVote], rng: &mut StdRng| {
+        let mut pend = Vec::new();
+        for v in ours {
+            if vote_status(&h, v.pkg.vote_id).await == Some(VoteStatus::Pending) {
+                pend.push(v.clone());
+            }
+        }
+        (!pend.is_empty()).then(|| pend[rng.gen_range(0..pend.len())].clone())
+    };
+    for _ in 0..steps {
+        match rng.gen_range(0..11) {
+            0..=2 => {
+                kseed += 1;
+                let voter = rng.gen_range(0..36);
+                let v = fake_vote(&s.env, voter, &[2, 1], kseed);
+                if h.submit(v.clone()).await.is_ok() {
+                    ours.push(v);
+                }
+            }
+            3 => s.chain.advance_time(400),
+            4 => {
+                if let Some(v) = pending_vote(&ours, &mut rng).await
+                    && let Some(b) = s.chain.try_peer_batch(&s, &[v])
+                {
+                    s.chain.settle_externally(&b);
+                }
+            }
+            5 => {
+                if let Some(v) = pending_vote(&ours, &mut rng).await
+                    && let Some(b) = s.chain.try_peer_batch(&s, &[v])
+                {
+                    s.chain.race_next_submit(b);
+                    s.chain.advance_time(400);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    s.chain.clear_race();
+                }
+            }
+            6 => {
+                if s.chain.root() != genesis {
+                    s.chain.reorg_out_last_transition();
+                    s.chain.reinclude_transition(0);
+                }
+            }
+            7 => s.chain.fail_blobs(rng.gen_range(1..4)),
+            8 => {
+                kseed += 1;
+                let v = fake_vote(&s.env, rng.gen_range(0..36), &[1, 1], kseed);
+                if let Some(b) = s.chain.try_peer_batch(&s, std::slice::from_ref(&v)) {
+                    s.chain.settle_externally(&b);
+                    unsent.push(v);
+                }
+            }
+            9 => {
+                if !unsent.is_empty() {
+                    let v = unsent.swap_remove(rng.gen_range(0..unsent.len()));
+                    if h.submit(v.clone()).await.is_ok() {
+                        ours.push(v);
+                    }
+                }
+            }
+            // A node-side check holds batches (or stops holding them).
+            _ => {
+                let mut w = prover.wrong_vk.lock().unwrap();
+                *w = !*w;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let sent = s.chain.sent_batches();
+        let (c, r) = check_coverage(seed, &s, &sent, &s.chain.fetched_txs(), from);
+        (checked, covered, from) = (checked + c, covered + r, sent.len());
+    }
+    // Let everything left settle (or close) and check once more.
+    s.chain.fail_blobs(0);
+    *prover.wrong_vk.lock().unwrap() = false;
+    for _ in 0..6 {
+        s.chain.advance_time(400);
+        tokio::time::sleep(Duration::from_secs(120)).await;
+    }
+    let sent = s.chain.sent_batches();
+    let (c, r) = check_coverage(seed, &s, &sent, &s.chain.fetched_txs(), from);
+    shutdown.cancel();
+    (checked + c, covered + r)
+}
+
+/// The coverage invariant, stated directly and over many random runs:
+/// every landing of ours refreshes every slot of every batch that ever
+/// carried one of its votes and that the node learned of.
+#[tokio::test(start_paused = true)]
+async fn coverage_invariant_holds_under_random_reorgs() {
+    let seeds: u64 = std::env::var("COVERAGE_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let (mut checked, mut covered) = (0, 0);
+    for seed in 0..seeds {
+        let (c, r) = coverage_run(seed, 40).await;
+        checked += c;
+        covered += r;
+    }
+    eprintln!("coverage invariant: {checked} landings checked, {covered} earlier batches covered");
+    assert!(
+        checked > 0 && covered > 0,
+        "the runs never re-sealed a vote"
+    );
 }

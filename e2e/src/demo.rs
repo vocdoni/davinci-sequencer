@@ -2349,7 +2349,7 @@ mod tests {
                 let span = (s.round1 as u64 - 1) * MEETING_GAP;
                 assert!((5 * MINUTE..=10 * MINUTE).contains(&span), "{at}");
             }
-            // Past the move, the last votes go in well inside Gnosis'
+            // Past the move, the last votes go in well inside the registry's
             // 60 s noticeMin, and one comes after the new end.
             if let Lifecycle::MeetingCloses { after } = s.lifecycle {
                 assert!(after >= 1 && after < s.round1, "{at}");
@@ -3175,8 +3175,8 @@ mod tests {
         assert_eq!(nf, 16);
         assert_eq!(blob_count(s.chunk, s.chunk, nf), 2);
         let steady = max_votes_for_cap(nf, 0, s.chunk, 2);
+        assert_eq!(steady, 126);
         assert!(steady < s.chunk, "{steady}");
-        assert!(steady > s.chunk / 2);
         // The revotes come with refreshes too.
         assert!(s.revotes >= 50 && s.round1 / s.chunk >= 3);
     }

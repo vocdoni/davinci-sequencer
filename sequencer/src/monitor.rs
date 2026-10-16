@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::actor::{ActorError, ActorHandle, Deps, spawn_actor};
+use crate::actor::{ActorError, ActorHandle, Deps, pid31_of, spawn_actor};
 use crate::census::onchain::OnchainIndex;
 use crate::census::{CensusError, CensusOptions, CensusStore};
 use crate::config::Config;
@@ -24,7 +24,17 @@ use crate::metrics::Metrics;
 use crate::storage::{Db, LocalStatus, ProcessRecord, StorageError};
 use crate::web3::{EventKind, RegistryEvent};
 
-const LAST_BLOCK_KEY: &str = "monitor_last_block";
+/// The monitor's cursor: every event up to this block was routed.
+pub(crate) const LAST_BLOCK_KEY: &str = "monitor_last_block";
+/// Hash of the cursor block, written with it: a change means a reorg.
+const LAST_HASH_KEY: &str = "monitor_last_hash";
+/// Rewind on a reorg at the cursor, in blocks. Not floored at the safe
+/// head: on OP the derivation behind an unsafe reorg makes the new branch
+/// safe at once, above the fork.
+const REORG_REWIND: u64 = 128;
+/// Consecutive failed block-hash reads before routing goes on unchecked: a
+/// rate-limited block read must not stall every election.
+const HASH_TRIES: u32 = 5;
 const BOOT_RETRIES_KEY: &str = "monitor_boot_retries";
 /// Bootstrap attempts per process before it is recorded ignored.
 const BOOT_ATTEMPT_CAP: u32 = 10;
@@ -121,14 +131,29 @@ pub async fn spawn_node(
         deps,
         node: node.clone(),
         vk_hash,
-        updates: Arc::default(),
+        queue: CensusQueue {
+            store: node.census.clone(),
+            updates: Arc::default(),
+        },
         prune: Arc::default(),
     };
+    // Before anything spawns: an unreadable list fails startup.
+    let mut retries = load_retries(&ctx.deps.db)?;
     // Respawn what a previous run served. A head read seeds each actor's
     // chain time so it does not accept votes into an already-ended window;
     // 0 means "unknown" and the actor refuses votes until the first Head.
-    let chain_time = ctx.deps.contracts.head().await.map(|(_, t)| t).unwrap_or(0);
+    // Events lost in mailboxes at a crash are not routed again: each
+    // actor's first tick re-reads its process and applies what moved.
+    let (_, chain_time) = ctx.deps.contracts.head().await.unwrap_or((0, 0));
+    if chain_time != 0 && ctx.deps.clock.now().abs_diff(chain_time) > 60 {
+        warn!(
+            local = ctx.deps.clock.now(),
+            head = chain_time,
+            "local clock differs from the chain's head time by over 60 s; admission closes at the later of the two, so a clock running ahead refuses votes early"
+        );
+    }
     let mut map = node.processes.write().await;
+    let mut failed = Vec::new();
     for rec in ctx.deps.db.processes()? {
         // Finalized processes respawn too: their actor is read-only
         // (never accepts, seals or finalizes) but keeps serving tracker
@@ -141,19 +166,53 @@ pub async fn spawn_node(
             Ok(h) => {
                 map.insert(rec.pid, h);
             }
-            Err(e) => error!(pid = %pid_hex(&rec.pid), %e, "respawn failed"),
+            Err(e) => {
+                error!(pid = %pid_hex(&rec.pid), %e, "respawn failed; retrying");
+                failed.push(rec.pid);
+            }
         }
     }
     drop(map);
+    // The monitor retries them (bootstrap starts a stored record's actor).
+    // The list goes to the monitor in memory: a failed persist (the same
+    // outage) must not lose a pid whose creation is behind the cursor.
+    if !failed.is_empty() {
+        for pid in failed {
+            if !retries.iter().any(|r| r.pid == pid) {
+                retries.push(BootRetry {
+                    pid,
+                    pid31: pid31_of(&pid),
+                    attempts: 1,
+                    due: tokio::time::Instant::now(),
+                });
+            }
+        }
+        save_retries(&ctx.deps.db, &retries);
+    }
     let tracker = ctx.deps.tasks.clone();
-    tracker.spawn(monitor_loop(ctx, shutdown));
+    tracker.spawn(heartbeat_loop(
+        ctx.deps.contracts.clone(),
+        node.processes.clone(),
+        ctx.cfg.confirmations,
+        ctx.cfg.heartbeat(),
+        shutdown.clone(),
+    ));
+    tracker.spawn(monitor_loop(ctx, shutdown, retries));
     Ok(node)
 }
 
-/// Origin-2 census updates: pid -> (uri, newest root, state). A newer
-/// update replaces uri and root; a running fetch finishes first, so each
+/// Census downloads by pid: origin-2 updates and bootstrap censuses. A newer
+/// root replaces uri and root; a running fetch finishes first, so each
 /// process has at most one fetch in flight and one pending.
-type Updates = Arc<Mutex<HashMap<Fr, (String, Fr, Job)>>>;
+type Updates = Arc<Mutex<HashMap<Fr, Update>>>;
+
+struct Update {
+    uri: String,
+    root: Fr,
+    job: Job,
+    /// The last transient failure, until a bootstrap counts it.
+    failed: Option<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Job {
@@ -167,7 +226,7 @@ struct Ctx {
     deps: Deps,
     node: Node,
     vk_hash: [u8; 32],
-    updates: Updates,
+    queue: CensusQueue,
     /// Set when an update loaded: the next tick drops unused censuses.
     prune: Arc<AtomicBool>,
 }
@@ -196,17 +255,65 @@ async fn resume_census(ctx: &Ctx, rec: &ProcessRecord) {
     }
 }
 
-fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
-    if let Err(e) = ctx.node.census.clear_bad(&pid) {
-        error!(pid = %pid_hex(&pid), %e, "clear census failure");
-    }
-    if let Ok(mut q) = ctx.updates.lock() {
-        let e = q.entry(pid).or_insert((String::new(), root, Job::Queued));
-        (e.0, e.1) = (uri, root);
-        if e.2 == Job::Done {
-            e.2 = Job::Queued;
+/// The origin-2 census downloads the monitor runs off its loop. Actors
+/// queue one too: a chain read can move a root whose event a crash lost.
+#[derive(Clone)]
+pub struct CensusQueue {
+    store: Arc<CensusStore>,
+    updates: Updates,
+}
+
+impl CensusQueue {
+    /// Queues `root` of `pid` for download; a newer root replaces it.
+    pub(crate) fn queue(&self, pid: Fr, uri: String, root: Fr) {
+        if let Err(e) = self.store.clear_bad(&pid) {
+            error!(pid = %pid_hex(&pid), %e, "clear census failure");
+        }
+        if let Ok(mut q) = self.updates.lock() {
+            let e = q.entry(pid).or_insert(Update {
+                uri: String::new(),
+                root,
+                job: Job::Queued,
+                failed: None,
+            });
+            if e.root != root {
+                e.failed = None;
+            }
+            (e.uri, e.root) = (uri, root);
+            if e.job == Job::Done {
+                e.job = Job::Queued;
+            }
         }
     }
+
+    /// Whether `pid`'s download is queued or running, with no failure to
+    /// report and its census not stored yet.
+    fn waiting(&self, pid: &Fr) -> bool {
+        let root = match self.updates.lock() {
+            Ok(q) => match q.get(pid) {
+                Some(e) if e.job != Job::Done && e.failed.is_none() => e.root,
+                _ => return false,
+            },
+            Err(_) => return false,
+        };
+        !self.store.has(&root).unwrap_or(true)
+    }
+
+    /// The transient failure of `pid`'s download since the last call.
+    fn take_failure(&self, pid: &Fr) -> Option<String> {
+        self.updates.lock().ok()?.get_mut(pid)?.failed.take()
+    }
+
+    /// Drops `pid`'s entry: its bootstrap ended.
+    fn forget(&self, pid: &Fr) {
+        if let Ok(mut q) = self.updates.lock() {
+            q.remove(pid);
+        }
+    }
+}
+
+fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
+    ctx.queue.queue(pid, uri, root);
 }
 
 /// Drops stored censuses no process uses any more: not the root of an
@@ -214,8 +321,8 @@ fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
 /// so it never races a bootstrap that stored a census before its record.
 /// Roots of finished processes are kept, so their proofs stay servable.
 async fn prune_censuses(ctx: &Ctx) {
-    let mut keep: HashSet<[u8; 32]> = match ctx.updates.lock() {
-        Ok(q) => q.values().map(|e| fr_to_be(&e.1)).collect(),
+    let mut keep: HashSet<[u8; 32]> = match ctx.queue.updates.lock() {
+        Ok(q) => q.values().map(|e| fr_to_be(&e.root)).collect(),
         Err(_) => return,
     };
     match ctx.deps.db.processes() {
@@ -233,17 +340,17 @@ async fn prune_censuses(ctx: &Ctx) {
     }
 }
 
-/// Starts a fetch for every queued origin-2 census not already in flight.
-/// Off the monitor loop: `CensusStore::fetch` applies the usual SSRF, size
-/// and backoff rules, and a transient failure stays queued for the next tick.
+/// Starts a fetch for every queued census not already in flight. Off the
+/// monitor loop: `CensusStore::fetch` applies the usual SSRF, size and
+/// backoff rules, and a transient failure stays queued for the next tick.
 fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
-    let jobs: Vec<(Fr, String, Fr)> = match ctx.updates.lock() {
+    let jobs: Vec<(Fr, String, Fr)> = match ctx.queue.updates.lock() {
         Ok(mut q) => q
             .iter_mut()
-            .filter(|(_, e)| e.2 == Job::Queued)
+            .filter(|(_, e)| e.job == Job::Queued)
             .map(|(pid, e)| {
-                e.2 = Job::Running;
-                (*pid, e.0.clone(), e.1)
+                e.job = Job::Running;
+                (*pid, e.uri.clone(), e.root)
             })
             .collect(),
         Err(_) => return,
@@ -251,7 +358,7 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
     for (pid, uri, root) in jobs {
         let (census, q, prune, sd) = (
             ctx.node.census.clone(),
-            ctx.updates.clone(),
+            ctx.queue.updates.clone(),
             ctx.prune.clone(),
             shutdown.clone(),
         );
@@ -260,6 +367,7 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                 _ = sd.cancelled() => return,
                 r = census.fetch(&uri, &root) => r,
             };
+            let mut failed = None;
             let done = match res {
                 Ok(()) => {
                     prune.store(true, Ordering::Relaxed);
@@ -272,14 +380,21 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                     | CensusError::Config(_)
                     | CensusError::Refused(_)),
                 ) => {
-                    error!(pid = %pid_hex(&pid), ?e, "census update can never load; votes are refused until the next one");
-                    if let Err(e) = census.mark_bad(&pid, &root, &e.to_string()) {
-                        error!(pid = %pid_hex(&pid), %e, "persist census failure");
+                    // Another process stored the root meanwhile: it is
+                    // servable, and its process may already run on it.
+                    if census.has(&root).unwrap_or(false) {
+                        warn!(pid = %pid_hex(&pid), ?e, "census document unusable; its root is stored");
+                    } else {
+                        error!(pid = %pid_hex(&pid), ?e, "census update can never load; votes are refused until the next one");
+                        if let Err(e) = census.mark_bad(&pid, &root, &e.to_string()) {
+                            error!(pid = %pid_hex(&pid), %e, "persist census failure");
+                        }
                     }
                     true
                 }
                 Err(e) => {
                     warn!(pid = %pid_hex(&pid), ?e, "census update fetch; retrying");
+                    failed = Some(e.to_string());
                     false
                 }
             };
@@ -287,7 +402,10 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
             if let Ok(mut q) = q.lock()
                 && let Some(e) = q.get_mut(&pid)
             {
-                e.2 = if done && e.1 == root {
+                if e.root == root && failed.is_some() {
+                    e.failed = failed;
+                }
+                e.job = if done && e.root == root {
                     Job::Done
                 } else {
                     Job::Queued
@@ -318,6 +436,7 @@ fn census_access(ctx: &Ctx) -> crate::actor::CensusAccess {
     crate::actor::CensusAccess {
         store: ctx.node.census.clone(),
         onchain: ctx.node.onchain.clone(),
+        queue: ctx.queue.clone(),
     }
 }
 
@@ -368,7 +487,8 @@ fn process_config(vk_hash: [u8; 32], rec: &ProcessRecord) -> Result<ProcessConfi
 }
 
 /// A process whose bootstrap failed transiently: retried with backoff up to
-/// [`BOOT_ATTEMPT_CAP`], then recorded ignored. Attempts survive restarts.
+/// [`BOOT_ATTEMPT_CAP`], then recorded ignored, unless it has a stored
+/// record (then retried at the longest backoff). Attempts survive restarts.
 struct BootRetry {
     pid: Fr,
     pid31: [u8; 31],
@@ -381,24 +501,29 @@ fn boot_backoff(poll: std::time::Duration, attempts: u32) -> std::time::Duration
     poll * 2u32.pow(attempts.saturating_sub(1).min(5))
 }
 
-fn load_retries(db: &Db) -> Vec<BootRetry> {
+/// The persisted retry list. A storage error fails startup (a restart
+/// retries): starting empty would drop pids whose creation is behind the
+/// cursor for good. A corrupt list is logged and dropped, since failing on
+/// it would wedge the node.
+fn load_retries(db: &Db) -> Result<Vec<BootRetry>, NodeError> {
     let bytes = match db.meta_bytes(BOOT_RETRIES_KEY) {
         Ok(Some(b)) => b,
-        Ok(None) => return Vec::new(),
+        Ok(None) => return Ok(Vec::new()),
         Err(e) => {
-            error!(%e, "bootstrap retry list unreadable; starting empty");
-            return Vec::new();
+            error!(%e, "bootstrap retry list unreadable; refusing to start");
+            return Err(e.into());
         }
     };
     let list: Vec<(String, u32)> = match serde_json::from_slice(&bytes) {
         Ok(l) => l,
         Err(e) => {
             error!(%e, "bootstrap retry list corrupt; starting empty");
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
     let now = tokio::time::Instant::now();
-    list.iter()
+    Ok(list
+        .iter()
         .filter_map(|(h, attempts)| {
             let mut pid31 = [0u8; 31];
             let pid = hex::decode_to_slice(h, &mut pid31)
@@ -419,7 +544,7 @@ fn load_retries(db: &Db) -> Vec<BootRetry> {
                 due: now,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn save_retries(db: &Db, retries: &[BootRetry]) {
@@ -437,7 +562,7 @@ fn save_retries(db: &Db, retries: &[BootRetry]) {
     }
 }
 
-async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
+async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<BootRetry>) {
     // The last scanned block; the start block only seeds a fresh database.
     let mut last = match ctx.deps.db.meta_u64(LAST_BLOCK_KEY).ok().flatten() {
         Some(b) => b,
@@ -452,25 +577,77 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
             }
         },
     };
-    let mut retries = load_retries(&ctx.deps.db);
-    // Independent cadences: a due tick is never lost to the other branch.
+    let mut last_hash = match ctx.deps.db.meta_bytes(LAST_HASH_KEY) {
+        Ok(b) => b.and_then(|b| <[u8; 32]>::try_from(b).ok()),
+        Err(e) => {
+            error!(%e, "cursor hash unreadable; reorg check resumes at the next page");
+            None
+        }
+    };
+    let mut hash_errors = 0u32;
+    // Actor task deaths per pid this run: each one doubles the respawn wait.
+    let mut deaths: HashMap<Fr, u32> = HashMap::new();
     let mut poll = tokio::time::interval(ctx.cfg.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     poll.reset(); // skip the immediate first tick
-    let mut beat = tokio::time::interval(ctx.cfg.heartbeat());
-    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    beat.reset();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = beat.tick() => {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = heartbeat(&ctx) => {}
-                }
-                continue;
-            }
             _ = poll.tick() => {}
+        }
+        if shutdown.is_cancelled() {
+            return; // actors end at shutdown: nothing to reap
+        }
+        reap_dead_actors(&ctx, &mut retries, &mut deaths).await;
+        // A reorg below the cursor may have replaced routed events: route
+        // the range again (actors are replay-tolerant). A cursor without a
+        // hash (a fail-open page, an older database) is armed here, so an
+        // idle chain is checked too.
+        let got = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            r = ctx.deps.contracts.block_hash(last) => r,
+        };
+        if got.is_ok() {
+            hash_errors = 0;
+        }
+        match (got, last_hash) {
+            (Ok(Some(h)), None) => {
+                last_hash = Some(h);
+                save_cursor(&ctx.deps.db, last, last_hash);
+            }
+            (Ok(Some(h)), Some(want)) if h != want => {
+                let to = last.saturating_sub(REORG_REWIND);
+                error!(
+                    depth = last - to,
+                    cursor = last,
+                    to,
+                    "registry reorg below the event cursor; routing the range again"
+                );
+                ctx.node.metrics.reorgs.fetch_add(1, Ordering::Relaxed);
+                (last, last_hash) = (to, None);
+                save_cursor(&ctx.deps.db, last, None);
+                // Every actor re-reads its process: one whose transitions the
+                // reorg took may have no event in the range to wake it. Off
+                // the loop, so a full mailbox cannot stall routing.
+                let handles: Vec<ActorHandle> =
+                    ctx.node.processes.read().await.values().cloned().collect();
+                ctx.deps.tasks.spawn(async move {
+                    for h in handles {
+                        h.reread().await;
+                    }
+                });
+            }
+            // The same block, or an endpoint behind the cursor.
+            (Ok(_), _) => {}
+            // Nothing to check yet: route on.
+            (Err(e), None) => {
+                hash_failed(&mut hash_errors, &e, last);
+            }
+            (Err(e), Some(_)) => {
+                if !hash_failed(&mut hash_errors, &e, last) {
+                    continue;
+                }
+            }
         }
         let head = tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -488,6 +665,23 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
         let mut failed = false;
         while last < confirmed {
             let to = confirmed.min(last.saturating_add(crate::web3::MAX_LOG_RANGE));
+            // Read before the page: a reorg in between leaves the old hash,
+            // which the next poll catches.
+            let hash = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                r = ctx.deps.contracts.block_hash(to) => r,
+            };
+            let hash = match hash {
+                Ok(h) => {
+                    hash_errors = 0;
+                    h
+                }
+                Err(e) if hash_failed(&mut hash_errors, &e, to) => None,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            };
             let page = tokio::select! {
                 _ = shutdown.cancelled() => return,
                 r = ctx.deps.contracts.events(last + 1, to) => r,
@@ -509,10 +703,8 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
             // last always advances: one unservable process must not stall
             // event routing for every other election. Failed bootstraps
             // live in the retry list instead.
-            last = to;
-            if let Err(e) = ctx.deps.db.set_meta_u64(LAST_BLOCK_KEY, last) {
-                error!(%e, "persist last block");
-            }
+            (last, last_hash) = (to, hash);
+            save_cursor(&ctx.deps.db, last, hash);
         }
         if failed {
             continue;
@@ -538,13 +730,98 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken) {
     }
 }
 
+/// Drops the handles of actors whose task ended (the release build unwinds,
+/// so a panic ends only its task) and queues their respawn on the retry
+/// list, where a stored record without an actor is respawned. Each death of
+/// a pid doubles its wait: a panic at every start respawns at the longest
+/// backoff, not every poll.
+async fn reap_dead_actors(ctx: &Ctx, retries: &mut Vec<BootRetry>, deaths: &mut HashMap<Fr, u32>) {
+    let dead: Vec<Fr> = ctx
+        .node
+        .processes
+        .read()
+        .await
+        .iter()
+        .filter(|(_, h)| h.is_closed())
+        .map(|(pid, _)| *pid)
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    let mut map = ctx.node.processes.write().await;
+    let now = tokio::time::Instant::now();
+    for pid in dead {
+        if !map.get(&pid).is_some_and(ActorHandle::is_closed) {
+            continue;
+        }
+        map.remove(&pid);
+        let n = deaths.entry(pid).or_default();
+        *n = n.saturating_add(1);
+        error!(pid = %pid_hex(&pid), deaths = *n, "actor task ended; respawning");
+        if !retries.iter().any(|r| r.pid == pid) {
+            retries.push(BootRetry {
+                pid,
+                pid31: pid31_of(&pid),
+                attempts: 0,
+                due: now + boot_backoff(ctx.cfg.poll_interval, *n),
+            });
+        }
+    }
+    drop(map);
+    save_retries(&ctx.deps.db, retries);
+}
+
+/// Persists the cursor and its block hash in one write.
+fn save_cursor(db: &Db, last: u64, hash: Option<[u8; 32]>) {
+    let hash = hash.as_ref().map(|h| &h[..]);
+    if let Err(e) = db.set_meta_u64_and_bytes(LAST_BLOCK_KEY, last, LAST_HASH_KEY, hash) {
+        error!(%e, "persist last block");
+    }
+}
+
+/// Counts a failed block-hash read; true once [`HASH_TRIES`] failed in a
+/// row: go on without the reorg check rather than stall routing.
+fn hash_failed(errors: &mut u32, e: &crate::web3::Web3Error, block: u64) -> bool {
+    *errors = errors.saturating_add(1);
+    match (*errors).cmp(&HASH_TRIES) {
+        std::cmp::Ordering::Less => warn!(%e, block, "block hash read"),
+        std::cmp::Ordering::Equal => {
+            warn!(%e, block, "block hash reads keep failing; routing without the reorg check")
+        }
+        std::cmp::Ordering::Greater => {}
+    }
+    *errors >= HASH_TRIES
+}
+
 /// The heartbeat: actors seal, close out, resync and finalize on Head.
-/// The block is the confirmed head, so gap replays never apply a
-/// transition still shallow enough to reorg out.
-async fn heartbeat(ctx: &Ctx) {
-    if let Ok((block, time)) = ctx.deps.contracts.head().await {
-        let confirmed_block = block.saturating_sub(ctx.cfg.confirmations);
-        for h in ctx.node.processes.read().await.values() {
+/// Its own task, so a slow page or bootstrap never delays it. The block is
+/// the confirmed head, so gap replays never apply a transition still
+/// shallow enough to reorg out.
+async fn heartbeat_loop(
+    contracts: Arc<dyn crate::actor::Chain>,
+    processes: Arc<RwLock<HashMap<Fr, ActorHandle>>>,
+    confirmations: u64,
+    every: std::time::Duration,
+    shutdown: CancellationToken,
+) {
+    let mut beat = tokio::time::interval(every);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beat.reset();
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = beat.tick() => {}
+        }
+        let head = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            r = contracts.head() => r,
+        };
+        let Ok((block, time)) = head else { continue };
+        let confirmed_block = block.saturating_sub(confirmations);
+        // Not under the map lock: a full mailbox must not hold up a spawn.
+        let hs: Vec<ActorHandle> = processes.read().await.values().cloned().collect();
+        // Never waits: a full mailbox drops this Head, not the others'.
+        for h in hs {
             h.head(confirmed_block, time).await;
         }
     }
@@ -570,9 +847,14 @@ async fn route(
             return; // already queued for retry
         }
         if let Err(e) = bootstrap(ctx, pid, &pid31, shutdown).await {
-            warn!(pid = %hex::encode(pid31), %e, "bootstrap failed; queued for retry");
-            // A wait (a census still syncing) is not a failed attempt.
-            let attempts = u32::from(!matches!(e, NodeError::Census(CensusError::Backoff(_))));
+            // A wait (a census still loading) is not a failed attempt.
+            let wait = matches!(e, NodeError::Census(CensusError::Backoff(_)));
+            if wait {
+                info!(pid = %hex::encode(pid31), "bootstrap waits for its census");
+            } else {
+                warn!(pid = %hex::encode(pid31), %e, "bootstrap failed; queued for retry");
+            }
+            let attempts = u32::from(!wait);
             retries.push(BootRetry {
                 pid,
                 pid31,
@@ -632,7 +914,16 @@ async fn run_boot_retries(ctx: &Ctx, retries: &mut Vec<BootRetry>, shutdown: &Ca
             Err(e) => {
                 changed = true;
                 retries[i].attempts += 1;
-                if retries[i].attempts >= BOOT_ATTEMPT_CAP {
+                // Fail closed: a read error may hide a live record.
+                let stored = !matches!(ctx.deps.db.process(&pid), Ok(None));
+                if retries[i].attempts >= BOOT_ATTEMPT_CAP && stored {
+                    // A process with state is never given up: retry at the
+                    // longest backoff and keep saying so.
+                    error!(pid = %hex::encode(pid31), %e, "actor still fails to start; retrying");
+                    retries[i].attempts = BOOT_ATTEMPT_CAP;
+                    retries[i].due = now + boot_backoff(ctx.cfg.poll_interval, BOOT_ATTEMPT_CAP);
+                    i += 1;
+                } else if retries[i].attempts >= BOOT_ATTEMPT_CAP {
                     ignore_unbootstrapped(ctx, pid, &pid31, &e.to_string()).await;
                     retries.remove(i);
                 } else {
@@ -670,6 +961,7 @@ async fn ignore_unbootstrapped(ctx: &Ctx, pid: Fr, pid31: &[u8; 31], note: &str)
     if let Err(e) = ignore(ctx, rec, &note) {
         error!(pid = %hex::encode(pid31), %e, "record ignored process");
     }
+    ctx.queue.forget(&pid);
 }
 
 /// Stand-in record for a process whose on-chain read never succeeded.
@@ -721,8 +1013,26 @@ async fn bootstrap(
     pid31: &[u8; 31],
     shutdown: &CancellationToken,
 ) -> Result<(), NodeError> {
-    if ctx.deps.db.process(&pid)?.is_some() || ctx.node.processes.read().await.contains_key(&pid) {
-        return Ok(()); // seen before (respawned or ignored)
+    if ctx.node.processes.read().await.contains_key(&pid) {
+        return Ok(()); // running
+    }
+    if let Some(rec) = ctx.deps.db.process(&pid)? {
+        // Ignored stays down. A stored record without an actor (its spawn
+        // failed here or at boot) starts now; an error keeps the retry.
+        if rec.local == LocalStatus::Ignored {
+            return Ok(());
+        }
+        let chain_time = ctx.deps.contracts.head().await.map(|(_, t)| t).unwrap_or(0);
+        let h = respawn(ctx, &rec, chain_time, shutdown)?;
+        ctx.node.processes.write().await.insert(pid, h);
+        info!(pid = %hex::encode(pid31), "process actor started on retry");
+        return Ok(());
+    }
+    // Its census is still downloading: nothing to re-read yet.
+    if ctx.queue.waiting(&pid) {
+        return Err(NodeError::Census(CensusError::Backoff(
+            ctx.cfg.poll_interval,
+        )));
     }
     // A failed fetch is transient: the caller queues the pid for retry.
     let onchain = match ctx.deps.contracts.process(pid31).await {
@@ -773,28 +1083,34 @@ async fn bootstrap(
             }));
         }
     }
+    // Origins 1 and 2 download off the loop (the URI is the creator's: a
+    // slow server must not stall routing). The process waits on the retry
+    // list until the census is stored; a failed download costs an attempt.
     if matches!(
         pcfg.census_origin,
         CensusOrigin::MerkleStatic | CensusOrigin::MerkleOffchainDynamic
-    ) && let Err(e) = ctx
-        .node
-        .census
-        .fetch(&rec.onchain.census.uri, &pcfg.census_root)
-        .await
-    {
-        return match e {
-            // A broken document or a policy refusal can never validate:
-            // ignore for good.
-            CensusError::Format(_)
-            | CensusError::RootMismatch { .. }
-            | CensusError::Config(_)
-            | CensusError::Refused(_) => ignore(ctx, rec, &format!("census: {e}")),
-            // Network trouble (or the store's own backoff): the caller puts
-            // the process on the bootstrap retry list.
-            e => Err(NodeError::Census(e)),
-        };
+    ) {
+        // A broken document or a policy refusal can never validate: ignore
+        // for good, even if another process stored the root meanwhile.
+        if let Some(why) = ctx.node.census.bad_reason(&pid, &pcfg.census_root) {
+            ctx.queue.forget(&pid);
+            if let Err(e) = ctx.node.census.clear_bad(&pid) {
+                error!(pid = %pid_hex(&pid), %e, "clear census failure");
+            }
+            return ignore(ctx, rec, &format!("census: {why}"));
+        }
+        if !ctx.node.census.has(&pcfg.census_root)? {
+            if let Some(why) = ctx.queue.take_failure(&pid) {
+                return Err(NodeError::Census(CensusError::Fetch(why)));
+            }
+            queue_census(ctx, pid, rec.onchain.census.uri.clone(), pcfg.census_root);
+            return Err(NodeError::Census(CensusError::Backoff(
+                ctx.cfg.poll_interval,
+            )));
+        }
     }
     ctx.deps.db.put_process(&rec)?;
+    ctx.queue.forget(&pid);
     let chain_time = ctx.deps.contracts.head().await.map(|(_, t)| t).unwrap_or(0);
     let h = spawn_actor(
         &ctx.cfg,

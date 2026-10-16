@@ -3,6 +3,7 @@
 //! `tests/integration/election.go` is the reference implementation).
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use arbo::{CircomProcessorProof, Storage};
 use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, ballot_leaf_hash, leaf_value_bytes};
@@ -27,9 +28,10 @@ use crate::validate::VerifiedVote;
 
 /// A built transition, ready to prove. `request` carries the private
 /// witness (the re-encryption seed and the refresh selection), so `Debug`
-/// redacts it and it must never be logged or persisted.
+/// redacts it and it must never be logged or persisted. Shared, so the
+/// prover job does not copy its 10+ MB.
 pub struct PreparedBatch {
-    pub request: ProveRequest,
+    pub request: Arc<ProveRequest>,
     pub blobs: TransitionBlobs,
     pub expected: BatchPublics,
     pub old_root: [u8; 32],
@@ -433,7 +435,6 @@ impl<S: Storage> ProcessState<S> {
         let tdata = TransitionData {
             vote_ids: vote_ids.clone(),
             updates,
-            accumulator: net,
             num_fields: nf,
         };
         let blobs = blob::build_blobs(&tdata, &cfg.process_id, old_root)?;
@@ -552,7 +553,7 @@ impl<S: Storage> ProcessState<S> {
 
         slot_writes.extend(refresh_writes);
         Ok(PreparedBatch {
-            request,
+            request: Arc::new(request),
             blobs,
             expected,
             old_root: *old_root,

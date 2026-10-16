@@ -8,6 +8,7 @@ pub mod census;
 pub mod config;
 mod finalize;
 pub mod keys;
+pub mod l1da;
 pub mod metrics;
 pub mod monitor;
 pub mod storage;

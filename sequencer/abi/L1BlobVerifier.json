@@ -1,0 +1,238 @@
+[
+  {
+    "type": "constructor",
+    "inputs": [
+      {
+        "name": "_l1Block",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "MAX_AGE",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "l1Block",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "record",
+    "inputs": [],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "recorded",
+    "inputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "verify",
+    "inputs": [
+      {
+        "name": "p",
+        "type": "tuple",
+        "internalType": "struct IL1BlobVerifier.L1BlobProof",
+        "components": [
+          {
+            "name": "headers",
+            "type": "bytes[]",
+            "internalType": "bytes[]"
+          },
+          {
+            "name": "txs",
+            "type": "tuple[]",
+            "internalType": "struct IL1BlobVerifier.L1TxProof[]",
+            "components": [
+              {
+                "name": "headerIndex",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "key",
+                "type": "bytes",
+                "internalType": "bytes"
+              },
+              {
+                "name": "proof",
+                "type": "bytes[]",
+                "internalType": "bytes[]"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "vhs",
+        "type": "bytes32[]",
+        "internalType": "bytes32[]"
+      },
+      {
+        "name": "blobBlocks",
+        "type": "uint256[]",
+        "internalType": "uint256[]"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "event",
+    "name": "OriginRecorded",
+    "inputs": [
+      {
+        "name": "number",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      },
+      {
+        "name": "hash",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "BadHeader",
+    "inputs": [
+      {
+        "name": "index",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BadVersionedHash",
+    "inputs": [
+      {
+        "name": "tx",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "BrokenHeaderChain",
+    "inputs": [
+      {
+        "name": "index",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ContentLengthMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "EmptyItem",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidDataRemainder",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidHeader",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "L1OriginMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotBlobTx",
+    "inputs": [
+      {
+        "name": "tx",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "TxAboveOrigin",
+    "inputs": [
+      {
+        "name": "tx",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "TxTooOld",
+    "inputs": [
+      {
+        "name": "tx",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "UnexpectedList",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "UnexpectedString",
+    "inputs": []
+  }
+]

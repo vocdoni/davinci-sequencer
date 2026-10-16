@@ -50,6 +50,14 @@ sol! {
     }
 }
 
+sol! {
+    /// The one `L1BlobVerifier` view the client reads.
+    #[sol(rpc)]
+    interface L1Verifier {
+        function l1Block() external view returns (address);
+    }
+}
+
 mod adapter {
     alloy::sol!(
         #[sol(rpc, all_derives)]
@@ -123,7 +131,7 @@ pub const USER_AGENT: &str = concat!("davinci-client/", env!("CARGO_PKG_VERSION"
 /// Default wait for a transaction receipt.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Retries of a rate-limited request, a second apart: the public Gnosis RPCs
+/// Retries of a rate-limited request, a second apart: public RPCs
 /// refuse a busy host for a minute or two at a time, so three minutes.
 const RATE_LIMIT_RETRIES: u32 = 180;
 const RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
@@ -151,7 +159,7 @@ impl RetryPolicy for CappedRateLimit {
 pub fn rpc_client(url: &str, user_agent: &str) -> Result<RpcClient> {
     let url: reqwest::Url = url
         .parse()
-        .map_err(|_| Error::Invalid(format!("bad RPC URL {url:.60}")))?;
+        .map_err(|e| Error::Invalid(format!("bad RPC URL ({e})")))?;
     let http = reqwest::Client::builder()
         .user_agent(user_agent)
         .build()
@@ -991,6 +999,22 @@ pub struct RegistryInfo {
     /// mode is disabled or the registry predates it. Callers creating
     /// Council processes must require it.
     pub council_adapter: Option<Address>,
+    /// The DA mode: where settlements put their blobs.
+    pub da: RegistryDa,
+}
+
+/// How a registry publishes transition data (`l1BlobVerifier()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryDa {
+    /// Blob transactions on the registry's own chain: a zero verifier, or a
+    /// registry from before the mode.
+    Blobs,
+    /// Ethereum blob transactions proven through `verifier`, which reads OP's
+    /// L1 origin from `l1_block`.
+    L1Blobs {
+        verifier: Address,
+        l1_block: Address,
+    },
 }
 
 fn pin(
@@ -1011,7 +1035,8 @@ fn pin(
 /// are the pinned ones. A DKG or Council adapter, if any, must name this
 /// registry. The first mismatch comes back as [`Error::Pin`]; a
 /// `councilAdapter()` read that fails for any reason but a registry without
-/// the function is an error, never "no adapter".
+/// the function is an error, never "no adapter". It also reports the DA mode (a
+/// registry without `l1BlobVerifier()` is in blob mode).
 pub async fn verify_registry(rpc_url: &str, registry: Address) -> Result<RegistryInfo> {
     let provider = read_provider(rpc_url)?;
     let rpc = |e: alloy::transports::TransportError| Error::Chain(e.to_string());
@@ -1098,11 +1123,28 @@ pub async fn verify_registry(rpc_url: &str, registry: Address) -> Result<Registr
         Err(e) if missing_function(&e) => None,
         Err(e) => return Err(chain_err(e)),
     };
+    let da = match r.l1BlobVerifier().call().await {
+        Ok(a) if a == Address::ZERO => RegistryDa::Blobs,
+        Ok(a) => {
+            let l1_block = L1Verifier::new(a, &provider)
+                .l1Block()
+                .call()
+                .await
+                .map_err(chain_err)?;
+            RegistryDa::L1Blobs {
+                verifier: a,
+                l1_block,
+            }
+        }
+        Err(e) if missing_function(&e) => RegistryDa::Blobs,
+        Err(e) => return Err(chain_err(e)),
+    };
     Ok(RegistryInfo {
         chain_id,
         verifier,
         dkg_adapter,
         council_adapter,
+        da,
     })
 }
 

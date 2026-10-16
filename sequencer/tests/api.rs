@@ -212,6 +212,17 @@ async fn ping_info_and_process_views() {
     assert_eq!(info.settled_by_self, 0);
     assert_eq!(info.synced_from_others, 0);
     assert_eq!(info.lost_races, 0);
+    assert_eq!((info.reorgs, info.rebuilds), (0, 0));
+    t.node
+        .metrics
+        .reorgs
+        .store(3, std::sync::atomic::Ordering::SeqCst);
+    t.node
+        .metrics
+        .rebuilds
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let info = t.client.info().await.unwrap();
+    assert_eq!((info.reorgs, info.rebuilds), (3, 2));
 
     assert_eq!(
         t.client.processes().await.unwrap(),
@@ -909,12 +920,7 @@ fn update_census(t: &Served, sub: &str, voters: &[usize], root: Fr) {
 }
 
 fn announce_census(t: &Served, uri: String, root: Fr) {
-    t.s.chain.advance_time(0);
-    t.s.chain.push_event(EventKind::CensusUpdated {
-        pid: pid31(),
-        root: fr_to_be(&root),
-        uri,
-    });
+    t.s.chain.set_census(fr_to_be(&root), uri);
 }
 
 async fn wait_served(t: &Served, voter: usize, root: Fr) {
@@ -1028,5 +1034,45 @@ async fn offchain_census_update_that_cannot_load_is_refused() {
     let root = census_root(0..5);
     update_census(&t, "good", &[0, 1, 2, 3, 4], root);
     wait_served(&t, 4, root).await;
+    t.shutdown.cancel();
+}
+
+/// `votersCount` and `overwrittenVotesCount` follow a synced transition
+/// and two own landings, overwrites included.
+#[tokio::test]
+async fn process_view_counts_follow_settled_transitions() {
+    let t = serve(FakeProver::open(), 2).await;
+    let h = handle(&t.node).await;
+    let counts = async || {
+        let p = t.client.process(&pid31()).await.unwrap();
+        (p.voters_count, p.overwritten_votes_count)
+    };
+    assert_eq!(counts().await, (0, 0));
+
+    // Another sequencer lands voters 0 and 1.
+    let mut other =
+        davinci_state::ProcessState::create(t.s.env.cfg.clone(), arbo::MemoryStorage::new())
+            .unwrap();
+    let theirs = [
+        fake_vote(&t.s.env, 0, &[1, 2], 30),
+        fake_vote(&t.s.env, 1, &[1, 2], 31),
+    ];
+    let b = other
+        .prepare(&theirs, &mut StdRng::seed_from_u64(4), &Default::default())
+        .unwrap();
+    t.s.chain.settle_externally(&b);
+    wait_until("synced", async || counts().await == (2, 0)).await;
+
+    // Own landings: an overwrite and a new voter each.
+    for (i, k) in [(0, 32), (2, 33)] {
+        h.submit(fake_vote(&t.s.env, i, &[2, 1], k)).await.unwrap();
+    }
+    wait_until("own landing 1", async || counts().await == (3, 1)).await;
+    for (i, k) in [(1, 34), (3, 35)] {
+        h.submit(fake_vote(&t.s.env, i, &[2, 2], k)).await.unwrap();
+    }
+    wait_until("own landing 2", async || counts().await == (4, 2)).await;
+    assert_eq!(t.s.chain.voters(), 4);
+    assert_eq!(t.client.info().await.unwrap().settled_by_self, 2);
     t.shutdown.cancel();
 }

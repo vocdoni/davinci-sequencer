@@ -9,7 +9,7 @@ use std::time::Duration;
 use alloy::eips::BlockNumberOrTag;
 use alloy::json_abi::JsonAbi;
 use alloy::network::{EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, B256, FixedBytes, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::{Filter, Log, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
@@ -27,8 +27,8 @@ use super::adapter::DavinciDKGAdapter as AD;
 use super::council::CouncilAdapter as CA;
 use super::tx::SendState;
 use super::{
-    DkgState, EventKind, GraceParams, KeyMode, NewProcess, OnchainCensus, OnchainProcess,
-    ProcessStatus, RegistryEvent, Result, TxReceipt, Web3Error, rpc_err, rpc_provider,
+    DkgState, EventKind, GraceParams, KeyMode, L1Blobs, NewProcess, OnchainCensus, OnchainProcess,
+    ProcessStatus, RegistryDa, RegistryEvent, Result, TxReceipt, Web3Error, rpc_err, rpc_provider,
 };
 use crate::config::{Config, SecretString};
 
@@ -39,6 +39,8 @@ const VERIFIER_ABI_JSON: &str = include_str!("../../abi/ZiskVerifier.json");
 const ADAPTER_ABI_JSON: &str = include_str!("../../abi/DavinciDKGAdapter.json");
 /// And the Council adapter's (`InvalidFieldRange`).
 const COUNCIL_ABI_JSON: &str = include_str!("../../abi/CouncilAdapter.json");
+/// And `L1BlobVerifier`'s (`L1OriginMismatch`, `TxTooOld`, the RLP errors).
+const L1_VERIFIER_ABI_JSON: &str = include_str!("../../abi/L1BlobVerifier.json");
 /// Council manager errors (all argument-less, `ICouncilManagerErrors`) the
 /// Council adapter bubbles up through the registry: binding at creation,
 /// request admission, the decryption gate.
@@ -98,10 +100,14 @@ pub struct Contracts {
     pub(super) errors: Arc<HashMap<[u8; 4], String>>,
     pub(super) send_lock: Arc<tokio::sync::Mutex<SendState>>,
     pub(super) receipt_timeout: Duration,
+    /// Most one send may cost in execution gas (`gas limit × max fee`), wei.
+    pub(super) max_tx_fee: u128,
     /// `dkgAdapter()`, an immutable: read once, on first DKG use.
     pub(super) dkg_adapter: Arc<tokio::sync::OnceCell<Address>>,
     /// `councilAdapter()`, likewise.
     pub(super) council_adapter: Arc<tokio::sync::OnceCell<Address>>,
+    /// The registry's DA mode, an immutable: read once (`da_mode`).
+    pub(super) da: Arc<tokio::sync::OnceCell<super::RegistryDa>>,
 }
 
 impl std::fmt::Debug for Contracts {
@@ -124,8 +130,8 @@ fn exact_u64(what: &str, v: U256) -> Result<u64> {
     u64::try_from(v).map_err(|_| Web3Error::Data(format!("{what} above 64 bits")))
 }
 
-/// Custom error selectors of the registry, the ZisK verifier, the DKG and
-/// Council adapters, and the DKG and Council contracts.
+/// Custom error selectors of the registry, the ZisK verifier, the L1 blob
+/// verifier, the DKG and Council adapters, and the DKG and Council contracts.
 pub(super) fn error_names() -> Result<HashMap<[u8; 4], String>> {
     let mut out = HashMap::new();
     for name in DKG_ERRORS.iter().chain(&COUNCIL_ERRORS) {
@@ -137,6 +143,7 @@ pub(super) fn error_names() -> Result<HashMap<[u8; 4], String>> {
         ("council adapter", COUNCIL_ABI_JSON),
         ("registry", ABI_JSON),
         ("verifier", VERIFIER_ABI_JSON),
+        ("l1 blob verifier", L1_VERIFIER_ABI_JSON),
     ] {
         let abi: JsonAbi = serde_json::from_str(json)
             .map_err(|e| Web3Error::Config(format!("{what} ABI: {e}")))?;
@@ -207,9 +214,57 @@ pub async fn probe_osaka<P: Provider>(p: &P) -> Result<bool> {
 /// the probe fails too: true for EIP-7594 cell proofs.
 fn known_chain_cell_proofs(chain_id: u64) -> Option<bool> {
     match chain_id {
-        100 | 10200 => Some(true), // Gnosis, Chiado: Osaka
+        100 | 10200 => Some(true),    // Gnosis, Chiado: Osaka
+        1 | 11_155_111 => Some(true), // Ethereum, Sepolia: Osaka
         _ => None,
     }
+}
+
+/// The chain's blob limit per transaction (`eth_config`, if an endpoint
+/// serves it) and whether its blob transactions carry EIP-7594 cell proofs:
+/// `eth_config`, else the P256VERIFY probe, else the known-chain table.
+pub(super) async fn blob_support(
+    rpcs: &[Url],
+    provider: &DynProvider,
+    chain_id: u64,
+) -> Result<(Option<usize>, bool)> {
+    // Endpoints lacking eth_config are common: ask each before the probe.
+    let mut eth_config = Err(TransportErrorKind::custom_str("no RPC endpoint"));
+    for u in rpcs {
+        eth_config = rpc_provider(std::slice::from_ref(u))
+            .raw_request("eth_config".into(), ())
+            .await;
+        if eth_config.is_ok() {
+            break;
+        }
+    }
+    let blob_cap = eth_config_blob_cap(&eth_config);
+    let cell_proofs = match &eth_config {
+        Ok(v) => eth_config_osaka(v),
+        Err(e) => {
+            tracing::warn!(error = %e, "eth_config unavailable: probing P256VERIFY for Osaka");
+            match (
+                probe_osaka(provider).await,
+                known_chain_cell_proofs(chain_id),
+            ) {
+                (Ok(v), _) => v,
+                (Err(e), Some(v)) => {
+                    tracing::warn!(error = %e, chain_id, cell_proofs = v,
+                        "P256VERIFY probe failed: sidecar version from the known-chain table");
+                    v
+                }
+                (Err(e), None) => {
+                    return Err(Web3Error::Config(format!(
+                        "blob sidecar version unknown: no eth_config and the P256VERIFY probe failed ({e})"
+                    )));
+                }
+            }
+        }
+    };
+    if !cell_proofs {
+        tracing::info!("pre-Osaka chain: blob transactions carry v0 sidecars");
+    }
+    Ok((blob_cap, cell_proofs))
 }
 
 /// `eth_chainId` of every endpoint: another chain is fatal and named, an
@@ -323,6 +378,17 @@ fn mode_from_abi(m: &T::BallotMode) -> Result<BallotMode> {
     })
 }
 
+// A `getProcess` answer: an unknown process reads as all zeros.
+fn process_checked(p: &T::Process, pid: &[u8; 31]) -> Result<OnchainProcess> {
+    if p.organizationId == Address::ZERO {
+        return Err(Web3Error::Data(format!(
+            "unknown process 0x{}",
+            hex::encode(pid)
+        )));
+    }
+    process_from_abi(p)
+}
+
 fn process_from_abi(p: &T::Process) -> Result<OnchainProcess> {
     let enc_key = Point::from_be(
         &p.encryptionKey.x.to_be_bytes(),
@@ -430,6 +496,7 @@ fn event_from_log(log: &Log) -> Result<Option<RegistryEvent>> {
                 voters: sat_u64(e.newVotersCount),
                 overwrites: sat_u64(e.newOverwrittenVotesCount),
                 n_blobs: sat_u64(e.nBlobs),
+                l1: None,
             }
         }
         PR::ProcessResultsSet::SIGNATURE_HASH => {
@@ -480,10 +547,99 @@ fn event_from_log(log: &Log) -> Result<Option<RegistryEvent>> {
     }))
 }
 
+/// A `ProcessStateTransitionedL1` log, merged into its transition by [`pair_l1`].
+struct L1Event {
+    block: u64,
+    tx_hash: B256,
+    log_index: u64,
+    pid: [u8; 31],
+    blobs: L1Blobs,
+}
+
+fn l1_event_from_log(log: &Log) -> Result<Option<L1Event>> {
+    if log.removed {
+        return Ok(None);
+    }
+    let (Some(block), Some(tx_hash), Some(log_index)) =
+        (log.block_number, log.transaction_hash, log.log_index)
+    else {
+        return Err(Web3Error::Data("log without block, tx or index".into()));
+    };
+    let e = PR::ProcessStateTransitionedL1::decode_log(&log.inner)
+        .map_err(|e| Web3Error::Data(format!("event decode: {e}")))?;
+    let blocks = e
+        .l1BlockNumbers
+        .iter()
+        .map(|b| exact_u64("l1BlockNumber", *b))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(L1Event {
+        block,
+        tx_hash,
+        log_index,
+        pid: e.processId.0,
+        blobs: L1Blobs {
+            blocks,
+            vhs: e.versionedHashes.clone(),
+        },
+    }))
+}
+
+/// Merges each L1 event into the `ProcessStateTransitioned` logged right
+/// before it, in the same transaction, for the same process and blob count.
+/// With `strict` (L1-blob mode) every transition must have one.
+fn pair_l1(out: &mut [RegistryEvent], l1s: Vec<L1Event>, strict: bool) -> Result<()> {
+    for e in l1s {
+        let prev = out.iter_mut().find(|r| {
+            r.block == e.block && r.tx_hash == e.tx_hash && r.log_index + 1 == e.log_index
+        });
+        match prev {
+            Some(RegistryEvent {
+                kind:
+                    EventKind::StateTransitioned {
+                        pid, n_blobs, l1, ..
+                    },
+                ..
+            }) if *pid == e.pid
+                && l1.is_none()
+                && *n_blobs == e.blobs.vhs.len() as u64
+                && e.blobs.blocks.len() == e.blobs.vhs.len() =>
+            {
+                *l1 = Some(e.blobs);
+            }
+            _ => {
+                return Err(Web3Error::Data(format!(
+                    "ProcessStateTransitionedL1 in tx {} has no matching transition",
+                    e.tx_hash
+                )));
+            }
+        }
+    }
+    if strict
+        && let Some(r) = out
+            .iter()
+            .find(|r| matches!(r.kind, EventKind::StateTransitioned { l1: None, .. }))
+    {
+        return Err(Web3Error::Data(format!(
+            "transition in tx {} without its ProcessStateTransitionedL1",
+            r.tx_hash
+        )));
+    }
+    Ok(())
+}
+
 impl Contracts {
-    /// Connects with the node configuration.
+    /// Connects with the node configuration. In L1-blob mode this chain
+    /// never carries blobs, so its blob support is not probed.
     pub async fn connect(cfg: &Config) -> Result<Self> {
-        Self::new(&cfg.rpc_url, cfg.registry, cfg.privkey.as_ref()).await
+        let mut c = Self::open(
+            &cfg.rpc_url,
+            cfg.registry,
+            cfg.privkey.as_ref(),
+            !cfg.l1_mode(),
+        )
+        .await?;
+        c.max_tx_fee = cfg.op_max_tx_fee;
+        Ok(c)
     }
 
     /// Connects to `rpcs` (in order of preference, with sticky failover).
@@ -494,6 +650,17 @@ impl Contracts {
         rpcs: &[Url],
         registry: Address,
         privkey: Option<&SecretString>,
+    ) -> Result<Self> {
+        Self::open(rpcs, registry, privkey, true).await
+    }
+
+    /// [`Contracts::new`]; `blobs` false skips the blob-support probe (the
+    /// sidecar version and the blob cap stay unknown).
+    pub async fn open(
+        rpcs: &[Url],
+        registry: Address,
+        privkey: Option<&SecretString>,
+        blobs: bool,
     ) -> Result<Self> {
         let (wallet, signer) = match privkey {
             Some(k) => {
@@ -511,42 +678,11 @@ impl Contracts {
         if code.is_empty() {
             return Err(Web3Error::Config(format!("no contract at {registry}")));
         }
-        // Endpoints lacking eth_config are common: ask each before the probe.
-        let mut eth_config = Err(TransportErrorKind::custom_str("no RPC endpoint"));
-        for u in rpcs {
-            eth_config = rpc_provider(std::slice::from_ref(u))
-                .raw_request("eth_config".into(), ())
-                .await;
-            if eth_config.is_ok() {
-                break;
-            }
-        }
-        let blob_cap = eth_config_blob_cap(&eth_config);
-        let cell_proofs = match &eth_config {
-            Ok(v) => eth_config_osaka(v),
-            Err(e) => {
-                tracing::warn!(error = %e, "eth_config unavailable: probing P256VERIFY for Osaka");
-                match (
-                    probe_osaka(&provider).await,
-                    known_chain_cell_proofs(chain_id),
-                ) {
-                    (Ok(v), _) => v,
-                    (Err(e), Some(v)) => {
-                        tracing::warn!(error = %e, chain_id, cell_proofs = v,
-                            "P256VERIFY probe failed: sidecar version from the known-chain table");
-                        v
-                    }
-                    (Err(e), None) => {
-                        return Err(Web3Error::Config(format!(
-                            "blob sidecar version unknown: no eth_config and the P256VERIFY probe failed ({e})"
-                        )));
-                    }
-                }
-            }
+        let (blob_cap, cell_proofs) = if blobs {
+            blob_support(rpcs, &provider, chain_id).await?
+        } else {
+            (None, false)
         };
-        if !cell_proofs {
-            tracing::info!("pre-Osaka chain: blob transactions carry v0 sidecars");
-        }
         Ok(Contracts {
             provider,
             epoch,
@@ -559,8 +695,10 @@ impl Contracts {
             errors: Arc::new(error_names()?),
             send_lock: Arc::new(tokio::sync::Mutex::new(SendState::default())),
             receipt_timeout: Duration::from_secs(120),
+            max_tx_fee: super::tx::DEFAULT_MAX_TX_FEE,
             dkg_adapter: Arc::default(),
             council_adapter: Arc::default(),
+            da: Arc::default(),
         })
     }
 
@@ -598,19 +736,37 @@ impl Contracts {
         self.receipt_timeout = d;
     }
 
+    /// Most one send may cost in execution gas, in wei (`--op-max-tx-fee`).
+    pub fn set_max_tx_fee(&mut self, cap: u128) {
+        self.max_tx_fee = cap;
+    }
+
     /// `getProcess`; an unknown pid is an error.
     pub async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess> {
         let call = PR::getProcessCall {
             processId: FixedBytes(*pid),
         };
-        let p = self.view(self.registry, call).await?;
-        if p.organizationId == Address::ZERO {
-            return Err(Web3Error::Data(format!(
-                "unknown process 0x{}",
-                hex::encode(pid)
-            )));
-        }
-        process_from_abi(&p)
+        process_checked(&self.view(self.registry, call).await?, pid)
+    }
+
+    /// `getProcess` at `block` (a head read just before): a backend below
+    /// that block fails the call instead of answering from an older state.
+    pub async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess> {
+        let call = PR::getProcessCall {
+            processId: FixedBytes(*pid),
+        };
+        let tx = TransactionRequest::default()
+            .with_to(self.registry)
+            .with_input(call.abi_encode());
+        let out = self
+            .provider
+            .call(tx)
+            .block(alloy::eips::BlockId::number(block))
+            .await
+            .map_err(|e| Web3Error::Rpc(format!("{}: {e}", PR::getProcessCall::SIGNATURE)))?;
+        let p = PR::getProcessCall::abi_decode_returns(&out)
+            .map_err(|e| Web3Error::Data(format!("{}: {e}", PR::getProcessCall::SIGNATURE)))?;
+        process_checked(&p, pid)
     }
 
     /// `getProcessGraceEnd`, saturating.
@@ -644,6 +800,7 @@ impl Contracts {
             PR::ProcessGraceChanged::SIGNATURE_HASH,
             PR::ProcessMaxVotersChanged::SIGNATURE_HASH,
             PR::ProcessStateTransitioned::SIGNATURE_HASH,
+            PR::ProcessStateTransitionedL1::SIGNATURE_HASH,
             PR::ProcessResultsSet::SIGNATURE_HASH,
             PR::CensusUpdated::SIGNATURE_HASH,
             PR::ProcessMetadataUpdated::SIGNATURE_HASH,
@@ -657,6 +814,7 @@ impl Contracts {
         let e0 = self.epoch.load(Ordering::SeqCst);
         let head = self.provider.get_block_number().await.map_err(rpc_err)?;
         let mut out = Vec::new();
+        let mut l1s = Vec::new();
         let mut start = from;
         while start <= to {
             let end = start.saturating_add(MAX_LOG_RANGE - 1).min(to);
@@ -669,7 +827,9 @@ impl Contracts {
                 if log.address() != self.registry {
                     continue;
                 }
-                if let Some(ev) = event_from_log(&log)? {
+                if log.topic0() == Some(&PR::ProcessStateTransitionedL1::SIGNATURE_HASH) {
+                    l1s.extend(l1_event_from_log(&log)?);
+                } else if let Some(ev) = event_from_log(&log)? {
                     out.push(ev);
                 }
             }
@@ -689,6 +849,8 @@ impl Contracts {
             )));
         }
         out.sort_by_key(|e| (e.block, e.log_index));
+        let strict = matches!(self.da.get(), Some(RegistryDa::L1Blobs { .. }));
+        pair_l1(&mut out, l1s, strict)?;
         Ok(out)
     }
 
@@ -706,6 +868,16 @@ impl Contracts {
             .map_err(rpc_err)?
             .ok_or_else(|| Web3Error::Data(format!("no {tag} block")))?;
         Ok((b.header.number, b.header.timestamp))
+    }
+
+    /// Hash of block `n`; `None` past the endpoint's head.
+    pub async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>> {
+        let b = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(n))
+            .await
+            .map_err(rpc_err)?;
+        Ok(b.map(|b| b.header.hash.0))
     }
 
     /// The highest block `confirmations` behind head.
@@ -846,6 +1018,31 @@ impl Contracts {
 }
 
 #[cfg(test)]
+impl Contracts {
+    /// A read-only handle on `url` without the boot checks (unit tests).
+    pub(super) fn at(url: Url) -> Contracts {
+        let (provider, epoch) = super::failover_provider(&[url]);
+        Contracts {
+            provider,
+            epoch,
+            registry: Address::repeat_byte(1),
+            signer: None,
+            wallet: None,
+            chain_id: 1,
+            cell_proofs: Default::default(),
+            blob_cap: None,
+            errors: Arc::new(error_names().unwrap()),
+            send_lock: Default::default(),
+            receipt_timeout: Duration::from_secs(1),
+            max_tx_fee: super::tx::DEFAULT_MAX_TX_FEE,
+            dkg_adapter: Default::default(),
+            council_adapter: Default::default(),
+            da: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use alloy::primitives::{B256, keccak256};
     use alloy::rpc::json_rpc::ErrorPayload;
@@ -888,7 +1085,9 @@ mod tests {
         assert!(!p256_probe_mode(&high));
         assert_eq!(known_chain_cell_proofs(100), Some(true));
         assert_eq!(known_chain_cell_proofs(10200), Some(true));
-        assert_eq!(known_chain_cell_proofs(1), None);
+        assert_eq!(known_chain_cell_proofs(1), Some(true));
+        assert_eq!(known_chain_cell_proofs(11_155_111), Some(true));
+        assert_eq!(known_chain_cell_proofs(31337), None);
     }
 
     #[test]
@@ -1005,6 +1204,64 @@ mod tests {
 
     const REGISTRY: Address = Address::repeat_byte(0x11);
     const PID: [u8; 31] = [7; 31];
+
+    fn transition(block: u64, tx: u8, log_index: u64, n_blobs: u64) -> RegistryEvent {
+        RegistryEvent {
+            block,
+            tx_hash: B256::repeat_byte(tx),
+            log_index,
+            kind: EventKind::StateTransitioned {
+                pid: PID,
+                sender: Address::ZERO,
+                old_root: [1; 32],
+                new_root: [2; 32],
+                voters: 1,
+                overwrites: 0,
+                n_blobs,
+                l1: None,
+            },
+        }
+    }
+
+    fn l1_event(block: u64, tx: u8, log_index: u64, pid: [u8; 31], n: usize) -> L1Event {
+        L1Event {
+            block,
+            tx_hash: B256::repeat_byte(tx),
+            log_index,
+            pid,
+            blobs: super::super::L1Blobs {
+                blocks: vec![77; n],
+                vhs: (0..n).map(|i| B256::repeat_byte(i as u8 + 1)).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn l1_events_pair_with_their_transition() {
+        let mut out = vec![transition(5, 1, 0, 2)];
+        pair_l1(&mut out, vec![l1_event(5, 1, 1, PID, 2)], true).unwrap();
+        assert!(
+            matches!(&out[0].kind, EventKind::StateTransitioned { l1: Some(b), .. }
+                if b.blocks == [77, 77] && b.vhs.len() == 2)
+        );
+        // Another tx, another process, not right after it, another count: refused.
+        for bad in [
+            l1_event(5, 2, 1, PID, 2),
+            l1_event(5, 1, 1, [9; 31], 2),
+            l1_event(5, 1, 2, PID, 2),
+            l1_event(5, 1, 1, PID, 3),
+        ] {
+            assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![bad], false).is_err());
+        }
+        // Blocks and hashes of different lengths: refused.
+        let mut odd = l1_event(5, 1, 1, PID, 2);
+        odd.blobs.blocks.pop();
+        assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![odd], false).is_err());
+        // L1-blob mode: a transition without its L1 event fails the page;
+        // blob mode passes it through.
+        assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![], true).is_err());
+        assert!(pair_l1(&mut [transition(5, 1, 0, 2)], vec![], false).is_ok());
+    }
 
     async fn node(head: u64, fail_logs: bool) -> (Url, Arc<Node>) {
         use axum::http::StatusCode;

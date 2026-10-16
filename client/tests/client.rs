@@ -138,6 +138,12 @@ fn router(seen: Seen, evil: bool) -> Router {
                     settled_by_self: 1,
                     synced_from_others: 2,
                     lost_races: 1,
+                    bisections: 0,
+                    isolated_votes: 0,
+                    held_batches: 0,
+                    guest_rejections: 0,
+                    reorgs: 0,
+                    rebuilds: 0,
                 })
             }),
         )

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use alloy::primitives::Address;
 use clap::Parser;
-use davinci_client::networks::{self, Network};
+use davinci_client::networks::{self, Network, NetworkDa};
 use davinci_zkvm_sdk::limits::{MAX_BATCH_SIZE, TX_BLOB_CAP};
 use url::Url;
 use zeroize::Zeroize;
@@ -216,6 +216,52 @@ fn parse_blob_cap(s: &str) -> Result<usize, ConfigError> {
     Ok(n)
 }
 
+/// A wei amount: `<n>` (wei), `<n>gwei` or `<n>eth`, decimals allowed with a
+/// unit (`0.01eth`).
+pub fn parse_wei(s: &str) -> Result<u128, ConfigError> {
+    let bad = || ConfigError::Invalid("wei amount", s.to_string());
+    let t = s.trim().to_ascii_lowercase();
+    let (num, decimals) = if let Some(n) = t.strip_suffix("gwei") {
+        (n.trim(), 9u32)
+    } else if let Some(n) = t.strip_suffix("eth") {
+        (n.trim(), 18)
+    } else {
+        (t.as_str(), 0)
+    };
+    let (int, frac) = num.split_once('.').unwrap_or((num, ""));
+    let digits = |x: &str| x.chars().all(|c| c.is_ascii_digit());
+    if (int.is_empty() && frac.is_empty())
+        || frac.len() > decimals as usize
+        || !digits(int)
+        || !digits(frac)
+    {
+        return Err(bad());
+    }
+    let int: u128 = if int.is_empty() {
+        0
+    } else {
+        int.parse().map_err(|_| bad())?
+    };
+    let frac: u128 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<width$}", width = decimals as usize)
+            .parse()
+            .map_err(|_| bad())?
+    };
+    int.checked_mul(10u128.pow(decimals))
+        .and_then(|v| v.checked_add(frac))
+        .ok_or_else(bad)
+}
+
+/// A fee cap: a [`parse_wei`] amount above zero (zero would withhold every send).
+fn parse_fee_cap(s: &str) -> Result<u128, ConfigError> {
+    match parse_wei(s)? {
+        0 => Err(ConfigError::Invalid("fee cap", format!("{s}: must be > 0"))),
+        v => Ok(v),
+    }
+}
+
 /// The node's settings. Parse with [`Config::load`] or [`Config::parse_args`]:
 /// both resolve `--network` into `registry`, `rpc_url`, `blob_source`,
 /// `confirmations` and `start_block`, which a bare `try_parse_from` leaves
@@ -232,6 +278,12 @@ pub struct Config {
     /// `<chain id>-<registry>` subdirectory.
     #[arg(long, env = "DAVINCI_DATADIR", default_value = "~/.davinci-sequencer")]
     pub datadir: PathBuf,
+    /// redb page cache, in MiB. It is long-lived heap, so it bounds most of
+    /// the node's steady memory.
+    #[arg(long, env = "DAVINCI_DB_CACHE_MB",
+        default_value_t = crate::storage::DEFAULT_CACHE_MB as u32,
+        value_parser = clap::value_parser!(u32).range(1..))]
+    pub db_cache_mb: u32,
     #[arg(long, env = "DAVINCI_API_HOST", default_value = "0.0.0.0")]
     pub api_host: String,
     #[arg(long, env = "DAVINCI_API_PORT", default_value_t = 9090)]
@@ -271,11 +323,44 @@ pub struct Config {
     /// Resolved blob source.
     #[arg(skip = BlobSourceKind::Anvil)]
     pub blob_source: BlobSourceKind,
+    /// L1-blob mode: Ethereum execution JSON-RPCs, comma-separated, in order
+    /// of preference. They post the blob transactions and serve the L1 proofs.
+    /// Set exactly when the registry has an `L1BlobVerifier`. Default: the
+    /// network's (none in blob mode).
+    #[arg(long = "l1-rpc-url", env = "DAVINCI_L1_RPC_URL", value_name = "URL",
+        value_parser = parse_http_url, value_delimiter = ',')]
+    l1_rpc_url_arg: Vec<Url>,
+    /// Resolved L1 RPC endpoints; empty in blob mode.
+    #[arg(skip)]
+    pub l1_rpc_url: Vec<Url>,
+    /// Endpoints that only receive the blob transactions (about 1.5 MB per
+    /// 6-blob send, which many public RPCs refuse). Default: `--l1-rpc-url`.
+    #[arg(long = "l1-send-rpc-url", env = "DAVINCI_L1_SEND_RPC_URL", value_name = "URL",
+        value_parser = parse_http_url, value_delimiter = ',')]
+    pub l1_send_rpc_url: Vec<Url>,
+    /// The dedicated Ethereum key that posts blobs, from `DAVINCI_L1_PRIVKEY`
+    /// or `--l1-privkey-file`. Nothing else may send from it: the blob pool
+    /// forbids nonce gaps.
+    #[arg(skip)]
+    pub l1_privkey: Option<SecretString>,
+    /// File holding the hex Ethereum blob key.
+    #[arg(long, env = "DAVINCI_L1_PRIVKEY_FILE")]
+    pub l1_privkey_file: Option<PathBuf>,
+    /// Most one blob post may cost at the fees it offers (`<wei>`, `<n>gwei`
+    /// or `<n>eth`); above it the node waits for cheaper fees.
+    #[arg(long, env = "DAVINCI_L1_MAX_POST_FEE", default_value = "0.001eth", value_parser = parse_fee_cap)]
+    pub l1_max_post_fee: u128,
+    /// Most one transaction on the registry chain may cost in execution gas,
+    /// `gas limit × max fee per gas` (`<wei>`, `<n>gwei` or `<n>eth`); above
+    /// it the send is withheld and retried later. OP's L1 data fee is apart.
+    #[arg(long, env = "DAVINCI_OP_MAX_TX_FEE", default_value = "0.002eth", value_parser = parse_fee_cap)]
+    pub op_max_tx_fee: u128,
     /// davinci-zkvm prover service.
     #[arg(long, env = "DAVINCI_PROVER_URL", default_value = "http://127.0.0.1:8080", value_parser = parse_http_url)]
     pub prover_url: Url,
     /// Hard cap on a batch; pending votes past it seal one without waiting.
-    #[arg(long, env = "DAVINCI_BATCH_MAX", default_value = "1024", value_parser = parse_batch_max)]
+    /// The guest takes up to 1024 votes; the default is 512.
+    #[arg(long, env = "DAVINCI_BATCH_MAX", default_value = "512", value_parser = parse_batch_max)]
     pub batch_max: usize,
     /// Most blobs one settlement transaction may carry. Unset: the chain's
     /// `eth_config` blob schedule, capped at the protocol's six.
@@ -300,9 +385,32 @@ pub struct Config {
     pub flush_horizon: Duration,
     /// Landing margin reserved after proving (submit, inclusion,
     /// confirmations): a batch is sized so its estimated proving time plus
-    /// this margin ends before the window closes.
-    #[arg(long, env = "DAVINCI_SETTLE_MARGIN", default_value = "60s", value_parser = parse_duration)]
+    /// this margin ends before the window closes. Default: 60s, 30s in
+    /// L1-blob mode (where `--l1-settle-lag` covers the Ethereum leg).
+    #[arg(
+        long = "settle-margin",
+        env = "DAVINCI_SETTLE_MARGIN",
+        value_name = "DURATION",
+        value_parser = parse_duration
+    )]
+    settle_margin_arg: Option<Duration>,
+    /// Resolved settle margin.
+    #[arg(skip)]
     pub settle_margin: Duration,
+    /// L1-blob mode: seal to provable blobs on OP (blob inclusion, OP's L1
+    /// origin lag, the reorg margin). It overlaps the proof; it and the
+    /// settle margin must fit before the window closes. Lower it only for a
+    /// faster L1 such as a local anvil.
+    #[arg(
+        long = "l1-settle-lag",
+        env = "DAVINCI_L1_SETTLE_LAG",
+        value_name = "DURATION",
+        value_parser = parse_duration
+    )]
+    l1_settle_lag_arg: Option<Duration>,
+    /// Resolved L1 settle lag.
+    #[arg(skip)]
+    pub l1_settle_lag: Duration,
     /// Queued votes one ballot slot may hold at once (settled in order).
     #[arg(long, env = "DAVINCI_SLOT_DEPTH", default_value = "3", value_parser = clap::value_parser!(u32).range(1..))]
     pub slot_depth: u32,
@@ -377,6 +485,7 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("network", &self.network.to_string())
             .field("datadir", &self.datadir)
+            .field("db_cache_mb", &self.db_cache_mb)
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
             .field("rpc_url", &Hosts(&self.rpc_url))
@@ -384,6 +493,12 @@ impl fmt::Debug for Config {
             .field("privkey_file", &self.privkey_file)
             .field("registry", &self.registry)
             .field("blob_source", &self.blob_source)
+            .field("l1_rpc_url", &Hosts(&self.l1_rpc_url))
+            .field("l1_send_rpc_url", &Hosts(&self.l1_send_rpc_url))
+            .field("l1_privkey", &self.l1_privkey)
+            .field("l1_privkey_file", &self.l1_privkey_file)
+            .field("l1_max_post_fee", &self.l1_max_post_fee)
+            .field("op_max_tx_fee", &self.op_max_tx_fee)
             .field("prover_url", &Hosts(std::slice::from_ref(&self.prover_url)))
             .field("batch_max", &self.batch_max)
             .field("max_blobs_per_tx", &self.max_blobs_per_tx)
@@ -392,6 +507,7 @@ impl fmt::Debug for Config {
             .field("solo_wait", &self.solo_wait)
             .field("flush_horizon", &self.flush_horizon)
             .field("settle_margin", &self.settle_margin)
+            .field("l1_settle_lag", &self.l1_settle_lag)
             .field("slot_depth", &self.slot_depth)
             .field("prove_base", &self.prove_base)
             .field("eager_results", &self.eager_results)
@@ -423,6 +539,12 @@ impl Config {
         c.census_dir = c.census_dir.as_deref().map(expand_home);
         c.privkey_file = c.privkey_file.as_deref().map(expand_home);
         c.resolve_privkey(std::env::var("DAVINCI_PRIVKEY").ok().map(SecretString::new))?;
+        c.l1_privkey_file = c.l1_privkey_file.as_deref().map(expand_home);
+        c.resolve_l1_privkey(
+            std::env::var("DAVINCI_L1_PRIVKEY")
+                .ok()
+                .map(SecretString::new),
+        )?;
         Ok(c)
     }
 
@@ -441,7 +563,17 @@ impl Config {
     }
 
     // Solo wait defaults to three batch times and never undercuts the timer.
+    // Runs after `resolve_network`: the margin's default depends on the mode,
+    // as in L1-blob mode the Ethereum leg is reserved apart (overlapping the
+    // proof) and the margin only covers the OP leg.
     fn resolve_batching(&mut self) -> Result<(), ConfigError> {
+        let margin = if self.l1_mode() { 30 } else { 60 };
+        self.settle_margin = self
+            .settle_margin_arg
+            .unwrap_or(Duration::from_secs(margin));
+        self.l1_settle_lag = self
+            .l1_settle_lag_arg
+            .unwrap_or(Duration::from_secs(crate::l1da::L1_SETTLE_LAG));
         self.solo_wait = match self.solo_wait_arg {
             Some(d) => d,
             None => self.batch_time.saturating_mul(3),
@@ -471,6 +603,16 @@ impl Config {
             (None, Some(n)) => n.registry,
             (None, None) => return Err(need("registry", "--registry")),
         };
+        if self.registry == Address::ZERO {
+            let why = match (self.registry_arg, preset) {
+                (None, Some(n)) => format!(
+                    "network {} has no registry yet (deployment pending); pass --registry",
+                    n.name
+                ),
+                _ => "the zero address is not a registry".into(),
+            };
+            return Err(ConfigError::Invalid("registry", why));
+        }
         self.rpc_url = match (self.rpc_url_arg.is_empty(), preset) {
             (false, _) => self.rpc_url_arg.clone(),
             (true, Some(n)) => n
@@ -480,6 +622,26 @@ impl Config {
                 .collect::<Result<_, _>>()?,
             (true, None) => return Err(need("rpc url", "--rpc-url")),
         };
+        let preset_l1 = preset.and_then(|n| match n.da {
+            NetworkDa::L1Blobs { l1_rpc_urls, .. } => Some(l1_rpc_urls),
+            NetworkDa::Blobs => None,
+        });
+        self.l1_rpc_url = match (self.l1_rpc_url_arg.is_empty(), preset_l1) {
+            (false, _) => self.l1_rpc_url_arg.clone(),
+            (true, Some(urls)) => urls
+                .iter()
+                .map(|u| parse_http_url(u))
+                .collect::<Result<_, _>>()?,
+            (true, None) => Vec::new(),
+        };
+        if self.l1_rpc_url.is_empty()
+            && (!self.l1_send_rpc_url.is_empty() || self.l1_privkey_file.is_some())
+        {
+            return Err(ConfigError::Invalid(
+                "l1",
+                "--l1-send-rpc-url and --l1-privkey-file need --l1-rpc-url".into(),
+            ));
+        }
         self.blob_source = match (&self.blob_source_arg, preset) {
             (Some(b), _) => b.clone(),
             (None, Some(n)) => n.blob_source.parse()?,
@@ -531,27 +693,73 @@ impl Config {
     /// Sets `privkey` from the environment value or `privkey_file`; both
     /// set is an error.
     pub fn resolve_privkey(&mut self, env: Option<SecretString>) -> Result<(), ConfigError> {
-        let file = match &self.privkey_file {
-            Some(p) => {
-                let mut raw = std::fs::read_to_string(p).map_err(|e| {
-                    ConfigError::Invalid("privkey file", format!("{}: {e}", p.display()))
-                })?;
-                let key = SecretString::new(raw.trim());
-                raw.zeroize();
-                Some(key)
-            }
-            None => None,
-        };
-        self.privkey = match (env, file) {
-            (Some(_), Some(_)) => {
-                return Err(ConfigError::Invalid(
-                    "privkey",
-                    "set DAVINCI_PRIVKEY or --privkey-file, not both".into(),
-                ));
-            }
-            (k, None) | (None, k) => k.filter(|k| !k.expose().trim().is_empty()),
-        };
+        self.privkey = read_key(
+            env,
+            self.privkey_file.as_deref(),
+            "privkey",
+            "DAVINCI_PRIVKEY or --privkey-file",
+        )?;
         Ok(())
+    }
+
+    /// Sets `l1_privkey` from the environment value or `l1_privkey_file`;
+    /// both set is an error.
+    pub fn resolve_l1_privkey(&mut self, env: Option<SecretString>) -> Result<(), ConfigError> {
+        self.l1_privkey = read_key(
+            env,
+            self.l1_privkey_file.as_deref(),
+            "l1 privkey",
+            "DAVINCI_L1_PRIVKEY or --l1-privkey-file",
+        )?;
+        Ok(())
+    }
+
+    /// Whether the node runs in L1-blob mode (an L1 RPC is configured).
+    pub fn l1_mode(&self) -> bool {
+        !self.l1_rpc_url.is_empty()
+    }
+
+    /// L1-blob mode: checks the Ethereum chain id and the verifier's
+    /// `L1Block` against the network's. A mismatch is fatal unless the
+    /// registry was given explicitly, then a warning.
+    pub fn check_l1(&self, l1_chain_id: u64, l1_block: Address) -> Result<(), ConfigError> {
+        let Some((n, want_id, want_block)) = self.network.preset().and_then(|n| match n.da {
+            NetworkDa::L1Blobs {
+                l1_chain_id,
+                l1_block,
+                ..
+            } => Some((n, l1_chain_id, l1_block)),
+            NetworkDa::Blobs => None,
+        }) else {
+            return Ok(());
+        };
+        let problems: Vec<String> = [
+            (l1_chain_id != want_id).then(|| {
+                format!(
+                    "the L1 RPC is on chain {l1_chain_id}, network {} posts to chain {want_id}",
+                    n.name
+                )
+            }),
+            (l1_block != want_block).then(|| {
+                format!(
+                    "the registry's verifier reads L1Block at {l1_block}, network {} uses {want_block}",
+                    n.name
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if problems.is_empty() {
+            return Ok(());
+        }
+        if self.registry_explicit() {
+            for p in &problems {
+                tracing::warn!(network = n.name, "{p}; following the explicit --registry");
+            }
+            return Ok(());
+        }
+        Err(ConfigError::Invalid("l1", problems.join("; ")))
     }
 
     /// Heartbeat cadence: `--heartbeat` or the poll interval.
@@ -564,6 +772,32 @@ fn expand_home(p: &std::path::Path) -> PathBuf {
     match (p.strip_prefix("~"), std::env::var_os("HOME")) {
         (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => p.to_path_buf(),
+    }
+}
+
+// A key from the environment or from `file`, never both; blank is none.
+fn read_key(
+    env: Option<SecretString>,
+    file: Option<&std::path::Path>,
+    what: &'static str,
+    sources: &str,
+) -> Result<Option<SecretString>, ConfigError> {
+    let from_file = match file {
+        Some(p) => {
+            let mut raw = std::fs::read_to_string(p)
+                .map_err(|e| ConfigError::Invalid(what, format!("{}: {e}", p.display())))?;
+            let key = SecretString::new(raw.trim());
+            raw.zeroize();
+            Some(key)
+        }
+        None => None,
+    };
+    match (env, from_file) {
+        (Some(_), Some(_)) => Err(ConfigError::Invalid(
+            what,
+            format!("set {sources}, not both"),
+        )),
+        (k, None) | (None, k) => Ok(k.filter(|k| !k.expose().trim().is_empty())),
     }
 }
 
@@ -596,14 +830,16 @@ mod tests {
         let c = Config::parse_args(with_rpc()).unwrap();
         assert_eq!(c.network, NetworkChoice::Custom);
         assert_eq!(c.api_port, 9090);
-        assert_eq!(c.batch_max, 1024);
+        assert_eq!(c.batch_max, 512);
         assert_eq!(c.max_blobs_per_tx, None);
         assert_eq!(c.batch_time, Duration::from_secs(900));
         assert_eq!(c.min_mix, 2);
         assert_eq!(c.solo_wait, Duration::from_secs(2700));
         assert_eq!(c.flush_horizon, Duration::from_secs(180));
         assert_eq!(c.settle_margin, Duration::from_secs(60));
+        assert_eq!(c.l1_settle_lag, Duration::from_secs(110));
         assert_eq!(c.slot_depth, 3);
+        assert_eq!(c.db_cache_mb, 256);
         assert_eq!(c.prove_base, Duration::from_secs(30));
         assert!(c.eager_results);
         assert_eq!(c.blob_source, BlobSourceKind::Anvil);
@@ -626,9 +862,12 @@ mod tests {
             "2",
             "--start-block",
             "41000000",
+            "--db-cache-mb",
+            "64",
         ]);
         let c = Config::parse_args(args).unwrap();
         assert_eq!(c.start_block, Some(41_000_000));
+        assert_eq!(c.db_cache_mb, 64);
         assert_eq!(c.batch_max, 8);
         assert_eq!(c.max_blobs_per_tx, Some(2));
         assert_eq!(c.poll_interval, Duration::from_millis(500));
@@ -739,31 +978,34 @@ mod tests {
     }
 
     #[test]
-    fn gnosis_is_the_default_network() {
-        let g = &networks::GNOSIS;
+    fn optimism_is_the_default_network() {
+        let o = &networks::OPTIMISM;
         let c = Config::parse_args(["davinci-sequencer"]).unwrap();
-        assert_eq!(c.network, NetworkChoice::Known(g));
-        assert_eq!(c.registry, g.registry);
+        assert_eq!(c.network, NetworkChoice::Known(o));
+        assert_eq!(c.registry, o.registry);
         assert!(!c.registry_explicit());
-        assert_eq!(c.start_block, Some(g.start_block));
-        assert_eq!(c.confirmations, 3);
+        assert_eq!(c.start_block, Some(o.start_block));
+        assert_eq!(c.confirmations, 1);
         let rpcs: Vec<&str> = c.rpc_url.iter().map(|u| u.as_str()).collect();
         assert_eq!(
             rpcs,
             [
-                "https://gnosis-rpc.publicnode.com/",
-                "https://gnosis-rpc.blockreq.com/v1/rpc/public",
-                "https://rpc.gnosischain.com/",
-                "https://gnosis.drpc.org/",
+                "https://optimism-rpc.publicnode.com/",
+                "https://mainnet.optimism.io/",
             ]
         );
-        assert_eq!(c.blob_source, g.blob_source.parse().unwrap());
+        assert_eq!(c.blob_source, o.blob_source.parse().unwrap());
+        // L1-blob mode, with the L1-blob margin.
+        assert!(c.l1_mode());
+        assert_eq!(c.settle_margin, Duration::from_secs(30));
         assert_eq!(
-            Config::parse_args(["davinci-sequencer", "--network", "GNOSIS"])
+            Config::parse_args(["davinci-sequencer", "--network", "OPTIMISM"])
                 .unwrap()
                 .network,
-            NetworkChoice::Known(g)
+            NetworkChoice::Known(o)
         );
+        // Gnosis is retired.
+        assert!(Config::parse_args(["davinci-sequencer", "--network", "gnosis"]).is_err());
     }
 
     // Each explicit setting replaces the network's; the network's start
@@ -774,8 +1016,8 @@ mod tests {
         assert!(c.registry_explicit());
         assert_eq!(c.registry, REG.parse::<Address>().unwrap());
         assert_eq!(c.start_block, None);
-        assert_eq!(c.rpc_url.len(), networks::GNOSIS.rpc_urls.len());
-        assert_eq!(c.confirmations, 3);
+        assert_eq!(c.rpc_url.len(), networks::OPTIMISM.rpc_urls.len());
+        assert_eq!(c.confirmations, 1);
         let c = Config::parse_args([
             "davinci-sequencer",
             "--start-block",
@@ -788,7 +1030,7 @@ mod tests {
             "anvil",
         ])
         .unwrap();
-        assert_eq!(c.registry, networks::GNOSIS.registry);
+        assert_eq!(c.registry, networks::OPTIMISM.registry);
         assert_eq!(c.start_block, Some(7));
         assert_eq!(c.confirmations, 0);
         assert_eq!(c.rpc_url, [Url::parse("http://a:8545").unwrap()]);
@@ -815,9 +1057,9 @@ mod tests {
     #[test]
     fn chain_id_must_match_the_network() {
         let c = Config::parse_args(["davinci-sequencer"]).unwrap();
-        assert!(c.check_chain_id(100).is_ok());
+        assert!(c.check_chain_id(10).is_ok());
         let e = c.check_chain_id(31337).unwrap_err().to_string();
-        assert!(e.contains("31337") && e.contains("gnosis"), "{e}");
+        assert!(e.contains("31337") && e.contains("optimism"), "{e}");
         // An explicit registry may live on another chain.
         let c = Config::parse_args(["davinci-sequencer", "--registry", REG]).unwrap();
         assert!(c.check_chain_id(31337).is_ok());
@@ -840,5 +1082,183 @@ mod tests {
         assert_eq!(two.to_string().parse::<BlobSourceKind>().unwrap(), two);
         assert!("beacon:http://a,ftp://b".parse::<BlobSourceKind>().is_err());
         assert!(parse_duration("2h").unwrap() == Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn op_max_tx_fee() {
+        let c = Config::parse_args(with_rpc()).unwrap();
+        assert_eq!(c.op_max_tx_fee, crate::web3::DEFAULT_MAX_TX_FEE);
+        assert_eq!(c.op_max_tx_fee, 2_000_000_000_000_000);
+        let mut args = with_rpc();
+        args.extend(["--op-max-tx-fee", "0.5gwei"]);
+        assert_eq!(Config::parse_args(args).unwrap().op_max_tx_fee, 500_000_000);
+        let mut args = with_rpc();
+        args.extend(["--op-max-tx-fee", "lots"]);
+        assert!(Config::parse_args(args).is_err());
+    }
+
+    // A zero cap would withhold every send or post: refused at boot.
+    #[test]
+    fn zero_fee_caps_are_refused() {
+        for flag in ["--op-max-tx-fee", "--l1-max-post-fee"] {
+            for zero in ["0", "0gwei", "0.0eth"] {
+                let mut args = with_rpc();
+                args.extend([flag, zero]);
+                let e = Config::parse_args(args).unwrap_err().to_string();
+                assert!(e.contains("> 0"), "{flag} {zero}: {e}");
+            }
+            let mut args = with_rpc();
+            args.extend([flag, "1"]);
+            assert!(Config::parse_args(args).is_ok(), "{flag} 1");
+        }
+    }
+
+    #[test]
+    fn l1_options() {
+        let c = Config::parse_args(with_rpc()).unwrap();
+        assert!(!c.l1_mode());
+        assert!(c.l1_send_rpc_url.is_empty() && c.l1_privkey.is_none());
+        assert_eq!(c.l1_max_post_fee, 1_000_000_000_000_000);
+        let mut args = with_rpc();
+        args.extend([
+            "--l1-rpc-url",
+            "http://l1a:8545,https://l1b/l1secretpath",
+            "--l1-send-rpc-url",
+            "https://send.example/sendsecret",
+            "--l1-max-post-fee",
+            "5gwei",
+        ]);
+        let c = Config::parse_args(args).unwrap();
+        assert!(c.l1_mode());
+        assert_eq!(c.l1_rpc_url.len(), 2);
+        assert_eq!(c.l1_send_rpc_url.len(), 1);
+        assert_eq!(c.l1_max_post_fee, 5_000_000_000);
+        let d = format!("{c:?}");
+        for secret in ["l1secretpath", "sendsecret"] {
+            assert!(!d.contains(secret), "{secret} in {d}");
+        }
+        assert!(d.contains("l1a:8545") && d.contains("send.example"), "{d}");
+        // L1-blob mode: the margin covers only the OP leg, the Ethereum leg
+        // is reserved apart.
+        assert_eq!(c.settle_margin, Duration::from_secs(30));
+        assert_eq!(c.l1_settle_lag, Duration::from_secs(110));
+        let mut args = with_rpc();
+        args.extend([
+            "--l1-rpc-url",
+            "http://l1a:8545",
+            "--settle-margin",
+            "45s",
+            "--l1-settle-lag",
+            "20s",
+        ]);
+        let c = Config::parse_args(args).unwrap();
+        assert_eq!(c.settle_margin, Duration::from_secs(45));
+        assert_eq!(c.l1_settle_lag, Duration::from_secs(20));
+        // A send endpoint or an L1 key without the L1 RPCs is a mistake.
+        for extra in [
+            ["--l1-send-rpc-url", "http://s:8545"],
+            ["--l1-privkey-file", "/nonexistent"],
+        ] {
+            let mut args = with_rpc();
+            args.extend(extra);
+            assert!(Config::parse_args(args).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn l1_key_only_from_env_or_file() {
+        let mut args = with_rpc();
+        args.extend(["--l1-privkey", "beef"]);
+        assert!(Config::try_parse_from(args).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("l1key");
+        std::fs::write(&f, "  beef\n").unwrap();
+        let fs = f.display().to_string();
+        let mut args = with_rpc();
+        args.extend(["--l1-rpc-url", "http://l1:8545", "--l1-privkey-file", &fs]);
+        let mut c = Config::parse_args(args).unwrap();
+        c.resolve_l1_privkey(None).unwrap();
+        assert_eq!(c.l1_privkey.as_ref().map(|s| s.expose()), Some("beef"));
+        assert!(!format!("{c:?}").contains("beef"));
+        assert!(c.resolve_l1_privkey(Some(SecretString::new("x"))).is_err());
+        // The OP key and the L1 key are read independently.
+        assert!(c.privkey.is_none());
+    }
+
+    #[test]
+    fn wei_amounts() {
+        assert_eq!(parse_wei("123").unwrap(), 123);
+        assert_eq!(parse_wei("5gwei").unwrap(), 5_000_000_000);
+        assert_eq!(parse_wei("0.5 gwei").unwrap(), 500_000_000);
+        assert_eq!(parse_wei(".5gwei").unwrap(), 500_000_000);
+        assert_eq!(parse_wei("0.01eth").unwrap(), 10_000_000_000_000_000);
+        assert_eq!(parse_wei("1ETH").unwrap(), 10u128.pow(18));
+        for bad in [
+            "",
+            "eth",
+            "1.5",
+            "0.0000000001gwei",
+            "-1",
+            "1e9",
+            "1.2.3gwei",
+        ] {
+            assert!(parse_wei(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn optimism_preset_is_l1_mode_and_needs_its_registry() {
+        let o = &networks::OPTIMISM;
+        let plain = Config::parse_args(["davinci-sequencer", "--network", "optimism"]);
+        if o.registry == Address::ZERO {
+            let e = plain.unwrap_err().to_string();
+            assert!(e.contains("--registry") && e.contains("optimism"), "{e}");
+        } else {
+            assert_eq!(plain.unwrap().start_block, Some(o.start_block));
+        }
+        let c = Config::parse_args([
+            "davinci-sequencer",
+            "--network",
+            "optimism",
+            "--registry",
+            REG,
+        ])
+        .unwrap();
+        assert!(c.l1_mode());
+        let NetworkDa::L1Blobs { l1_rpc_urls, .. } = o.da else {
+            panic!("optimism is an L1-blob preset");
+        };
+        assert_eq!(c.l1_rpc_url.len(), l1_rpc_urls.len());
+        assert_eq!(c.confirmations, 1);
+        assert_eq!(c.blob_source, o.blob_source.parse().unwrap());
+        assert_eq!(c.start_block, None);
+        // The zero address is refused as an explicit registry too.
+        let mut args = base();
+        args[4] = "0x0000000000000000000000000000000000000000";
+        args.extend(["--rpc-url", "http://a:8545"]);
+        assert!(Config::parse_args(args).is_err());
+    }
+
+    #[test]
+    fn l1_side_must_match_the_preset() {
+        let mut c = Config::parse_args([
+            "davinci-sequencer",
+            "--network",
+            "optimism",
+            "--registry",
+            REG,
+        ])
+        .unwrap();
+        // An explicit registry: mismatches only warn.
+        assert!(c.check_l1(11_155_111, Address::repeat_byte(1)).is_ok());
+        // The preset's own registry: they are fatal.
+        c.registry_arg = None;
+        assert!(c.check_l1(1, networks::OP_L1_BLOCK).is_ok());
+        let e = c.check_l1(11_155_111, networks::OP_L1_BLOCK).unwrap_err();
+        assert!(e.to_string().contains("11155111"), "{e}");
+        assert!(c.check_l1(1, Address::repeat_byte(1)).is_err());
+        // Custom deployments check nothing.
+        let c = Config::parse_args(with_rpc()).unwrap();
+        assert!(c.check_l1(5, Address::ZERO).is_ok());
     }
 }

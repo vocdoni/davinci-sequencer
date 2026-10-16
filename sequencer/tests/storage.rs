@@ -4,9 +4,11 @@
 
 use davinci_sequencer::keys::KeyStore;
 use davinci_sequencer::storage::{
-    DB_FILE, Db, ExposedRecord, LocalStatus, ProcessRecord, SCHEMA_VERSION_KEY, StorageError,
-    StoredVote, TransitionRecord, VoteStatus, deployment_dir, pid_prefix,
+    DB_FILE, DEFAULT_CACHE_MB, Db, ExposedRecord, L1PostRecord, LocalStatus, ProcessRecord,
+    SCHEMA_VERSION_KEY, StorageError, StoredVote, TransitionRecord, VoteStatus, deployment_dir,
+    pid_prefix,
 };
+use davinci_sequencer::web3::L1Fees;
 use davinci_sequencer::web3::{DkgState, KeyMode, OnchainCensus, OnchainProcess, ProcessStatus};
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::blob::{BLOB_SIZE, Blob};
@@ -264,6 +266,22 @@ fn status_transition() {
         db.vote(&pid(1), base).unwrap().unwrap().status,
         VoteStatus::Aggregated
     );
+    // The restart scan finds the in-flight votes of this process only.
+    db.put_vote(&vote(2, base + 9)).unwrap();
+    db.set_status(&pid(2), &[base + 9], VoteStatus::Processed, None)
+        .unwrap();
+    db.set_status(&pid(1), &[base + 1], VoteStatus::Processed, None)
+        .unwrap();
+    let in_flight = [VoteStatus::Aggregated, VoteStatus::Processed];
+    assert_eq!(
+        db.vote_ids_with_status(&pid(1), &in_flight).unwrap(),
+        [base, base + 1]
+    );
+    assert_eq!(
+        db.vote_ids_with_status(&pid(1), &[VoteStatus::Pending])
+            .unwrap(),
+        [base + 2]
+    );
     // Wire strings are davinci-node's.
     assert_eq!(
         serde_json::to_string(&VoteStatus::Aggregated).unwrap(),
@@ -425,7 +443,10 @@ fn vote_lifecycle_is_atomic_and_durable() {
     let va = db.vote(&pid(1), a).unwrap().unwrap();
     assert_eq!((va.status, va.error), (VoteStatus::Pending, None));
 
-    db.settle(&pid(1), &[a, c], &transition(0), &[blob(1), blob(2)])
+    // The pinned root moves with the transition.
+    let mut rec = process(1);
+    rec.onchain.state_root = transition(0).new_root;
+    db.settle(&pid(1), &[a, c], &transition(0), &[blob(1), blob(2)], &rec)
         .unwrap();
     drop(db);
     let db = open(&dir);
@@ -435,14 +456,30 @@ fn vote_lifecycle_is_atomic_and_durable() {
     assert_eq!(status(&db, b), VoteStatus::Aggregated);
     assert_eq!(db.transitions(&pid(1)).unwrap(), vec![transition(0)]);
     assert_eq!(db.blobs(&pid(1), 0).unwrap(), vec![blob(1), blob(2)]);
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(rec.clone()));
 
-    // A failed settle leaves the transition out too.
+    // A failed settle leaves the transition and the record out too.
+    let mut next = rec.clone();
+    next.onchain.state_root = transition(1).new_root;
     assert!(
-        db.settle(&pid(1), &[base + 77], &transition(1), &[blob(5)])
+        db.settle(&pid(1), &[base + 77], &transition(1), &[blob(5)], &next)
             .is_err()
     );
     assert_eq!(db.transitions(&pid(1)).unwrap().len(), 1);
     assert!(db.blobs(&pid(1), 1).unwrap().is_empty());
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(rec.clone()));
+
+    // So does a write failing at commit: nothing of it persists.
+    db.fail_next_writes(1);
+    assert!(
+        db.settle(&pid(1), &[], &transition(1), &[blob(5)], &next)
+            .is_err()
+    );
+    assert_eq!(db.transitions(&pid(1)).unwrap().len(), 1);
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(rec));
+    db.settle(&pid(1), &[], &transition(1), &[blob(5)], &next)
+        .unwrap();
+    assert_eq!(db.process(&pid(1)).unwrap(), Some(next));
 }
 
 #[test]
@@ -465,7 +502,7 @@ fn settled_vote_cannot_be_admitted_again() {
     db.admit_vote(&vote(1, a)).unwrap();
     db.admit_vote(&vote(1, b)).unwrap();
     db.seal_batch(&pid(1), &[a]).unwrap();
-    db.settle(&pid(1), &[a], &transition(0), &[blob(1)])
+    db.settle(&pid(1), &[a], &transition(0), &[blob(1)], &process(1))
         .unwrap();
     let mut again = vote(1, a);
     again.package = vec![9, 9, 9];
@@ -532,7 +569,7 @@ fn another_registry_starts_fresh() {
     let dir = tempfile::tempdir().unwrap();
     let a = process_of(&REG_A, 1);
     {
-        let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+        let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
         db.put_process(&a).unwrap();
         db.set_meta_u64("monitor_last_block", 500).unwrap();
         KeyStore::open(&db, 100, REG_A).unwrap();
@@ -542,7 +579,7 @@ fn another_registry_starts_fresh() {
     let before = std::fs::read(&path_a).unwrap();
     assert!(path_a.ends_with(format!("100-0x{}/sequencer.redb", "aa".repeat(20))));
 
-    let db = Db::open_deployment(dir.path(), 100, &REG_B).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_B, DEFAULT_CACHE_MB).unwrap();
     assert!(db.processes().unwrap().is_empty());
     assert_eq!(db.meta_u64("monitor_last_block").unwrap(), None);
     assert_eq!(db.enc_key_count().unwrap(), 0);
@@ -550,7 +587,7 @@ fn another_registry_starts_fresh() {
     assert_eq!(std::fs::read(&path_a).unwrap(), before);
 
     // Back on the first registry, everything is where it was.
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
+    let db = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap();
     assert_eq!(db.processes().unwrap(), vec![a]);
     assert_eq!(db.meta_u64("monitor_last_block").unwrap(), Some(500));
     let mode = |p: &std::path::Path| {
@@ -565,64 +602,194 @@ fn another_registry_starts_fresh() {
 #[test]
 fn a_database_is_bound_to_its_deployment() {
     let dir = tempfile::tempdir().unwrap();
-    drop(Db::open_deployment(dir.path(), 100, &REG_A).unwrap());
+    drop(Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB).unwrap());
     std::fs::rename(
         deployment_dir(dir.path(), 100, &REG_A),
         deployment_dir(dir.path(), 100, &REG_B),
     )
     .unwrap();
-    let err = Db::open_deployment(dir.path(), 100, &REG_B).err().unwrap();
+    let err = Db::open_deployment(dir.path(), 100, &REG_B, DEFAULT_CACHE_MB)
+        .err()
+        .unwrap();
     assert!(matches!(err, StorageError::Deployment { .. }), "{err}");
 }
 
-// The flat layout (`<datadir>/sequencer.redb`) moves into the deployment
-// its processes belong to.
+// The flat layout (`<datadir>/sequencer.redb`) predates the coverage
+// history: refused, with or without processes, and left in place.
 #[test]
-fn flat_layout_moves_into_its_deployment() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = process_of(&REG_A, 1);
-    {
-        let db = Db::open_in(dir.path()).unwrap();
-        db.put_process(&a).unwrap();
-        db.put_process(&process_of(&REG_A, 2)).unwrap();
-        db.set_meta_u64("monitor_last_block", 900).unwrap();
+fn flat_layout_is_refused() {
+    for with_process in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open_in(dir.path()).unwrap();
+            if with_process {
+                db.put_process(&process_of(&REG_A, 1)).unwrap();
+            }
+        }
+        let err = Db::open_deployment(dir.path(), 100, &REG_A, DEFAULT_CACHE_MB)
+            .err()
+            .unwrap();
+        assert!(matches!(err, StorageError::PredatesHistory), "{err}");
+        assert!(dir.path().join(DB_FILE).exists());
+        assert!(
+            !deployment_dir(dir.path(), 100, &REG_A)
+                .join(DB_FILE)
+                .exists()
+        );
     }
-    // Another registry's node leaves it alone.
-    let db = Db::open_deployment(dir.path(), 100, &REG_B).unwrap();
-    assert!(db.processes().unwrap().is_empty());
+}
+
+fn post(nonce: u64, fee: u128) -> L1PostRecord {
+    L1PostRecord {
+        pid: [3; 31],
+        root_before: [4; 32],
+        nonce,
+        tx_hash: alloy::primitives::B256::repeat_byte(nonce as u8),
+        fees: L1Fees {
+            max_fee: fee,
+            tip: 1_000_000,
+            blob_fee: 2,
+        },
+        vhs: vec![alloy::primitives::B256::repeat_byte(1)],
+        posted_at: 1_700_000_000,
+        from: [5; 20],
+    }
+}
+
+#[test]
+fn l1_posts_round_trip_by_nonce() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    assert!(db.l1_posts().unwrap().is_empty());
+    db.put_l1_post(&post(7, 10)).unwrap();
+    db.put_l1_post(&post(5, 10)).unwrap();
+    // A replacement at the same nonce overwrites its record.
+    db.put_l1_post(&post(7, 20)).unwrap();
+    let got = db.l1_posts().unwrap();
+    assert_eq!(got, vec![post(5, 10), post(7, 20)]);
+    // Fees above u64 survive the JSON encoding.
+    db.put_l1_post(&post(9, u128::from(u64::MAX) * 4)).unwrap();
     drop(db);
-    assert!(dir.path().join(DB_FILE).exists());
-
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
-    assert!(!dir.path().join(DB_FILE).exists());
-    assert_eq!(db.processes().unwrap().len(), 2);
-    assert_eq!(db.process(&a.pid).unwrap(), Some(a));
-    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), Some(900));
+    let db = open(&dir);
+    assert_eq!(db.l1_posts().unwrap().len(), 3);
+    db.remove_l1_posts_upto(7).unwrap();
+    assert_eq!(
+        db.l1_posts().unwrap(),
+        vec![post(9, u128::from(u64::MAX) * 4)]
+    );
 }
 
-// Without processes the flat database's deployment is unknown: it stays.
+// Every earlier schema predates the coverage history: no upgrade.
 #[test]
-fn flat_layout_without_processes_stays() {
-    let dir = tempfile::tempdir().unwrap();
-    {
-        let db = Db::open_in(dir.path()).unwrap();
-        db.set_meta_u64("monitor_last_block", 900).unwrap();
+fn files_before_the_coverage_history_are_refused() {
+    for old in [7, 8, 9, 10] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open(&dir);
+            db.put_process(&process(3)).unwrap();
+            db.set_meta_u64(SCHEMA_VERSION_KEY, old).unwrap();
+        }
+        let err = Db::open(&dir.path().join("sequencer.redb")).err().unwrap();
+        assert!(matches!(err, StorageError::PredatesHistory), "{old}: {err}");
+        assert!(
+            err.to_string()
+                .contains("start this node with a fresh datadir")
+        );
     }
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
-    assert_eq!(db.meta_u64("monitor_last_block").unwrap(), None);
-    assert!(dir.path().join(DB_FILE).exists());
 }
 
-// A flat database of another schema is not moved: it would be refused.
 #[test]
-fn flat_layout_of_another_schema_stays() {
+fn dropped_arbo_handle_releases_its_snapshot() {
     let dir = tempfile::tempdir().unwrap();
-    {
-        let db = Db::open_in(dir.path()).unwrap();
-        db.put_process(&process_of(&REG_A, 1)).unwrap();
-        db.set_meta_u64(SCHEMA_VERSION_KEY, 999).unwrap();
-    }
-    let db = Db::open_deployment(dir.path(), 100, &REG_A).unwrap();
-    assert!(db.processes().unwrap().is_empty());
-    assert!(dir.path().join(DB_FILE).exists());
+    let db = open(&dir);
+    let store = db.arbo_storage(&pid(1)).unwrap();
+    // A node-key read opens the cached snapshot, hit or miss.
+    arbo::Storage::get(&store, &[7u8; 32]).unwrap();
+    assert_eq!(db.arbo_snapshots_open(), 1);
+    drop(store);
+    assert_eq!(db.arbo_snapshots_open(), 0);
+}
+
+/// The coverage history: an entry per batch root, re-writing a root is
+/// idempotent, and `coverage_for` unions exactly the entries naming a vote.
+#[test]
+fn coverage_history_is_append_by_root_and_read_by_vote() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let rec = |slots: &[u64], vids: &[u64]| ExposedRecord {
+        slots: slots.to_vec(),
+        vote_ids: vids.to_vec(),
+    };
+    db.put_coverage(&pid(1), &[1; 32], &rec(&[10, 11], &[100, 101]))
+        .unwrap();
+    db.put_coverage(&pid(1), &[2; 32], &rec(&[20, 21], &[101]))
+        .unwrap();
+    db.put_coverage(&pid(1), &[3; 32], &rec(&[30], &[102]))
+        .unwrap();
+    // Another process's entries never leak in.
+    db.put_coverage(&pid(2), &[4; 32], &rec(&[40], &[100]))
+        .unwrap();
+    let cov = |vids: &[u64]| db.coverage_for(&pid(1), vids).unwrap();
+    assert_eq!(cov(&[100]).into_iter().collect::<Vec<_>>(), [10, 11]);
+    assert_eq!(
+        cov(&[101]).into_iter().collect::<Vec<_>>(),
+        [10, 11, 20, 21]
+    );
+    assert_eq!(
+        cov(&[102, 100]).into_iter().collect::<Vec<_>>(),
+        [10, 11, 30]
+    );
+    assert!(cov(&[999]).is_empty());
+    // The same root again (a replay) changes nothing.
+    db.put_coverage(&pid(1), &[1; 32], &rec(&[10, 11], &[100, 101]))
+        .unwrap();
+    assert_eq!(db.coverage_history(&pid(1)).unwrap().len(), 3);
+    // A large entry (a full batch plus MAX_REFRESH refreshes) round-trips.
+    let big: Vec<u64> = (0..2560).collect();
+    db.put_coverage(&pid(1), &[5; 32], &rec(&big, &[103]))
+        .unwrap();
+    drop(db);
+    let db = open(&dir);
+    assert_eq!(db.coverage_for(&pid(1), &[103]).unwrap().len(), 2560);
+}
+
+/// A seal is one commit: the votes go aggregated, the exposed set and the
+/// history entry are stored together, or nothing is.
+#[test]
+fn seal_with_coverage_is_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let base = 1u64 << 63;
+    let (a, b) = (base + 1, base + 2);
+    db.admit_vote(&vote(1, a)).unwrap();
+    db.admit_vote(&vote(1, b)).unwrap();
+    let exposed = ExposedRecord {
+        slots: vec![1, 2, 3],
+        vote_ids: vec![a, b],
+    };
+    let entry = ExposedRecord {
+        slots: vec![1, 2, 3],
+        vote_ids: vec![a, b],
+    };
+    db.fail_next_writes(1);
+    assert!(
+        db.seal_batch_covered(&pid(1), &[a, b], &exposed, &[9; 32], &entry)
+            .is_err()
+    );
+    assert_eq!(
+        db.vote(&pid(1), a).unwrap().unwrap().status,
+        VoteStatus::Pending
+    );
+    assert_eq!(db.pending(&pid(1)).unwrap(), vec![a, b]);
+    assert_eq!(db.exposed(&pid(1)).unwrap(), None);
+    assert!(db.coverage_for(&pid(1), &[a]).unwrap().is_empty());
+    db.seal_batch_covered(&pid(1), &[a, b], &exposed, &[9; 32], &entry)
+        .unwrap();
+    assert_eq!(
+        db.vote(&pid(1), a).unwrap().unwrap().status,
+        VoteStatus::Aggregated
+    );
+    assert!(db.pending(&pid(1)).unwrap().is_empty());
+    assert_eq!(db.exposed(&pid(1)).unwrap(), Some(exposed));
+    assert_eq!(db.coverage_for(&pid(1), &[b]).unwrap().len(), 3);
 }

@@ -36,11 +36,17 @@ const BALLOT_VK_HASH: [u8; 32] = [0x44; 32];
 const NF: u8 = 4;
 /// Registry grace constructor args: default, floor, ceil, max total, notice.
 const GRACE_ARGS: (u32, u32, u32, u32, u32) = (10, 2, 60, 60, 5);
-/// Registry constructor args after `_dkgManager`: `_councilManager`, then the
-/// grace window.
+/// Registry constructor args after `_dkgManager`: `_councilManager`, the grace
+/// window, then `_l1BlobVerifier` (zero: blob mode).
 fn ctor_tail(council_manager: Address) -> Vec<u8> {
+    ctor_tail_l1(council_manager, Address::ZERO)
+}
+
+/// [`ctor_tail`] with an L1 blob verifier: the registry in L1-blob mode.
+fn ctor_tail_l1(council_manager: Address, l1_blob_verifier: Address) -> Vec<u8> {
     let mut v = council_manager.abi_encode();
     v.extend(GRACE_ARGS.abi_encode_params());
+    v.extend(l1_blob_verifier.abi_encode());
     v
 }
 
@@ -334,7 +340,6 @@ async fn registry_on_anvil() {
     let t1 = TransitionData {
         vote_ids: vec![VOTE_ID_MIN + 42, VOTE_ID_MIN + 7],
         updates: vec![(0x12, some_ballot(&pk, 1)), (0x11, some_ballot(&pk, 2))],
-        accumulator: some_ballot(&pk, 3),
         num_fields: NF,
     };
     let root1 = [0x91u8; 32];
@@ -405,13 +410,12 @@ async fn registry_on_anvil() {
     }
 
     // Second transition: two blobs, occupied_before = the first batch's voters.
-    let n = 460u64;
+    let n = 500u64;
     let t2 = TransitionData {
         vote_ids: (0..n).map(|i| VOTE_ID_MIN + 1000 + i).collect(),
         updates: (0..n)
             .map(|i| (0x20 + i, Ballot([Ciphertext::IDENTITY; 16])))
             .collect(),
-        accumulator: some_ballot(&pk, 4),
         num_fields: NF,
     };
     let blobs2 = build_blobs(&t2, &pid_fr(&pid), &root1).unwrap();
@@ -488,6 +492,7 @@ async fn registry_on_anvil() {
             voters: 2 + n,
             overwrites: 0,
             n_blobs: 2,
+            l1: None,
         }
     );
 
@@ -594,6 +599,152 @@ async fn registry_on_anvil() {
     assert_eq!(c.process(&pid3).await.unwrap().metadata_uri, "ipfs://third");
     // The node keeps sending after it.
     c.end_process(&pid2).await.unwrap();
+}
+
+// `--op-max-tx-fee` below a settlement's price: the node's transition is
+// withheld before signing, nothing reaches the chain, and the same call
+// lands under the default cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn op_max_tx_fee_withholds_a_settlement() {
+    use davinci_sequencer::config::Config;
+    use davinci_sequencer::web3::DEFAULT_MAX_TX_FEE;
+
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let me = key.address();
+    let secret = SecretString::new(hex::encode(key.to_bytes()));
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(BALLOT_VK_HASH),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    code.extend(ctor_tail(Address::ZERO));
+    let registry = deploy(&deployer, code).await;
+
+    // The node, from its configuration, capped at one wei.
+    let mut cfg = Config::parse_args([
+        "davinci-sequencer",
+        "--network",
+        "custom",
+        "--registry",
+        &registry.to_string(),
+        "--rpc-url",
+        url.as_str(),
+        "--blob-source",
+        "anvil",
+        "--op-max-tx-fee",
+        "1",
+    ])
+    .unwrap();
+    cfg.privkey = Some(secret);
+    let mut c = Contracts::connect(&cfg).await.unwrap();
+    assert_eq!(c.signer(), Some(me));
+
+    let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+    let mut census_root = [0u8; 32];
+    census_root[0] = 0x01;
+    let np = NewProcess {
+        status: ProcessStatus::Ready,
+        start_time: 0,
+        duration: 3600,
+        max_voters: 1000,
+        ballot_mode: BallotMode {
+            num_fields: NF,
+            group_size: 1,
+            unique_values: false,
+            cost_exponent: 1,
+            max_value: 5,
+            min_value: 0,
+            max_value_sum: 20,
+            min_value_sum: 0,
+        },
+        census: OnchainCensus {
+            origin: 1,
+            root: census_root,
+            uri: "file:///tmp/census.json".into(),
+            contract_address: [0u8; 20],
+        },
+        metadata: "ipfs://meta".into(),
+        metadata_hash: metadata_hash(META_DOC),
+        enc_key: pk,
+    };
+    let count = async || {
+        let latest = deployer.get_transaction_count(me).await.unwrap();
+        let pending = deployer.get_transaction_count(me).pending().await.unwrap();
+        (latest, pending)
+    };
+
+    // Any send: the process creation is withheld too.
+    let before = count().await;
+    let err = c.create_process(&np).await.err().unwrap();
+    assert!(matches!(err, Web3Error::FeeCap { cap: 1, .. }), "{err}");
+    assert_eq!(count().await, before, "nothing broadcast");
+    c.set_max_tx_fee(DEFAULT_MAX_TX_FEE);
+    let (pid, _) = c.create_process(&np).await.unwrap();
+    c.set_max_tx_fee(1);
+
+    let p = c.process(&pid).await.unwrap();
+    let t = TransitionData {
+        vote_ids: vec![VOTE_ID_MIN + 1],
+        updates: vec![(0x11, some_ballot(&pk, 1))],
+        num_fields: NF,
+    };
+    let blobs = build_blobs(&t, &pid_fr(&pid), &p.state_root).unwrap();
+    let snark = batch_snark(
+        &Batch {
+            before: p.state_root,
+            after: [0x91; 32],
+            voters: 1,
+            overwrites: 0,
+            occupied_before: 0,
+        },
+        &census_root,
+        &blobs,
+    );
+    c.simulate_transition(&pid, &snark, &blobs).await.unwrap();
+    let before = count().await;
+    let err = c
+        .submit_transition(&pid, &snark, &blobs)
+        .await
+        .err()
+        .unwrap();
+    let Web3Error::FeeCap { want, cap: 1 } = err else {
+        panic!("want FeeCap, got {err}")
+    };
+    assert_eq!(count().await, before, "nothing broadcast");
+    assert_eq!(c.process(&pid).await.unwrap().voters_count, 0);
+
+    // Under the default cap the same transition lands.
+    assert!(want <= DEFAULT_MAX_TX_FEE, "{want}");
+    c.set_max_tx_fee(DEFAULT_MAX_TX_FEE);
+    let r = c.submit_transition(&pid, &snark, &blobs).await.unwrap();
+    assert_eq!(r.replacements, 0);
+    assert_eq!(count().await, (before.0 + 1, before.1 + 1));
+    assert_eq!(c.process(&pid).await.unwrap().voters_count, 1);
 }
 
 // An organizer replaces the metadata: the node reads each value from
@@ -1102,7 +1253,6 @@ async fn same_block_race_names_the_loser() {
                     (0x10 + 2 * tag as u64, some_ballot(&pk, tag as u64)),
                     (0x11 + 2 * tag as u64, some_ballot(&pk, 9 + tag as u64)),
                 ],
-                accumulator: some_ballot(&pk, 20 + tag as u64),
                 num_fields: NF,
             };
             let blobs = build_blobs(&t, &pid_fr(&pid), &p.state_root).unwrap();
@@ -2139,4 +2289,646 @@ async fn council_gate_on_anvil() {
     let p = c.process(&voted).await.unwrap();
     assert_eq!(p.status, ProcessStatus::Results);
     assert_eq!(p.results, tally.to_vec());
+}
+
+/// L1-blob mode on two anvils: Ethereum (blobs, Osaka) and an OP-like chain
+/// whose registry proves blob transactions through `L1BlobVerifier`, reading
+/// its origin from a `MockL1Block` the tests point at Ethereum blocks. The
+/// mock cannot reproduce OP's derivation timing, real blob-pool replacement,
+/// RPC body limits or PeerDAS beacons: the live phase covers those.
+mod l1_blob_mode {
+    use std::sync::Arc;
+
+    use alloy::consensus::Transaction as _;
+    use alloy::node_bindings::AnvilInstance;
+    use alloy::providers::DynProvider;
+    use davinci_sequencer::l1da::{
+        Anchor, L1Da, L1Job, Posting, Settled, choose_anchor, settle, with_post,
+    };
+    use davinci_sequencer::storage::Db;
+    use davinci_sequencer::web3::l1proof::verify_local;
+    use davinci_sequencer::web3::{L1Blobs, L1Chain, L1Rpc, OnchainProcess, RegistryDa};
+    use davinci_zkvm_sdk::crypto::babyjubjub::Point;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    alloy::sol! {
+        #[sol(rpc)]
+        interface MockL1Block {
+            function set(uint64 n, bytes32 h) external;
+        }
+    }
+
+    const CENSUS_ROOT: [u8; 32] = {
+        let mut r = [0u8; 32];
+        r[0] = 0x01;
+        r[31] = 0x2a;
+        r
+    };
+
+    struct TwoChains {
+        _l1: AnvilInstance,
+        _op: AnvilInstance,
+        l1_url: url::Url,
+        verifier: Address,
+        l1_block: Address,
+        me: Address,
+        c: Contracts,
+        l1c: Arc<L1Rpc>,
+        /// OP key 2: moves the mock origin without racing `c`'s nonces.
+        relay: DynProvider,
+        l1_read: DynProvider,
+        db: Db,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn two_chains() -> TwoChains {
+        let l1 = Anvil::at(anvil_bin())
+            .args(["--hardfork", "osaka"])
+            .try_spawn()
+            .expect("spawn the Ethereum anvil");
+        let op = Anvil::at(anvil_bin())
+            .args(["--hardfork", "osaka"])
+            .try_spawn()
+            .expect("spawn the OP anvil");
+        let (l1_url, op_url) = (l1.endpoint_url(), op.endpoint_url());
+        let key: PrivateKeySigner = op.keys()[0].clone().into();
+        let me = key.address();
+        let secret = SecretString::new(hex::encode(key.to_bytes()));
+        let deployer = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(key))
+            .connect_http(op_url.clone());
+        let relay_key: PrivateKeySigner = op.keys()[2].clone().into();
+        let relay = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(relay_key))
+            .connect_http(op_url.clone())
+            .erased();
+        // The dedicated Ethereum key: L1 anvil key 1.
+        let l1_key: PrivateKeySigner = l1.keys()[1].clone().into();
+        let l1_secret = SecretString::new(hex::encode(l1_key.to_bytes()));
+        let l1_read = ProviderBuilder::new().connect_http(l1_url.clone()).erased();
+
+        let zisk = deploy(
+            &deployer,
+            bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+        )
+        .await;
+        let l1_block = deploy(&deployer, bytecode("MockL1Block.sol/MockL1Block.json")).await;
+        let mut code = bytecode("L1BlobVerifier.sol/L1BlobVerifier.json");
+        code.extend(l1_block.abi_encode());
+        let verifier = deploy(&deployer, code).await;
+        let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+        code.extend(
+            (
+                op.chain_id() as u32,
+                zisk,
+                B256::from(BATCH_VK),
+                B256::from(RESULTS_VK),
+                B256::from(ROOT_C),
+                B256::from(BALLOT_VK_HASH),
+                Address::ZERO,
+            )
+                .abi_encode_params(),
+        );
+        code.extend(ctor_tail_l1(Address::ZERO, verifier));
+        let registry = deploy(&deployer, code).await;
+
+        let c = Contracts::new(std::slice::from_ref(&op_url), registry, Some(&secret))
+            .await
+            .unwrap();
+        let l1c = Arc::new(
+            L1Rpc::connect(std::slice::from_ref(&l1_url), &[], Some(&l1_secret))
+                .await
+                .unwrap(),
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_in(dir.path()).unwrap();
+        TwoChains {
+            _l1: l1,
+            _op: op,
+            l1_url,
+            verifier,
+            l1_block,
+            me,
+            c,
+            l1c,
+            relay,
+            l1_read,
+            db,
+            _dir: dir,
+        }
+    }
+
+    impl TwoChains {
+        /// Posts in chunks of `chunk` blobs.
+        fn da(&self, chunk: usize) -> L1Da {
+            L1Da::new(
+                self.l1c.clone(),
+                self.db.clone(),
+                u128::MAX,
+                Duration::from_millis(100),
+                chunk,
+            )
+            .unwrap()
+        }
+
+        async fn l1_head(&self) -> u64 {
+            self.l1_read.get_block_number().await.unwrap()
+        }
+
+        async fn mine_l1(&self, n: u64) {
+            let _: serde_json::Value = self
+                .l1_read
+                .raw_request("anvil_mine".into(), (alloy::primitives::U256::from(n),))
+                .await
+                .unwrap();
+        }
+
+        /// Points OP's origin at Ethereum block `n`.
+        async fn set_origin(&self, n: u64) {
+            let h = self
+                .l1_read
+                .get_block_by_number(n.into())
+                .await
+                .unwrap()
+                .unwrap()
+                .header
+                .hash;
+            self.set_origin_raw(n, h).await;
+        }
+
+        async fn set_origin_raw(&self, n: u64, h: B256) {
+            let r = MockL1Block::new(self.l1_block, &self.relay)
+                .set(n, h)
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+            assert!(r.status());
+        }
+
+        /// A READY process with a fresh election key.
+        async fn process(&self) -> ([u8; 31], OnchainProcess, Point) {
+            let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+            let np = NewProcess {
+                status: ProcessStatus::Ready,
+                start_time: 0,
+                duration: 3600,
+                max_voters: 1000,
+                ballot_mode: BallotMode {
+                    num_fields: NF,
+                    group_size: 1,
+                    unique_values: false,
+                    cost_exponent: 1,
+                    max_value: 5,
+                    min_value: 0,
+                    max_value_sum: 20,
+                    min_value_sum: 0,
+                },
+                census: OnchainCensus {
+                    origin: 1,
+                    root: CENSUS_ROOT,
+                    uri: "file:///tmp/census.json".into(),
+                    contract_address: [0u8; 20],
+                },
+                metadata: "ipfs://meta".into(),
+                metadata_hash: metadata_hash(META_DOC),
+                enc_key: pk,
+            };
+            let (pid, _) = self.c.create_process(&np).await.unwrap();
+            (pid, self.c.process(&pid).await.unwrap(), pk)
+        }
+    }
+
+    /// A two-vote transition from `before`, its blobs and its snark.
+    fn transition(
+        pid: &[u8; 31],
+        before: [u8; 32],
+        after: [u8; 32],
+        occupied_before: u32,
+        pk: &Point,
+        seed: u64,
+    ) -> (TransitionBlobs, PlonkSnark) {
+        let t = TransitionData {
+            vote_ids: vec![VOTE_ID_MIN + seed, VOTE_ID_MIN + seed + 1],
+            updates: vec![
+                (0x100 + seed, some_ballot(pk, seed)),
+                (0x101 + seed, some_ballot(pk, seed + 1)),
+            ],
+            num_fields: NF,
+        };
+        let blobs = build_blobs(&t, &pid_fr(pid), &before).unwrap();
+        let snark = batch_snark(
+            &Batch {
+                before,
+                after,
+                voters: 2,
+                overwrites: 0,
+                occupied_before,
+            },
+            &CENSUS_ROOT,
+            &blobs,
+        );
+        (blobs, snark)
+    }
+
+    /// A 500-vote transition from `before`: two blobs at NF 4.
+    fn two_blob_transition(
+        pid: &[u8; 31],
+        before: [u8; 32],
+        after: [u8; 32],
+    ) -> (TransitionBlobs, PlonkSnark) {
+        let n = 500u64;
+        let t = TransitionData {
+            vote_ids: (0..n).map(|i| VOTE_ID_MIN + 5000 + i).collect(),
+            updates: (0..n)
+                .map(|i| (0x400 + i, Ballot([Ciphertext::IDENTITY; 16])))
+                .collect(),
+            num_fields: NF,
+        };
+        let blobs = build_blobs(&t, &pid_fr(pid), &before).unwrap();
+        assert_eq!(blobs.blobs.len(), 2);
+        let snark = batch_snark(
+            &Batch {
+                before,
+                after,
+                voters: n as u32,
+                overwrites: 0,
+                occupied_before: 0,
+            },
+            &CENSUS_ROOT,
+            &blobs,
+        );
+        (blobs, snark)
+    }
+
+    /// Ethereum produces a block every 400 ms and OP's origin follows its
+    /// head, until `stop`.
+    async fn relay_origin(
+        l1: DynProvider,
+        op: DynProvider,
+        l1_block: Address,
+        stop: CancellationToken,
+    ) {
+        let mock = MockL1Block::new(l1_block, &op);
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+            }
+            let _: serde_json::Value = l1.raw_request("evm_mine".into(), ()).await.unwrap();
+            let b = l1
+                .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+                .await
+                .unwrap()
+                .unwrap();
+            mock.set(b.header.number, b.header.hash)
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_settlement_on_two_anvils() {
+        if !enabled() {
+            eprintln!("skipped: set ANVIL=1");
+            return;
+        }
+        let t = two_chains().await;
+        assert_eq!(
+            t.c.da_mode().await.unwrap(),
+            RegistryDa::L1Blobs {
+                verifier: t.verifier,
+                l1_block: t.l1_block
+            }
+        );
+        assert!(t.l1c.cell_proofs(), "anvil --hardfork osaka: v1 sidecars");
+        let da = t.da(6);
+        let (pid, p, pk) = t.process().await;
+        let (blobs1, snark1) = transition(&pid, p.state_root, [0x91; 32], 0, &pk, 1);
+        // Blob mode's entry point is refused on this registry.
+        let r =
+            t.c.simulate_transition(&pid, &snark1, &blobs1)
+                .await
+                .unwrap_err();
+        assert_eq!(r.name(), Some("WrongDAMode"), "{r}");
+
+        // The blobs go to Ethereum, then one more block on top.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let posted = da
+            .poster
+            .post(&pid, &p.state_root, &blobs1, deadline)
+            .await
+            .unwrap();
+        assert!(
+            t.db.l1_posts().unwrap().is_empty(),
+            "a mined post leaves no record"
+        );
+        t.mine_l1(1).await;
+        let head = t.l1_head().await;
+        let proof = t.l1c.build_proof(&[posted.tx], head).await.unwrap();
+        // An origin that is no header of the proof is named.
+        t.set_origin_raw(head, B256::repeat_byte(7)).await;
+        let r =
+            t.c.simulate_transition_l1(&pid, &snark1, &blobs1, &proof)
+                .await
+                .unwrap_err();
+        assert_eq!(r.name(), Some("L1OriginMismatch"), "{r}");
+        // OP's origin at the head: the proof anchors there.
+        t.set_origin(head).await;
+        let origin = t.c.l1_origin().await.unwrap();
+        assert_eq!(origin.number, head);
+        let want: Vec<B256> = blobs1
+            .versioned_hashes
+            .iter()
+            .map(|h| B256::from(*h))
+            .collect();
+        let (vhs, blocks) = verify_local(&proof, origin.hash).unwrap();
+        assert_eq!(vhs, want);
+        assert_eq!(blocks, vec![posted.block; want.len()]);
+        t.c.simulate_transition_l1(&pid, &snark1, &blobs1, &proof)
+            .await
+            .unwrap();
+        let r1 =
+            t.c.submit_transition_l1(&pid, &snark1, &blobs1, &proof)
+                .await
+                .unwrap();
+        // The transition and its L1 event come back as one event.
+        let evs = t.c.events(r1.block, r1.block).await.unwrap();
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(
+            evs[0].kind,
+            EventKind::StateTransitioned {
+                pid,
+                sender: t.me,
+                old_root: p.state_root,
+                new_root: [0x91; 32],
+                voters: 2,
+                overwrites: 0,
+                n_blobs: want.len() as u64,
+                l1: Some(L1Blobs {
+                    blocks: vec![posted.block; want.len()],
+                    vhs: want.clone(),
+                }),
+            }
+        );
+        // A follower reads the blobs from the Ethereum anvil.
+        let got = AnvilBlobs::new(std::slice::from_ref(&t.l1_url))
+            .blobs_for_l1(&blocks, &want)
+            .await
+            .unwrap();
+        assert_eq!(got, blobs1.blobs);
+
+        // Second transition: OP's origin runs ahead; the proof anchors at the
+        // origin recorded when it reached the blobs.
+        let (blobs2, snark2) = transition(&pid, [0x91; 32], [0x92; 32], 2, &pk, 10);
+        let posted2 = da
+            .poster
+            .post(&pid, &[0x91; 32], &blobs2, deadline)
+            .await
+            .unwrap();
+        assert_eq!(posted2.nonce, posted.nonce + 1);
+        t.set_origin(posted2.block).await;
+        let rec = t.c.record_l1_origin().await.unwrap();
+        assert_eq!(rec.number, posted2.block);
+        t.mine_l1(20).await;
+        let head = t.l1_head().await;
+        t.set_origin(head).await;
+        let origin = t.c.l1_origin().await.unwrap();
+        let Anchor::At { top, hash } =
+            choose_anchor(posted2.block, posted2.block, head, origin, Some(rec))
+        else {
+            panic!("a deep proof anchors at the record");
+        };
+        assert_eq!((top, hash), (rec.number, rec.hash));
+        let proof2 = t.l1c.build_proof(&[posted2.tx], top).await.unwrap();
+        assert_eq!(proof2.headers.len(), 1);
+        assert!(
+            verify_local(&proof2, origin.hash).is_err(),
+            "not at the current origin"
+        );
+        t.c.simulate_transition_l1(&pid, &snark2, &blobs2, &proof2)
+            .await
+            .unwrap();
+        let r2 =
+            t.c.submit_transition_l1(&pid, &snark2, &blobs2, &proof2)
+                .await
+                .unwrap();
+        let p = t.c.process(&pid).await.unwrap();
+        assert_eq!((p.state_root, p.voters_count), ([0x92; 32], 4));
+        let evs = t.c.events(r2.block, r2.block).await.unwrap();
+        assert!(
+            matches!(&evs[0].kind, EventKind::StateTransitioned { l1: Some(b), .. }
+                if b.blocks[0] == posted2.block),
+            "{evs:?}"
+        );
+    }
+
+    // One blob per Ethereum transaction: a two-blob transition goes out in
+    // two transactions, in two blocks, and settles with one L1 proof of both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_settlement_spans_two_transactions() {
+        if !enabled() {
+            eprintln!("skipped: set ANVIL=1");
+            return;
+        }
+        let t = two_chains().await;
+        // Initialises the mode cell: events() pairs L1 events strictly from here on.
+        t.c.da_mode().await.unwrap();
+        let da = t.da(1);
+        let (pid, p, _pk) = t.process().await;
+        let (blobs, snark) = two_blob_transition(&pid, p.state_root, [0x93; 32]);
+        let want: Vec<B256> = blobs
+            .versioned_hashes
+            .iter()
+            .map(|h| B256::from(*h))
+            .collect();
+        let stop = CancellationToken::new();
+        let relay = tokio::spawn(relay_origin(
+            t.l1_read.clone(),
+            t.relay.clone(),
+            t.l1_block,
+            stop.clone(),
+        ));
+        let job = L1Job {
+            pid,
+            root_before: p.state_root,
+            blobs: &blobs,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+            cancel: CancellationToken::new(),
+            posted: Default::default(),
+        };
+        let (_, posting) = with_post(&da, &t.c, &job, std::future::ready(())).await;
+        let posts = posting.posts.clone();
+        assert_eq!(posts.len(), 2, "{posting:?}");
+        assert_eq!(posts[1].nonce, posts[0].nonce + 1);
+        assert!(posts[1].block > posts[0].block);
+        let out = settle(&da, &t.c, &job, &snark, posting).await;
+        stop.cancel();
+        relay.await.unwrap();
+        let Settled::Landed(rc) = out else {
+            panic!("{out:?}");
+        };
+        let evs = t.c.events(rc.block, rc.block).await.unwrap();
+        let EventKind::StateTransitioned {
+            l1: Some(b),
+            n_blobs,
+            new_root,
+            ..
+        } = &evs[0].kind
+        else {
+            panic!("{evs:?}");
+        };
+        assert_eq!((*n_blobs, *new_root), (2, [0x93; 32]));
+        assert_eq!(b.blocks, vec![posts[0].block, posts[1].block]);
+        assert_eq!(b.vhs, want);
+        // A follower reads them back from the two Ethereum blocks.
+        let got = AnvilBlobs::new(std::slice::from_ref(&t.l1_url))
+            .blobs_for_l1(&b.blocks, &b.vhs)
+            .await
+            .unwrap();
+        assert_eq!(got, blobs.blobs);
+        assert_eq!(t.c.process(&pid).await.unwrap().state_root, [0x93; 32]);
+        assert!(t.db.l1_posts().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_settle_loop_posts_again_after_an_l1_reorg() {
+        if !enabled() {
+            eprintln!("skipped: set ANVIL=1");
+            return;
+        }
+        let t = two_chains().await;
+        // Initialises the mode cell: events() pairs L1 events strictly from here on.
+        t.c.da_mode().await.unwrap();
+        let da = t.da(6);
+        let (pid, p, pk) = t.process().await;
+        let (blobs, snark) = transition(&pid, p.state_root, [0x91; 32], 0, &pk, 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let posted = da
+            .poster
+            .post(&pid, &p.state_root, &blobs, deadline)
+            .await
+            .unwrap();
+        // A reorg of depth one drops the block holding the blob transaction.
+        assert_eq!(t.l1_head().await, posted.block);
+        let _: serde_json::Value = t
+            .l1_read
+            .raw_request(
+                "anvil_reorg".into(),
+                (1u64, Vec::<serde_json::Value>::new()),
+            )
+            .await
+            .unwrap();
+        assert!(t.l1c.receipt(posted.tx).await.unwrap().is_none());
+        // From now on Ethereum produces blocks and OP's origin follows its head.
+        let stop = CancellationToken::new();
+        let relay = tokio::spawn(relay_origin(
+            t.l1_read.clone(),
+            t.relay.clone(),
+            t.l1_block,
+            stop.clone(),
+        ));
+        let job = L1Job {
+            pid,
+            root_before: p.state_root,
+            blobs: &blobs,
+            deadline,
+            cancel: CancellationToken::new(),
+            posted: Default::default(),
+        };
+        let posting = Posting {
+            posts: vec![posted],
+            ..Posting::default()
+        };
+        let out = settle(&da, &t.c, &job, &snark, posting).await;
+        stop.cancel();
+        relay.await.unwrap();
+        let Settled::Landed(rc) = out else {
+            panic!("{out:?}");
+        };
+        let evs = t.c.events(rc.block, rc.block).await.unwrap();
+        let EventKind::StateTransitioned { l1: Some(b), .. } = &evs[0].kind else {
+            panic!("{evs:?}");
+        };
+        assert!(b.blocks[0] > posted.block, "the blobs of the new chain");
+        assert!(t.db.l1_posts().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l1_post_replaces_a_dropped_transaction() {
+        if !enabled() {
+            eprintln!("skipped: set ANVIL=1");
+            return;
+        }
+        let t = two_chains().await;
+        let da = Arc::new(t.da(6));
+        let (pid, p, pk) = t.process().await;
+        let (blobs, _) = transition(&pid, p.state_root, [0x91; 32], 0, &pk, 1);
+        let _: serde_json::Value = t
+            .l1_read
+            .raw_request("evm_setAutomine".into(), (false,))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let task = {
+            let (da, blobs, root) = (da.clone(), blobs.clone(), p.state_root);
+            tokio::spawn(async move { da.poster.post(&pid, &root, &blobs, deadline).await })
+        };
+        common::wait_until("first send recorded", async || {
+            t.db.l1_posts().unwrap().len() == 1
+        })
+        .await;
+        let first = t.db.l1_posts().unwrap().remove(0);
+        // The record precedes the send: drop the transaction once it is pooled.
+        common::wait_until("first tx pooled", async || {
+            t.l1_read
+                .get_transaction_by_hash(first.tx_hash)
+                .await
+                .unwrap()
+                .is_some()
+        })
+        .await;
+        let _: serde_json::Value = t
+            .l1_read
+            .raw_request("anvil_dropTransaction".into(), (first.tx_hash,))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            t.mine_l1(1).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        common::wait_until("replacement sent", async || {
+            t.db.l1_posts()
+                .unwrap()
+                .first()
+                .is_some_and(|r| r.tx_hash != first.tx_hash)
+        })
+        .await;
+        t.mine_l1(1).await;
+        let posted = task.await.unwrap().unwrap();
+        assert_ne!(posted.tx, first.tx_hash);
+        assert_eq!(posted.nonce, first.nonce);
+        let tx = t
+            .l1_read
+            .get_transaction_by_hash(posted.tx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tx.inner.max_fee_per_blob_gas().unwrap() >= 2 * first.fees.blob_fee);
+        assert!(
+            t.l1_read
+                .get_transaction_by_hash(first.tx_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

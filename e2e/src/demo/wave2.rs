@@ -155,10 +155,10 @@ pub fn elections() -> Vec<Spec> {
             key: KeySource::Node(0),
             lifecycle: Lifecycle::Tally,
             // Every first ballot to node 1, in chunks of 130. At 16 fields a
-            // slot update takes 33 of a blob's 4096 cells, so two blobs hold
-            // about 121 new votes with their silent refreshes: from the second
-            // chunk on the node splits what is pending over several
-            // transitions.
+            // slot update takes 32 of a blob's 4096 cells plus a quarter of an
+            // integer cell, so two blobs hold 126 new votes with their silent
+            // refreshes: from the second chunk on the node splits what is
+            // pending over several transitions.
             round1: 390,
             round2: (390, 400),
             revotes: 60,

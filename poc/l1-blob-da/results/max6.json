@@ -1,0 +1,108 @@
+{
+  "cost_eth": {
+    "max": 7.727363854422e-6,
+    "median": 7.727363854422e-6,
+    "min": 7.727363854422e-6
+  },
+  "eth_usd": 2508.0,
+  "latency_ms": {
+    "max": 109160.0,
+    "median": 109160.0,
+    "min": 109160.0
+  },
+  "len_s": 761856,
+  "n_blobs": 6,
+  "repeat": 1,
+  "runs": [
+    {
+      "beacon_block_root": "0x0f089443abb894b8b78e61fe0f51ad42cb9e74d60843a7ebfbc032948d08675a",
+      "beacon_slot": 15417596,
+      "blob_indices": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checks": {
+        "follower_rebuild_ok": true,
+        "header_root_matches_beacon_api": true,
+        "inclusion_proof_ok": true,
+        "l1_next_parent_root_ok": true,
+        "l1_status_ok": true,
+        "op_4788_matches_root": true,
+        "op_origin_reached": true,
+        "op_status_ok": true,
+        "settled_beacon_root_ok": true,
+        "settled_digest_ok": true
+      },
+      "l1": {
+        "base_fee": "112972695",
+        "blob_base_fee": "6524160",
+        "max_fee": "226945390",
+        "max_fee_per_blob_gas": "19572480",
+        "metrics": {
+          "blob_fee_wei": "5447133167616",
+          "blob_gas_price": "6926388",
+          "blob_gas_used": 786432,
+          "block": 26178643,
+          "cost_wei": "7675823750616",
+          "effective_gas_price": "106128123",
+          "exec_fee_wei": "2228690583000",
+          "gas_used": 21000
+        },
+        "raw_tx_bytes": 824711,
+        "tip": "1000000",
+        "tx_hash": "0xad35b39ee9a605de642aa0110c1e2de4f98e4ab7dade92632a6514172a7ea1c8"
+      },
+      "l1_block": 26178643,
+      "latency_proof_ready_to_op_block_ts_ms": 107984,
+      "latency_proof_ready_to_settled_ms": 109160,
+      "len_s": 761856,
+      "n_blobs": 6,
+      "op": {
+        "block": 158118246,
+        "calldata_bytes": 7140,
+        "cost_wei": "51540103806",
+        "effective_gas_price": "10907",
+        "gas_limit": 1031013,
+        "gas_used": 851255,
+        "l1BaseFeeScalar": "0x146b",
+        "l1BlobBaseFee": "0x63ec78",
+        "l1BlobBaseFeeScalar": "0xf79c5",
+        "l1Fee": "0x9d69f3c31",
+        "l1GasPrice": "0x6563aaf",
+        "l1GasUsed": "0xaa05",
+        "l1_fee_wei": "42255465521",
+        "l2_fee_wei": "9284638285",
+        "operator_fee_wei": "0",
+        "status": 1,
+        "tx_hash": "0xa7852f03ef7cad641959a71a9d1f04c7b4f5d6c1baebb5490cbd4ab7195efcff"
+      },
+      "op_l2_timestamp_T": 1791835265,
+      "op_origin_at_ready": 26178644,
+      "origin_polls": 37,
+      "pid": "34a92c93e934a9b7e35e75a26ebf89ff1286ead28d4c99723827253310dfc0",
+      "post_delay_secs": null,
+      "scenario": "max6",
+      "timestamps_ms": {
+        "beacon_proof_ready": 1791835189849,
+        "l1_included_block_ts": 1791835175000,
+        "l1_receipt_seen": 1791835178583,
+        "l1_sent": 1791835164520,
+        "l1_tx_built": 1791835163550,
+        "op_included_block_ts": 1791835269000,
+        "op_receipt_seen": 1791835270176,
+        "op_sent": 1791835267488,
+        "origin_ready": 1791835266254,
+        "proof_ready": 1791835161016
+      },
+      "total_cost_eth": 7.727363854422e-6,
+      "total_cost_usd": 0.019380228546890376,
+      "total_cost_wei": "7727363854422"
+    }
+  ],
+  "scenario": "max6",
+  "with_proof": true
+}

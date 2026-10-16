@@ -6,7 +6,7 @@
 //! `b"occ" -> sorted occupied slot list (u64 LE each)`,
 //! `b"committed" -> root || voters || overwrites || compressed accumulator`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arbo::{Sha256, Storage, Tree, WriteBatch};
@@ -14,7 +14,9 @@ use davinci_zkvm_sdk::ballot::Ballot;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::Ciphertext;
 use davinci_zkvm_sdk::groth16::BallotVerifier;
-use davinci_zkvm_sdk::limits::{MAX_BATCH_SIZE, MAX_REFRESH, NUM_FIELDS, SMT_LEVELS, TX_BLOB_CAP};
+use davinci_zkvm_sdk::limits::{
+    MAX_BATCH_SIZE, MAX_BLOBS, MAX_REFRESH, NUM_FIELDS, SMT_LEVELS, TX_BLOB_CAP,
+};
 use davinci_zkvm_sdk::types::SnarkJsVk;
 use davinci_zkvm_sdk::{blob, limits, release};
 
@@ -22,6 +24,69 @@ use crate::config::{ProcessConfig, genesis_leaves, key_bytes};
 use crate::error::Error;
 use crate::transition::PreparedBatch;
 use crate::validate::VerifiedVote;
+
+/// What [`ProcessState::select_covered`] picked.
+#[derive(Debug)]
+pub struct Selection<'a> {
+    pub votes: Vec<&'a VerifiedVote>,
+    /// A vote was turned away (it waits for a later batch).
+    pub blocked: bool,
+    /// The batch is full: no further vote fits for its size alone.
+    pub full: bool,
+    /// The slots the selection's seal must refresh.
+    pub cover: BTreeSet<u64>,
+}
+
+/// Per-vote coverage for a selection: the history entries (slot sets) and,
+/// per vote id, the entries naming it. A seal of a vote refreshes every
+/// slot of every entry naming it.
+#[derive(Debug, Default, Clone)]
+pub struct Coverage {
+    entries: Vec<BTreeSet<u64>>,
+    by_vote: HashMap<u64, Vec<usize>>,
+    /// The vote ids the histories were read for; `None`: any (no history).
+    requested: Option<HashSet<u64>>,
+}
+
+impl Coverage {
+    /// An empty coverage read for `vids`: a selection takes no other vote,
+    /// whose history it does not know.
+    pub fn for_votes(vids: &[u64]) -> Self {
+        Coverage {
+            requested: Some(vids.iter().copied().collect()),
+            ..Default::default()
+        }
+    }
+
+    /// Whether `vid`'s history was read (a selection may charge it).
+    pub fn covers(&self, vid: u64) -> bool {
+        self.requested.as_ref().is_none_or(|r| r.contains(&vid))
+    }
+
+    /// Adds an entry naming `vids`.
+    pub fn add(&mut self, slots: BTreeSet<u64>, vids: &[u64]) {
+        let i = self.entries.len();
+        self.entries.push(slots);
+        for v in vids {
+            self.by_vote.entry(*v).or_default().push(i);
+        }
+    }
+
+    fn entries_of(&self, vid: u64) -> &[usize] {
+        self.by_vote.get(&vid).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every slot the entries naming any of `vids` hold.
+    pub fn union(&self, vids: &[u64]) -> BTreeSet<u64> {
+        let idx: BTreeSet<usize> = vids
+            .iter()
+            .flat_map(|v| self.entries_of(*v).iter().copied())
+            .collect();
+        idx.iter()
+            .flat_map(|i| self.entries[*i].iter().copied())
+            .collect()
+    }
+}
 
 const KEY_OCC: &[u8] = b"occ";
 const KEY_COMMITTED: &[u8] = b"committed";
@@ -47,6 +112,9 @@ impl<S: Storage> Storage for Shared<S> {
     }
     fn write(&self, batch: WriteBatch) -> Result<(), arbo::Error> {
         self.0.write(batch)
+    }
+    fn release_snapshot(&self) {
+        self.0.release_snapshot()
     }
 }
 
@@ -133,7 +201,8 @@ pub struct ProcessState<S: Storage> {
     pub(crate) occupied: Vec<u64>,
     /// The process ballot VK, hash-checked against the 0x07 leaf.
     pub(crate) vk: SnarkJsVk,
-    /// Most blobs one transition may use: the chain's per-tx limit.
+    /// Most blobs one transition may use: the chain's per-tx limit, or the
+    /// guest's `MAX_BLOBS` when the blobs go out in several transactions.
     pub(crate) blob_cap: usize,
 }
 
@@ -150,7 +219,10 @@ fn load_vk(cfg: &ProcessConfig) -> Result<SnarkJsVk, Error> {
 }
 
 impl<S: Storage> ProcessState<S> {
-    /// Creates the genesis state in an empty `storage`.
+    /// Creates the genesis state in a `storage` holding no process. The
+    /// committed record is written last, so a tree without one is a genesis
+    /// a crash cut short: it starts over from the empty root (no slot was
+    /// ever written without the record).
     pub fn create(cfg: ProcessConfig, storage: S) -> Result<Self, Error> {
         let db = Shared(Arc::new(storage));
         if db.get(KEY_COMMITTED)?.is_some() {
@@ -159,7 +231,7 @@ impl<S: Storage> ProcessState<S> {
         let vk = load_vk(&cfg)?;
         let mut tree = Tree::new(db.clone(), SMT_LEVELS, Sha256)?;
         if tree.root() != arbo::EMPTY_HASH {
-            return Err(Error::Invalid("storage already holds a tree".into()));
+            tree.set_root(&arbo::EMPTY_HASH)?;
         }
         for (k, v) in genesis_leaves(&cfg)? {
             tree.add(&key_bytes(k), &v)?;
@@ -188,13 +260,25 @@ impl<S: Storage> ProcessState<S> {
     /// Opens an existing state and rewinds to `committed` (drops any
     /// prepared-but-uncommitted tree nodes).
     pub fn open(cfg: ProcessConfig, storage: S, committed: &Committed) -> Result<Self, Error> {
+        Self::open_at(cfg, storage, Some(committed))
+    }
+
+    /// Opens an existing state at the committed record it stores, which is
+    /// written in one batch with the slot store it describes, and rewinds
+    /// to it. Fails with "storage holds no process" before `create`.
+    pub fn open_stored(cfg: ProcessConfig, storage: S) -> Result<Self, Error> {
+        Self::open_at(cfg, storage, None)
+    }
+
+    // `want`, when given, must equal the stored record.
+    fn open_at(cfg: ProcessConfig, storage: S, want: Option<&Committed>) -> Result<Self, Error> {
         let db = Shared(Arc::new(storage));
         let vk = load_vk(&cfg)?;
         let stored = db
             .get(KEY_COMMITTED)?
             .ok_or_else(|| Error::Invalid("storage holds no process".into()))?;
-        let stored = committed_from_bytes(&stored)?;
-        if stored != *committed {
+        let committed = committed_from_bytes(&stored)?;
+        if want.is_some_and(|w| *w != committed) {
             return Err(Error::Invalid(
                 "stored committed record differs from the given one".into(),
             ));
@@ -208,7 +292,7 @@ impl<S: Storage> ProcessState<S> {
             cfg,
             db,
             tree,
-            committed: committed.clone(),
+            committed,
             occupied: occ_from_bytes(&occ)?,
             vk,
             blob_cap: TX_BLOB_CAP,
@@ -219,12 +303,14 @@ impl<S: Storage> ProcessState<S> {
         &self.cfg
     }
 
-    /// Caps the blobs of every batch `select_batch` and `prepare` size, for
-    /// chains that take fewer than `TX_BLOB_CAP` per transaction.
+    /// Caps the blobs of every batch `select_batch` and `prepare` size
+    /// (`TX_BLOB_CAP` by default): lower for chains that take fewer per
+    /// transaction, up to the guest's `MAX_BLOBS` for a node that posts one
+    /// transition in several transactions.
     pub fn set_blob_cap(&mut self, cap: usize) -> Result<(), Error> {
-        if cap == 0 || cap > TX_BLOB_CAP {
+        if cap == 0 || cap > MAX_BLOBS {
             return Err(Error::Invalid(format!(
-                "blob cap {cap} not in 1..={TX_BLOB_CAP}"
+                "blob cap {cap} not in 1..={MAX_BLOBS}"
             )));
         }
         self.blob_cap = cap;
@@ -252,13 +338,25 @@ impl<S: Storage> ProcessState<S> {
         self.committed.clone()
     }
 
+    /// Drops the storage's cached read snapshot. Call when idle: an open
+    /// snapshot keeps the database from reusing pages freed after it.
+    pub fn release_reads(&self) {
+        self.db.release_snapshot();
+    }
+
     /// Number of occupied ballot slots.
     pub fn occupied(&self) -> usize {
         self.occupied.len()
     }
 
+    /// Whether `vid` is in the committed tree. Read at the committed root,
+    /// never the tree's current one, which a prepare (or one whose reset
+    /// failed) has moved ahead.
     pub fn has_vote_id(&self, vid: u64) -> Result<bool, Error> {
-        Ok(self.tree.get(&key_bytes(vid))?.is_some())
+        Ok(self
+            .tree
+            .gen_proof_at(&self.committed.root, &key_bytes(vid))?
+            .exists)
     }
 
     /// The active (committed) ballot of `slot`, if occupied.
@@ -283,15 +381,15 @@ impl<S: Storage> ProcessState<S> {
     /// FIFO batch selection: at most one vote per slot, no reused vote id,
     /// the on-chain `max_voters` cap on distinct voters, at most `max_votes`
     /// (and `MAX_BATCH_SIZE`) votes, and the whole transition (refreshes
-    /// included) within the blob cap (`TX_BLOB_CAP` unless
-    /// [`Self::set_blob_cap`] lowered it). Votes that don't fit are left for
-    /// a later batch; the flag is true when the blob or refresh cap turned
-    /// one away (the transaction is full).
+    /// included) within the blob cap ([`Self::set_blob_cap`]). Votes that
+    /// don't fit are left for a later batch; the flag is true when the blob
+    /// or refresh cap turned one away (the allowed blobs are full).
     ///
     /// The refresh count is at least the live `must_include` slots (the
     /// exposed set `prepare` will keep), so a large exposed set shrinks the
-    /// batch. If not even one vote fits next to it (more than `MAX_REFRESH`
-    /// live slots, or the blob cap), this returns `RefreshOverflow`.
+    /// batch. If a vote does not fit even alone next to it (more than
+    /// `MAX_REFRESH` live slots, or the blob cap), this returns
+    /// `RefreshOverflow`.
     pub fn select_batch<'a>(
         &self,
         pending: &'a [VerifiedVote],
@@ -299,24 +397,91 @@ impl<S: Storage> ProcessState<S> {
         must_include: &BTreeSet<u64>,
         max_votes: usize,
     ) -> Result<(Vec<&'a VerifiedVote>, bool), Error> {
+        self.select_batch_within(pending, max_voters, must_include, max_votes, self.blob_cap)
+    }
+
+    /// [`Self::select_batch`] within at most `max_blobs` blobs (never above
+    /// the blob cap): a node whose landing time fits fewer blob
+    /// transactions sizes the batch down to them. A vote that fits the cap
+    /// but not `max_blobs` is skipped (`Ok` with the flag set: wait for a
+    /// wider window); `RefreshOverflow` means the blob cap or `MAX_REFRESH`
+    /// binds (permanent). `prepare` keeps checking the blob cap, which a
+    /// selection made here never passes.
+    pub fn select_batch_within<'a>(
+        &self,
+        pending: &'a [VerifiedVote],
+        max_voters: u64,
+        must_include: &BTreeSet<u64>,
+        max_votes: usize,
+        max_blobs: usize,
+    ) -> Result<(Vec<&'a VerifiedVote>, bool), Error> {
+        let none = Coverage::default();
+        let sel = self.select_covered(
+            pending,
+            max_voters,
+            must_include,
+            &none,
+            max_votes,
+            max_blobs,
+        )?;
+        Ok((sel.votes, sel.blocked))
+    }
+
+    /// [`Self::select_batch_within`] with per-vote coverage: a vote is
+    /// charged `base` plus the histories (`cov`) of the votes selected so
+    /// far and its own, never those of votes left out. A vote that does not
+    /// fit is skipped (its slot too, keeping cast order), the rest go on.
+    /// `CoverageOverflow` names a vote whose own history does not fit even
+    /// alone at the blob cap; `RefreshOverflow` means `base` alone does not.
+    /// Returns the selection, whether a vote was turned away (`blocked`) and
+    /// whether that was the batch being full (`full`: `max_votes` reached, or
+    /// a vote bringing no history of its own did not fit), and the slots its
+    /// seal must refresh (`base` and the selected votes' histories).
+    pub fn select_covered<'a>(
+        &self,
+        pending: &'a [VerifiedVote],
+        max_voters: u64,
+        base: &BTreeSet<u64>,
+        cov: &Coverage,
+        max_votes: usize,
+        max_blobs: usize,
+    ) -> Result<Selection<'a>, Error> {
+        if max_blobs == 0 {
+            return Err(Error::Invalid("max_blobs must be at least 1".into()));
+        }
+        let cap = max_blobs.min(self.blob_cap);
         let nf = self.cfg.ballot_mode.num_fields;
         let occupied_before = self.occupied.len();
+        let live = |s: &u64| self.occupied.binary_search(s).is_ok();
+        // Whether a batch of `n` votes, `w` of them overwrites, refreshing
+        // at least `e` must slots fits `cap` blobs.
+        let fits = |n: usize, w: usize, e: usize, cap: usize| {
+            let r = limits::required_refresh(n, w, occupied_before).max(e);
+            r <= MAX_REFRESH && blob::blob_count(n, n + r, nf) <= cap
+        };
         let mut out: Vec<&VerifiedVote> = Vec::new();
         let mut slots: HashSet<u64> = HashSet::new();
+        // Slots of votes turned away: later votes of the slot wait too.
+        let mut held: HashSet<u64> = HashSet::new();
         let mut vids: HashSet<u64> = HashSet::new();
+        let mut cover: BTreeSet<u64> = base.clone();
+        let mut used: HashSet<usize> = HashSet::new();
         let mut new_distinct = 0u64;
         let mut w = 0usize;
-        // Live exposed slots that stay refresh candidates.
-        let mut exposed = must_include
-            .iter()
-            .filter(|s| self.occupied.binary_search(s).is_ok())
-            .count();
+        // Live cover slots that stay refresh candidates (not written).
+        let mut exposed = cover.iter().filter(|s| live(s)).count();
         let mut blocked = false;
+        let mut full = false;
         for v in pending {
             if out.len() >= max_votes.min(MAX_BATCH_SIZE) {
+                full = true;
                 break;
             }
-            if slots.contains(&v.slot) || vids.contains(&v.pkg.vote_id) {
+            if slots.contains(&v.slot) || held.contains(&v.slot) || vids.contains(&v.pkg.vote_id) {
+                continue;
+            }
+            // A vote whose history was not read would be charged nothing.
+            if !cov.covers(v.pkg.vote_id) {
                 continue;
             }
             // A reused vote id would fail the guest's INSERT; a storage
@@ -324,21 +489,58 @@ impl<S: Storage> ProcessState<S> {
             if self.has_vote_id(v.pkg.vote_id)? {
                 continue;
             }
-            let overwrite = self.occupied.binary_search(&v.slot).is_ok();
+            let overwrite = live(&v.slot);
             if !overwrite && self.occupied.len() as u64 + new_distinct + 1 > max_voters {
                 continue;
             }
-            // Blob cap: n votes plus the refreshes the guest will demand or
-            // the exposed set forces, whichever is larger. An overwritten
-            // exposed slot is written, not refreshed.
-            let n = out.len() + 1;
+            // Its history beyond the cover so far.
+            let entries: Vec<usize> = cov
+                .entries_of(v.pkg.vote_id)
+                .iter()
+                .copied()
+                .filter(|i| !used.contains(i))
+                .collect();
+            let added: BTreeSet<u64> = entries
+                .iter()
+                .flat_map(|i| cov.entries[*i].iter().copied())
+                .filter(|s| !cover.contains(s))
+                .collect();
+            let add_live = added
+                .iter()
+                .filter(|s| live(s) && !slots.contains(s))
+                .count();
+            // An overwritten cover slot is written, not refreshed.
+            let own = overwrite && (cover.contains(&v.slot) || added.contains(&v.slot));
+            let e1 = (exposed + add_live).saturating_sub(own as usize);
             let w1 = w + overwrite as usize;
-            let e1 = exposed.saturating_sub((overwrite && must_include.contains(&v.slot)) as usize);
-            let r = limits::required_refresh(n, w1, occupied_before).max(e1);
-            if r > MAX_REFRESH || blob::blob_count(n, n + r, nf) > self.blob_cap {
+            if !fits(out.len() + 1, w1, e1, cap) {
                 blocked = true;
+                full |= added.is_empty();
+                held.insert(v.slot);
+                // Alone, at the blob cap: does it ever fit?
+                let mut alone: BTreeSet<u64> = base.clone();
+                for i in cov.entries_of(v.pkg.vote_id) {
+                    alone.extend(cov.entries[*i].iter().copied());
+                }
+                let mine = alone.iter().filter(|s| live(s)).count();
+                let e = mine.saturating_sub((overwrite && alone.contains(&v.slot)) as usize);
+                if !fits(1, overwrite as usize, e, self.blob_cap) {
+                    let base_live = base.iter().filter(|s| live(s)).count();
+                    if fits(1, overwrite as usize, base_live, self.blob_cap) {
+                        return Err(Error::CoverageOverflow {
+                            vote_id: v.pkg.vote_id,
+                            slots: e,
+                        });
+                    }
+                    return Err(Error::RefreshOverflow {
+                        exposed: base_live,
+                        votes: 1,
+                    });
+                }
                 continue;
             }
+            cover.extend(added);
+            used.extend(entries);
             w = w1;
             exposed = e1;
             if !overwrite {
@@ -348,12 +550,12 @@ impl<S: Storage> ProcessState<S> {
             vids.insert(v.pkg.vote_id);
             out.push(v);
         }
-        // One vote with its own refreshes always fits, so an empty batch
-        // here means the exposed set alone is too large.
-        if out.is_empty() && blocked {
-            return Err(Error::RefreshOverflow { exposed, votes: 1 });
-        }
-        Ok((out, blocked))
+        Ok(Selection {
+            votes: out,
+            blocked,
+            full,
+            cover,
+        })
     }
 
     /// Applies a prepared batch after its proof was accepted: slot store,
@@ -378,6 +580,18 @@ impl<S: Storage> ProcessState<S> {
         self.occupied = occ;
         self.committed = committed;
         Ok(())
+    }
+
+    /// Whether this storage holds tree root `root`: one our tree reached at
+    /// some point (nodes are keyed by hash and never deleted).
+    pub fn has_root(&self, root: &[u8; 32]) -> Result<bool, Error> {
+        Ok(*root == arbo::EMPTY_HASH || self.db.get(root)?.is_some())
+    }
+
+    /// Points the tree back at the committed root, after a failed prepare
+    /// whose own reset failed. The committed record is authoritative.
+    pub fn reset_to_committed(&mut self) -> Result<(), Error> {
+        Ok(self.tree.set_root(&self.committed.root)?)
     }
 
     /// Drops a prepared batch: the tree goes back to the committed root.
