@@ -106,9 +106,21 @@ pub struct Balances {
     pub organizer_op: U256,
 }
 
+/// The accounts a budget is measured on; index 0 is seq-a, 1 is seq-b.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Accounts {
+    pub l1: [Address; 2],
+    pub op: [Address; 2],
+    pub organizer: Address,
+}
+
 /// `<campaign>/budget.json`, written at the first go.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
+    /// What `start` was read from; `None` in a file written before they were
+    /// recorded, which [`Budget::check_accounts`] refuses.
+    #[serde(default)]
+    pub accounts: Option<Accounts>,
     pub start: Balances,
     /// Transfers `fund` made since the start.
     #[serde(default)]
@@ -119,7 +131,7 @@ pub struct Budget {
 impl Budget {
     /// A budget needs funded sequencer accounts: below its cap, an account
     /// could never reach the cap by spending.
-    pub fn new(start: Balances, caps: Caps) -> Result<Budget, String> {
+    pub fn new(accounts: Accounts, start: Balances, caps: Caps) -> Result<Budget, String> {
         let mut low = Vec::new();
         for (n, b, cap) in [
             ("seq-a.l1", start.l1[0], caps.l1_per_key),
@@ -133,6 +145,7 @@ impl Budget {
         }
         if low.is_empty() {
             Ok(Budget {
+                accounts: Some(accounts),
                 start,
                 inflows: Balances::default(),
                 caps,
@@ -140,6 +153,34 @@ impl Budget {
         } else {
             Err(format!("fund first: {}", low.join("; ")))
         }
+    }
+
+    /// Fails unless the budget was measured on `acc`: another account's
+    /// balance against this start reads as no spend, and no cap would fire.
+    pub fn check_accounts(&self, acc: &Accounts) -> Result<()> {
+        let Some(b) = &self.accounts else {
+            bail!(
+                "budget.json records no accounts; if it was measured on these keys, add \"accounts\": {}",
+                serde_json::to_string(acc)?
+            );
+        };
+        let diff: Vec<String> = [
+            ("seq-a.l1", b.l1[0], acc.l1[0]),
+            ("seq-b.l1", b.l1[1], acc.l1[1]),
+            ("seq-a.op", b.op[0], acc.op[0]),
+            ("seq-b.op", b.op[1], acc.op[1]),
+            ("organizer", b.organizer, acc.organizer),
+        ]
+        .into_iter()
+        .filter(|(_, was, is)| was != is)
+        .map(|(n, was, is)| format!("{n} was {was}, the key is {is}"))
+        .collect();
+        ensure!(
+            diff.is_empty(),
+            "budget.json was measured on other accounts: {}",
+            diff.join("; ")
+        );
+        Ok(())
     }
 
     /// Balances fell since the start plus the inflows.
@@ -419,12 +460,6 @@ async fn balances(op: &DynProvider, l1: &DynProvider, a: &Accounts) -> Result<Ba
     })
 }
 
-struct Accounts {
-    l1: [Address; 2],
-    op: [Address; 2],
-    organizer: Address,
-}
-
 fn two_keys(var: &str) -> Result<[Address; 2]> {
     let v = env_list(var);
     ensure!(
@@ -437,26 +472,32 @@ fn two_keys(var: &str) -> Result<[Address; 2]> {
     ])
 }
 
+/// The accounts of the key files `DAVINCI_E2E_L1_KEYS`,
+/// `DAVINCI_E2E_SEQUENCER_KEYS` and `DAVINCI_E2E_ORGANIZER_KEY` name.
+pub fn env_accounts() -> Result<Accounts> {
+    let org = std::env::var("DAVINCI_E2E_ORGANIZER_KEY").context("DAVINCI_E2E_ORGANIZER_KEY")?;
+    Ok(Accounts {
+        l1: two_keys("DAVINCI_E2E_L1_KEYS")?,
+        op: two_keys("DAVINCI_E2E_SEQUENCER_KEYS")?,
+        organizer: crate::net::read_key(Path::new(&org))?.address(),
+    })
+}
+
 /// Adds a transfer to `<campaign>/budget.json`'s inflows (a no-op while the
 /// file does not exist: the first go then starts from the funded balances).
 /// Call before sending, so a failed send only makes the budget stricter.
 pub fn record_inflow(campaign: &Path, to: Address, l1: bool, amount: U256) -> Result<()> {
-    record_inflow_with(campaign, to, l1, amount, |l1| {
-        two_keys(if l1 {
-            "DAVINCI_E2E_L1_KEYS"
-        } else {
-            "DAVINCI_E2E_SEQUENCER_KEYS"
-        })
-    })
+    record_inflow_with(campaign, to, l1, amount, env_accounts)
 }
 
-/// [`record_inflow`] with the sequencer addresses (a side's A and B) from `keys`.
+/// [`record_inflow`] with the current accounts from `keys`; the budget must
+/// have been measured on them.
 pub fn record_inflow_with(
     campaign: &Path,
     to: Address,
     l1: bool,
     amount: U256,
-    keys: impl FnOnce(bool) -> Result<[Address; 2]>,
+    keys: impl FnOnce() -> Result<Accounts>,
 ) -> Result<()> {
     let path = campaign.join("budget.json");
     let raw = match std::fs::read(&path) {
@@ -466,10 +507,12 @@ pub fn record_inflow_with(
     };
     let mut b: Budget =
         serde_json::from_slice(&raw).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    let acc = keys()?;
+    b.check_accounts(&acc)?;
     let (keys, slots) = if l1 {
-        (keys(true)?, &mut b.inflows.l1)
+        (acc.l1, &mut b.inflows.l1)
     } else {
-        (keys(false)?, &mut b.inflows.op)
+        (acc.op, &mut b.inflows.op)
     };
     let i = keys
         .iter()
@@ -497,12 +540,7 @@ pub async fn gate_check(campaign: Option<&Path>, own: &[u32]) -> Result<GateRepo
     let l1 = ProviderBuilder::new()
         .connect_client(chain::rpc(&l1_rpc)?)
         .erased();
-    let org = std::env::var("DAVINCI_E2E_ORGANIZER_KEY").context("DAVINCI_E2E_ORGANIZER_KEY")?;
-    let acc = Accounts {
-        l1: two_keys("DAVINCI_E2E_L1_KEYS")?,
-        op: two_keys("DAVINCI_E2E_SEQUENCER_KEYS")?,
-        organizer: crate::net::read_key(Path::new(&org))?.address(),
-    };
+    let acc = env_accounts()?;
 
     let f = fees(&l1).await?;
     r.lines.push(format!(
@@ -526,10 +564,14 @@ pub async fn gate_check(campaign: Option<&Path>, own: &[u32]) -> Result<GateRepo
         };
         let path = dir.join("budget.json");
         let budget = match std::fs::read(&path) {
-            Ok(b) => serde_json::from_slice::<Budget>(&b)
-                .map_err(|e| anyhow!("{}: {e}", path.display()))?,
+            Ok(b) => {
+                let b = serde_json::from_slice::<Budget>(&b)
+                    .map_err(|e| anyhow!("{}: {e}", path.display()))?;
+                b.check_accounts(&acc)?;
+                b
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match Budget::new(now.clone(), caps.clone()) {
+                match Budget::new(acc, now.clone(), caps.clone()) {
                     Ok(b) => {
                         if r.problems.is_empty() {
                             std::fs::write(&path, serde_json::to_vec_pretty(&b)?)
@@ -540,6 +582,7 @@ pub async fn gate_check(campaign: Option<&Path>, own: &[u32]) -> Result<GateRepo
                     Err(why) => {
                         r.problems.push(format!("budget: {why}"));
                         Budget {
+                            accounts: Some(acc),
                             start: now.clone(),
                             inflows: Balances::default(),
                             caps,
@@ -701,6 +744,7 @@ mod tests {
     fn budget_stops_at_a_cap() {
         let e = |x: u64| U256::from(x);
         let b = Budget {
+            accounts: None,
             inflows: Balances::default(),
             start: Balances {
                 l1: [e(1000), e(1000)],
@@ -735,18 +779,19 @@ mod tests {
             op: [e(100), e(100)],
             organizer_op: e(500),
         };
-        let err = Budget::new(low, b.caps.clone()).unwrap_err();
+        let err = Budget::new(accounts(), low, b.caps.clone()).unwrap_err();
         assert!(
             err.contains("fund first") && err.contains("seq-b.l1"),
             "{err}"
         );
-        assert!(Budget::new(b.start.clone(), b.caps.clone()).is_ok());
+        assert!(Budget::new(accounts(), b.start.clone(), b.caps.clone()).is_ok());
     }
 
     #[test]
     fn caps_are_the_owners() {
         let e = |x: u64| U256::from(x);
         let mut b = Budget {
+            accounts: None,
             inflows: Balances::default(),
             start: Balances {
                 l1: [e(10u64.pow(15)), e(10u64.pow(15))],
@@ -848,10 +893,18 @@ mod tests {
         assert_eq!(gaps, vec!["seq-a.l1".to_string()]);
     }
 
+    fn accounts() -> Accounts {
+        Accounts {
+            l1: [Address::repeat_byte(1), Address::repeat_byte(2)],
+            op: [Address::repeat_byte(3), Address::repeat_byte(4)],
+            organizer: Address::repeat_byte(5),
+        }
+    }
+
     #[test]
     fn record_inflow_adds_once_to_the_matching_slot() {
         let d = tempfile::tempdir().unwrap();
-        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let b = Address::repeat_byte(2);
         let one = U256::from(1u8);
         let bal = Balances {
             l1: [one; 2],
@@ -863,17 +916,57 @@ mod tests {
             op_per_key: one,
             organizer_op: one,
         };
-        let budget = Budget::new(bal, caps).unwrap();
+        let budget = Budget::new(accounts(), bal, caps).unwrap();
         std::fs::write(
             d.path().join("budget.json"),
             serde_json::to_vec(&budget).unwrap(),
         )
         .unwrap();
         let amount = U256::from(7u8);
-        record_inflow_with(d.path(), b, true, amount, |_| Ok([a, b])).unwrap();
+        record_inflow_with(d.path(), b, true, amount, || Ok(accounts())).unwrap();
         let got: Budget =
             serde_json::from_slice(&std::fs::read(d.path().join("budget.json")).unwrap()).unwrap();
         assert_eq!(got.inflows.l1, [U256::ZERO, amount]);
         assert_eq!(got.inflows.op, [U256::ZERO; 2]);
+    }
+
+    #[test]
+    fn a_budget_of_other_accounts_is_refused() {
+        let one = U256::from(1u8);
+        let bal = Balances {
+            l1: [one; 2],
+            op: [one; 2],
+            organizer_op: one,
+        };
+        let caps = Caps {
+            l1_per_key: one,
+            op_per_key: one,
+            organizer_op: one,
+        };
+        let budget = Budget::new(accounts(), bal, caps).unwrap();
+        assert!(budget.check_accounts(&accounts()).is_ok());
+        // seq-b's OP key changed after the gate measured the start.
+        let mut now = accounts();
+        now.op[1] = Address::repeat_byte(9);
+        let err = budget.check_accounts(&now).unwrap_err().to_string();
+        assert!(err.contains("seq-b.op") && !err.contains("seq-a"), "{err}");
+        let mut org = accounts();
+        org.organizer = Address::repeat_byte(9);
+        assert!(budget.check_accounts(&org).is_err());
+        // A file from before the accounts were recorded parses, and is refused.
+        let mut old = serde_json::to_value(&budget).unwrap();
+        old.as_object_mut().unwrap().remove("accounts");
+        let old: Budget = serde_json::from_value(old).unwrap();
+        assert_eq!(old.accounts, None);
+        let err = old.check_accounts(&accounts()).unwrap_err().to_string();
+        assert!(err.contains("records no accounts"), "{err}");
+        // An inflow is not recorded against other accounts, and the file stays.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("budget.json");
+        let raw = serde_json::to_vec(&budget).unwrap();
+        std::fs::write(&path, &raw).unwrap();
+        let to = now.op[1];
+        assert!(record_inflow_with(d.path(), to, false, one, || Ok(now)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
     }
 }

@@ -693,6 +693,7 @@ async fn real_main() -> Result<ExitCode> {
                 &std::fs::read(&path).context("budget.json: run `gate --campaign` first")?,
             )
             .with_context(|| format!("parse {}", path.display()))?;
+            budget.check_accounts(&money::env_accounts()?)?;
             if budget.set_caps(cap_l1.as_deref(), cap_op.as_deref(), cap_org.as_deref())? {
                 std::fs::write(&path, serde_json::to_vec_pretty(&budget)?)
                     .with_context(|| format!("write {}", path.display()))?;

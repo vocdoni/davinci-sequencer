@@ -2845,6 +2845,7 @@ mod tests {
         assert_eq!(need, 52_485_760_000_000);
         let ueth = |x: u64| U256::from(x) * U256::from(1_000_000_000_000u64);
         let budget = Budget {
+            accounts: None,
             start: Balances {
                 l1: [ueth(1000), ueth(1000)],
                 ..Balances::default()
@@ -2876,6 +2877,7 @@ mod tests {
         use crate::bench::money::Caps;
         let e = |x: u64| U256::from(x);
         let b = Budget {
+            accounts: None,
             start: Balances {
                 l1: [e(1000), e(1000)],
                 op: [e(100), e(100)],
