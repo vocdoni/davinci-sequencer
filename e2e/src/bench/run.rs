@@ -1864,6 +1864,10 @@ pub async fn run_scenario_in(
     let t0 = Instant::now();
     let t0_unix = unix_now();
     report.params.insert("t0".into(), format!("{t0_unix:.0}"));
+    report.params.insert(
+        "fee ceilings".into(),
+        money::ceilings().map_or_else(|e| e, |c| money::describe(&c)),
+    );
     let meta = RunMeta {
         name: sc.name.clone(),
         wave: sc.wave,

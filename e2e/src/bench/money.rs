@@ -31,19 +31,64 @@ pub const MAX_EXEC: u128 = 500_000_000;
 /// Blob base fee, at most 0.02 gwei.
 pub const MAX_BLOB: u128 = 20_000_000;
 
-/// A ceiling in wei, raised for a deliberate high-fee run by `var`.
-fn ceiling(var: &str, default: u128) -> u128 {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
+const MAX_EXEC_VAR: &str = "DAVINCI_BENCH_MAX_EXEC_WEI";
+const MAX_BLOB_VAR: &str = "DAVINCI_BENCH_MAX_BLOB_WEI";
+
+/// A fee ceiling in wei; `overridden` when its env var set it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ceiling {
+    pub wei: u128,
+    pub overridden: bool,
 }
 
+/// `raw`, the value of `var`, raises the ceiling for a deliberate high-fee
+/// run; one that is no wei amount is an error, never the default.
+fn ceiling_of(var: &str, raw: Option<&str>, default: u128) -> Result<Ceiling, String> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(Ceiling {
+            wei: default,
+            overridden: false,
+        }),
+        Some(v) => v
+            .parse()
+            .map(|wei| Ceiling {
+                wei,
+                overridden: true,
+            })
+            .map_err(|_| format!("{var} {v:?} is not a wei amount")),
+    }
+}
+
+/// The exec (base fee plus tip) and blob ceilings the gate applies.
+pub fn ceilings() -> Result<[Ceiling; 2], String> {
+    let c = |var: &str, default| ceiling_of(var, std::env::var(var).ok().as_deref(), default);
+    Ok([c(MAX_EXEC_VAR, MAX_EXEC)?, c(MAX_BLOB_VAR, MAX_BLOB)?])
+}
+
+/// `exec X wei blob Y wei`, naming the variables that override them.
+pub fn describe(c: &[Ceiling; 2]) -> String {
+    let over: Vec<&str> = [MAX_EXEC_VAR, MAX_BLOB_VAR]
+        .into_iter()
+        .zip(c)
+        .filter(|(_, c)| c.overridden)
+        .map(|(v, _)| v)
+        .collect();
+    let mut s = format!("exec {} wei blob {} wei", c[0].wei, c[1].wei);
+    if !over.is_empty() {
+        s.push_str(&format!(" (override {})", over.join(", ")));
+    }
+    s
+}
+
+/// [`gate_with`] at the [`ceilings`].
 pub fn gate(f: &Fees) -> Result<(), String> {
-    let max_exec = ceiling("DAVINCI_BENCH_MAX_EXEC_WEI", MAX_EXEC);
-    let max_blob = ceiling("DAVINCI_BENCH_MAX_BLOB_WEI", MAX_BLOB);
+    let [exec, blob] = ceilings()?;
+    gate_with(f, exec.wei, blob.wei)
+}
+
+pub fn gate_with(f: &Fees, max_exec: u128, max_blob: u128) -> Result<(), String> {
     let mut why = Vec::new();
-    if f.base + f.tip > max_exec {
+    if f.base.saturating_add(f.tip) > max_exec {
         why.push(format!(
             "base {} + tip {} wei is above {max_exec}",
             f.base, f.tip
@@ -547,6 +592,10 @@ pub async fn gate_check(campaign: Option<&Path>, own: &[u32]) -> Result<GateRepo
         "fees: base {} + tip {} wei, blob {} wei",
         f.base, f.tip, f.blob
     ));
+    match ceilings() {
+        Ok(c) => r.lines.push(format!("ceilings: {}", describe(&c))),
+        Err(why) => r.problems.push(format!("ceilings: {why}")),
+    }
     if let Err(why) = gate(&f) {
         r.problems.push(format!("fees: {why}"));
     }
@@ -716,6 +765,7 @@ mod tests {
             tip: 100_000_000,
             blob: 20_000_000,
         };
+        let gate = |f: &Fees| gate_with(f, MAX_EXEC, MAX_BLOB);
         assert!(gate(&ok).is_ok());
         assert!(
             gate(&Fees {
@@ -738,6 +788,47 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn ceiling_overrides_are_flagged() {
+        let none = ceiling_of(MAX_EXEC_VAR, None, MAX_EXEC).unwrap();
+        assert_eq!(
+            none,
+            Ceiling {
+                wei: MAX_EXEC,
+                overridden: false
+            }
+        );
+        assert_eq!(ceiling_of(MAX_EXEC_VAR, Some(" "), MAX_EXEC), Ok(none));
+        let raised = ceiling_of(MAX_EXEC_VAR, Some(" 2000000000 "), MAX_EXEC).unwrap();
+        assert_eq!(
+            raised,
+            Ceiling {
+                wei: 2_000_000_000,
+                overridden: true
+            }
+        );
+        // A typo is no silent default.
+        let err = ceiling_of(MAX_BLOB_VAR, Some("1gwei"), MAX_BLOB).unwrap_err();
+        assert!(err.contains(MAX_BLOB_VAR), "{err}");
+        let blob = ceiling_of(MAX_BLOB_VAR, None, MAX_BLOB).unwrap();
+        assert_eq!(
+            describe(&[none, blob]),
+            "exec 500000000 wei blob 20000000 wei"
+        );
+        assert_eq!(
+            describe(&[raised, blob]),
+            "exec 2000000000 wei blob 20000000 wei (override DAVINCI_BENCH_MAX_EXEC_WEI)"
+        );
+        // The raised ceiling is what the gate applies.
+        let f = Fees {
+            base: 1_500_000_000,
+            tip: 100_000_000,
+            blob: 1,
+        };
+        assert!(gate_with(&f, MAX_EXEC, MAX_BLOB).is_err());
+        assert!(gate_with(&f, raised.wei, blob.wei).is_ok());
     }
 
     #[test]
