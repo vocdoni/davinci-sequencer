@@ -218,17 +218,15 @@ struct RigArgs {
     /// API ports of nodes A, B and O.
     #[arg(long, value_delimiter = ',', default_value = "9101,9102,9103")]
     ports: Vec<u16>,
+    /// Node A's prover, on this host.
     #[arg(
         long,
         env = "DAVINCI_BENCH_PROVER_A",
         default_value = "http://127.0.0.1:8080"
     )]
     prover_a: String,
-    #[arg(
-        long,
-        env = "DAVINCI_BENCH_PROVER_B",
-        default_value = "http://10.200.0.27:8080"
-    )]
+    /// Node B's prover, on another host: required, there is no default.
+    #[arg(long, env = "DAVINCI_BENCH_PROVER_B")]
     prover_b: String,
 }
 
@@ -948,6 +946,31 @@ async fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {}", davinci_e2e::redact_urls(&format!("{e:#}")));
             ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn prover_b_has_no_default() {
+        let cli = Cli::command();
+        cli.clone().debug_assert();
+        for sub in ["plan", "run", "audit", "serve", "dry"] {
+            let a = cli
+                .find_subcommand(sub)
+                .and_then(|c| c.get_arguments().find(|a| a.get_id() == "prover_b"))
+                .unwrap_or_else(|| panic!("{sub} takes --prover-b"));
+            assert!(a.get_default_values().is_empty(), "{sub}");
+            assert!(a.is_required_set(), "{sub}");
+            assert_eq!(
+                a.get_env(),
+                Some(std::ffi::OsStr::new("DAVINCI_BENCH_PROVER_B"))
+            );
         }
     }
 }
