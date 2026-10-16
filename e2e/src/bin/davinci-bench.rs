@@ -679,6 +679,8 @@ async fn real_main() -> Result<ExitCode> {
             rig,
         } => {
             require_live("run")?;
+            // A mistyped ceiling override is a config error: fail now, not as a fee breach per scenario.
+            money::ceilings().map_err(anyhow::Error::msg)?;
             let campaign = campaign
                 .canonicalize()
                 .with_context(|| format!("campaign {}", campaign.display()))?;
