@@ -783,6 +783,33 @@ fn budget_breach(ctx: &Ctx, now: &Balances) -> Option<String> {
     ctx.budget.as_ref().and_then(|b| b.check(now).err())
 }
 
+/// Unreadable balances in a row (one read per `TICK`) before the budget
+/// stops the run: 3 min with sends paused.
+const BALANCE_FAILS: u32 = 6;
+
+/// The budget's call on one progress tick.
+#[derive(Clone, Debug, PartialEq)]
+enum Decision {
+    Go,
+    /// New sends pause until the balances read again.
+    Pause(String),
+    Stop(String),
+}
+
+/// A cap reached stops; balances that cannot be read are no go, like fees
+/// that cannot be read: sends pause, and stop after `BALANCE_FAILS` reads in
+/// a row (`failures` counts this one). No budget (anvil) is always a go.
+fn budget_decision(b: Option<&Budget>, now: Option<&Balances>, failures: u32) -> Decision {
+    let Some(b) = b else {
+        return Decision::Go;
+    };
+    match now {
+        Some(n) => b.check(n).map_or_else(Decision::Stop, |()| Decision::Go),
+        None if failures >= BALANCE_FAILS => Decision::Stop("balances unreadable".into()),
+        None => Decision::Pause("balances unreadable".into()),
+    }
+}
+
 /// The fee gate and the budget before a scenario: `None` on a go; a budget
 /// breach stops at once, a fee breach after `GATE_WAIT`. On a fee go,
 /// `need` (the scenario's per-key bound at those fees, wei) must fit what
@@ -947,8 +974,11 @@ impl Liner {
     }
 }
 
-/// One progress tick: the line, then the budget (a breach stops) and the
-/// fee gate (a breach pauses new sends, and stops them after `FEE_PAUSE`).
+/// One progress tick: the line, then the budget (a breach stops, unreadable
+/// balances pause new sends and stop them after `BALANCE_FAILS`) and the fee
+/// gate (a breach pauses new sends, and stops them after `FEE_PAUSE`).
+/// `bal_fails` counts the unreadable balance reads in a row.
+#[allow(clippy::too_many_arguments)]
 async fn tick_once(
     ctx: &Ctx,
     name: &str,
@@ -957,22 +987,41 @@ async fn tick_once(
     logs: &LogReader,
     sub: &Submitter,
     fee_since: &mut Option<Instant>,
+    bal_fails: &mut u32,
 ) -> Result<Option<Stop>> {
     let (now, fees) = line.print(ctx, ledger, logs).await?;
-    if let Some(w) = now.as_ref().and_then(|b| budget_breach(ctx, b)) {
-        return Ok(Some(Stop::Budget(w)));
-    }
-    if let Some(w) = fee_breach(&ctx.net, fees) {
-        let since = *fee_since.get_or_insert_with(Instant::now);
-        sub.pause(true);
-        if since.elapsed() >= FEE_PAUSE {
-            return Ok(Some(Stop::Fees(w)));
+    let was_paused = *bal_fails > 0 || fee_since.is_some();
+    *bal_fails = match (&ctx.budget, &now) {
+        (Some(_), None) => bal_fails.saturating_add(1),
+        _ => 0,
+    };
+    let unread = match budget_decision(ctx.budget.as_ref(), now.as_ref(), *bal_fails) {
+        Decision::Stop(w) => return Ok(Some(Stop::Budget(w))),
+        Decision::Pause(w) => {
+            eprintln!("{name}: {w} ({bal_fails} in a row): sends paused");
+            true
         }
-        eprintln!("{name}: fee gate no-go ({w}): sends paused");
-    } else if fee_since.take().is_some() {
-        eprintln!("{name}: fee gate go: sends resume");
-        sub.pause(false);
+        Decision::Go => false,
+    };
+    let fee = fee_breach(&ctx.net, fees);
+    match &fee {
+        Some(w) => {
+            let since = *fee_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= FEE_PAUSE {
+                sub.pause(true);
+                return Ok(Some(Stop::Fees(w.clone())));
+            }
+            eprintln!("{name}: fee gate no-go ({w}): sends paused");
+        }
+        None => {
+            *fee_since = None;
+        }
     }
+    let paused = unread || fee.is_some();
+    if was_paused && !paused {
+        eprintln!("{name}: fee gate and budget go: sends resume");
+    }
+    sub.pause(paused);
     Ok(None)
 }
 
@@ -1929,6 +1978,7 @@ pub async fn run_scenario_in(
     let mut done = Lanes::default();
     let mut stop: Option<Stop> = None;
     let mut fee_since: Option<Instant> = None;
+    let mut bal_fails = 0u32;
     let mut seen = 0usize;
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     let mut chaos_tick = tokio::time::interval(Duration::from_secs(1));
@@ -1950,7 +2000,7 @@ pub async fn run_scenario_in(
             tokio::select! {
                 r = &mut fut => break Some(r),
                 _ = tick.tick() => {
-                    if let Some(s) = tick_once(ctx, &name, &line, &ledger, &logs, &sub, &mut fee_since).await? {
+                    if let Some(s) = tick_once(ctx, &name, &line, &ledger, &logs, &sub, &mut fee_since, &mut bal_fails).await? {
                         stop = Some(s);
                         // The rounds see the stop: sends give up, waits end.
                         sub.stop();
@@ -2000,7 +2050,7 @@ pub async fn run_scenario_in(
                 }
             }
             _ = tick.tick() => {
-                stop = tick_once(ctx, &name, &line, &ledger, &logs, &sub, &mut fee_since).await?;
+                stop = tick_once(ctx, &name, &line, &ledger, &logs, &sub, &mut fee_since, &mut bal_fails).await?;
             }
             _ = chaos_tick.tick(), if chaos.is_some() => {
                 chaos_step(chaos, rig, &ctx.net, &logs.snapshot(), &mut seen, t0_unix, first_end(&done.ended)).await?;
@@ -2819,6 +2869,43 @@ mod tests {
         now.l1[1] += ueth(10);
         assert!(fits(&budget, &now, need).is_ok());
         assert_eq!(Stop::Fit(err).label().split(':').next(), Some("budget"));
+    }
+
+    #[test]
+    fn unreadable_balances_pause_then_stop() {
+        use crate::bench::money::Caps;
+        let e = |x: u64| U256::from(x);
+        let b = Budget {
+            start: Balances {
+                l1: [e(1000), e(1000)],
+                op: [e(100), e(100)],
+                organizer_op: e(500),
+            },
+            inflows: Balances::default(),
+            caps: Caps {
+                l1_per_key: e(300),
+                op_per_key: e(50),
+                organizer_op: e(200),
+            },
+        };
+        let unread = Decision::Pause("balances unreadable".into());
+        // One failed read pauses sends; it does not stop.
+        assert_eq!(budget_decision(Some(&b), None, 1), unread);
+        assert_eq!(budget_decision(Some(&b), None, BALANCE_FAILS - 1), unread);
+        // Too many in a row stop the run like a cap.
+        let stop = Decision::Stop("balances unreadable".into());
+        assert_eq!(budget_decision(Some(&b), None, BALANCE_FAILS), stop);
+        assert_eq!(budget_decision(Some(&b), None, BALANCE_FAILS + 9), stop);
+        // A read balance decides by the caps alone.
+        assert_eq!(budget_decision(Some(&b), Some(&b.start), 0), Decision::Go);
+        let mut spent = b.start.clone();
+        spent.op[0] = e(50);
+        assert!(matches!(
+            budget_decision(Some(&b), Some(&spent), 0),
+            Decision::Stop(w) if w.contains("seq-a.op")
+        ));
+        // Anvil has no budget.
+        assert_eq!(budget_decision(None, None, BALANCE_FAILS), Decision::Go);
     }
 
     #[test]
