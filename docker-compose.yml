@@ -17,7 +17,7 @@
 # Watchtower follows. A release that moves the network to a new registry
 # needs no action: the node opens a fresh database for it in the datadir
 # volume and leaves the old one there. A production node pins instead:
-# DAVINCI_SEQUENCER_TAG=v0.6.0 plus DAVINCI_REGISTRY and DAVINCI_START_BLOCK
+# DAVINCI_SEQUENCER_TAG=v0.7.1 plus DAVINCI_REGISTRY and DAVINCI_START_BLOCK
 # in .env (see docs/configuration.md, "Pinning a production node").
 #
 # To build locally instead, with davinci-zkvm/ checked out next to this

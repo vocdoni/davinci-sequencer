@@ -53,14 +53,14 @@ impl Network {
 }
 
 /// OP Mainnet in L1-blob mode: transitions settle on OP, their blobs live on
-/// Ethereum (ZisK 1.3.2 registry deployed 2026-10-13, see docs/deployments.md). Blob sends need an
+/// Ethereum (protocol v5 pre-production registry deployed 2026-10-19, see docs/deployments.md). Blob sends need an
 /// Ethereum RPC that takes 1.5 MB bodies: publicnode refuses them, dRPC takes
 /// them, and the node sends to every L1 endpoint at once.
 pub const OPTIMISM: Network = Network {
     name: "optimism",
     chain_id: 10,
-    registry: address!("64d41aD49009204E8dAcc153Fc98a5Ee14cB6916"),
-    start_block: 158_245_426,
+    registry: address!("6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6"),
+    start_block: 158_414_417,
     rpc_urls: &[
         "https://optimism-rpc.publicnode.com",
         "https://mainnet.optimism.io",
@@ -118,23 +118,20 @@ mod tests {
         }
     }
 
-    // The preset's registry verifies the ZisK 1.3.2 programs: a build
-    // against another davinci-zkvm release would settle nothing there. The
-    // protocol v5 programs differ, so the node refuses this registry at boot
-    // until the redeploy moves the preset and these values.
+    // The preset's registry verifies the protocol v5 programs: a build
+    // against another davinci-zkvm release would settle nothing there.
     #[test]
-    #[ignore = "re-pinned at the OP registry redeploy"]
     fn optimism_pins_equal_the_zkvm_release() {
         use alloy::primitives::hex;
         use davinci_zkvm_sdk::release;
         assert_eq!(
             release::BATCH_PROGRAM_VK,
-            hex!("e39e460085ecddecf365649a61183a71c0fe778aa9c06fd2aa1a6c43cddb988b"),
+            hex!("1e4a74a1c6fb1cd1874d80895e1e075930837955efb4a135539016f7cdead2a8"),
             "batch program vk"
         );
         assert_eq!(
             release::RESULTS_PROGRAM_VK,
-            hex!("394694558f39d0b2da0bbb09322333a0f567ee8d16bea2f354543a086587d167"),
+            hex!("de55d751582e510bf378d4eec0d98ee3fa5817a50b77bc0e5ce560035e29e4e9"),
             "results program vk"
         );
         assert_eq!(
@@ -144,15 +141,15 @@ mod tests {
         );
     }
 
-    // The registry with the DKG and Council adapters (davinci-contracts'
-    // deployments/10.json), whose pins equal the ones above.
+    // The protocol v5 pre-production registry with the DKG and Council
+    // adapters, whose pins equal the ones above.
     #[test]
     fn optimism_preset_is_deployed() {
         assert_eq!(
             OPTIMISM.registry,
-            address!("64d41aD49009204E8dAcc153Fc98a5Ee14cB6916")
+            address!("6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6")
         );
-        assert_eq!(OPTIMISM.start_block, 158_245_426);
+        assert_eq!(OPTIMISM.start_block, 158_414_417);
     }
 
     #[test]
