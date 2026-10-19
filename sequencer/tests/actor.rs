@@ -2848,9 +2848,8 @@ async fn onchain_short_scan_verdict_keeps_queued_votes() {
     let (vid0, vid1) = (v0.pkg.vote_id, v1.pkg.vote_id);
     h.submit(v0).await.unwrap();
     h.submit(v1).await.unwrap();
-    // Let a background sync in flight finish: a good sync clears the mark.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    node.onchain.mark_short_scans_for_test(&c);
+    // The hook waits for a sync in flight, which would clear the mark.
+    node.onchain.mark_short_scans_for_test(&c).await;
     prover.release(100);
     wait_until("v0 settled", async || all_settled(&h, &[vid0]).await).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2888,7 +2887,7 @@ async fn onchain_terminal_verdict_still_closes_out() {
     let vid1 = v1.pkg.vote_id;
     h.submit(v0).await.unwrap();
     h.submit(v1).await.unwrap();
-    node.onchain.mark_terminal_for_test(&c);
+    node.onchain.mark_terminal_for_test(&c).await;
     prover.release(100);
     wait_until("v1 errored", async || {
         h.status(vid1).await.unwrap().unwrap().error.is_some()

@@ -460,9 +460,11 @@ impl OnchainIndex {
     }
 
     /// Test hook: the verdict of three short full scans, as a sync gives it.
+    /// Takes the sync gate, so a sync already running cannot overwrite it.
     #[doc(hidden)]
-    pub fn mark_short_scans_for_test(&self, contract: &[u8; 20]) {
+    pub async fn mark_short_scans_for_test(&self, contract: &[u8; 20]) {
         if let Some(e) = self.entry(contract) {
+            let _g = e.gate.lock().await;
             if let Ok(mut m) = e.suspect.lock() {
                 *m = Some("treeSize says 9, logs show 0 after 3 full scans".into());
             }
@@ -477,10 +479,12 @@ impl OnchainIndex {
         }
     }
 
-    /// Test hook: a terminal verdict (weight change, slot collision).
+    /// Test hook: a terminal verdict (weight change, slot collision). Takes
+    /// the sync gate, so a sync already running cannot overwrite it.
     #[doc(hidden)]
-    pub fn mark_terminal_for_test(&self, contract: &[u8; 20]) {
+    pub async fn mark_terminal_for_test(&self, contract: &[u8; 20]) {
         if let Some(e) = self.entry(contract) {
+            let _g = e.gate.lock().await;
             let mut s = (*e.snapshot()).clone();
             s.meta.unusable = Some("weight of 0x00 changed from 1 at block 1".into());
             e.set(s);
