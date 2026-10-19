@@ -48,6 +48,9 @@ pub const MAX_REPOSTS: u32 = 3;
 /// overlapping the proof. Seconds; the default of `--l1-settle-lag`.
 pub const L1_SETTLE_LAG: u64 = 110;
 
+/// A proof whose transactions carry other blobs than the batch's.
+const OTHER_BLOBS: &str = "the L1 blob transactions carry other blobs";
+
 /// Where a proof is anchored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Anchor {
@@ -96,7 +99,7 @@ pub fn choose_anchor(
         return Anchor::Wait;
     }
     Anchor::At {
-        top: head.min(origin.number + TOP_ABOVE_ORIGIN),
+        top: head.min(origin.number.saturating_add(TOP_ABOVE_ORIGIN)),
         hash: origin.hash,
     }
 }
@@ -140,7 +143,8 @@ macro_rules! repost {
 /// that fails to build (RPC trouble) or anchor for [`PROOF_FAIL_FOR`], or
 /// `TxTooOld` posts every chunk again; each counts one of [`MAX_REPOSTS`].
 /// A proof that keeps failing otherwise (bad header, broken chain, bad trie
-/// proof) ends the settle after [`PROOF_FAIL_FOR`] without a post.
+/// proof) ends the settle after [`PROOF_FAIL_FOR`] without a post; one that
+/// keeps proving other blobs is held then.
 /// `L1OriginMismatch` rebuilds the proof from fresh reads, up to
 /// [`MAX_PROOF_RETRIES`] times. Other reverts end the job with their name,
 /// as in blob mode.
@@ -261,7 +265,8 @@ pub async fn settle(
                 continue;
             }
         };
-        if head < newest + REORG_MARGIN || origin.number < newest {
+        // Endpoint numbers are not trusted to be sane: saturate.
+        if head < newest.saturating_add(REORG_MARGIN) || origin.number < newest {
             pause_or_abort!(da, job);
             continue;
         }
@@ -286,9 +291,9 @@ pub async fn settle(
         let built = match da.l1.build_proof(&hashes, top).await {
             Ok(proof) => match verify_local(&proof, anchor) {
                 Ok((vhs, _)) if vhs == want => Ok(proof),
-                Ok(_) => {
-                    return Settled::Failed("the L1 blob transactions carry other blobs".into());
-                }
+                // One inconsistent read (an endpoint's backends on two forks)
+                // clears on the next build; only a persistent one is held.
+                Ok(_) => Err((false, OTHER_BLOBS.to_string())),
                 Err(e @ (L1ProofError::NoAnchor(_) | L1ProofError::AboveOrigin(_))) => {
                     Err((true, format!("the L1 proof does not anchor: {e}")))
                 }
@@ -305,6 +310,9 @@ pub async fn settle(
             // Retried each poll (a reorg between reads clears); past the
             // window the batch goes back to the queue without a post.
             Err((false, e)) if proof_failing.is_some_and(|t| t.elapsed() >= PROOF_FAIL_FOR) => {
+                if e == OTHER_BLOBS {
+                    return Settled::Failed(e);
+                }
                 return Settled::Transient(format!("{e}; no new post can fix it"));
             }
             // A lagging or pruning endpoint: retry each poll; past the
@@ -336,7 +344,9 @@ pub async fn settle(
                     return Settled::Landed(rc);
                 }
                 Err(Web3Error::Revert(RevertReason::Revert { name, data })) => named(name, &data),
-                Err(e @ Web3Error::Lost { .. }) => return Settled::Lost(e.to_string()),
+                Err(e @ Web3Error::Lost { block, .. }) => {
+                    return Settled::Lost(e.to_string(), block);
+                }
                 Err(e @ Web3Error::FeeCap { .. }) => return Settled::Transient(e.to_string()),
                 Err(e) => return Settled::Transient(e.to_string()),
             },

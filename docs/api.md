@@ -7,13 +7,17 @@ The node serves JSON over HTTP, by default on port 9090. The wire types live in
 
 - Field names are camelCase.
 - Field elements are decimal strings; bytes are `0x` hex.
+- Census values (roots, leaves, siblings) are 256-bit big-endian integers, never field elements:
+  `0x` followed by exactly 64 hex digits, written lowercase and read in either case.
 - A process id is `0x` followed by 62 hex digits (`bytes31`).
 - A vote id is `0x` followed by 16 hex digits and must be at least 2^63.
 - Points are twisted Edwards `{x, y}`.
 - A ballot is exactly 16 `{c1: {x, y}, c2: {x, y}}` ciphertexts.
 
 Decoding is strict: field elements must be below the field modulus, points on the curve, byte
-lengths exact, and vote bodies may carry no unknown fields. Bodies are capped at 256 KiB and
+lengths exact, census values exactly 64 hex digits after `0x` (a decimal or short value is a
+40001), vote bodies may carry no unknown fields, and nothing but whitespace may follow the JSON
+value. Bodies are capped at 256 KiB and
 requests time out after 60 s.
 
 ## Routes
@@ -25,7 +29,7 @@ requests time out after 60 s.
 | GET | `/processes` | Process ids this node knows. | |
 | GET | `/processes/{pid}` | On-chain parameters plus the node's view, described below. | 40001, 40402 |
 | POST | `/processes/keys` | Body `{"processId"}`: this node's election key for that future process, as `{x, y}`. | 40001, 41203, 42901 |
-| GET | `/processes/{pid}/participants/{address}` | Weight and Merkle census proof, which a voter needs to build a ballot. Merkle censuses only. | 40001, 40402, 40401 |
+| GET | `/processes/{pid}/participants/{address}` | Weight and Merkle census proof (`root`, `leaf`, `pathBits`, `siblings`), which a voter needs to build a ballot. Merkle censuses only. | 40001, 40402, 40401 |
 | GET | `/processes/{pid}/transitions` | Settled transitions: roots, transaction hash, block, sender, voters, overwrites, blob count. | 40001, 40402 |
 | GET | `/processes/{pid}/transitions/{index}/blobs` | The raw blobs of one transition, `0x` hex. | 40001, 40402, 40401 |
 | POST | `/votes` | Submit a vote. | see [Errors](#errors) |
@@ -35,6 +39,8 @@ requests time out after 60 s.
 
 `GET /processes/{pid}` adds the node's view to the registry's parameters:
 
+- `census`: `censusOrigin`, `censusRoot` (a census value; for a CSP census the CSP address as an
+  integer) and `censusURI`;
 - `isAcceptingVotes`: false before the start time and from the end on;
 - `localStateRoot`: the node's committed tree root, and `synced`: whether it equals the on-chain
   root;
@@ -56,11 +62,13 @@ the same key. Organizers ask for the registry's `getNextProcessId(organizer)`.
 | `address` | The voter's address. |
 | `voteId` | The vote id. |
 | `ballot` | 16 ciphertexts. |
-| `ballotProof` | snarkjs Groth16 proof. |
-| `ballotInputsHash` | Hash of the ballot proof inputs. |
+| `ballotProof` | snarkjs Groth16 proof. Its 71 public inputs are not sent: the node derives them from the vote and the process (address, vote id, process id, ballot mode, election key, weight, then the 64 ciphertext coordinates) and checks the proof against them. |
 | `signature` | 65 bytes `r‖s‖v`, a personal-sign over the vote id. |
 | `weight` | Decimal string. |
-| `censusProof` | Required for a CSP census: `{"type": "csp", "r", "s", "recid", "index"}`. The CSP signature covers the top-level `weight`. For a Merkle census the node derives the proof from its own copy and ignores this field. |
+| `censusProof` | Required for a CSP census: `{"type": "csp", "r", "s", "recid", "index"}`. The CSP signature covers the top-level `weight`. For a Merkle census it is optional (`{"type": "merkle", "root", "leaf", "pathBits", "siblings"}`, census values): the node derives the proof from its own copy and ignores this one. |
+
+A body with any other field is refused with 40001; that includes the `ballotInputsHash` of
+earlier clients.
 
 The response is `{"voteId": "0x..."}`.
 
@@ -82,7 +90,7 @@ the one that settles last stands. Clients should send all of one voter's ballots
 | `aggregated` | In a batch being proved. |
 | `processed` | Proof checked, settlement pending. |
 | `settled` | On-chain. |
-| `error` | Failed; an `error` field says why (a circuit failure, `process closed`, a settlement revert, a vote the prover fails `(isolated by bisection)`, or `census changed, recast`). |
+| `error` | Failed; an `error` field says why (a circuit failure, `process closed`, a settlement revert, a vote the prover fails `(isolated by bisection)`, `census changed, recast`, or `superseded by a later vote` when another sequencer settled a later vote of the same voter first). |
 
 A batch that loses a race goes back to `pending`, and so does one the settlement refuses because
 the organizer paused the process. Votes still queued when the grace window closes, or when the
@@ -100,10 +108,11 @@ plus a discriminator. A 500 body says only `internal error`; the detail goes to 
 
 | Status | Code | Meaning |
 |---|---|---|
-| 400 | 40001 | Malformed request or field. For votes also: address not in the census, missing CSP proof, or a vote for another process. |
-| 400 | 40002 | The vote failed a protocol check: ballot proof, signature, inputs hash, census binding, ballot encoding or weight. |
-| 404 | 40401 | Not found. |
+| 400 | 40001 | Malformed request or field, an unknown field included. For votes also: address not in the census, missing CSP proof, or a vote for another process. |
+| 400 | 40002 | The vote failed a protocol check: ballot proof, signature, census binding (a leaf at or above 2^248 included), ballot encoding or weight. |
+| 404 | 40401 | Not found, including an unknown route. |
 | 404 | 40402 | Unknown process, or one this node does not serve. |
+| 405 | 40501 | The route exists, the method does not. |
 | 408 | 40801 | The 60 s request deadline fired. The request may still have taken effect: a timed-out `POST /votes` may have admitted the vote, and a retry then answers 40901. |
 | 409 | 40901 | Vote id already submitted, queued or in the tree. |
 | 409 | 40902 | The slot already holds `--slot-depth` queued votes; retry once one settles. |
@@ -111,7 +120,7 @@ plus a discriminator. A 500 body says only `internal error`; the detail goes to 
 | 412 | 41202 | Max voters reached. |
 | 412 | 41203 | Observer node. |
 | 412 | 41204 | Not open yet: the start time is ahead. |
-| 413 | 41301 | Body over 256 KiB. |
+| 413 | 41301 | Body over 256 KiB, or a `Content-Length` over it. |
 | 429 | 42901 | Key generation rate limit (`--keys-per-minute` per client IP). |
-| 429 | 42903 | Busy: vote validation at capacity, the process queue full (16384), or the census still loading. |
+| 429 | 42903 | Busy: vote validation at capacity, the process's pending votes at their cap (16384, `pending queue full`), its mailbox full (`process queue busy`), or the census still loading. |
 | 500 | 50001 | Internal error. |

@@ -38,7 +38,7 @@ fn inconsistent_inputs_are_rejected() {
     // Wrong weight for the leaf.
     invalid(vs[0].prepare_vote(&e.chain, &[1], own(), 11, k()));
     // Census from another root.
-    let mut e2 = election(2, 1, Fr::from(1u64), &mut rng);
+    let mut e2 = election(2, 1, [1; 32], &mut rng);
     e2.chain.encryption_key = e.chain.encryption_key;
     invalid(vs[0].prepare_vote(&e2.chain, &[1], own(), 10, k()));
     // More values than fields; no fields at all.

@@ -98,29 +98,49 @@ fn blob_versioned_hash(b: &Blob) -> Option<B256> {
     Some(B256::from(versioned_hash(com.to_bytes().as_ref())))
 }
 
+/// Most candidates one answer may offer. Each costs a KZG commitment (about
+/// 30 ms of blocking CPU), so a hostile beacon padding its answer is cut off
+/// here; a block holds at most 21 blobs (Osaka BPO2), so this leaves room for
+/// later raises and for an anvil block of several transitions.
+pub const MAX_BLOB_CANDIDATES: usize = 128;
+
 /// Picks, for each versioned hash in order, the candidate that commits to it
-/// (one commitment per candidate). Fails if any hash has no matching blob.
+/// (one commitment per candidate), stopping once every hash has one. Fails
+/// if any hash has no matching blob or there are more than
+/// [`MAX_BLOB_CANDIDATES`] candidates.
 pub fn match_blobs(hashes: &[B256], candidates: Vec<Blob>) -> Result<Vec<Blob>> {
-    let mut pool: Vec<(Option<B256>, Option<Blob>)> = candidates
-        .into_iter()
-        .map(|b| (blob_versioned_hash(&b), Some(b)))
-        .collect();
-    let mut out = Vec::with_capacity(hashes.len());
-    for (i, h) in hashes.iter().enumerate() {
-        let found = pool
-            .iter_mut()
-            .find(|(vh, b)| b.is_some() && vh.as_ref() == Some(h))
-            .and_then(|(_, b)| b.take());
-        match found {
-            Some(b) => out.push(b),
-            None => {
-                return Err(Web3Error::Blob(format!(
-                    "no blob matches versioned hash {i} ({h})"
-                )));
-            }
+    if candidates.len() > MAX_BLOB_CANDIDATES {
+        return Err(Web3Error::Blob(format!(
+            "{} candidate blobs, at most {MAX_BLOB_CANDIDATES}",
+            candidates.len()
+        )));
+    }
+    let mut out: Vec<Option<Blob>> = vec![None; hashes.len()];
+    let mut missing = hashes.len();
+    for b in candidates {
+        if missing == 0 {
+            break;
+        }
+        let Some(vh) = blob_versioned_hash(&b) else {
+            continue;
+        };
+        if let Some(slot) = hashes
+            .iter()
+            .zip(out.iter_mut())
+            .find_map(|(h, o)| (*h == vh && o.is_none()).then_some(o))
+        {
+            *slot = Some(b);
+            missing -= 1;
         }
     }
-    Ok(out)
+    hashes
+        .iter()
+        .zip(out)
+        .enumerate()
+        .map(|(i, (h, b))| {
+            b.ok_or_else(|| Web3Error::Blob(format!("no blob matches versioned hash {i} ({h})")))
+        })
+        .collect()
 }
 
 /// [`match_blobs`] on the blocking pool (KZG commitments are CPU work).
@@ -223,7 +243,8 @@ impl BlobSource for AnvilBlobs {
 
 /// Consensus-layer beacon APIs, with the RPC failover rule: requests go to the
 /// last one that worked and move on only on a transport error, 429 or 5xx (a
-/// 404 for a slot is an answer). The slot of a block is
+/// 404 for a slot is an answer); an answer without the blobs asks each other
+/// beacon once without moving. The slot of a block is
 /// `(timestamp - genesis_time) / SECONDS_PER_SLOT`, as davinci-node derives it.
 pub struct BeaconBlobs {
     bases: Vec<Url>,
@@ -286,15 +307,7 @@ impl BeaconBlobs {
     // beacon may still serve it.
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<(u16, Vec<u8>)> {
         let n = self.bases.len();
-        let url = |i: usize| -> Result<Url> {
-            let base = self.bases[i].as_str().trim_end_matches('/');
-            let mut url = Url::parse(&format!("{base}{path}"))
-                .map_err(|e| Web3Error::Config(e.to_string()))?;
-            for (k, v) in query {
-                url.query_pairs_mut().append_pair(k, v);
-            }
-            Ok(url)
-        };
+        let url = |i: usize| self.url(i, path, query);
         let start = self.current.load(Ordering::Acquire);
         let mut last = Web3Error::Config("no beacon URL configured".into());
         for k in 0..n {
@@ -325,6 +338,34 @@ impl BeaconBlobs {
             }
         }
         Err(last)
+    }
+
+    fn url(&self, i: usize, path: &str, query: &[(&str, String)]) -> Result<Url> {
+        let base = self.bases[i].as_str().trim_end_matches('/');
+        let mut url =
+            Url::parse(&format!("{base}{path}")).map_err(|e| Web3Error::Config(e.to_string()))?;
+        for (k, v) in query {
+            url.query_pairs_mut().append_pair(k, v);
+        }
+        Ok(url)
+    }
+
+    // GET from beacon `at` alone, or from the current one with failover.
+    async fn get_at(
+        &self,
+        at: Option<usize>,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<(u16, Vec<u8>)> {
+        let Some(i) = at else {
+            return self.get(path, query).await;
+        };
+        self.get_one(self.url(i, path, query)?).await.map_err(|e| {
+            Web3Error::Blob(format!(
+                "beacon {}{path}: {e}",
+                super::failover::host(&self.bases[i])
+            ))
+        })
     }
 
     // One GET; errors are the failover kind (transport, oversized body).
@@ -387,47 +428,80 @@ impl BeaconBlobs {
     }
 
     /// Blobs matching `hashes` from the block at `timestamp`. Uses
-    /// `/eth/v1/beacon/blobs/{slot}` and falls back to `blob_sidecars`.
+    /// `/eth/v1/beacon/blobs/{slot}` and falls back to `blob_sidecars`. An
+    /// answer without every blob (pruned, not a supernode, lying) asks each
+    /// other beacon once.
     pub async fn blobs_at(&self, timestamp: u64, hashes: &[B256]) -> Result<Vec<Blob>> {
         let slot = self.slot_for(timestamp).await?;
+        let unusable = match self.blobs_from(None, slot, hashes).await? {
+            Ok(b) => return Ok(b),
+            Err(e) => e,
+        };
+        let n = self.bases.len();
+        let cur = self.current.load(Ordering::Acquire);
+        for k in 1..n {
+            if let Ok(Ok(b)) = self.blobs_from(Some((cur + k) % n), slot, hashes).await {
+                return Ok(b);
+            }
+        }
+        Err(unusable)
+    }
+
+    // The blobs beacon `at` (else the current one, with failover) serves for
+    // `slot`: the outer error when no beacon answered, the inner one when the
+    // answer lacks a blob.
+    async fn blobs_from(
+        &self,
+        at: Option<usize>,
+        slot: u64,
+        hashes: &[B256],
+    ) -> Result<Result<Vec<Blob>>> {
         let query: Vec<_> = hashes
             .iter()
             .map(|h| ("versioned_hashes", h.to_string()))
             .collect();
         let (status, body) = self
-            .get(&format!("/eth/v1/beacon/blobs/{slot}"), &query)
+            .get_at(at, &format!("/eth/v1/beacon/blobs/{slot}"), &query)
             .await?;
         if status == 200 {
-            let d: Data<Vec<String>> = serde_json::from_slice(&body)
-                .map_err(|e| Web3Error::Blob(format!("beacon blobs: {e}")))?;
-            let candidates = d
-                .data
-                .iter()
-                .map(|s| to_blob(&hex_bytes(s)?))
-                .collect::<Result<Vec<_>>>()?;
-            return match_blobs_blocking(hashes.to_vec(), candidates).await;
+            let got: Result<Vec<Blob>> = async {
+                let d: Data<Vec<String>> = serde_json::from_slice(&body)
+                    .map_err(|e| Web3Error::Blob(format!("beacon blobs: {e}")))?;
+                let candidates = d
+                    .data
+                    .iter()
+                    .map(|s| to_blob(&hex_bytes(s)?))
+                    .collect::<Result<Vec<_>>>()?;
+                match_blobs_blocking(hashes.to_vec(), candidates).await
+            }
+            .await;
+            return Ok(got);
         }
         let path = format!("/eth/v1/beacon/blob_sidecars/{slot}");
-        let (status2, body) = self.get(&path, &[]).await?;
+        let (status2, body) = self.get_at(at, &path, &[]).await?;
         if status2 != 200 {
-            return Err(Web3Error::Blob(format!(
+            return Ok(Err(Web3Error::Blob(format!(
                 "beacon: blobs {status}, blob_sidecars {status2} for slot {slot}"
-            )));
+            ))));
         }
-        let d: Data<Vec<Sidecar>> = serde_json::from_slice(&body)
-            .map_err(|e| Web3Error::Blob(format!("beacon blob_sidecars: {e}")))?;
-        // Keep the sidecars whose claimed commitment is one we want; the blob
-        // itself is still checked against the hash in `match_blobs`.
-        let mut candidates = Vec::new();
-        for s in &d.data {
-            let com: [u8; 48] = hex_bytes(&s.kzg_commitment)?
-                .try_into()
-                .map_err(|_| Web3Error::Blob("beacon: commitment is not 48 bytes".into()))?;
-            if hashes.contains(&B256::from(versioned_hash(&com))) {
-                candidates.push(to_blob(&hex_bytes(&s.blob)?)?);
+        let got: Result<Vec<Blob>> = async {
+            let d: Data<Vec<Sidecar>> = serde_json::from_slice(&body)
+                .map_err(|e| Web3Error::Blob(format!("beacon blob_sidecars: {e}")))?;
+            // Keep the sidecars whose claimed commitment is one we want; the
+            // blob itself is still checked against the hash in `match_blobs`.
+            let mut candidates = Vec::new();
+            for s in &d.data {
+                let com: [u8; 48] = hex_bytes(&s.kzg_commitment)?
+                    .try_into()
+                    .map_err(|_| Web3Error::Blob("beacon: commitment is not 48 bytes".into()))?;
+                if hashes.contains(&B256::from(versioned_hash(&com))) {
+                    candidates.push(to_blob(&hex_bytes(&s.blob)?)?);
+                }
             }
+            match_blobs_blocking(hashes.to_vec(), candidates).await
         }
-        match_blobs_blocking(hashes.to_vec(), candidates).await
+        .await;
+        Ok(got)
     }
 }
 

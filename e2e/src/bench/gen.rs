@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use davinci_client::api::Fr;
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::Voter;
 use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, csp_sign, eth_address};
@@ -46,7 +45,7 @@ pub fn census_source(e: &Election, seed: &Seed, wave: u32) -> Result<CensusSourc
 }
 
 /// The census root a process of `e` commits to.
-pub fn census_root(e: &Election, seed: &Seed, wave: u32) -> Result<Fr> {
+pub fn census_root(e: &Election, seed: &Seed, wave: u32) -> Result<[u8; 32]> {
     Ok(match census_source(e, seed, wave)? {
         CensusSource::Merkle(t) => t.root(),
         CensusSource::Csp(k) => fx::csp_root(&k)?,

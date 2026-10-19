@@ -4,7 +4,9 @@
 //!
 //! Gated: `ZISKEMU=1 cargo test -p davinci-state --test dryrun`. Needs
 //! `ziskemu` (`ZISKEMU_BIN` or `~/.zisk/bin/ziskemu`) and the circuit ELF
-//! (`CIRCUIT_ELF_PATH` or `../davinci-zkvm/circuit/elf/circuit.elf`).
+//! (`CIRCUIT_ELF_PATH` or `../davinci-zkvm/circuit/elf/circuit.elf`); the
+//! results request runs on `RESULTS_ELF_PATH` or
+//! `../davinci-zkvm/circuit-results/elf/results.elf`.
 
 mod common;
 
@@ -18,7 +20,6 @@ use davinci_zkvm_input_gen as ig;
 use std::collections::BTreeSet;
 
 use davinci_zkvm_sdk::census::{CensusWitness, csp_sign, slot_key_address, slot_key_csp};
-use davinci_zkvm_sdk::crypto::field::fr_from_be;
 use davinci_zkvm_sdk::limits::{MAX_BLOBS, required_refresh};
 use davinci_zkvm_sdk::publics::BatchPublics;
 use davinci_zkvm_sdk::types::ProveRequest;
@@ -77,9 +78,8 @@ fn smt_entry(e: &davinci_zkvm_sdk::types::SmtEntryJson) -> ig::SmtEntry {
 fn input_bytes(req: &ProveRequest) -> Vec<u8> {
     let vk: ig::SnarkJsVk = reser(&req.vk);
     let proofs: Vec<ig::SnarkJsProof> = req.proofs.iter().map(reser).collect();
-    let public_inputs: Vec<Vec<String>> = req.public_inputs.iter().map(|p| p.to_vec()).collect();
     let sigs: Vec<ig::EcdsaSig> = req.sigs.iter().map(reser).collect();
-    let mut bytes = ig::generate_input(&vk, &proofs, &public_inputs, &sigs).unwrap();
+    let mut bytes = ig::generate_input(&vk, &proofs, &sigs).unwrap();
 
     if let Some(st) = &req.state {
         let bp = st.ballot_proofs.as_ref().map(|bp| {
@@ -185,20 +185,35 @@ fn input_bytes(req: &ProveRequest) -> Vec<u8> {
 
 /// Runs the guest on `req` and parses its output registers.
 fn run_guest(req: &ProveRequest) -> BatchPublics {
-    let bytes = input_bytes(req);
+    BatchPublics::parse(&run_elf(&elf_path(), &input_bytes(req))).unwrap()
+}
+
+fn results_elf_path() -> PathBuf {
+    if let Ok(p) = std::env::var("RESULTS_ELF_PATH") {
+        return p.into();
+    }
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../davinci-zkvm/circuit-results/elf/results.elf"
+    )
+    .into()
+}
+
+/// Runs `elf` on raw input `bytes`; its output registers as bytes.
+fn run_elf(elf: &std::path::Path, bytes: &[u8]) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let in_path = dir.path().join("input.bin");
     let out_path = dir.path().join("output.bin");
     // read_slice framing: u64 LE length, payload, zero-pad to 8 bytes.
     let mut f = std::fs::File::create(&in_path).unwrap();
     f.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
-    f.write_all(&bytes).unwrap();
+    f.write_all(bytes).unwrap();
     let pad = (8 - bytes.len() % 8) % 8;
     f.write_all(&vec![0u8; pad]).unwrap();
     drop(f);
     let out = Command::new(ziskemu_bin())
         .arg("-e")
-        .arg(elf_path())
+        .arg(elf)
         .arg("-i")
         .arg(&in_path)
         .arg("-o")
@@ -211,7 +226,7 @@ fn run_guest(req: &ProveRequest) -> BatchPublics {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    BatchPublics::parse(&std::fs::read(&out_path).unwrap()).unwrap()
+    std::fs::read(&out_path).unwrap()
 }
 
 fn assert_accepted(b: &davinci_state::PreparedBatch) {
@@ -231,6 +246,8 @@ fn first_batch_accepted_by_the_guest() {
         return;
     }
     let env = env(2, 4);
+    // A Keccak root above the BN254 modulus, carried to register 20 unreduced.
+    assert!(davinci_zkvm_sdk::crypto::field::fr_from_be(&env.cfg.census_root).is_err());
     let mut st = new_state(&env);
     let votes: Vec<_> = (0..3)
         .map(|i| real_vote(&env, i, &[1, 2], 20 + i as u64))
@@ -321,7 +338,7 @@ fn csp_batch_accepted() {
     be[12..].copy_from_slice(&voter_address(99));
     let cfg = ProcessConfig {
         census_origin: CensusOrigin::Csp,
-        census_root: fr_from_be(&be).unwrap(),
+        census_root: be,
         ..env.cfg.clone()
     };
     let mut st = ProcessState::create(cfg.clone(), arbo::MemoryStorage::new()).unwrap();
@@ -337,10 +354,9 @@ fn csp_batch_accepted() {
     let b = st
         .prepare(&votes, &mut StdRng::seed_from_u64(23), &none())
         .unwrap();
-    assert_eq!(
-        b.expected.census_root,
-        davinci_zkvm_sdk::crypto::field::fr_to_le(&cfg.census_root)
-    );
+    let mut le = be;
+    le.reverse();
+    assert_eq!(b.expected.census_root, le);
     assert_accepted(&b);
 }
 
@@ -510,4 +526,38 @@ fn guest_rejects_tampered_requests() {
 
     // The untampered request still passes.
     assert_accepted(&b);
+}
+
+/// The results request the node builds for a committed tally, through the
+/// circuit-results guest (R20: relinked with the batch guest's primitives,
+/// same checks). The batch is never proved, so fake ballot proofs do.
+#[test]
+fn results_request_accepted_by_the_results_guest() {
+    if !gated() {
+        return;
+    }
+    let env = env(2, 4);
+    let mut st = new_state(&env);
+    let votes: Vec<_> = (0..3)
+        .map(|i| fake_vote(&env, i, &[i as u64 + 1, 2], 120 + i as u64))
+        .collect();
+    let b = st
+        .prepare(&votes, &mut StdRng::seed_from_u64(31), &none())
+        .unwrap();
+    st.commit(&b).unwrap();
+    let (req, tally) = st
+        .results_request(&env.sk, &mut StdRng::seed_from_u64(32))
+        .unwrap();
+    assert_eq!(tally[..3], [6, 6, 0]);
+    let input = ig::results::build_results_input(&reser(&req)).unwrap();
+    let got =
+        davinci_zkvm_sdk::publics::ResultsPublics::parse(&run_elf(&results_elf_path(), &input))
+            .unwrap();
+    assert!(
+        got.passed(),
+        "results guest rejected: mask {:#x}",
+        got.fail_mask
+    );
+    assert_eq!(got.state_root, st.committed().root);
+    assert_eq!(got.results, tally);
 }

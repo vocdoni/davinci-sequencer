@@ -80,7 +80,7 @@ use davinci_e2e::net::{self, Net};
 use davinci_e2e::node::{self, Metrics, Node, NodeConfig, WorkDir};
 use davinci_e2e::proxy::Proxy;
 use davinci_e2e::wait;
-use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr};
+use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, public_signals};
 use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, vote_id_recover};
 use davinci_zkvm_sdk::client::ProverClient;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
@@ -317,13 +317,24 @@ async fn setup_checks(
     say!("proved the ballots in {:.1} s", t.elapsed().as_secs_f64());
 
     let verifier = BallotVerifier::from_snarkjs_json(release::ballot_vk_json())?;
+    // Against the 71 public signals the node derives from the vote and the
+    // registry's process.
     let proof_ok = |r: &VoteRequest| {
-        let pubs = [
-            address_to_fr(&r.address),
-            Fr::from(r.vote_id),
-            r.ballot_inputs_hash,
-        ];
-        verifier.verify(&r.ballot_proof, &pubs)
+        let p = if r.process_id.0 == e.p1.id {
+            &e.p1
+        } else {
+            &e.p2
+        };
+        public_signals(
+            &r.process_id.to_fr(),
+            &p.ballot_mode,
+            &p.encryption_key,
+            &address_to_fr(&r.address),
+            r.vote_id,
+            &r.ballot,
+            &Fr::from(r.weight),
+        )
+        .is_ok_and(|pubs| verifier.verify(&r.ballot_proof, &pubs))
     };
     let sig_ok =
         |r: &VoteRequest| vote_id_recover(r.vote_id, &r.signature()).ok() == Some(r.address);
@@ -396,13 +407,7 @@ async fn setup_checks(
     };
     let next = org.next_process_id().await?;
     let pid3 = org
-        .create_process(&mk(
-            next,
-            3,
-            Fr::from(0u64),
-            c.address.0.0,
-            "onchain://x".into(),
-        ))
+        .create_process(&mk(next, 3, [0u8; 32], c.address.0.0, "onchain://x".into()))
         .await?
         .pid;
     let p3 = reader.process(&pid3).await?;
@@ -1500,7 +1505,12 @@ async fn scenario(dir: &Path) -> Result<()> {
 
 /// Waits until every node serves `addr`'s census proof at `root`: the node
 /// has loaded (origin 2) or synced (origin 3) that census.
-async fn wait_census(nodes: &[Node], pid: &[u8; 31], addr: &[u8; 20], root: Fr) -> Result<()> {
+async fn wait_census(
+    nodes: &[Node],
+    pid: &[u8; 31],
+    addr: &[u8; 20],
+    root: [u8; 32],
+) -> Result<()> {
     for n in nodes {
         let last = std::sync::Mutex::new(String::new());
         let r = wait::until(
@@ -1515,7 +1525,7 @@ async fn wait_census(nodes: &[Node], pid: &[u8; 31], addr: &[u8; 20], root: Fr) 
                 alive(nodes)?;
                 let m = match n.api.participant(pid, addr).await {
                     Ok((p, _)) if p.root == root => return Ok(Some(())),
-                    Ok((p, _)) => format!("proof at {}", p.root),
+                    Ok((p, _)) => format!("proof at 0x{}", hex::encode(p.root)),
                     // Not in the census yet, or still loading (429).
                     Err(ClientError::Api {
                         status: 400 | 404 | 429,
@@ -1862,7 +1872,7 @@ async fn onchain_votes(
             ballot_mode: fx::ballot_mode(),
             census_origin: 3,
             // The registry reads the root from the contract.
-            census_root: Fr::from(0u64),
+            census_root: [0u8; 32],
             census_contract: census.address.0.0,
             census_uri: "onchain://davinci-e2e".into(),
             metadata,

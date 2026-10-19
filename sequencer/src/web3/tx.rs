@@ -159,9 +159,15 @@ struct Fees {
 }
 
 // Replacement pricing: +12.5% (+1 wei) on the execution fees, x2 on the blob
-// fee, and never below what the node asks now.
-fn bumped(old: &Fees, now_max: u128, now_prio: u128, now_blob: u128) -> Fees {
-    let up = |v: u128| v.saturating_add(v.div_ceil(8)).saturating_add(1);
+// fee, and never below what the node asks now. A blob transaction doubles
+// every fee: geth's blob pool (core/txpool/blobpool, `PriceBump` 100) and
+// reth's (`replace_blob_tx_price_bump` 100) refuse less on the fee cap, the
+// tip or the blob fee cap. anvil does not check it.
+fn bumped(old: &Fees, blob: bool, now_max: u128, now_prio: u128, now_blob: u128) -> Fees {
+    let up = |v: u128| match blob {
+        true => v.saturating_mul(2).max(1),
+        false => v.saturating_add(v.div_ceil(8)).saturating_add(1),
+    };
     Fees {
         nonce: old.nonce,
         max_fee: up(old.max_fee).max(now_max),
@@ -502,7 +508,7 @@ impl Contracts {
             blob_fee,
         };
         if let Some(old) = &state.stuck {
-            fees = bumped(old, max_fee, priority, blob_fee);
+            fees = bumped(old, blobs.is_some(), max_fee, priority, blob_fee);
         }
         let mut tx = tx.with_from(from).with_chain_id(self.chain_id);
         tx.set_nonce(nonce);
@@ -600,12 +606,12 @@ impl Contracts {
                         if underpriced(&msg) {
                             if attempt == MAX_ATTEMPTS {
                                 // Something of ours holds this nonce at least this price.
-                                // Kept (sent, refused): the next call climbs on to the blob pool's 2x rule.
+                                // Kept (sent, refused): the next call bids above it.
                                 state.stuck = Some(fees);
                                 return Err(Web3Error::Underpriced(msg));
                             }
                             let (m, pr, bl) = self.fees_now(blobs.is_some()).await?;
-                            fees = bumped(&fees, m, pr, bl);
+                            fees = bumped(&fees, blobs.is_some(), m, pr, bl);
                             continue;
                         }
                         let raced = raced(&msg);
@@ -706,7 +712,7 @@ impl Contracts {
             }
             tracing::warn!(nonce, attempt, "no receipt yet, replacing with higher fees");
             let (m, pr, bl) = self.fees_now(blobs.is_some()).await?;
-            fees = bumped(&fees, m, pr, bl);
+            fees = bumped(&fees, blobs.is_some(), m, pr, bl);
         }
         // `state.stuck` keeps the last price sent, so the next send replaces it.
         Err(Web3Error::Stuck {
@@ -883,14 +889,14 @@ mod tests {
             priority: 80,
             blob_fee: 3,
         };
-        let b = bumped(&old, 0, 0, 0);
+        let b = bumped(&old, false, 0, 0, 0);
         assert_eq!(b.nonce, 7);
         // At least +12.5% (nodes want +10%) and x2 on blobs.
         assert!(b.max_fee * 8 >= old.max_fee * 9 && b.max_fee > old.max_fee);
         assert!(b.priority * 8 >= old.priority * 9 && b.priority > old.priority);
         assert!(b.blob_fee >= 2 * old.blob_fee);
         // Never below the current price, and progress from zero.
-        let b = bumped(&old, 5_000, 900, 40);
+        let b = bumped(&old, false, 5_000, 900, 40);
         assert_eq!((b.max_fee, b.priority, b.blob_fee), (5_000, 900, 40));
         let zero = Fees {
             nonce: 0,
@@ -898,7 +904,7 @@ mod tests {
             priority: 0,
             blob_fee: 0,
         };
-        let b = bumped(&zero, 0, 0, 0);
+        let b = bumped(&zero, false, 0, 0, 0);
         assert!(b.max_fee > 0 && b.priority > 0 && b.blob_fee > 0);
         let max = Fees {
             nonce: 0,
@@ -906,7 +912,13 @@ mod tests {
             priority: u128::MAX,
             blob_fee: u128::MAX,
         };
-        assert_eq!(bumped(&max, 0, 0, 0).max_fee, u128::MAX);
+        assert_eq!(bumped(&max, false, 0, 0, 0).max_fee, u128::MAX);
+        // A blob transaction doubles every fee, the blob pool's rule.
+        let b = bumped(&old, true, 0, 0, 0);
+        assert_eq!((b.max_fee, b.priority, b.blob_fee), (2_000, 160, 6));
+        let b = bumped(&zero, true, 0, 0, 0);
+        assert!(b.max_fee > 0 && b.priority > 0 && b.blob_fee > 0);
+        assert_eq!(bumped(&max, true, 0, 0, 0).priority, u128::MAX);
     }
 
     #[test]
@@ -1452,7 +1464,7 @@ mod tests {
         c.max_tx_fee = u128::MAX;
         chain.lock().unwrap().hold = false;
         c.send(call(&[3]), None).await.unwrap();
-        let next = bumped(&held, market, 0, 0).max_fee;
+        let next = bumped(&held, false, market, 0, 0).max_fee;
         assert_eq!(prices(&chain), [market, next]);
     }
 

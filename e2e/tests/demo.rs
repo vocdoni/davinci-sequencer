@@ -169,9 +169,12 @@ fn prepare(wave: Wave) -> Result<()> {
     }
     for s in &specs {
         let root = |updated| -> Result<String> {
-            Ok(hex_fr(&demo::census_root(&demo::census_parts(
-                s, &secrets, updated,
-            )?)?))
+            Ok(format!(
+                "0x{}",
+                hex::encode(demo::census_root(&demo::census_parts(
+                    s, &secrets, updated,
+                )?)?)
+            ))
         };
         let census = match s.census {
             CensusKind::Static => format!("root {}", root(false)?),
@@ -212,7 +215,7 @@ async fn check(wave: Wave) -> Result<()> {
 
 /// A stand-in of `spec`'s process: its ballot mode and origin, key `pk`,
 /// census root `root`.
-fn stand_in(spec: &Spec, pk: Point, root: Fr) -> OnchainProcess {
+fn stand_in(spec: &Spec, pk: Point, root: [u8; 32]) -> OnchainProcess {
     OnchainProcess {
         id: [spec.n as u8; 31],
         status: ProcessStatus::Ready,
@@ -457,13 +460,6 @@ fn refusal_ballot(
             strict: None,
         },
     })
-}
-
-fn hex_fr(x: &Fr) -> String {
-    format!(
-        "0x{}",
-        hex::encode(davinci_zkvm_sdk::crypto::field::fr_to_be(x))
-    )
 }
 
 /// Everything a run holds.
@@ -1062,7 +1058,7 @@ impl Run {
                 } else {
                     format!("onchain://{a}")
                 };
-                (Fr::from(0u64), a.0.0, uri)
+                ([0u8; 32], a.0.0, uri)
             }
             CensusKind::Csp => (
                 fx::csp_root(&self.secrets.csp()?)?,
@@ -1175,7 +1171,7 @@ impl Run {
 
     /// The member the nodes must serve, and the root they must serve it at:
     /// the last member of the census in force.
-    async fn census_probe(&self, spec: &Spec) -> Result<Option<([u8; 20], Fr)>> {
+    async fn census_probe(&self, spec: &Spec) -> Result<Option<([u8; 20], [u8; 32])>> {
         let n = spec.n;
         let parts = match spec.census {
             CensusKind::Csp => return Ok(None),

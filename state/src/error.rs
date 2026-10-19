@@ -41,8 +41,6 @@ pub enum VoteError {
     PaddingNotIdentity,
     #[error("weight does not fit in 88 bits")]
     WeightRange,
-    #[error("inputs hash does not match the vote")]
-    InputsHashMismatch,
     #[error("ballot proof does not verify")]
     BadProof,
     #[error("vote id signature invalid: {0}")]
@@ -53,6 +51,8 @@ pub enum VoteError {
     OriginMismatch,
     #[error("census proof deeper than 61 levels")]
     CensusDepth,
+    #[error("census leaf is not below 2^248")]
+    CensusLeafRange,
     #[error("census path bits above the proof depth")]
     CensusPathBits,
     #[error("census proof does not verify")]

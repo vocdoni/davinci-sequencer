@@ -84,6 +84,7 @@ DAVINCI_PRIVKEY_FILE=/etc/davinci/sequencer.key \
 | `--slot-depth` | `DAVINCI_SLOT_DEPTH` | `3` | Queued votes one ballot slot may hold, in flight included. |
 | `--max-blobs-per-tx` | `DAVINCI_MAX_BLOBS_PER_TX` | from the chain | Most blobs one blob transaction carries (1 to 6): the most per batch in blob mode; in L1-blob mode a batch takes up to 32, posted in transactions of this many. See [Chain limits](#chain-limits). |
 | `--eager-results` | `DAVINCI_EAGER_RESULTS` | `true` | Prove a sequencer-key election's results during its grace window and submit them when it closes. |
+| `--degraded-number-reads` | `DAVINCI_DEGRADED_NUMBER_READS` | `false` | For an RPC endpoint without EIP-1898 calls (`eth_call` by block hash) and with a single backend only: once reads by hash have failed for 90 s, decide on reads at the anchor's block number, checked against its hash before and after. Behind a load balancer such a read can come from another branch. Off, the node keeps sealing on events but decides nothing from the chain until reads by hash answer. See [Reorgs](lifecycle.md#reorgs). |
 | `--poll-interval` | `DAVINCI_POLL_INTERVAL` | `5s` | Chain polling interval. |
 | `--heartbeat` | `DAVINCI_HEARTBEAT` | poll interval | Drives batch timing, the close-out at the grace end and finalization. |
 | `--prover-poll` | `DAVINCI_PROVER_POLL` | `2s` | Prover job polling interval. |
@@ -181,8 +182,9 @@ On OP Mainnet:
   limit) and about 2 gwei on the smallest. Above it the send is refused before
   signing, logged at error level with the price and the cap, and the batch is retried under the
   usual backoff; a replacement whose bump would cross it is withheld and the transaction waits at
-  its current price. Near the grace end the cap trades spend for liveness: watch for
-  `send withheld` and `replacement withheld`. In L1-blob mode the node also checks it before
+  its current price. A replacement bumps the execution fees by 12.5 %, or doubles every fee for a
+  blob-mode transition, as blob pools require. Near the grace end the cap trades spend for
+  liveness: watch for `send withheld` and `replacement withheld`. In L1-blob mode the node also checks it before
   posting a batch's blobs on Ethereum, for the smallest settlement (800k gas plus the margin,
   about 2.1 gwei at the default): if even that would be withheld, nothing is posted and no
   Ethereum fee is spent. The post is retried like a fee-capped one while the proof runs and goes
@@ -222,9 +224,9 @@ until it fails, then move to the next and stay there, so the node never mixes pr
 different heads within one scan.
 
 - An RPC fails over on a connection error, a timeout, any non-2xx status, a 2xx body that is not
-  JSON-RPC, or a node-side JSON-RPC error (missing historical state, rate limits, `-32603`).
-  Reverts, nonce and funding errors come back as they are. A too-wide `eth_getLogs` range is
-  halved instead.
+  JSON-RPC, an answer over 128 MiB, or a node-side JSON-RPC error (missing historical state, rate
+  limits, `-32603`). Reverts, nonce and funding errors come back as they are. A too-wide
+  `eth_getLogs` range is halved instead.
 - A rate limit (429, or a JSON-RPC rate-limit error) rests that endpoint for its `Retry-After`
   (up to 5 minutes), or else for 1 s doubling on each limit in a row (up to a minute). When every
   endpoint rests, a request waits up to 10 s for the first one back.
@@ -233,7 +235,8 @@ different heads within one scan.
   load-balanced backend can lag.
 - A beacon API fails over on a connection error, 429 or 5xx. A 404 (a slot pruned there) is asked
   once of the next beacon without switching, so an archive beacon listed second can serve old
-  blobs.
+  blobs. An answer that still lacks a blob (pruned, not a supernode, or wrong) is asked of every
+  other beacon once, so an archive listed anywhere is reached.
 - At boot every RPC must report the same `eth_chainId`. An unreachable one is kept with a
   warning, and at least one must answer.
 

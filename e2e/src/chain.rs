@@ -204,10 +204,13 @@ pub struct Deployment {
 
 /// Grace immutables of the anvil registry, in seconds: `defaultGrace,
 /// graceFloor, graceCeil, graceMaxTotal, noticeMin`. The floor bounds every
-/// node's round budget, so it fits one small batch's proof and settlement. The
-/// default covers the first landing after an END that three racing nodes flush
-/// through one GPU: the losers' proofs still queue ahead, up to five jobs.
-pub const GRACE_ARGS: (u32, u32, u32, u32, u32) = (120, 40, 180, 240, 5);
+/// node's round budget, so it fits one small batch's proof and settlement.
+/// The three signing nodes share one GPU (~25 s a proof), so a landing in the
+/// grace can wait behind every node's job: the default covers nodes × proof
+/// time (75 s) plus settlement, and the 2 × nodes − 1 = 5 jobs (125 s) of a
+/// prover without `DELETE /jobs/{id}`, where the losers' stale jobs stay
+/// queued. The cap scenario waits out `graceMaxTotal` under the ceil.
+pub const GRACE_ARGS: (u32, u32, u32, u32, u32) = (150, 40, 180, 240, 5);
 
 /// The anvil registry's grace args: `DAVINCI_E2E_GRACE`
 /// (`default,floor,ceil,max_total,notice`, seconds; `300,240,600,1800,60` is

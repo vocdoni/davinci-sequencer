@@ -18,7 +18,8 @@ use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use serde::{Deserialize, Serialize};
 
 pub use blobs::{
-    AnvilBlobs, BeaconBlobs, BlobSource, blob_source, match_blobs, match_blobs_blocking,
+    AnvilBlobs, BeaconBlobs, BlobSource, MAX_BLOB_CANDIDATES, blob_source, match_blobs,
+    match_blobs_blocking,
 };
 pub use contracts::{
     Contracts, MAX_LOG_RANGE, endpoints_chain_id as rpc_chain_id, probe_osaka, resolve_blob_cap,
@@ -65,13 +66,24 @@ pub(crate) fn failover_provider(
     (p, epoch)
 }
 
+/// Longest wait for one RPC answer: past it a hung endpoint (one that
+/// accepts and never answers) fails over.
+pub(crate) const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The reqwest client under [`Failover`], with [`USER_AGENT`] and timeouts,
 /// so a hung endpoint fails over instead of stalling.
 pub(crate) fn rpc_http_client() -> alloy::transports::http::reqwest::Client {
+    rpc_http_client_with(RPC_TIMEOUT)
+}
+
+/// [`rpc_http_client`] with its request timeout.
+pub(crate) fn rpc_http_client_with(
+    timeout: std::time::Duration,
+) -> alloy::transports::http::reqwest::Client {
     alloy::transports::http::reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(timeout)
         .build()
         .unwrap_or_else(|_| alloy::transports::http::reqwest::Client::new())
 }

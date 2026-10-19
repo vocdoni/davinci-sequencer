@@ -66,7 +66,7 @@ impl Net {
     }
 }
 
-fn bad_census_root() -> Fr {
+fn bad_census_root() -> [u8; 32] {
     LeanImt::from_leaves(vec![census_leaf(&voter_address(7), 1).unwrap()]).root()
 }
 
@@ -80,7 +80,7 @@ impl Chain for Net {
         let mut p = self.chain.process(pid).await?;
         if *pid == bad_pid31() {
             self.bad_reads.fetch_add(1, Ordering::SeqCst);
-            p.census.root = fr_to_be(&bad_census_root());
+            p.census.root = bad_census_root();
         }
         Ok(p)
     }
@@ -90,6 +90,22 @@ impl Chain for Net {
         }
         self.read_of(pid);
         self.chain.process_at(pid, block).await
+    }
+    async fn process_at_hash(
+        &self,
+        pid: &[u8; 31],
+        hash: [u8; 32],
+    ) -> Result<OnchainProcess, Web3Error> {
+        if *pid == bad_pid31() {
+            return self.process(pid).await;
+        }
+        self.read_of(pid);
+        // Canonical blocks only, by this double's own hashes.
+        let n = u64::from_be_bytes(hash[..8].try_into().unwrap());
+        if n > self.chain.head_block() || hash != self.hash_of(n) {
+            return Err(Web3Error::Rpc("header not found".into()));
+        }
+        self.chain.process_at(pid, n).await
     }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
         let armed = self.reorg_in_page.lock().unwrap().take_if(|r| r.0 == to);
@@ -104,11 +120,11 @@ impl Chain for Net {
     async fn confirmed_head(&self, confirmations: u64) -> Result<u64, Web3Error> {
         self.chain.confirmed_head(confirmations).await
     }
-    async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>, Web3Error> {
+    async fn block_ref(&self, n: u64) -> Result<Option<([u8; 32], u64)>, Web3Error> {
         if self.fail_hashes.load(Ordering::SeqCst) {
             return Err(Web3Error::Rpc("scripted block read failure".into()));
         }
-        Ok((n <= self.chain.head_block()).then(|| self.hash_of(n)))
+        Ok((n <= self.chain.head_block()).then(|| (self.hash_of(n), self.chain.block_time(n))))
     }
     async fn simulate_transition(
         &self,
@@ -1312,4 +1328,40 @@ async fn deterministic_actor_panic_backs_off() {
     let deaths = net.reads.load(Ordering::SeqCst) - before;
     assert!((1..=10).contains(&deaths), "{deaths} respawns in 2 s");
     sd.cancel();
+}
+
+// The node refuses at boot a `--ballot-vk` it could not trust or use: one
+// without a phase-2 contribution (delta == gamma: anyone can forge its
+// proofs) and one of another circuit shape (not 71 public inputs).
+#[tokio::test]
+async fn ballot_vk_without_phase_2_or_71_inputs_is_refused_at_boot() {
+    let s = setup(2, 4, None);
+    let vk: serde_json::Value = serde_json::from_str(release::ballot_vk_json()).unwrap();
+    let mut no_phase2 = vk.clone();
+    no_phase2["vk_delta_2"] = vk["vk_gamma_2"].clone();
+    let mut three = vk.clone();
+    three["IC"] = serde_json::Value::Array(vk["IC"].as_array().unwrap()[..4].to_vec());
+    three["nPublic"] = 3.into();
+    for (bad, want) in [(no_phase2, "delta == gamma"), (three, "IC points")] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vk.json");
+        std::fs::write(&path, bad.to_string()).unwrap();
+        let cfg = test_config_with(
+            dir.path(),
+            &s.census_dir,
+            2,
+            "0s",
+            &["--ballot-vk", path.to_str().unwrap()],
+        );
+        let (r, _) = try_start_node(
+            Db::open_in(dir.path()).unwrap(),
+            s.chain.clone(),
+            FakeProver::open(),
+            cfg,
+            CancellationToken::new(),
+        )
+        .await;
+        let e = r.err().expect("a bad ballot vk boots");
+        assert!(e.to_string().contains(want), "{e}");
+    }
 }

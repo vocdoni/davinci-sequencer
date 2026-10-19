@@ -27,6 +27,12 @@ pub struct Metrics {
     pub guest_rejections: AtomicU64,
     /// Reorgs seen at the monitor's event cursor (events re-routed).
     pub reorgs: AtomicU64,
+    /// Event pages routed without a block hash (failing hash reads): the
+    /// anchor stays behind and actors make no anchored decision past it.
+    pub anchor_stalls: AtomicU64,
+    /// Times a process's reads by block hash failed for 90 s with degraded
+    /// reads off: it decides nothing from the chain until they answer.
+    pub hash_read_stalls: AtomicU64,
     /// Processes rebuilt from the chain after a reorg took transitions
     /// they had committed.
     pub rebuilds: AtomicU64,

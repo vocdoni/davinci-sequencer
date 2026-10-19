@@ -14,7 +14,7 @@ use davinci_client::api::{CensusProofWire, ProcessId, VoteRequest};
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::Voter;
 use davinci_state::{CensusOrigin, ProcessConfig, VoteError, VotePackage, validate_vote};
-use davinci_zkvm_sdk::ballot::{address_to_fr, encrypt_ballot, inputs_hash, vote_id};
+use davinci_zkvm_sdk::ballot::{address_to_fr, encrypt_ballot, public_signals, vote_id};
 use davinci_zkvm_sdk::census::{
     CensusWitness, csp_sign, slot_key_address, slot_key_csp, vote_id_recover,
 };
@@ -77,15 +77,14 @@ fn package(req: &VoteRequest, census: CensusWitness) -> VotePackage {
         address: req.address,
         ballot: req.ballot,
         proof: req.ballot_proof.clone(),
-        inputs_hash: req.ballot_inputs_hash,
         signature: req.signature(),
         census,
         weight: req.weight,
     }
 }
 
-// davinci-state accepts the vote; one changed ballot coordinate is caught
-// by the inputs hash.
+// davinci-state accepts the vote; one changed ballot coordinate fails the
+// proof, whose public inputs the node derives.
 fn check_state_accepts(e: &Election, req: &VoteRequest, census: CensusWitness, slot: u64) {
     let cfg = config(e);
     let vf = verifier();
@@ -93,13 +92,13 @@ fn check_state_accepts(e: &Election, req: &VoteRequest, census: CensusWitness, s
     assert_eq!(ok.slot, slot);
     assert_eq!(ok.pkg.vote_id, req.vote_id);
 
-    // Negating x keeps the point on the curve: only the hash can notice.
+    // Negating x keeps the point on the curve: only the proof can notice.
     let mut bad = package(req, census);
     bad.ballot.0[0].c1.x = -bad.ballot.0[0].c1.x;
     assert!(bad.ballot.0[0].c1.is_on_curve());
     match validate_vote(&cfg, &vf, bad) {
-        Err(VoteError::InputsHashMismatch) => {}
-        other => panic!("want InputsHashMismatch, got {other:?}"),
+        Err(VoteError::BadProof) => {}
+        other => panic!("want BadProof, got {other:?}"),
     }
 }
 
@@ -123,7 +122,7 @@ fn check_vote(e: &Election, v: &Voter, req: &VoteRequest, k: &Fr, fields: &[u64]
         let want = fields.get(i).copied().unwrap_or(0);
         assert_eq!(decrypt(&e.sk, ct, 64), Some(want), "field {i}");
     }
-    let ih = inputs_hash(
+    let pubs = public_signals(
         &pid,
         &p.ballot_mode,
         &p.encryption_key,
@@ -133,8 +132,6 @@ fn check_vote(e: &Election, v: &Voter, req: &VoteRequest, k: &Fr, fields: &[u64]
         &Fr::from(weight),
     )
     .unwrap();
-    assert_eq!(req.ballot_inputs_hash, ih);
-    let pubs = [addr, Fr::from(req.vote_id), ih];
     let vf = verifier();
     assert!(
         vf.verify(&req.ballot_proof, &pubs),
@@ -142,8 +139,8 @@ fn check_vote(e: &Election, v: &Voter, req: &VoteRequest, k: &Fr, fields: &[u64]
     );
     assert_eq!(req.ballot_proof.protocol, "groth16");
     assert_eq!(req.ballot_proof.curve, "bn128");
-    // The checks bite: any other public signal fails.
-    for i in 0..3 {
+    // The checks bite: any of the 71 public signals changed fails.
+    for i in 0..pubs.len() {
         let mut bad = pubs;
         bad[i] += Fr::from(1u64);
         assert!(!vf.verify(&req.ballot_proof, &bad), "tampered public {i}");
@@ -230,7 +227,8 @@ fn vote_csp() {
     check_state_accepts(&e, &req, CensusWitness::Csp(att), slot_key_csp(17).unwrap());
 }
 
-// A ballot outside the mode never gets a proof: the circuit's own asserts fail.
+// A ballot outside the mode never gets a proof: the voter refuses it before
+// proving (the circuit's own rejection is covered in attack_client.rs).
 #[test]
 fn invalid_ballot_is_not_proved() {
     let Some(prover) = prover() else {
@@ -241,7 +239,7 @@ fn invalid_ballot_is_not_proved() {
     let census = merkle_census(&vs, 10);
     let e = election(2, 1, census.root(), &mut rng);
     let w = || CensusWitness::Merkle(census.proof(0).unwrap());
-    let circuit_rejects = |fields: &[u64], rng: &mut StdRng| match vs[0].build_vote(
+    let refused = |fields: &[u64], rng: &mut StdRng| match vs[0].build_vote(
         prover,
         &e.chain,
         fields,
@@ -249,13 +247,13 @@ fn invalid_ballot_is_not_proved() {
         10,
         rng,
     ) {
-        Err(Error::Prover(m)) => assert!(m.contains("rejected by the circuit"), "{m}"),
-        other => panic!("want a circuit rejection, got {other:?}"),
+        Err(Error::Invalid(m)) => assert!(m.contains("ballot mode"), "{m}"),
+        other => panic!("want a local refusal, got {other:?}"),
     };
     // max_value is 7.
-    circuit_rejects(&[8, 0], &mut rng);
+    refused(&[8, 0], &mut rng);
     // Sum above the weight (max_value_sum = 0 means the weight bounds it).
-    circuit_rejects(&[7, 7], &mut rng);
+    refused(&[7, 7], &mut rng);
     // More values than fields: refused before proving.
     assert!(matches!(
         vs[0].build_vote(prover, &e.chain, &[1, 1, 1], w(), 10, &mut rng),

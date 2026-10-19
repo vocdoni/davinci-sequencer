@@ -1,12 +1,12 @@
 //! Stateless vote validation: every per-vote check the zkVM guest makes,
 //! so an invalid vote never reaches a batch.
 
-use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, inputs_hash};
+use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, public_signals};
 use davinci_zkvm_sdk::census::{
-    CensusWitness, CspProof, EcdsaSignature, census_leaf, csp_recover, slot_key_address,
+    CensusWitness, CspProof, EcdsaSignature, Node, census_leaf, csp_recover, slot_key_address,
     slot_key_csp, verify_census_proof,
 };
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be};
+use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::limits::{BALLOT_COORDS, MAX_CENSUS_DEPTH, VOTE_ID_MIN};
 use davinci_zkvm_sdk::types::SnarkJsProof;
@@ -22,7 +22,6 @@ pub struct VotePackage {
     pub address: [u8; 20],
     pub ballot: Ballot,
     pub proof: SnarkJsProof,
-    pub inputs_hash: Fr,
     pub signature: EcdsaSignature,
     pub census: CensusWitness,
     pub weight: u128,
@@ -48,6 +47,11 @@ pub fn ballot_from_be_coords(coords: &[[u8; 32]; BALLOT_COORDS]) -> Result<Ballo
 fn check_census(cfg: &ProcessConfig, pkg: &VotePackage) -> Result<u64, VoteError> {
     match (&pkg.census, cfg.census_origin) {
         (CensusWitness::Merkle(p), o) if o.is_merkle() => {
+            // Guest 3A.6: a leaf is below 2^248, which keeps leaves apart
+            // from the 256-bit internal nodes.
+            if p.leaf[0] != 0 {
+                return Err(VoteError::CensusLeafRange);
+            }
             if p.siblings.len() > MAX_CENSUS_DEPTH {
                 return Err(VoteError::CensusDepth);
             }
@@ -76,7 +80,7 @@ fn check_census(cfg: &ProcessConfig, pkg: &VotePackage) -> Result<u64, VoteError
             }
             let signer = csp_root_signer(&pkg.process_id, p)?;
             // The census root is the CSP address as uint160.
-            let root = fr_to_be(&cfg.census_root);
+            let root = &cfg.census_root;
             if root[..12] != [0u8; 12] || root[12..] != signer {
                 return Err(VoteError::CspSignerMismatch);
             }
@@ -87,7 +91,13 @@ fn check_census(cfg: &ProcessConfig, pkg: &VotePackage) -> Result<u64, VoteError
 }
 
 fn csp_root_signer(pid: &Fr, p: &CspProof) -> Result<[u8; 20], VoteError> {
-    csp_recover(pid, p).map_err(|e| VoteError::CspSignatureInvalid(e.to_string()))
+    let (s, recid) = low_s(&p.r, &p.s, p.recid);
+    let p = CspProof {
+        s,
+        recid,
+        ..p.clone()
+    };
+    csp_recover(pid, &p).map_err(|e| VoteError::CspSignatureInvalid(e.to_string()))
 }
 
 /// Runs every guest per-vote rule against `pkg`. `verifier` must be the
@@ -116,50 +126,64 @@ pub fn validate_vote(
     if !pkg.ballot.is_padded_ok(cfg.ballot_mode.num_fields) {
         return Err(VoteError::PaddingNotIdentity);
     }
+    // The guest's bound on Merkle leaves and CSP entries (3B.2c) alike.
     if pkg.weight >> 88 != 0 {
         return Err(VoteError::WeightRange);
     }
 
     let slot = check_census(cfg, &pkg)?;
 
-    // Vote id signature by the voter's own key (high-S and bad recid are
-    // rejected by the recover itself).
+    // Vote id signature by the voter's own key.
     let signer = vote_id_signer(pkg.vote_id, &pkg.signature)?;
     if signer != pkg.address {
         return Err(VoteError::SignatureMismatch);
     }
 
-    let addr = address_to_fr(&pkg.address);
-    let ih = inputs_hash(
+    // The 71 inputs the guest derives for this vote. The mode packs (it is
+    // a genesis leaf), so an error here cannot come from the vote.
+    let pubs = public_signals(
         &cfg.process_id,
         &cfg.ballot_mode,
         &cfg.enc_key,
-        &addr,
+        &address_to_fr(&pkg.address),
         pkg.vote_id,
         &pkg.ballot,
         &Fr::from(pkg.weight),
     )
-    .map_err(|_| VoteError::InputsHashMismatch)?;
-    if ih != pkg.inputs_hash {
-        return Err(VoteError::InputsHashMismatch);
-    }
-
-    if !verifier.verify(&pkg.proof, &[addr, Fr::from(pkg.vote_id), ih]) {
+    .map_err(|_| VoteError::BadProof)?;
+    if !verifier.verify(&pkg.proof, &pubs) {
         return Err(VoteError::BadProof);
     }
 
     Ok(VerifiedVote { pkg, slot })
 }
 
+// The guest takes v in {0, 1} (the wire maps 27/28 down) and any s in
+// [1, n-1], while the SDK recover refuses high-S: fold s to its low twin,
+// which recovers the same key with the other recid.
+fn low_s(r: &[u8; 32], s: &[u8; 32], v: u8) -> ([u8; 32], u8) {
+    let recid = if v >= 27 { v - 27 } else { v };
+    match k256::ecdsa::Signature::from_scalars(*r, *s) {
+        Ok(sig) if recid <= 1 => match sig.normalize_s() {
+            Some(low) => (low.s().to_bytes().into(), recid ^ 1),
+            None => (*s, recid),
+        },
+        // Out of range or a bad recid: the SDK recover refuses it as is.
+        _ => (*s, v),
+    }
+}
+
 fn vote_id_signer(vote_id: u64, sig: &EcdsaSignature) -> Result<[u8; 20], VoteError> {
-    davinci_zkvm_sdk::census::vote_id_recover(vote_id, sig)
+    let (s, v) = low_s(&sig.r, &sig.s, sig.v);
+    let sig = EcdsaSignature { r: sig.r, s, v };
+    davinci_zkvm_sdk::census::vote_id_recover(vote_id, &sig)
         .map_err(|e| VoteError::SignatureInvalid(e.to_string()))
 }
 
 /// Whether a pending vote survives a census update: for a Merkle
 /// origin, `new_leaf` (the address's leaf in the new census, if any) must be
 /// the leaf the vote was validated with. A CSP census never changes.
-pub fn vote_still_valid(cfg: &ProcessConfig, pkg: &VotePackage, new_leaf: Option<Fr>) -> bool {
+pub fn vote_still_valid(cfg: &ProcessConfig, pkg: &VotePackage, new_leaf: Option<Node>) -> bool {
     if !cfg.census_origin.is_merkle() {
         return true;
     }

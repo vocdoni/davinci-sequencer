@@ -151,6 +151,7 @@ fn batch_snark(b: &Batch, census_root_be: &[u8; 32], blobs: &TransitionBlobs) ->
     p.reg32(28, &blobs.digest);
     p.word(36, blobs.blobs.len() as u32);
     p.word(42, b.occupied_before);
+    p.reg32(46, &blobs.cells_digest);
     PlonkSnark {
         program_vk: BATCH_VK,
         root_c_vadcop_final: ROOT_C,
@@ -810,7 +811,7 @@ async fn metadata_updates_on_anvil() {
                 min_value_sum: 0,
             },
             census_origin: 1,
-            census_root: Fr::from(42u64),
+            census_root: [0xc5; 32],
             census_contract: [0; 20],
             census_uri: "file:///tmp/census.json".into(),
             metadata: "ipfs://meta".into(),
@@ -1477,7 +1478,7 @@ async fn dkg_results_on_anvil() {
     use davinci_sequencer::web3::KeyMode;
     use davinci_state::{CensusOrigin, ProcessConfig, ProcessState};
     use davinci_zkvm_sdk::crypto::babyjubjub::Point;
-    use davinci_zkvm_sdk::crypto::field::{fr_to_be, u256_to_be};
+    use davinci_zkvm_sdk::crypto::field::u256_to_be;
     use davinci_zkvm_sdk::dkg::point_to_rte;
 
     if !enabled() {
@@ -1610,7 +1611,7 @@ async fn dkg_results_on_anvil() {
             overwrites: 0,
             occupied_before: 0,
         },
-        &fr_to_be(&census_root),
+        &census_root,
         &b.blobs,
     );
     c.submit_transition(&pid, &snark, &b.blobs).await.unwrap();
@@ -1982,7 +1983,7 @@ async fn council_results_on_anvil() {
             overwrites: 0,
             occupied_before: 0,
         },
-        &fr_to_be(&census_root),
+        &census_root,
         &b.blobs,
     );
     c.submit_transition(&pid, &snark, &b.blobs).await.unwrap();
@@ -2210,7 +2211,7 @@ async fn council_gate_on_anvil() {
             overwrites: 0,
             occupied_before: 0,
         },
-        &fr_to_be(&census_root),
+        &census_root,
         &b.blobs,
     );
     c.submit_transition(&voted, &snark, &b.blobs).await.unwrap();

@@ -9,7 +9,8 @@ use arbo::{CircomProcessorProof, Storage};
 use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, ballot_leaf_hash, leaf_value_bytes};
 use davinci_zkvm_sdk::blob::{self, TransitionBlobs, TransitionData};
 use davinci_zkvm_sdk::census::CensusWitness;
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_to_dec, fr_to_le};
+use davinci_zkvm_sdk::crypto::field::{Fr, fr_to_dec};
+use davinci_zkvm_sdk::groth16::N_PUBLIC;
 use davinci_zkvm_sdk::limits::{
     self, KEY_RESULTS, MAX_BATCH_SIZE, MAX_REFRESH, PROCESS_KEYS, SMT_LEVELS,
 };
@@ -111,6 +112,9 @@ impl PreparedBatch {
         }
         if got.n_blobs != e.n_blobs {
             return field("n_blobs");
+        }
+        if got.cells_digest != e.cells_digest {
+            return field("cells_digest");
         }
         if got.occupied_before != e.occupied_before {
             return field("occupied_before");
@@ -303,6 +307,15 @@ impl<S: Storage> ProcessState<S> {
             if votes[..i].iter().any(|o| o.slot == v.slot) {
                 return Err(Error::Invalid(format!("vote {i} reuses a batch slot")));
             }
+            // A witness at another root (stale after a re-root) fails the
+            // whole batch in the guest (FAIL_CENSUS): a node fault, refused here.
+            if let CensusWitness::Merkle(p) = &v.pkg.census
+                && p.root != cfg.census_root
+            {
+                return Err(Error::Invalid(format!(
+                    "vote {i}: census witness is not at the batch census root"
+                )));
+            }
             if votes[..i].iter().any(|o| o.pkg.vote_id == v.pkg.vote_id) {
                 return Err(Error::Invalid(format!(
                     "vote id {:#x} used twice",
@@ -440,19 +453,15 @@ impl<S: Storage> ProcessState<S> {
         let blobs = blob::build_blobs(&tdata, &cfg.process_id, old_root)?;
 
         // The wire request.
+        // No public inputs: the guest derives each proof's 71 from the
+        // other blocks.
         let mut proofs = Vec::with_capacity(n);
-        let mut public_inputs = Vec::with_capacity(n);
         let mut sigs = Vec::with_capacity(n);
         let mut census_proofs = Vec::new();
         let mut csp_proofs = Vec::new();
         for v in votes {
             let addr = address_to_fr(&v.pkg.address);
             proofs.push(v.pkg.proof.clone());
-            public_inputs.push([
-                fr_to_dec(&addr),
-                v.pkg.vote_id.to_string(),
-                fr_to_dec(&v.pkg.inputs_hash),
-            ]);
             let sig = &v.pkg.signature;
             sigs.push(EcdsaSigJson {
                 // The guest recovers the key from (r, s, v); x/y are unused.
@@ -466,10 +475,10 @@ impl<S: Storage> ProcessState<S> {
             });
             match &v.pkg.census {
                 CensusWitness::Merkle(p) => census_proofs.push(CensusProofJson {
-                    root: enc::fr_be_hex(&p.root),
-                    leaf: enc::fr_be_hex(&p.leaf),
+                    root: enc::be_hex(&p.root),
+                    leaf: enc::be_hex(&p.leaf),
                     index: p.path_bits,
-                    siblings: p.siblings.iter().map(enc::fr_be_hex).collect(),
+                    siblings: p.siblings.iter().map(enc::be_hex).collect(),
                 }),
                 CensusWitness::Csp(p) => csp_proofs.push(CspProofJson {
                     r: format!("0x{}", hex::encode(p.r)),
@@ -521,9 +530,8 @@ impl<S: Storage> ProcessState<S> {
                 .collect(),
         };
         let request = ProveRequest {
-            vk: self.vk.clone(),
+            vk: (*self.vk).clone(),
             proofs,
-            public_inputs,
             sigs,
             state: Some(state),
             census_proofs: (!census_proofs.is_empty()).then_some(census_proofs),
@@ -533,6 +541,9 @@ impl<S: Storage> ProcessState<S> {
             output: None,
         };
 
+        // Register 20 carries the census root's little-endian bytes.
+        let mut census_root = cfg.census_root;
+        census_root.reverse();
         let expected = BatchPublics {
             ok: true,
             fail_mask: 0,
@@ -540,15 +551,16 @@ impl<S: Storage> ProcessState<S> {
             root_after: new_root,
             voters: n as u32,
             overwrites: w as u32,
-            census_root: fr_to_le(&cfg.census_root),
+            census_root,
             blobs_digest: blobs.digest,
             n_blobs: blobs.blobs.len() as u32,
             occupied_before: occupied_before as u32,
             nproofs: n as u32,
-            // The ballot circuit has 3 public inputs; input-gen publishes
-            // log_n = floor(log2(nproofs)) (f64 log2 truncated).
-            n_public: 3,
+            // input-gen publishes log_n = floor(log2(nproofs)) (f64 log2
+            // truncated).
+            n_public: N_PUBLIC as u32,
             log_n: (n as u32).ilog2(),
+            cells_digest: blobs.cells_digest,
         };
 
         slot_writes.extend(refresh_writes);

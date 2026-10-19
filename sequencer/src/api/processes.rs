@@ -3,16 +3,15 @@
 use std::net::SocketAddr;
 
 use axum::Json;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
 use davinci_client::api::{
     BlobsResponse, CensusView, EncryptionKeyRequest, EncryptionKeyResponse, MerkleProof,
     ParticipantResponse, ProcessId, ProcessList, ProcessStatus, ProcessView, TransitionList,
     TransitionView,
 };
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be};
+use davinci_zkvm_sdk::crypto::field::{Fr, fr_to_be};
 
+use super::extract::{Path, StrictJson};
 use super::{AppState, parse_addr};
 use crate::api::error::ApiError;
 use crate::storage::ProcessRecord;
@@ -52,8 +51,6 @@ fn view(
 ) -> Result<ProcessView, ApiError> {
     let p = &rec.onchain;
     let status = ProcessStatus::from_onchain(p.status as u8).unwrap_or(ProcessStatus::Unknown);
-    let census_root =
-        fr_from_be(&p.census.root).map_err(|e| ApiError::Internal(format!("census root: {e}")))?;
     Ok(ProcessView {
         id: pid_wire(&rec.pid),
         status,
@@ -63,7 +60,9 @@ fn view(
         ballot_mode: p.ballot_mode,
         census: CensusView {
             census_origin: p.census.origin,
-            census_root,
+            // The registry's bytes32, unreduced (a Keccak root is not a
+            // field element).
+            census_root: p.census.root,
             census_uri: p.census.uri.clone(),
         },
         state_root: p.state_root,
@@ -119,20 +118,14 @@ pub async fn get(
 pub async fn new_key(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    payload: Result<Json<EncryptionKeyRequest>, JsonRejection>,
+    payload: Result<StrictJson<EncryptionKeyRequest>, ApiError>,
 ) -> Result<Json<EncryptionKeyResponse>, ApiError> {
     // An observer's keys would lock the election: it can never finalize.
     if st.node.statics.sequencer_address.is_none() {
         return Err(ApiError::Observer("this node cannot finalize elections"));
     }
     st.take_key_token(peer.ip())?;
-    let Json(req) = payload.map_err(|r| {
-        if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::TooLarge
-        } else {
-            ApiError::Invalid(r.body_text())
-        }
-    })?;
+    let StrictJson(req) = payload?;
     let pk = st.node.keys.public_key(&req.process_id.0);
     Ok(Json(EncryptionKeyResponse::from_point(&pk)))
 }

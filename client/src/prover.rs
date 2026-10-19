@@ -111,6 +111,7 @@ fn g2_json(p: &G2Affine) -> [[String; 2]; 3] {
 // The zkey's VK hashed like the guest and the 0x07 leaf (SDK `vk_hash`).
 fn vk_hash(vk: &VerifyingKey<Bn254>) -> Result<[u8; 32]> {
     let json = SnarkJsVk {
+        setup: None,
         protocol: "groth16".into(),
         curve: "bn128".into(),
         n_public: Some(N_PUBLIC as u64),
@@ -185,9 +186,9 @@ impl BallotProver {
         })
     }
 
-    /// Proves `inputs`; returns the snarkjs proof and the public signals
-    /// `[address, vote_id, inputs_hash]`. The proof is verified before it is
-    /// returned.
+    /// Proves `inputs`; returns the snarkjs proof and its 71 public signals
+    /// (see [`CircomInputs::public_signals`]). The proof is verified before it
+    /// is returned.
     pub fn prove(&self, inputs: &CircomInputs) -> Result<(SnarkJsProof, [Fr; N_PUBLIC])> {
         let w = self.witness(inputs)?;
         if w.len() != self.num_witness || w.first() != Some(&Fr06::from(1u64)) {

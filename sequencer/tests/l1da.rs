@@ -429,6 +429,7 @@ fn rig_of(poll: Duration, blobs: TransitionBlobs, chunk: usize) -> Rig {
         nproofs: 1,
         n_public: 3,
         log_n: 0,
+        cells_digest: blobs.cells_digest,
     };
     let snark = PlonkSnark {
         program_vk: release::BATCH_PROGRAM_VK,

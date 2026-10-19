@@ -42,11 +42,11 @@ fn ballot_prover() -> &'static BallotProver {
     })
 }
 
-// The inputs hash binds everything the proof binds, so it keys the cache.
-fn cached_proof(inputs: &CircomInputs, ih: &Fr) -> SnarkJsProof {
+// Keyed by the public signals (`common::signals_key`).
+fn cached_proof(inputs: &CircomInputs) -> SnarkJsProof {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cache");
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{}.json", hex::encode(fr_to_be(ih))));
+    let path = dir.join(format!("{}.json", signals_key(&inputs.public_signals())));
     if let Ok(s) = std::fs::read_to_string(&path)
         && let Ok(p) = serde_json::from_str(&s)
     {
@@ -75,9 +75,8 @@ fn real_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedVote 
         encryption_pubkey: [cfg.enc_key.x, cfg.enc_key.y],
         k: Fr::from(kseed),
         cipherfields: v.pkg.ballot.coords(),
-        inputs_hash: v.pkg.inputs_hash,
     };
-    v.pkg.proof = cached_proof(&inputs, &v.pkg.inputs_hash);
+    v.pkg.proof = cached_proof(&inputs);
     v
 }
 
@@ -94,7 +93,6 @@ fn wire_vote(v: &VerifiedVote) -> VoteRequest {
         vote_id: pkg.vote_id,
         ballot: pkg.ballot,
         ballot_proof: pkg.proof.clone(),
-        ballot_inputs_hash: pkg.inputs_hash,
         signature: sig,
         weight: pkg.weight,
         census_proof: None,
@@ -158,7 +156,7 @@ fn csp_setup() -> TestSetup {
     e.cfg.census_origin = CensusOrigin::Csp;
     let mut be = [0u8; 32];
     be[12..].copy_from_slice(&voter_address(99));
-    e.cfg.census_root = fr_from_be(&be).unwrap();
+    e.cfg.census_root = be;
     let census_dir = TempDir::new().unwrap();
     let uri = write_census(census_dir.path(), 4); // unused for CSP
     let chain = FakeChain::new(&e, uri);
@@ -299,6 +297,80 @@ async fn participant_proof_verifies() {
         .await
         .unwrap_err();
     assert_eq!(api_code(e), (404, 40401));
+    t.shutdown.cancel();
+}
+
+// A Keccak census root above the BN254 modulus: the process is served (not
+// ignored), its view and the participant proofs carry the 256-bit values
+// unreduced, as `0x` and 64 lowercase hex digits, and a vote under it is
+// admitted.
+#[tokio::test]
+async fn census_root_above_the_modulus_is_served_unreduced() {
+    let t = serve(FakeProver::gated(), 100).await;
+    handle(&t.node).await;
+    let root = t.s.env.cfg.census_root;
+    assert!(
+        fr_from_be(&root).is_err(),
+        "the 4-member root is above the modulus"
+    );
+    let hex64 = |v: &serde_json::Value| {
+        let s = v.as_str().unwrap_or_default();
+        s.len() == 66
+            && s.starts_with("0x")
+            && s[2..]
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let get = |path: String| {
+        let url = format!("{}{path}", t.base);
+        async move {
+            reqwest::get(url)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let p = get(format!("/processes/0x{}", hex::encode(pid31()))).await;
+    assert_eq!(
+        p["census"]["censusRoot"],
+        format!("0x{}", hex::encode(root))
+    );
+    assert!(p.get("ignored").is_none(), "{p}");
+    let part = get(format!(
+        "/processes/0x{}/participants/0x{}",
+        hex::encode(pid31()),
+        hex::encode(voter_address(2))
+    ))
+    .await;
+    let cp = &part["censusProof"];
+    assert_eq!(cp["root"], format!("0x{}", hex::encode(root)));
+    assert!(hex64(&cp["leaf"]), "{cp}");
+    let sibs = cp["siblings"].as_array().unwrap();
+    assert!(!sibs.is_empty() && sibs.iter().all(hex64), "{cp}");
+    t.client
+        .submit_vote(&wire_vote(&real_vote(&t.s.env, 2, &[1, 2], 31)))
+        .await
+        .unwrap();
+    t.shutdown.cancel();
+}
+
+// An earlier client still sends `ballotInputsHash`: refused as an unknown
+// field (400/40001), the message naming it.
+#[tokio::test]
+async fn vote_with_an_inputs_hash_is_refused() {
+    let t = serve(FakeProver::gated(), 100).await;
+    handle(&t.node).await;
+    let mut body = serde_json::to_value(wire_vote(&real_vote(&t.s.env, 0, &[1, 2], 5))).unwrap();
+    body["ballotInputsHash"] = serde_json::json!("12345");
+    let (status, e) = raw_post(&t.base, "/votes", body.to_string()).await;
+    assert_eq!((status, e.code), (400, 40001));
+    assert!(e.error.contains("ballotInputsHash"), "{}", e.error);
+    assert_eq!(
+        t.client.process(&pid31()).await.unwrap().pending_votes,
+        Some(0)
+    );
     t.shutdown.cancel();
 }
 
@@ -784,7 +856,7 @@ async fn onchain_bootstrap_waits_out_an_rpc_outage() {
 
     let mut e = env(2, 4, None);
     e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
-    e.cfg.census_root = fr_from_be(&root).unwrap();
+    e.cfg.census_root = root;
     let census_dir = TempDir::new().unwrap();
     let chain = FakeChain::new(&e, String::new());
     let c = ch.census.into_array();
@@ -820,7 +892,7 @@ async fn onchain_bootstrap_waits_out_an_rpc_outage() {
         .participant(&pid31(), &voter_address(0))
         .await
         .unwrap();
-    assert_eq!(fr_to_be(&proof.root), root);
+    assert_eq!(proof.root, root);
     t.shutdown.cancel();
 }
 
@@ -839,7 +911,7 @@ async fn onchain_census_votes_at_the_latest_root() {
     // The registry recorded the root of the first block; voter 1 came later.
     let mut e = env(2, 4, None);
     e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
-    e.cfg.census_root = fr_from_be(&recorded).unwrap();
+    e.cfg.census_root = recorded;
     let census_dir = TempDir::new().unwrap();
     let chain = FakeChain::new(&e, String::new());
     chain.set_census_contract(ch.census.into_array());
@@ -862,7 +934,7 @@ async fn onchain_census_votes_at_the_latest_root() {
         .participant(&pid31(), &voter_address(1))
         .await
         .unwrap();
-    assert_eq!((fr_to_be(&proof.root), weight), (latest, 1));
+    assert_eq!((proof.root, weight), (latest, 1));
     t.client
         .submit_vote(&wire_vote(&real_vote(&t.s.env, 1, &[1, 2], 7)))
         .await
@@ -900,7 +972,7 @@ fn offchain_setup() -> TestSetup {
     }
 }
 
-fn census_root(voters: impl IntoIterator<Item = usize>) -> Fr {
+fn census_root(voters: impl IntoIterator<Item = usize>) -> [u8; 32] {
     LeanImt::from_leaves(
         voters
             .into_iter()
@@ -912,18 +984,18 @@ fn census_root(voters: impl IntoIterator<Item = usize>) -> Fr {
 
 /// Writes `voters` to `<census dir>/<sub>/census.json` and emits
 /// `CensusUpdated` for it with `root`.
-fn update_census(t: &Served, sub: &str, voters: &[usize], root: Fr) {
+fn update_census(t: &Served, sub: &str, voters: &[usize], root: [u8; 32]) {
     let dir = t.s.census_dir.join(sub);
     std::fs::create_dir(&dir).unwrap();
     let uri = write_census_of(&dir, voters.iter().copied());
     announce_census(t, uri, root);
 }
 
-fn announce_census(t: &Served, uri: String, root: Fr) {
-    t.s.chain.set_census(fr_to_be(&root), uri);
+fn announce_census(t: &Served, uri: String, root: [u8; 32]) {
+    t.s.chain.set_census(root, uri);
 }
 
-async fn wait_served(t: &Served, voter: usize, root: Fr) {
+async fn wait_served(t: &Served, voter: usize, root: [u8; 32]) {
     wait_until("census update served", async || {
         t.client
             .participant(&pid31(), &voter_address(voter))
@@ -954,12 +1026,16 @@ async fn offchain_census_update_is_fetched_and_served() {
 
     // The organizer grows the census to five voters.
     let root1 = census_root(0..5);
+    // Every root of this test is above the BN254 modulus (Keccak roots).
+    for r in [root0, root1, census_root(1..5)] {
+        assert!(fr_from_be(&r).is_err());
+    }
     update_census(&t, "v2", &[0, 1, 2, 3, 4], root1);
     wait_served(&t, 4, root1).await;
     // Another process's record points at root1, so it outlives the update.
     let mut other = t.node.db.process(&pid_fr()).unwrap().unwrap();
     other.pid = bad_pid_fr();
-    other.onchain.census.root = fr_to_be(&root1);
+    other.onchain.census.root = root1;
     t.node.db.put_process(&other).unwrap();
 
     // Then drops voter 0, who already voted.

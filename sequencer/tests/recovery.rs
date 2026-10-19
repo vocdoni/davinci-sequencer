@@ -71,6 +71,66 @@ async fn killed_after_seal_restarts_pending_with_committed_root() {
     shutdown2.cancel();
 }
 
+/// A vote queued under a Keccak census root above the BN254 modulus
+/// survives a restart: its stored witness is reread as the 256-bit values it
+/// was written with.
+#[tokio::test]
+async fn queued_vote_under_a_root_above_the_modulus_survives_a_restart() {
+    let s = setup(2, 4, None);
+    assert!(fr_from_be(&s.env.cfg.census_root).is_err());
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let node = start_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        2,
+        "0s",
+        shutdown.clone(),
+    )
+    .await;
+    let h = handle(&node).await;
+    let v = fake_vote(&s.env, 1, &[1, 2], 720);
+    let vid = v.pkg.vote_id;
+    h.submit(v).await.unwrap();
+    assert_eq!(vote_status(&h, vid).await, Some(VoteStatus::Pending));
+    shutdown.cancel();
+    drop(h);
+    drop(node);
+
+    let shutdown2 = CancellationToken::new();
+    let node2 = start_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        s.chain.clone(),
+        FakeProver::open(),
+        2,
+        "0s",
+        shutdown2.clone(),
+    )
+    .await;
+    let h2 = handle(&node2).await;
+    wait_until("vote reloaded", async || {
+        vote_status(&h2, vid).await == Some(VoteStatus::Pending)
+    })
+    .await;
+    let v2 = fake_vote(&s.env, 2, &[2, 1], 721);
+    let vid2 = v2.pkg.vote_id;
+    h2.submit(v2).await.unwrap();
+    wait_until("both settled", async || {
+        all_settled(&h2, &[vid, vid2]).await
+    })
+    .await;
+    assert_eq!(
+        s.chain.last_census_root(),
+        Some(census_le(&s.env.cfg.census_root))
+    );
+    shutdown2.cancel();
+}
+
 /// The chain moved while the node was down (another sequencer settled a
 /// transition): the restart syncs it from the blobs and then settles its
 /// own pending vote on the new root.

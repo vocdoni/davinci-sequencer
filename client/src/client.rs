@@ -19,10 +19,27 @@ const MAX_BODY: usize = 16 << 20;
 /// Longest error text kept from a response.
 const MAX_ERR: usize = 4096;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SequencerClient {
     base: String,
     http: reqwest::Client,
+}
+
+// The base URL may carry credentials (`user:pass@host`): keep them out of logs.
+impl std::fmt::Debug for SequencerClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = match reqwest::Url::parse(&self.base) {
+            Ok(mut u) => {
+                let _ = u.set_username("");
+                let _ = u.set_password(None);
+                u.to_string()
+            }
+            Err(_) => "<invalid url>".into(),
+        };
+        f.debug_struct("SequencerClient")
+            .field("base", &shown)
+            .finish_non_exhaustive()
+    }
 }
 
 fn api_error(status: u16, body: &[u8]) -> Error {
@@ -53,9 +70,12 @@ fn hex_addr(a: &[u8; 20]) -> String {
 }
 
 impl SequencerClient {
-    /// Client with a 10 s connect and 60 s request timeout.
+    /// Client with a 10 s connect and 60 s request timeout. It follows no
+    /// redirects: a sequencer must not steer the client (or a vote body) to
+    /// another host.
     pub fn new(url: &str) -> Self {
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build()
@@ -132,7 +152,11 @@ impl SequencerClient {
     }
 
     pub async fn process(&self, pid: &[u8; 31]) -> Result<ProcessView> {
-        self.get(&format!("/processes/{}", ProcessId(*pid))).await
+        let v: ProcessView = self.get(&format!("/processes/{}", ProcessId(*pid))).await?;
+        if v.id.0 != *pid {
+            return Err(Error::Decode("process view is for another process".into()));
+        }
+        Ok(v)
     }
 
     /// Census proof and weight of `addr`. The proof must be for `addr`'s own
@@ -200,12 +224,17 @@ impl SequencerClient {
     }
 
     pub async fn ballot(&self, pid: &[u8; 31], addr: &[u8; 20]) -> Result<BallotResponse> {
-        self.get(&format!(
-            "/votes/{}/address/{}",
-            ProcessId(*pid),
-            hex_addr(addr)
-        ))
-        .await
+        let r: BallotResponse = self
+            .get(&format!(
+                "/votes/{}/address/{}",
+                ProcessId(*pid),
+                hex_addr(addr)
+            ))
+            .await?;
+        if r.address != *addr {
+            return Err(Error::Decode("ballot is for another address".into()));
+        }
+        Ok(r)
     }
 
     pub async fn transitions(&self, pid: &[u8; 31]) -> Result<Vec<TransitionView>> {

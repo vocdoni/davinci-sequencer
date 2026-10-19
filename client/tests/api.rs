@@ -63,7 +63,6 @@ fn sample_vote(census: CensusProofWire) -> VoteRequest {
         vote_id: 0x8000_0000_0000_1234,
         ballot: sample_ballot(),
         ballot_proof: sample_proof(),
-        ballot_inputs_hash: Fr::from(999u64),
         signature: [7u8; 65],
         weight: 42,
         census_proof: Some(census),
@@ -89,18 +88,16 @@ fn vote_request_json_shape_and_roundtrip() {
         "voteId",
         "ballot",
         "ballotProof",
-        "ballotInputsHash",
         "signature",
         "weight",
         "censusProof",
     ] {
         assert!(keys.contains(&k), "missing {k}: {keys:?}");
     }
-    assert_eq!(keys.len(), 9);
+    assert_eq!(keys.len(), 8);
     assert_eq!(j["processId"], json!(format!("0x{}", "ab".repeat(31))));
     assert_eq!(j["address"], json!(format!("0x{}", "11".repeat(20))));
     assert_eq!(j["voteId"], json!("0x8000000000001234"));
-    assert_eq!(j["ballotInputsHash"], json!("999"));
     assert_eq!(j["weight"], json!("42"));
     assert_eq!(j["signature"].as_str().unwrap().len(), 2 + 130);
     // 16 ciphertexts of decimal TE coordinates.
@@ -116,7 +113,19 @@ fn vote_request_json_shape_and_roundtrip() {
     );
     assert_eq!(j["ballotProof"]["protocol"], json!("groth16"));
     assert_eq!(j["censusProof"]["type"], json!("merkle"));
-    assert!(j["censusProof"]["siblings"].is_array());
+    // Census values: `0x` and 64 lowercase hex digits.
+    let hex64 = |v: &Value| {
+        let s = v.as_str().unwrap();
+        s.len() == 66
+            && s.starts_with("0x")
+            && s[2..]
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let cp = &j["censusProof"];
+    assert!(hex64(&cp["root"]) && hex64(&cp["leaf"]), "{cp}");
+    assert!(!cp["siblings"].as_array().unwrap().is_empty());
+    assert!(cp["siblings"].as_array().unwrap().iter().all(hex64), "{cp}");
 
     let back: VoteRequest = serde_json::from_value(j).unwrap();
     assert_eq!(back, v);
@@ -160,10 +169,11 @@ fn vote_request_rejects_bad_encodings() {
         serde_json::from_value::<VoteRequest>(j).is_err()
     };
     assert!(!bad(&|_| {}));
-    assert!(bad(&|j| j["ballotInputsHash"] = json!(P)), "Fr = p");
-    assert!(bad(&|j| j["ballotInputsHash"] = json!("0x10")), "hex Fr");
-    assert!(bad(&|j| j["ballotInputsHash"] = json!("-1")));
-    assert!(bad(&|j| j["ballotInputsHash"] = json!(5)), "number Fr");
+    // An old client's inputs hash is an unknown field, named in the error.
+    let mut old = good.clone();
+    old["ballotInputsHash"] = json!("999");
+    let e = serde_json::from_value::<VoteRequest>(old).unwrap_err();
+    assert!(e.to_string().contains("ballotInputsHash"), "{e}");
     assert!(
         bad(&|j| j["ballot"][0]["c1"]["x"] = json!("5")),
         "off curve"
@@ -203,8 +213,56 @@ fn vote_request_rejects_bad_encodings() {
     ));
     assert!(bad(&|j| j["weight"] = json!(42)), "number weight");
     assert!(bad(&|j| j["censusProof"]["type"] = json!("dynamic")));
-    assert!(bad(&|j| j["censusProof"]["root"] = json!(P)));
     assert!(bad(&|j| j["extra"] = json!(1)), "unknown field");
+}
+
+// Census values are `0x` and exactly 64 hex digits, either case; any other
+// form (decimal, short, long, no prefix, `0X`, a number) is refused (R5).
+#[test]
+fn census_values_are_0x_and_64_hex_digits() {
+    let good = serde_json::to_value(sample_vote(merkle_wire())).unwrap();
+    let root = good["censusProof"]["root"].as_str().unwrap().to_string();
+    let with = |field: &str, v: Value| {
+        let mut j = good.clone();
+        if field == "siblings" {
+            j["censusProof"]["siblings"][0] = v;
+        } else {
+            j["censusProof"][field] = v;
+        }
+        serde_json::from_value::<VoteRequest>(j)
+    };
+    for field in ["root", "leaf", "siblings"] {
+        assert!(
+            with(field, json!(root.to_uppercase().replacen("0X", "0x", 1))).is_ok(),
+            "{field} upper"
+        );
+        for bad in [
+            json!(P),
+            json!("5"),
+            json!(5),
+            json!(root[2..].to_string()),
+            json!(format!("0X{}", &root[2..])),
+            json!(format!("0x{}", &root[3..])),
+            json!(format!("{root}0")),
+            json!(format!("0x{}", "zz".repeat(32))),
+        ] {
+            assert!(with(field, bad.clone()).is_err(), "{field} {bad}");
+        }
+    }
+}
+
+// A census root above the BN254 modulus is carried as is, never reduced.
+#[test]
+fn census_view_carries_a_root_above_the_modulus() {
+    let mut v = view(mode(2));
+    v.census.census_root = [0xee; 32];
+    let j = serde_json::to_value(&v).unwrap();
+    assert_eq!(
+        j["census"]["censusRoot"],
+        json!(format!("0x{}", "ee".repeat(32)))
+    );
+    let back: ProcessView = serde_json::from_value(j).unwrap();
+    assert_eq!(back.census.census_root, [0xee; 32]);
 }
 
 #[test]
@@ -285,7 +343,7 @@ fn view(m: BallotMode) -> ProcessView {
         ballot_mode: m,
         census: api::CensusView {
             census_origin: 1,
-            census_root: Fr::from(5u64),
+            census_root: [5; 32],
             census_uri: "file:///tmp/census.json".into(),
         },
         state_root: [4; 32],
@@ -508,7 +566,7 @@ fn census_proof_is_optional() {
     v.census_proof = None;
     let j = serde_json::to_value(&v).unwrap();
     assert!(j.get("censusProof").is_none(), "omitted when absent");
-    assert_eq!(j.as_object().unwrap().len(), 8);
+    assert_eq!(j.as_object().unwrap().len(), 7);
     let back: VoteRequest = serde_json::from_value(j).unwrap();
     assert_eq!(back, v);
     assert_eq!(back.census_witness(), None);
@@ -578,10 +636,7 @@ fn process_view_is_checked_against_the_registry() {
         ),
         ("mode", Box::new(|v| v.ballot_mode.max_value += 1)),
         ("num fields", Box::new(|v| v.ballot_mode.num_fields = 3)),
-        (
-            "census root",
-            Box::new(|v| v.census.census_root += Fr::from(1u64)),
-        ),
+        ("census root", Box::new(|v| v.census.census_root[31] ^= 1)),
         ("census origin", Box::new(|v| v.census.census_origin = 4)),
     ];
     for (what, f) in tampered {

@@ -6,7 +6,7 @@ The tests read sibling checkouts next to this repository:
 
 | Checkout | Used by | Override |
 |---|---|---|
-| `../davinci-zkvm` | Everything (path dependency), the emulator runs | `CIRCUIT_ELF_PATH` for the circuit |
+| `../davinci-zkvm` | Everything (path dependency), the emulator runs | `CIRCUIT_ELF_PATH` for the batch circuit, `RESULTS_ELF_PATH` for the results circuit |
 | `../davinci-contracts` (`forge build`) | Anvil tests, e2e | `DAVINCI_CONTRACTS_DIR` |
 | `../davinci-onchain-census-contract` (`forge build`) | Census anvil tests, e2e | `DAVINCI_CENSUS_CONTRACT_DIR` |
 | `../davinci-circom/artifacts` | Ballot proofs | `CIRCOM_ARTIFACTS` |
@@ -23,18 +23,20 @@ cargo test -p davinci-state                 # one crate
 ```
 
 The state and API tests use real ballot proofs. They are cached under `state/tests/cache` and
-`sequencer/tests/cache` (gitignored); a cold cache proves them from `CIRCOM_ARTIFACTS`.
+`sequencer/tests/cache` (gitignored), each file named by the sha256 of the proof's 71 public
+signals (big-endian, concatenated); a cold cache proves them from `CIRCOM_ARTIFACTS`.
 
 Tests that need external tools are gated by an environment variable. When it is unset they print
 a skip line and pass, so check the output before assuming they ran.
 
 | Command | Needs | Covers |
 |---|---|---|
-| `ZISKEMU=1 cargo test -p davinci-state --test dryrun -- --test-threads=1` | `ziskemu` and the circuit ELF | Rust-built transitions through the real circuit on the emulator, all 64 outputs compared. No GPU. |
+| `ZISKEMU=1 cargo test -p davinci-state --test dryrun -- --test-threads=1` | `ziskemu`, the batch and the results ELFs | Rust-built transitions and one results request through the real guests on the emulator, all 64 outputs compared. No GPU. |
 | `ANVIL=1 cargo test -p davinci-sequencer --test web3_anvil` | anvil, davinci-contracts build | One- and two-blob transitions and results on a real registry. |
 | `ANVIL=1 cargo test -p davinci-sequencer --test web3_anvil l1_blob_mode` | anvil, davinci-contracts build with `L1BlobVerifier` and `MockL1Block` | L1-blob mode on two anvils: blob post, settlement, recorded anchor, origin mismatch, reorg re-post, dropped-post replacement. |
 | `ANVIL=1 cargo test -p davinci-client --test organizer` | anvil, davinci-contracts build | The organizer against a real registry. |
 | `ANVIL=1 cargo test -p davinci-sequencer --test census_anvil` (and `--test api`) | anvil, census contract build | The on-chain census index: incremental sync, restart, reorg, origin-3 votes. |
+| `ANVIL=1 cargo test -p davinci-sequencer --test attack_chaos chaos_onchain` | anvil, census contract build | Seeded chaos runs of an origin-3 election: members added to a real `OwnedCensus` while it runs, its RPC behind a failing proxy. Real time, 1.5 to 5 min a seed; `CHAOS_SEEDS=N` per shard (default 1, four shards in parallel). |
 | `CIRCOM_ARTIFACTS=<dir> cargo test -p davinci-client --test prover` | circom artifacts | The ballot prover. |
 | `cargo test -p arbo --features sdk-poseidon` | nothing extra | arbo's circom Poseidon vectors. |
 | `ARBO_BENCH_1M=1 cargo bench -p arbo` | nothing extra | arbo benchmarks with the 1M-leaf rows. |
@@ -93,7 +95,11 @@ transition in the block after it reverts `InvalidTimeBounds`.
 
 The nodes run with short timers (`BATCH_MAX=8`, `BATCH_TIME=3s`, `SOLO_WAIT=9s`,
 `FLUSH_HORIZON=10s`, `CONFIRMATIONS=0`, a 1 s poll) so they race, and the registry's grace
-parameters are sized for real proofs (`davinci_e2e::chain::GRACE_ARGS`).
+parameters are sized for real proofs (`davinci_e2e::chain::GRACE_ARGS`). The three nodes share
+one prover, so a landing in the grace can wait behind every node's job: the default grace must be
+at least nodes × proof time plus settlement, and (2 × nodes − 1) × proof time with a prover
+without `DELETE /jobs/{id}`, whose stale jobs stay queued after a lost race. With slower proofs,
+raise it through `DAVINCI_E2E_GRACE`.
 
 ```bash
 make e2e E2E_LOG=$HOME/.cache/davinci-e2e/e2e.log                              # blob mode

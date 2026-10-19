@@ -7,9 +7,9 @@ proofs that match what it computed itself.
 ## Properties
 
 - **One bad ballot cannot sink a batch.** `davinci_state::validate_vote` repeats every per-vote
-  check the circuit makes (ballot proof, signature, inputs hash, census binding, ballot encoding,
-  weight), and the actor applies the stateful rules (unused vote id, slot queue depth,
-  `maxVoters`). The batch builder mirrors the contract's `maxVoters` check and the blob limit.
+  check the circuit makes (ballot proof against the 71 public inputs the circuit derives,
+  signature, census binding with the leaf below 2^248, ballot encoding, weight below 2^88), and the
+  actor applies the stateful rules (unused vote id, slot queue depth, `maxVoters`). The batch builder mirrors the contract's `maxVoters` check and the blob limit.
 - **Proofs are checked against pins.** A batch settles only when the proof's program key and
   `rootCVadcopFinal` equal the SDK release pins and every public output equals what the node
   computed. The startup check refuses a registry or verifier that pins anything else. On-chain,
@@ -117,21 +117,27 @@ a DKG mode when no single node should hold the key.
   receipt. Deeper reorgs are detected and recovered (see
   [lifecycle.md](lifecycle.md#reorgs)):
   - the monitor compares the hash of the block at its event cursor each poll, and on a mismatch
-    rewinds 128 blocks and routes them again. After 5 failed block reads in a row it routes on
-    without the check until a read succeeds, so a reorg in that window goes unseen until then;
+    rewinds 128 blocks and routes them again, storing the rewound cursor with its hash. The
+    cursor block and its hash are the *anchor*: every state decision a process makes comes from
+    an event or from a read at the anchor's block hash (`requireCanonical`), which a backend on
+    the old branch cannot answer, and decides only what is at or below that block. Reads by
+    number only delay. After 5 failed block reads in a row (an unknown block counts as failed) the
+    monitor routes on without the check until a read succeeds; the anchor stays where it was, so
+    nothing closes out or finalizes past it meanwhile;
   - an own transaction whose event never confirms is rolled back after 90 s and its votes
     requeued;
-  - a process left ahead of the chain (a read at a root its log passed, or a transition forking
-    from one, for 90 s) is rebuilt from the chain: the lost transitions' votes go back to the
-    queue and re-seal on the chain's root. The rebuild replays the process from its blobs, so it
-    needs them (see Blob retention). A reorg the cursor check misses (its fail-open window) is
-    noticed only at the process's next chain read, which an idle process makes when it next has
-    work.
+  - a process left ahead of the chain (an anchored read at a root its log passed, or a transition
+    forking from one, for 90 s) is rebuilt from the chain: the lost transitions' votes go back to
+    the queue and re-seal on the chain's root. The rebuild replays the process from its blobs, so
+    it needs them (see Blob retention).
 
-  Results a reorg drops after the node finalized are submitted again once a chain read shows
-  them gone (the cursor check's re-read, a transition event, or the first read after a restart);
-  a reorg in the cursor check's fail-open window is seen only at the process's next read. A reorg
-  deeper than the 128-block rewind can leave events of the dropped range unrouted.
+  Results or a cancel a reorg drops are undone by the first anchored read at or above the block
+  they were confirmed at that lacks them: the results go in again, the cancel reopens admission.
+  Below that block they are suspended, never undone. An endpoint that refuses reads by block hash
+  holds every chain-read decision (sealing goes on) until it answers again; only with
+  `--degraded-number-reads`, for a single-backend endpoint, is it read by number between two
+  checks of the anchor's hash. A
+  reorg deeper than the 128-block rewind can leave events of the dropped range unrouted.
 - **Scalar bias.** Re-encryption scalars are SHA-256 digests reduced modulo the BN254 scalar
   field, which leaves them 2^-7.6 from uniform modulo the subgroup order. Closing the gap needs a
   512-bit reduction, which changes the batch circuit and its program key.

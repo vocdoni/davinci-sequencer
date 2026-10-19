@@ -1,5 +1,6 @@
 //! `OwnedCensus` (origin 3) from the davinci-onchain-census-contract forge
-//! project: deploy with PoseidonT3 linked, add members, read root and size.
+//! project: deploy (KeccakLeanIMT, no library to link), add members, read
+//! root and size.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -9,8 +10,6 @@ use alloy::providers::DynProvider;
 use alloy::rpc::types::TransactionReceipt;
 use alloy::sol;
 use anyhow::{Context, Result, bail, ensure};
-use davinci_client::api::Fr;
-use davinci_zkvm_sdk::crypto::field::fr_from_be;
 
 use crate::chain::deploy_receipt;
 
@@ -56,42 +55,24 @@ pub struct Census {
 }
 
 impl Census {
-    /// Deploys PoseidonT3 and an `OwnedCensus` linked to it (`dir` built)
-    /// from `provider`'s account. Share the provider with any other sender
-    /// on that account: it caches the nonce.
+    /// Deploys an `OwnedCensus` (`dir` built) from `provider`'s account; its
+    /// KeccakLeanIMT is internal, so there is no library to deploy or link.
+    /// Share the provider with any other sender on that account: it caches
+    /// the nonce.
     pub async fn deploy(provider: DynProvider, dir: &Path) -> Result<Census> {
-        let lib_code = code_of(&artifact(dir, "PoseidonT3.sol/PoseidonT3.json")?)?;
-        let lib_r = deploy_receipt(&provider, hex::decode(lib_code)?)
-            .await
-            .context("deploy PoseidonT3")?;
-        let lib = lib_r.contract_address.context("no PoseidonT3 address")?;
         let owned = artifact(dir, "OwnedCensus.sol/OwnedCensus.json")?;
-        let mut code = code_of(&owned)?;
-        let lib_hex = hex::encode(lib);
-        let mut linked = 0;
-        let refs = owned["bytecode"]["linkReferences"]
-            .as_object()
-            .context("OwnedCensus without linkReferences")?;
-        for file in refs.values() {
-            for r in file["PoseidonT3"].as_array().into_iter().flatten() {
-                let at = 2 * r["start"].as_u64().context("link start")? as usize;
-                ensure!(at + 40 <= code.len(), "link reference out of range");
-                code.replace_range(at..at + 40, &lib_hex);
-                linked += 1;
-            }
-        }
-        ensure!(linked > 0, "OwnedCensus has no PoseidonT3 link reference");
-        let r = deploy_receipt(&provider, hex::decode(code)?)
+        ensure!(
+            owned["bytecode"]["linkReferences"] == serde_json::json!({}),
+            "OwnedCensus links a library: rebuild davinci-onchain-census-contract"
+        );
+        let r = deploy_receipt(&provider, hex::decode(code_of(&owned)?)?)
             .await
             .context("deploy OwnedCensus")?;
         let address = r.contract_address.context("no OwnedCensus address")?;
         Ok(Census {
             address,
             c: OwnedCensus::new(address, provider),
-            receipts: Mutex::new(vec![
-                ("deploy PoseidonT3".into(), lib_r),
-                ("deploy OwnedCensus".into(), r),
-            ]),
+            receipts: Mutex::new(vec![("deploy OwnedCensus".into(), r)]),
         })
     }
 
@@ -154,9 +135,10 @@ impl Census {
         Ok(())
     }
 
-    pub async fn root(&self) -> Result<Fr> {
+    /// The contract's root, big-endian (a 256-bit Keccak value).
+    pub async fn root(&self) -> Result<[u8; 32]> {
         let r: U256 = self.c.getCensusRoot().call().await?;
-        Ok(fr_from_be(&r.to_be_bytes::<32>())?)
+        Ok(r.to_be_bytes::<32>())
     }
 
     pub async fn size(&self) -> Result<u64> {

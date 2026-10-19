@@ -217,7 +217,6 @@ pub fn fake_req(vid: u64, address: [u8; 20]) -> VoteRequest {
             protocol: "groth16".into(),
             curve: "bn128".into(),
         },
-        ballot_inputs_hash: Default::default(),
         signature: [0; 65],
         weight: 10,
         census_proof: None,

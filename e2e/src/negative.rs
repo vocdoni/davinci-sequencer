@@ -602,6 +602,20 @@ pub async fn grace(rpc: &str, registry: Address, pid: [u8; 31], from: u64) -> Re
     verdict(out)
 }
 
+/// The cancel one block before a DKG request: allowed while the block is
+/// before the grace end (a control), refused `InvalidTimeBounds` from it on.
+fn cancel_before_request(block_ts: u64, grace_end: u64, got: Outcome) -> Check {
+    if block_ts < grace_end {
+        control("cancel before the request (L-1)", got)
+    } else {
+        judge(
+            "cancel from the grace end (L-1)",
+            got,
+            &["InvalidTimeBounds"],
+        )
+    }
+}
+
 /// Prints every check; fails when a decidable one failed.
 fn verdict(out: Vec<Check>) -> Result<Vec<Check>> {
     for c in &out {
@@ -702,7 +716,19 @@ pub async fn dkg(
         &["ResultsNotReady"],
     ));
 
-    // The request closes the organizer's veto on a process past its end.
+    // The organizer's veto ends at the grace end, and the request needs the
+    // grace end, so after it the status refuses CANCELED too (InvalidTimeBounds).
+    // Votes stop before the request, so the grace end read now is the one at
+    // L-1; its block time decides whether the cancel there is still allowed.
+    let reader = RegistryReader::connect(rpc, registry)?;
+    let grace_end = reader.grace_end(&l.processId.0).await?;
+    let ts_before = sim
+        .p
+        .get_block_by_number((locked.block - 1).into())
+        .await?
+        .with_context(|| format!("block {}", locked.block - 1))?
+        .header
+        .timestamp;
     let cancel = PR::setProcessStatusCall {
         processId: l.processId,
         newStatus: 2,
@@ -716,7 +742,7 @@ pub async fn dkg(
             BlockId::number(locked.block - 1),
         )
         .await;
-    out.push(control("cancel before the request (L-1)", got));
+    out.push(cancel_before_request(ts_before, grace_end, got));
     let got = sim
         .call(organizer, cancel, None, BlockId::number(locked.block))
         .await;
@@ -771,6 +797,27 @@ mod tests {
         assert!(control("x", Outcome::Ok).problem.is_none());
         let c = control("x", r("InvalidStateRoot"));
         assert!(c.problem.is_some() && !c.inconclusive);
+    }
+
+    #[test]
+    fn cancel_before_request_by_grace_end() {
+        let r = |n: &str| Outcome::Reverted(n.into());
+        let open = cancel_before_request(99, 100, Outcome::Ok);
+        assert!(open.name.starts_with("cancel before") && open.problem.is_none());
+        assert!(
+            cancel_before_request(99, 100, r("InvalidTimeBounds"))
+                .problem
+                .is_some()
+        );
+        for ts in [100, 101] {
+            let c = cancel_before_request(ts, 100, r("InvalidTimeBounds"));
+            assert!(c.name.starts_with("cancel from") && c.problem.is_none());
+            assert!(
+                cancel_before_request(ts, 100, Outcome::Ok)
+                    .problem
+                    .is_some()
+            );
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ struct FakeTx {
     nonce: u64,
     fees: L1Fees,
     envelope: Bytes,
+    vhs: Vec<B256>,
 }
 
 struct Block {
@@ -78,6 +79,9 @@ struct L1Inner {
     sends: Vec<L1Send>,
     /// Sets the blocks of a reorg apart from the ones they replace.
     epoch: u8,
+    /// Mines an account's transaction only at its next nonce, as a real
+    /// chain does (off: the pool's order, gaps and all).
+    strict_nonces: bool,
 }
 
 /// The scripted Ethereum; every clone shares it, each handle posts as its
@@ -125,7 +129,20 @@ fn mine(i: &mut L1Inner) {
     let txs: Vec<FakeTx> = if i.hold {
         Vec::new()
     } else {
-        let keys: Vec<(Address, u64)> = i.pool.keys().take(room).copied().collect();
+        let mut keys: Vec<(Address, u64)> = i.pool.keys().copied().collect();
+        if i.strict_nonces {
+            // Each account's run of nonces from its next one, no gaps.
+            let mut next: HashMap<Address, u64> = HashMap::new();
+            keys.retain(|(from, nonce)| {
+                let n = next.entry(*from).or_insert_with(|| mined_count(i, *from));
+                let ok = *nonce == *n;
+                if ok {
+                    *n += 1;
+                }
+                ok
+            });
+        }
+        keys.truncate(room);
         keys.iter().filter_map(|k| i.pool.remove(k)).collect()
     };
     let envs: Vec<Bytes> = txs.iter().map(|t| t.envelope.clone()).collect();
@@ -198,6 +215,7 @@ impl FakeL1 {
             proof_fault: None,
             sends: Vec::new(),
             epoch: 0,
+            strict_nonces: false,
         };
         for _ in 0..10 {
             mine(&mut i);
@@ -254,6 +272,11 @@ impl FakeL1 {
 
     pub fn hold(&self, on: bool) {
         self.lock().hold = on;
+    }
+
+    /// Mines only an account's next nonce (no gaps after a reorg).
+    pub fn strict_nonces(&self, on: bool) {
+        self.lock().strict_nonces = on;
     }
 
     pub fn set_auto_mine(&self, on: bool) {
@@ -319,6 +342,38 @@ impl FakeL1 {
         self.lock().blocks.iter().map(|b| b.txs.len()).sum()
     }
 
+    /// Mined transactions of `from` on the canonical chain: (nonce, hash,
+    /// blob hashes).
+    pub fn mined_by(&self, from: Address) -> Vec<(u64, B256, Vec<B256>)> {
+        self.lock()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.txs)
+            .filter(|t| t.from == from)
+            .map(|t| (t.nonce, t.hash, t.vhs.clone()))
+            .collect()
+    }
+
+    /// Transactions of `from` waiting in the pool.
+    pub fn pending_of(&self, from: Address) -> usize {
+        self.lock().pool.values().filter(|t| t.from == from).count()
+    }
+
+    /// The nonces of `from` waiting in the pool.
+    pub fn pending_nonces(&self, from: Address) -> Vec<u64> {
+        self.lock()
+            .pool
+            .values()
+            .filter(|t| t.from == from)
+            .map(|t| t.nonce)
+            .collect()
+    }
+
+    /// The blob hashes a sent transaction carries.
+    pub fn sent_vhs(&self, tx: &B256) -> Option<Vec<B256>> {
+        self.lock().signed.get(tx).map(|t| t.vhs.clone())
+    }
+
     pub fn block_of(&self, tx: &B256) -> Option<u64> {
         locate(&self.lock(), tx).map(|(n, _)| n)
     }
@@ -331,7 +386,8 @@ impl FakeL1 {
     /// (a lost database).
     pub fn inject_orphan(&self, nonce: u64, fees: L1Fees) -> B256 {
         let from = self.sender.expect("a sender");
-        let (hash, envelope) = envelope(from, nonce, &fees, &[B256::repeat_byte(1)]);
+        let vhs = vec![B256::repeat_byte(1)];
+        let (hash, envelope) = envelope(from, nonce, &fees, &vhs);
         self.lock().pool.insert(
             (from, nonce),
             FakeTx {
@@ -340,6 +396,7 @@ impl FakeL1 {
                 nonce,
                 fees,
                 envelope,
+                vhs,
             },
         );
         hash
@@ -372,6 +429,7 @@ impl FakeL1 {
                 nonce,
                 fees,
                 envelope,
+                vhs,
             },
         );
         let hold = std::mem::replace(&mut i.hold, false);
@@ -429,6 +487,7 @@ impl L1Chain for FakeL1 {
                 nonce,
                 fees: *fees,
                 envelope,
+                vhs,
             },
         );
         Ok(SignedBlobTx {
@@ -475,7 +534,11 @@ impl L1Chain for FakeL1 {
                 return Ok(());
             }
             let (o, n) = (old.fees, t.fees);
-            if n.max_fee < 2 * o.max_fee || n.tip < 2 * o.tip || n.blob_fee < 2 * o.blob_fee {
+            let twice = |x: u128| x.saturating_mul(2);
+            if n.max_fee < twice(o.max_fee)
+                || n.tip < twice(o.tip)
+                || n.blob_fee < twice(o.blob_fee)
+            {
                 return Err(L1SendError::Underpriced(
                     "replacement transaction underpriced".into(),
                 ));

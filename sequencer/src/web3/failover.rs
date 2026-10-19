@@ -1,6 +1,6 @@
 //! Sticky RPC failover. Every request goes to the current endpoint; a
 //! node-side failure (transport error, any non-2xx status such as 429/5xx or
-//! 401/403/413, an unparsable 2xx body, a [`NODE_SIDE`] JSON-RPC error) moves
+//! 401/403/413, an unparsable or oversized body, a [`NODE_SIDE`] JSON-RPC error) moves
 //! `current` to the next one, retries there (each endpoint at most once per
 //! request, bar rate limits) and stays: a bad key or a proxy error page on
 //! one provider says nothing about the next. A [`DETERMINISTIC`] error never
@@ -70,6 +70,10 @@ pub(super) const ALL_RESTING: &str = "every RPC endpoint is resting after a rate
 
 /// Longest a broadcast `eth_sendRawTransaction` waits on one endpoint.
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Largest answer read, far above any block, log range or blob list the node
+/// asks for: a bigger one is an endpoint fault and fails over.
+const MAX_BODY: usize = 128 << 20;
 
 /// Answers another endpoint would give too; they win over [`NODE_SIDE`] and
 /// -32603 (some clients wrap a revert in an internal error).
@@ -227,16 +231,27 @@ async fn post(client: &reqwest::Client, url: &Url, req: &RequestPacket) -> Poste
         retry_after: None,
         res: Err(TransportErrorKind::custom_str(&describe(&e.without_url()))),
     };
-    let resp = match client.post(url.clone()).json(req).send().await {
+    let mut resp = match client.post(url.clone()).json(req).send().await {
         Ok(r) => r,
         Err(e) => return failed(0, e),
     };
     let status = resp.status().as_u16();
     let retry_after = retry_after(resp.headers());
-    let body = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return failed(status, e),
-    };
+    let mut body = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(c)) if body.len() + c.len() > MAX_BODY => {
+                return Posted {
+                    status,
+                    retry_after,
+                    res: Err(TransportErrorKind::custom_str("response too large")),
+                };
+            }
+            Ok(Some(c)) => body.extend_from_slice(&c),
+            Ok(None) => break,
+            Err(e) => return failed(status, e),
+        }
+    }
     let ok = (200..300).contains(&status);
     let res = match serde_json::from_slice::<ResponsePacket>(&body) {
         // As alloy: a non-2xx body holding a JSON-RPC error is an answer.
@@ -519,6 +534,37 @@ mod tests {
 
     fn n(c: &AtomicUsize) -> usize {
         c.load(Ordering::SeqCst)
+    }
+
+    // BUG: the production client's request timeout was a day, and an
+    // endpoint that accepts and never answers moves the failover only on a
+    // timeout: one hung endpoint held every registry call for a day. The
+    // node's client times out in a minute at most, and the next endpoint
+    // answers within that timeout.
+    #[tokio::test]
+    async fn a_hung_endpoint_fails_over_within_the_client_timeout() {
+        assert!(
+            crate::web3::RPC_TIMEOUT <= Duration::from_secs(60),
+            "RPC timeout {:?}",
+            crate::web3::RPC_TIMEOUT
+        );
+        let timeout = Duration::from_secs(1);
+        let (hung, hung_calls) = slow_stub(Duration::from_secs(86_400), block).await;
+        let (good, good_calls) = stub(block).await;
+        let f = Failover::new(crate::web3::rpc_http_client_with(timeout), &[hung, good]);
+        let p = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_client(RpcClient::new(f.clone(), false))
+            .erased();
+        let t = Instant::now();
+        assert_eq!(p.get_block_number().await.unwrap(), 0x10);
+        assert!(
+            t.elapsed() < 2 * timeout,
+            "failed over after {:?}",
+            t.elapsed()
+        );
+        assert_eq!((n(&hung_calls), n(&good_calls)), (1, 1));
+        assert_eq!(f.current(), 1);
     }
 
     #[tokio::test]

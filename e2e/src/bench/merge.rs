@@ -9,9 +9,10 @@ use davinci_client::api::CensusProofWire;
 use davinci_client::api::Fr;
 use davinci_client::organizer::OnchainProcess;
 use davinci_client::organizer::RegistryReader;
-use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, encrypt_ballot, inputs_hash, vote_id};
-use davinci_zkvm_sdk::census::{CspProof, csp_recover, eth_address, vote_id_recover};
-use davinci_zkvm_sdk::crypto::field::{fr_from_dec, fr_to_be};
+use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, encrypt_ballot, public_signals, vote_id};
+use davinci_zkvm_sdk::census::{
+    CspProof, csp_recover, eth_address, node_from_hex, vote_id_recover,
+};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
 use serde::{Deserialize, Serialize};
@@ -34,13 +35,20 @@ pub struct ElectionIndex {
     pub sha256: String,
 }
 
-fn proof_ok(r: &BallotRecord, v: &BallotVerifier) -> Result<()> {
+// Against the 71 public signals the guest derives from the record and the
+// planned process.
+fn proof_ok(e: &Election, r: &BallotRecord, v: &BallotVerifier) -> Result<()> {
     let q = &r.req;
-    let pubs: [Fr; 3] = [
-        address_to_fr(&q.address),
-        Fr::from(q.vote_id),
-        q.ballot_inputs_hash,
-    ];
+    let p = e.snap.onchain()?;
+    let pubs = public_signals(
+        &q.process_id.to_fr(),
+        &p.ballot_mode,
+        &p.encryption_key,
+        &address_to_fr(&q.address),
+        q.vote_id,
+        &q.ballot,
+        &Fr::from(q.weight),
+    )?;
     ensure!(
         v.verify(&q.ballot_proof, &pubs),
         "{} round {} voter {}: ballot proof does not verify",
@@ -51,9 +59,9 @@ fn proof_ok(r: &BallotRecord, v: &BallotVerifier) -> Result<()> {
     Ok(())
 }
 
-/// The ballot, vote id and inputs hash a voter's record must carry, from the
-/// same functions `Voter::prepare_vote` uses.
-pub fn binding(e: &Election, seed: &Seed, round: u8, voter: u32) -> Result<(Ballot, u64, Fr)> {
+/// The ballot and vote id a voter's record must carry, from the same
+/// functions `Voter::prepare_vote` uses.
+pub fn binding(e: &Election, seed: &Seed, round: u8, voter: u32) -> Result<(Ballot, u64)> {
     let p = e.snap.onchain()?;
     let tag = &e.spec.tag;
     let key = seed.voter_key(tag, voter);
@@ -63,16 +71,7 @@ pub fn binding(e: &Election, seed: &Seed, round: u8, voter: u32) -> Result<(Ball
     let fields = seed.choices(tag, voter, round, e.spec.nf);
     let ballot = encrypt_ballot(&p.encryption_key, &fields, &k, p.ballot_mode.num_fields);
     let vid = vote_id(&pid, &addr, &k);
-    let ih = inputs_hash(
-        &pid,
-        &p.ballot_mode,
-        &p.encryption_key,
-        &addr,
-        vid,
-        &ballot,
-        &Fr::from(WEIGHT),
-    )?;
-    Ok((ballot, vid, ih))
+    Ok((ballot, vid))
 }
 
 /// One record against the plan and the seed: its pid, voter address,
@@ -106,16 +105,12 @@ pub fn check_record(
     let got = vote_id_recover(q.vote_id, &q.signature())
         .map_err(|e| anyhow!("{who}: vote id signature: {e}"))?;
     ensure!(got == want, "{who}: vote id signed by another key");
-    let (ballot, vid, ih) = binding(e, seed, r.round, r.voter)?;
+    let (ballot, vid) = binding(e, seed, r.round, r.voter)?;
     ensure!(
         q.ballot == ballot,
         "{who}: ballot is not the seed's under the plan's key and mode"
     );
     ensure!(q.vote_id == vid, "{who}: vote id is not the seed's");
-    ensure!(
-        q.ballot_inputs_hash == ih,
-        "{who}: inputs hash is not the seed's"
-    );
     if e.snap.census_origin == 4 {
         let Some(CensusProofWire::Csp(c)) = &q.census_proof else {
             bail!("{who}: CSP election without a CSP attestation");
@@ -135,14 +130,14 @@ pub fn check_record(
         };
         let signer = csp_recover(&e.snap.pid.to_fr(), &att)
             .map_err(|x| anyhow!("{who}: CSP attestation: {x}"))?;
-        let root = fr_to_be(&fr_from_dec(&e.snap.census_root).map_err(|x| anyhow!("{x}"))?);
+        let root = node_from_hex(&e.snap.census_root).map_err(|x| anyhow!("{x}"))?;
         ensure!(
             root[..12] == [0u8; 12] && root[12..] == signer,
             "{who}: CSP attestation is not signed by the census root's CSP"
         );
     }
     if let Some(v) = v {
-        proof_ok(r, v)?;
+        proof_ok(e, r, v)?;
     }
     Ok(())
 }
@@ -238,7 +233,12 @@ pub fn merge_wave(
     }
 
     if let Some(vf) = &verifier {
-        let flat: Vec<&BallotRecord> = merged.iter().flat_map(|(_, r)| r).collect();
+        let flat: Vec<(&Election, &BallotRecord)> = w
+            .elections
+            .iter()
+            .zip(&merged)
+            .flat_map(|(e, (_, recs))| recs.iter().map(move |r| (e, r)))
+            .collect();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|sc| {
@@ -247,10 +247,10 @@ pub fn merge_wave(
                     sc.spawn(|| -> Result<()> {
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(r) = flat.get(i) else {
+                            let Some(&(e, r)) = flat.get(i) else {
                                 return Ok(());
                             };
-                            if let Err(e) = proof_ok(r, vf) {
+                            if let Err(e) = proof_ok(e, r, vf) {
                                 next.store(flat.len(), std::sync::atomic::Ordering::Relaxed);
                                 return Err(e);
                             }
@@ -345,8 +345,8 @@ mod tests {
         let key = seed.voter_key(&e.spec.tag, voter);
         let mut req = fake_req(vid, eth_address(key.verifying_key()));
         req.process_id = e.snap.pid;
-        let (ballot, vid, ih) = binding(e, seed, round, voter).unwrap();
-        (req.ballot, req.vote_id, req.ballot_inputs_hash) = (ballot, vid, ih);
+        let (ballot, vid) = binding(e, seed, round, voter).unwrap();
+        (req.ballot, req.vote_id) = (ballot, vid);
         let sig = vote_id_sign(&key, vid);
         req.signature[..32].copy_from_slice(&sig.r);
         req.signature[32..64].copy_from_slice(&sig.s);
@@ -463,9 +463,8 @@ mod tests {
         let err = check_record(e, &seed, &bad, None).unwrap_err().to_string();
         assert!(err.contains("ballot"), "{err}");
         let mut bad = good;
-        bad.req.ballot_inputs_hash += Fr::from(1u64);
-        let err = check_record(e, &seed, &bad, None).unwrap_err().to_string();
-        assert!(err.contains("inputs hash"), "{err}");
+        bad.req.vote_id ^= 1;
+        assert!(check_record(e, &seed, &bad, None).is_err());
     }
 
     #[test]
@@ -475,7 +474,7 @@ mod tests {
         let e = &p.wave(1).unwrap().elections[0];
         let mut live = e.snap.onchain().unwrap();
         snapshot_matches(e, &live).unwrap();
-        live.census_root += Fr::from(1u64);
+        live.census_root[31] ^= 1;
         assert!(snapshot_matches(e, &live).is_err());
         let mut e3 = e.clone();
         e3.snap.census_origin = 3;

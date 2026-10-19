@@ -322,6 +322,7 @@ mod tests {
             proofs: vec![[5; 48]],
             versioned_hashes: vec![[1; 32]],
             digest: [0; 32],
+            cells_digest: [0; 32],
         };
         let data = transition_call_l1(&[7; 31], &snark, &blobs, &proof);
         let call = PR::submitStateTransitionL1Call::abi_decode(&data).unwrap();

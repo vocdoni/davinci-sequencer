@@ -1,7 +1,7 @@
 //! HTTP API and the node entry point [`run`].
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,7 @@ use crate::storage::Db;
 use crate::web3::{Contracts, L1Chain, L1Rpc, RegistryDa, blob_source};
 
 mod error;
+mod extract;
 mod info;
 mod processes;
 mod votes;
@@ -29,7 +30,7 @@ mod votes;
 pub use error::ApiError;
 
 /// Largest request body accepted (a 16-field vote is ~8 KiB).
-const MAX_BODY: usize = 256 * 1024;
+pub(crate) const MAX_BODY: usize = 256 * 1024;
 
 /// Hard per-request deadline; census rebuilds and proof checks fit well
 /// inside it, a stuck handler gets a 408 instead of a leaked connection.
@@ -127,6 +128,9 @@ pub fn router(node: Node) -> Router {
         .route("/votes/:pid/voteId/:vid", get(votes::status))
         .route("/votes/:pid/voteId/:vid/proof", get(votes::proof))
         .route("/votes/:pid/address/:address", get(votes::ballot))
+        // Unmatched routes and methods answer in the JSON error shape too.
+        .fallback(|| async { ApiError::NotFound })
+        .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         // tower's TimeoutLayer errors instead of responding; map it back
         // to the JSON error shape (408 40801, 500 50001 for the rest).
@@ -136,6 +140,66 @@ pub fn router(node: Node) -> Router {
                 .layer(TimeoutLayer::new(REQUEST_TIMEOUT)),
         )
         .with_state(state)
+}
+
+/// How long a client has to send a request head, idle keep-alive included
+/// (hyper's own default). The request deadline only starts once the head is
+/// parsed, so without this a half-sent head would hold its connection for ever.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Serves [`router`] on `listener` until `shutdown` fires, then lets the open
+/// connections finish. `axum::serve` would do, but it cannot bound the head.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    node: Node,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    serve_with_head_timeout(listener, node, shutdown, HEAD_TIMEOUT).await
+}
+
+/// [`serve`] with its own request-head bound (tests use a short one).
+pub async fn serve_with_head_timeout(
+    listener: tokio::net::TcpListener,
+    node: Node,
+    shutdown: CancellationToken,
+    head_timeout: Duration,
+) -> std::io::Result<()> {
+    use hyper::server::conn::http1;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::server::graceful::GracefulShutdown;
+    use hyper_util::service::TowerToHyperService;
+
+    let app = router(node);
+    let graceful = GracefulShutdown::new();
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            r = listener.accept() => match r {
+                Ok(c) => c,
+                // Out of descriptors and the like: back off, keep serving.
+                Err(e) => {
+                    tracing::warn!(%e, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        // Wrap the service, not the router: `Router::layer` would re-wrap
+        // every route on each accept.
+        let svc = tower::ServiceBuilder::new()
+            .layer(axum::Extension(axum::extract::ConnectInfo(peer)))
+            .service(app.clone());
+        let conn = http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(head_timeout)
+            .serve_connection(TokioIo::new(stream), TowerToHyperService::new(svc));
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+    graceful.shutdown().await;
+    Ok(())
 }
 
 /// Builds the real dependencies, spawns the node and serves the API until
@@ -150,12 +214,7 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
     };
     if let Some((listener, node)) = started {
         tracing::info!(addr = %listener.local_addr()?, "API listening");
-        axum::serve(
-            listener,
-            router(node).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
+        serve(listener, node, shutdown).await?;
     }
     // Let the actors and the monitor finish before dropping the process:
     // they hold the database and may be mid-commit.

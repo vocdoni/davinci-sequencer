@@ -9,10 +9,12 @@
 //!   regular files inside it (after resolving symlinks), read through a cap.
 //!
 //! Accepted: `{"participants": [{"key": "0x<address>", "weight": "<dec>"}]}`,
-//! davinci-node's lean-imt-go `CensusDump` (`address`, numeric `weight` up to
-//! 2^88 - 1, `addressIndex`, a `root` that must equal the on-chain one), and
-//! JSONL with one participant per line (Content-Type `ndjson`/`jsonl`, or
-//! sniffed for files). Two voters on one ballot slot refuse the census.
+//! a census dump in lean-imt-go's `CensusDump` shape (`address`, numeric
+//! `weight` up to 2^88 - 1, `addressIndex`, a `root` that must equal the
+//! on-chain one, `0x` and 64 hex digits), and JSONL with one participant per
+//! line (Content-Type `ndjson`/`jsonl`, or sniffed for files). The tree is
+//! the Keccak lean-IMT; its root is a 256-bit value, never a field element.
+//! Two voters on one ballot slot refuse the census.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
@@ -22,9 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use davinci_zkvm_sdk::census::{
-    CensusProof, LeanImt, census_leaf, census_leaf_weight, slot_key_address,
+    CensusProof, LeanImt, Node, census_leaf, census_leaf_weight, node_from_hex, node_to_hex,
+    slot_key_address,
 };
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_from_dec, fr_to_be};
+use davinci_zkvm_sdk::crypto::field::{Fr, fr_to_be};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio::sync::Semaphore;
@@ -35,17 +38,23 @@ use crate::storage::{Db, StorageError};
 
 pub mod onchain;
 
+#[cfg(test)]
+mod attack;
+
 /// Largest census document read.
 pub const MAX_CENSUS_BYTES: u64 = 256 << 20;
 /// Census trees kept in memory.
 const TREE_CACHE: usize = 8;
 /// Concurrent census builds (parse, tree, store).
 const BUILD_PERMITS: usize = 2;
-/// Concurrent census downloads: apart from the builds, so a few slow
-/// servers (any organizer picks the URI) cannot hold up every bootstrap.
-/// A downloaded body keeps its permit until it gets a build permit, so at
-/// most this many plus `BUILD_PERMITS` bodies of `max_bytes` are held.
-const DOWNLOAD_PERMITS: usize = 4;
+/// Open census connections (downloads and file reads): bounds sockets and
+/// tasks, nothing else. A silent server holds one of these and no memory,
+/// so any organizer's slow URI can only take a socket, not a download slot.
+const DOWNLOAD_SOCKETS: usize = 32;
+/// Bytes of census bodies held at once (in KiB): downloads take it a chunk
+/// at a time and a body keeps it until a build takes the body. The memory
+/// bound is this plus `BUILD_PERMITS` bodies of `max_bytes` being built.
+const BODY_BUDGET_KIB: usize = 1 << 20;
 /// From the first body byte, a download bringing fewer than this many
 /// bytes in a window is cut off (transient): a trickle that stays inside
 /// the read timeout would hold its permit for the whole 300 s.
@@ -125,7 +134,7 @@ type AddressIndex = ([u8; 20], u64);
 /// Value: (last failure, failures).
 type FailKey = (String, [u8; 32]);
 
-fn fail_key(uri: &str, root: &Fr) -> FailKey {
+fn fail_key(uri: &str, root: &Node) -> FailKey {
     let base = match Url::parse(uri) {
         Ok(mut u) => {
             u.set_query(None);
@@ -134,14 +143,14 @@ fn fail_key(uri: &str, root: &Fr) -> FailKey {
         }
         Err(_) => uri.chars().take(256).collect(),
     };
-    (base, fr_to_be(root))
+    (base, *root)
 }
 
 /// A census document: `{"participants": [...]}`, optionally lean-imt-go's
 /// `CensusDump` fields (`root`, and others we ignore).
 #[derive(Deserialize)]
 struct CensusJson<'a> {
-    /// A JSON number (big.Int) or a decimal string; must be the expected root.
+    /// `0x` and 64 hex digits; must be the expected root.
     #[serde(default, borrow)]
     root: Option<&'a RawValue>,
     #[serde(borrow)]
@@ -209,10 +218,6 @@ fn clean(s: &str) -> String {
     s.chars().flat_map(char::escape_debug).collect()
 }
 
-fn hex_fr(root: &Fr) -> String {
-    format!("0x{}", hex::encode(fr_to_be(root)))
-}
-
 fn parse_address(s: &str) -> Result<[u8; 20]> {
     let mut a = [0u8; 20];
     let h = s.strip_prefix("0x").unwrap_or(s);
@@ -237,9 +242,11 @@ fn parse_weight(w: &RawValue) -> Result<u128> {
     d.parse().map_err(|_| bad())
 }
 
-fn parse_root(r: &RawValue) -> Result<Fr> {
-    raw_digits(r)
-        .and_then(|d| fr_from_dec(d).ok())
+// A census value is a JSON string: `0x` and exactly 64 hex digits.
+fn parse_root(r: &RawValue) -> Result<Node> {
+    serde_json::from_str::<&str>(r.get())
+        .ok()
+        .and_then(|s| node_from_hex(s).ok())
         .ok_or_else(|| CensusError::Format(format!("bad root {:.80}", clean(r.get()))))
 }
 
@@ -248,7 +255,7 @@ fn parse_root(r: &RawValue) -> Result<Fr> {
 /// with the zero address is a leaf but not a voter (`0x0`, weight 0 is
 /// davinci-node's empty slot). Rejects two voters on one ballot slot,
 /// including one address listed twice.
-fn leaves_of(doc: &CensusJson, max: usize) -> Result<(Vec<Fr>, Vec<AddressIndex>)> {
+fn leaves_of(doc: &CensusJson, max: usize) -> Result<(Vec<Node>, Vec<AddressIndex>)> {
     leaves_of_with(doc, max, slot_key_address)
 }
 
@@ -256,7 +263,7 @@ fn leaves_of_with(
     doc: &CensusJson,
     max: usize,
     slot_of: fn(&[u8; 20]) -> u64,
-) -> Result<(Vec<Fr>, Vec<AddressIndex>)> {
+) -> Result<(Vec<Node>, Vec<AddressIndex>)> {
     let n = doc.participants.len();
     if n == 0 {
         return Err(CensusError::Format("no participants".into()));
@@ -291,7 +298,7 @@ fn leaves_of_with(
             }
         }
     }
-    let mut leaves = vec![Fr::default(); n];
+    let mut leaves = vec![Node::default(); n];
     let mut index = Vec::with_capacity(n);
     let mut slots: HashMap<u64, [u8; 20]> = HashMap::with_capacity(n);
     for (pos, p) in doc.participants.iter().enumerate() {
@@ -342,6 +349,8 @@ fn is_public(ip: IpAddr) -> bool {
                 || v.is_multicast()
                 || o[0] == 0
                 || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking
                 || o[0] >= 240)
         }
         IpAddr::V6(v) => {
@@ -349,6 +358,13 @@ fn is_public(ip: IpAddr) -> bool {
                 return is_public(IpAddr::V4(v4));
             }
             let s = v.segments();
+            // IPv4-translated `::ffff:0:a.b.c.d` (RFC 2765) too.
+            if s[..4] == [0; 4] && s[4] == 0xffff && s[5] == 0 {
+                let o = v.octets();
+                return is_public(IpAddr::V4(std::net::Ipv4Addr::new(
+                    o[12], o[13], o[14], o[15],
+                )));
+            }
             // IPv4-compatible `::a.b.c.d` (deprecated) carries an IPv4 address too.
             if s[..6] == [0; 6] && !v.is_loopback() && !v.is_unspecified() {
                 let o = v.octets();
@@ -361,6 +377,7 @@ fn is_public(ip: IpAddr) -> bool {
                 || v.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00 // unique local
                 || (s[0] & 0xffc0) == 0xfe80 // link local
+                || (s[0] & 0xffc0) == 0xfec0 // site local (deprecated)
 
                 || (s[0], s[1]) == (0x64, 0xff9b) // NAT64 (incl. 64:ff9b:1::/48)
                 || s[0] == 0x2002 // 6to4
@@ -396,8 +413,8 @@ fn special_path(p: &Path) -> bool {
     ["/proc", "/sys", "/dev"].iter().any(|d| p.starts_with(d))
 }
 
-// Reads a regular file inside `dir` (canonical), at most `max` bytes.
-fn read_census_file(dir: &Path, path: &Path, max: u64) -> Result<Vec<u8>> {
+// Opens a regular file inside `dir` (canonical); its length is only a hint.
+fn open_census_file(dir: &Path, path: &Path) -> Result<(std::fs::File, u64)> {
     let refuse = |why: &str| CensusError::Fetch(format!("{}: {why}", path.display()));
     let canon = std::fs::canonicalize(path).map_err(|e| refuse(&e.to_string()))?;
     if !canon.starts_with(dir) {
@@ -413,18 +430,75 @@ fn read_census_file(dir: &Path, path: &Path, max: u64) -> Result<Vec<u8>> {
         return Err(refuse("not a regular file"));
     }
     let f = std::fs::File::open(&canon).map_err(|e| refuse(&e.to_string()))?;
-    // Checked again on the open handle; sizes are not trusted, the read is capped.
-    if !f.metadata().map_err(|e| refuse(&e.to_string()))?.is_file() {
+    // Checked again on the open handle.
+    let meta = f.metadata().map_err(|e| refuse(&e.to_string()))?;
+    if !meta.is_file() {
         return Err(refuse("not a regular file"));
     }
-    let mut body = Vec::new();
-    f.take(max.saturating_add(1))
+    Ok((f, meta.len()))
+}
+
+// Reads at most `cap` bytes of `f`; `max` is the census cap, `cap <= max`.
+fn read_capped(f: std::fs::File, path: &Path, cap: u64, max: u64) -> Result<Vec<u8>> {
+    let refuse = |why: &str| CensusError::Fetch(format!("{}: {why}", path.display()));
+    // Sized from the file, so reading does not double through a larger copy.
+    let hint = f.metadata().map_or(0, |m| m.len()).min(cap);
+    let mut body = Vec::with_capacity(usize::try_from(hint).unwrap_or(0).saturating_add(1));
+    f.take(cap.saturating_add(1))
         .read_to_end(&mut body)
         .map_err(|e| refuse(&e.to_string()))?;
-    if body.len() as u64 > max {
-        return Err(refuse("larger than the census cap"));
+    if body.len() as u64 > cap {
+        return Err(refuse(if cap >= max {
+            "larger than the census cap"
+        } else {
+            "grew while being read"
+        }));
     }
     Ok(body)
+}
+
+// Reads a regular file inside `dir` (canonical), at most `max` bytes.
+#[cfg(test)]
+fn read_census_file(dir: &Path, path: &Path, max: u64) -> Result<Vec<u8>> {
+    let (f, _) = open_census_file(dir, path)?;
+    read_capped(f, path, max, max)
+}
+
+/// KiB of the shared body budget held for one document.
+struct BodyBudget {
+    sem: Arc<Semaphore>,
+    held: Option<tokio::sync::OwnedSemaphorePermit>,
+    kib: u32,
+}
+
+impl BodyBudget {
+    fn new(sem: Arc<Semaphore>) -> Self {
+        BodyBudget {
+            sem,
+            held: None,
+            kib: 0,
+        }
+    }
+
+    /// Holds enough budget for a body of `len` bytes.
+    async fn cover(&mut self, len: usize) -> Result<()> {
+        let need = u32::try_from(len.div_ceil(1024)).unwrap_or(u32::MAX);
+        if need <= self.kib {
+            return Ok(());
+        }
+        let more = self
+            .sem
+            .clone()
+            .acquire_many_owned(need - self.kib)
+            .await
+            .map_err(|e| CensusError::Fetch(e.to_string()))?;
+        match &mut self.held {
+            Some(h) => h.merge(more),
+            None => self.held = Some(more),
+        }
+        self.kib = need;
+        Ok(())
+    }
 }
 
 // Most recently used census trees.
@@ -466,7 +540,9 @@ pub struct CensusStore {
     http: reqwest::Client,
     cache: Mutex<TreeCache>,
     builds: Semaphore,
-    downloads: Semaphore,
+    sockets: Semaphore,
+    /// Body bytes in KiB; see [`BODY_BUDGET_KIB`].
+    body_kib: Arc<Semaphore>,
     /// From the first body byte, each window must bring this many bytes.
     min_rate: (u64, Duration),
     failures: Mutex<HashMap<FailKey, (Instant, u32)>>,
@@ -483,7 +559,7 @@ impl std::fmt::Debug for CensusStore {
     }
 }
 
-fn backoff(failures: u32) -> Duration {
+pub(crate) fn backoff(failures: u32) -> Duration {
     BASE_BACKOFF
         .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
         .min(MAX_BACKOFF)
@@ -513,6 +589,13 @@ impl CensusStore {
     }
 
     fn build(db: Db, opts: CensusOptions) -> Result<Self> {
+        // A document above the whole budget could never get its bytes.
+        if opts.max_bytes.div_ceil(1024) > BODY_BUDGET_KIB as u64 {
+            return Err(CensusError::Config(format!(
+                "census byte cap {} is above the download budget",
+                opts.max_bytes
+            )));
+        }
         let mut b = reqwest::Client::builder()
             // A proxy would resolve the host itself, past `PublicOnly`.
             .no_proxy()
@@ -541,7 +624,8 @@ impl CensusStore {
             http,
             cache: Mutex::new(TreeCache::default()),
             builds: Semaphore::new(BUILD_PERMITS),
-            downloads: Semaphore::new(DOWNLOAD_PERMITS),
+            sockets: Semaphore::new(DOWNLOAD_SOCKETS),
+            body_kib: Arc::new(Semaphore::new(BODY_BUDGET_KIB)),
             min_rate: (MIN_RATE_BYTES, MIN_RATE_WINDOW),
             failures: Mutex::new(HashMap::new()),
             rebuilds: tokio::sync::Mutex::new(HashMap::new()),
@@ -549,12 +633,19 @@ impl CensusStore {
         })
     }
 
+    /// Test hook: a smaller byte budget (KiB).
+    #[doc(hidden)]
+    pub fn with_body_budget_kib(mut self, kib: usize) -> Self {
+        self.body_kib = Arc::new(Semaphore::new(kib));
+        self
+    }
+
     /// Records that `pid`'s census update to `root` can never load; votes
     /// answer 412 with `why` until the next update.
-    pub fn mark_bad(&self, pid: &Fr, root: &Fr, why: &str) -> Result<()> {
+    pub fn mark_bad(&self, pid: &Fr, root: &Node, why: &str) -> Result<()> {
         self.edit_bad(|m| {
-            m.insert(fr_to_be(pid), (fr_to_be(root), why.to_string()))
-                .is_none_or(|(r, w)| r != fr_to_be(root) || w != why)
+            m.insert(fr_to_be(pid), (*root, why.to_string()))
+                .is_none_or(|(r, w)| r != *root || w != why)
         })
     }
 
@@ -564,10 +655,10 @@ impl CensusStore {
     }
 
     /// Why `pid`'s update to `root` can never load, if it can't.
-    pub fn bad_reason(&self, pid: &Fr, root: &Fr) -> Option<String> {
+    pub fn bad_reason(&self, pid: &Fr, root: &Node) -> Option<String> {
         let m = self.bad.lock().ok()?;
         m.get(&fr_to_be(pid))
-            .filter(|(r, _)| *r == fr_to_be(root))
+            .filter(|(r, _)| r == root)
             .map(|(_, w)| w.clone())
     }
 
@@ -611,14 +702,14 @@ impl CensusStore {
     }
 
     /// Whether the census with this root is stored.
-    pub fn has(&self, root: &Fr) -> Result<bool> {
-        Ok(self.db.census_exists(&fr_to_be(root))?)
+    pub fn has(&self, root: &Node) -> Result<bool> {
+        Ok(self.db.census_exists(root)?)
     }
 
     /// Downloads the census at `uri`, and stores it if its lean-IMT root is
     /// `expected_root`. A census already stored is not downloaded again; a
     /// (uri, root) that failed is not retried before its backoff expires.
-    pub async fn fetch(&self, uri: &str, expected_root: &Fr) -> Result<()> {
+    pub async fn fetch(&self, uri: &str, expected_root: &Node) -> Result<()> {
         if self.has(expected_root)? {
             return Ok(());
         }
@@ -631,14 +722,9 @@ impl CensusStore {
             }
         }
         let res = async {
-            let dl = self
-                .downloads
-                .acquire()
-                .await
-                .map_err(|e| CensusError::Fetch(e.to_string()))?;
-            let (body, format) = self.download(uri).await?;
-            // The body waits for a build holding its download permit: at most
-            // DOWNLOAD_PERMITS + BUILD_PERMITS bodies in memory.
+            let (body, format, dl) = self.download(uri).await?;
+            // The body waits for a build holding its byte budget: at most
+            // BODY_BUDGET_KIB + BUILD_PERMITS bodies in memory.
             let _build = self
                 .builds
                 .acquire()
@@ -653,6 +739,8 @@ impl CensusStore {
                 Ok(()) => {
                     f.remove(&key);
                 }
+                // "Not yet" (the byte budget is busy): not the census's fault.
+                Err(CensusError::Backoff(_)) => {}
                 Err(_) => {
                     let n = f.get(&key).map_or(0, |e| e.1).saturating_add(1);
                     if !f.contains_key(&key) && f.len() >= MAX_FAILURES {
@@ -680,7 +768,7 @@ impl CensusStore {
         &self,
         body: Vec<u8>,
         format: DocFormat,
-        expected_root: &Fr,
+        expected_root: &Node,
     ) -> Result<()> {
         let want = *expected_root;
         let max = self.opts.max_participants;
@@ -690,8 +778,8 @@ impl CensusStore {
                 && r != want
             {
                 return Err(CensusError::RootMismatch {
-                    got: hex_fr(&r),
-                    want: hex_fr(&want),
+                    got: node_to_hex(&r),
+                    want: node_to_hex(&want),
                 });
             }
             let (leaves, index) = leaves_of(&doc, max)?;
@@ -700,28 +788,32 @@ impl CensusStore {
             let tree = LeanImt::from_leaves(leaves.clone());
             if tree.root() != want {
                 return Err(CensusError::RootMismatch {
-                    got: hex_fr(&tree.root()),
-                    want: hex_fr(&want),
+                    got: node_to_hex(&tree.root()),
+                    want: node_to_hex(&want),
                 });
             }
             Ok((leaves, index, tree))
         })
         .await
         .map_err(|e| CensusError::Format(format!("census build task: {e}")))??;
-        let root = fr_to_be(expected_root);
-        let be: Vec<[u8; 32]> = leaves.iter().map(fr_to_be).collect();
-        self.db.put_census(&root, &be, &index)?;
+        self.db.put_census(expected_root, &leaves, &index)?;
         if let Ok(mut c) = self.cache.lock() {
-            c.put(root, Arc::new(tree));
+            c.put(*expected_root, Arc::new(tree));
         }
-        tracing::info!(root = %hex_fr(expected_root), leaves = leaves.len(), "census stored");
+        tracing::info!(root = %node_to_hex(expected_root), leaves = leaves.len(), "census stored");
         Ok(())
     }
 
-    async fn download(&self, uri: &str) -> Result<(Vec<u8>, DocFormat)> {
+    async fn download(&self, uri: &str) -> Result<(Vec<u8>, DocFormat, BodyBudget)> {
         let url = Url::parse(uri)
             .map_err(|e| CensusError::Refused(format!("{:.200}: {e}", clean(uri))))?;
         let max = self.opts.max_bytes;
+        let _socket = self
+            .sockets
+            .acquire()
+            .await
+            .map_err(|e| CensusError::Fetch(e.to_string()))?;
+        let mut budget = BodyBudget::new(self.body_kib.clone());
         match url.scheme() {
             "http" | "https" => {
                 let ip = match url.host() {
@@ -786,11 +878,17 @@ impl CensusStore {
                     if (body.len() + chunk.len()) as u64 > max {
                         return Err(CensusError::Refused("census document too large".into()));
                     }
+                    // Bytes are charged as they arrive: a silent server holds
+                    // none. Waiting for the budget while holding some could
+                    // deadlock two big downloads, so it is bounded.
+                    tokio::time::timeout(span, budget.cover(body.len() + chunk.len()))
+                        .await
+                        .map_err(|_| CensusError::Backoff(Duration::from_secs(5)))??;
                     body.extend_from_slice(&chunk);
                     let (end, got) = win.unwrap_or_else(|| (tokio::time::Instant::now() + span, 0));
                     win = Some((end, got.saturating_add(chunk.len() as u64)));
                 }
-                Ok((body, format))
+                Ok((body, format, budget))
             }
             "file" => {
                 let dir = self.opts.dir.clone().ok_or_else(|| {
@@ -803,10 +901,28 @@ impl CensusStore {
                     .map_err(|_| CensusError::Refused(format!("{uri:.200}: not a local path")))?;
                 // File errors stay transient (Fetch): the organizer may still
                 // be placing the document; the bootstrap attempt cap ends them.
-                let body = tokio::task::spawn_blocking(move || read_census_file(&dir, &path, max))
+                let join = |e: tokio::task::JoinError| CensusError::Fetch(e.to_string());
+                let p = path.clone();
+                let (f, len) = tokio::task::spawn_blocking(move || open_census_file(&dir, &p))
                     .await
-                    .map_err(|e| CensusError::Fetch(e.to_string()))??;
-                Ok((body, DocFormat::Sniff))
+                    .map_err(join)??;
+                if len > max {
+                    return Err(CensusError::Fetch(format!(
+                        "{}: larger than the census cap",
+                        path.display()
+                    )));
+                }
+                // The bytes are reserved before they are read. The budget
+                // moves into the blocking read: it outlives a cancelled
+                // caller and so does the reservation.
+                budget.cover(len as usize).await?;
+                let cap = (u64::from(budget.kib) << 10).min(max);
+                let (body, budget) = tokio::task::spawn_blocking(move || {
+                    read_capped(f, &path, cap, max).map(|b| (b, budget))
+                })
+                .await
+                .map_err(join)??;
+                Ok((body, DocFormat::Sniff, budget))
             }
             s => Err(CensusError::Refused(format!("unsupported scheme {s}"))),
         }
@@ -861,10 +977,9 @@ impl CensusStore {
     /// census, an error if the census is not loaded. A cache miss rebuilds
     /// the tree (O(n)) on the calling thread; async handlers must use
     /// [`CensusStore::proof_async`] instead.
-    pub fn proof(&self, root: &Fr, address: &[u8; 20]) -> Result<Option<(CensusProof, u128)>> {
-        let key = fr_to_be(root);
-        let tree = self.tree(&key)?;
-        let Some(i) = self.db.census_index(&key, address)? else {
+    pub fn proof(&self, root: &Node, address: &[u8; 20]) -> Result<Option<(CensusProof, u128)>> {
+        let tree = self.tree(root)?;
+        let Some(i) = self.db.census_index(root, address)? else {
             return Ok(None);
         };
         proof_at(&tree, i, address).map(Some)
@@ -875,10 +990,10 @@ impl CensusStore {
     /// in `spawn_blocking`, single-flight per root.
     pub async fn proof_async(
         &self,
-        root: &Fr,
+        root: &Node,
         address: &[u8; 20],
     ) -> Result<Option<(CensusProof, u128)>> {
-        let key = fr_to_be(root);
+        let key = *root;
         let Some(i) = self.db.census_index(&key, address)? else {
             if self.db.census_exists(&key)? {
                 return Ok(None);
@@ -891,18 +1006,14 @@ impl CensusStore {
 }
 
 /// Rebuilds the lean-IMT from stored leaves and checks it gives `root`.
-fn rebuild_tree(root: &[u8; 32], leaves: &[[u8; 32]]) -> Result<LeanImt> {
-    let corrupt = |reason: String| StorageError::Corrupt {
-        table: "census",
-        reason,
-    };
-    let leaves = leaves
-        .iter()
-        .map(|l| fr_from_be(l).map_err(|e| corrupt(e.to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
-    let tree = LeanImt::from_leaves(leaves);
-    if fr_to_be(&tree.root()) != *root {
-        return Err(corrupt("stored leaves do not give the root".into()).into());
+fn rebuild_tree(root: &Node, leaves: &[Node]) -> Result<LeanImt> {
+    let tree = LeanImt::from_leaves(leaves.to_vec());
+    if tree.root() != *root {
+        return Err(StorageError::Corrupt {
+            table: "census",
+            reason: "stored leaves do not give the root".into(),
+        }
+        .into());
     }
     Ok(tree)
 }
@@ -929,18 +1040,19 @@ mod tests {
     use std::path::PathBuf;
 
     use davinci_zkvm_sdk::census::verify_census_proof;
-    use davinci_zkvm_sdk::crypto::field::fr_from_dec;
+    use davinci_zkvm_sdk::crypto::field::fr_from_be;
 
     use super::*;
 
-    // lean-imt-go vector from the SDK: leaves are `address << 88 | weight`.
-    fn vector() -> (Vec<([u8; 20], u128)>, Fr) {
+    // Keccak lean-IMT vector from the SDK: leaves are `address << 88 | weight`.
+    // The 10-member root is above the BN254 modulus.
+    fn vector() -> (Vec<([u8; 20], u128)>, Node) {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../davinci-zkvm/rust-sdk/testdata/leanimt.json");
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let mut out = Vec::new();
         for l in v["leaves"].as_array().unwrap().iter().take(10) {
-            let be = fr_to_be(&fr_from_dec(l.as_str().unwrap()).unwrap());
+            let be = node_from_hex(l.as_str().unwrap()).unwrap();
             let mut addr = [0u8; 20];
             addr.copy_from_slice(&be[1..21]);
             let mut w = [0u8; 16];
@@ -949,7 +1061,26 @@ mod tests {
         }
         let tree = &v["trees"][9];
         assert_eq!(tree["size"], 10);
-        (out, fr_from_dec(tree["root"].as_str().unwrap()).unwrap())
+        let root = node_from_hex(tree["root"].as_str().unwrap()).unwrap();
+        assert!(
+            fr_from_be(&root).is_err(),
+            "the vector root is above the modulus"
+        );
+        (out, root)
+    }
+
+    // A small census value: `n` as a 256-bit big-endian integer.
+    fn node(n: u64) -> Node {
+        let mut b = [0u8; 32];
+        b[24..].copy_from_slice(&n.to_be_bytes());
+        b
+    }
+
+    // Another root: the low bit flipped.
+    fn bump(r: &Node) -> Node {
+        let mut b = *r;
+        b[31] ^= 1;
+        b
     }
 
     fn census_json(parts: &[([u8; 20], u128)]) -> String {
@@ -1015,7 +1146,7 @@ mod tests {
         drop(cs);
         let cs = store(&dir);
         assert!(cs.proof_async(&root, &[0xee; 20]).await.unwrap().is_none());
-        let key = fr_to_be(&root);
+        let key = root;
         assert!(
             cs.cache.lock().unwrap().get(&key).is_none(),
             "a non-member lookup must not rebuild the tree"
@@ -1030,11 +1161,7 @@ mod tests {
         assert_eq!((&pa.siblings, wa), (&ps.siblings, ws));
         assert!(verify_census_proof(&pa));
         // An unloaded census is an error, not a silent None.
-        assert!(
-            cs.proof_async(&(root + Fr::from(1u64)), &parts[0].0)
-                .await
-                .is_err()
-        );
+        assert!(cs.proof_async(&bump(&root), &parts[0].0).await.is_err());
     }
 
     #[tokio::test]
@@ -1043,7 +1170,7 @@ mod tests {
         let (parts, root) = vector();
         let uri = write(&dir, "census.json", &census_json(&parts));
         let cs = store(&dir);
-        let wrong = root + Fr::from(1u64);
+        let wrong = bump(&root);
         assert!(matches!(
             cs.fetch(&uri, &wrong).await,
             Err(CensusError::RootMismatch { .. })
@@ -1068,7 +1195,7 @@ mod tests {
         // A duplicate address would give one voter two slots.
         let mut dup = parts.clone();
         dup.push(parts[2]);
-        let leaves: Vec<Fr> = dup
+        let leaves: Vec<Node> = dup
             .iter()
             .map(|(a, w)| census_leaf(a, *w).unwrap())
             .collect();
@@ -1080,7 +1207,7 @@ mod tests {
             .unwrap();
         assert!(e.to_string().contains("listed twice"), "{e}");
 
-        let any = Fr::from(5u64);
+        let any = node(5);
         let a = hex::encode([1u8; 20]);
         let b = hex::encode([2u8; 20]);
         for (name, body) in [
@@ -1136,12 +1263,13 @@ mod tests {
         let big = (1u128 << 88) - 1;
         let want = vec![
             census_leaf(&a, big).unwrap(),
-            Fr::default(),
+            Node::default(),
             census_leaf(&b, 1).unwrap(),
         ];
+        let seven = node_to_hex(&node(7));
         let (ha, hb, hz) = (hex::encode(a), hex::encode(b), hex::encode(z));
         let dump = format!(
-            r#"{{"root":"7","tree":{{}},"participants":[{{"addressIndex":2,"address":"0x{hb}","weight":1}},{{"addressIndex":1,"address":"0x{hz}","weight":0}},{{"addressIndex":0,"address":"0x{ha}","weight":{big}}}]}}"#
+            r#"{{"root":"{seven}","tree":{{}},"participants":[{{"addressIndex":2,"address":"0x{hb}","weight":1}},{{"addressIndex":1,"address":"0x{hz}","weight":0}},{{"addressIndex":0,"address":"0x{ha}","weight":{big}}}]}}"#
         );
         let jsonl = format!(
             "{{\"key\":\"0x{ha}\",\"weight\":\"{big}\"}}\r\n\n{{\"address\":\"0x{hz}\",\"weight\":0}}\n  \n{{\"key\":\"0x{hb}\",\"weight\":1}}\n\n"
@@ -1159,7 +1287,26 @@ mod tests {
             assert_eq!(index, vec![(a, 0), (b, 2)], "{f:?}");
         }
         let doc = parse_doc(dump.as_bytes(), DocFormat::Dump).unwrap();
-        assert_eq!(parse_root(doc.root.unwrap()).unwrap(), Fr::from(7u64));
+        assert_eq!(parse_root(doc.root.unwrap()).unwrap(), node(7));
+        // A root is `0x` and 64 hex digits, either case (R5); a decimal, a
+        // number, a short or prefix-less value is refused.
+        let raw = |s: &str| serde_json::value::RawValue::from_string(s.into()).unwrap();
+        let upper = format!("\"0x{}\"", seven[2..].to_uppercase());
+        assert_eq!(parse_root(&raw(&upper)).unwrap(), node(7));
+        for bad in [
+            "\"7\"".to_string(),
+            "7".into(),
+            "\"0x07\"".into(),
+            format!("\"{}\"", &seven[2..]),
+            format!("\"0X{}\"", &seven[2..]),
+            format!("\"{seven}0\""),
+            "null".into(),
+        ] {
+            assert!(
+                matches!(parse_root(&raw(&bad)), Err(CensusError::Format(_))),
+                "{bad}"
+            );
+        }
         // A bad JSONL line is named.
         let e = parse_doc(
             b"{\"key\":\"0x00\",\"weight\":1}\n\n{oops",
@@ -1197,12 +1344,11 @@ mod tests {
             .iter()
             .map(|(a, w)| serde_json::json!({"address": format!("0x{}", hex::encode(a)), "weight": w.to_string()}))
             .collect();
-        let dec = davinci_zkvm_sdk::crypto::field::fr_to_dec(&root);
         let cs = store(&dir);
         let bad = write(
             &dir,
             "bad.json",
-            &serde_json::json!({"root": "5", "participants": ps}).to_string(),
+            &serde_json::json!({"root": node_to_hex(&node(5)), "participants": ps}).to_string(),
         );
         assert!(matches!(
             cs.fetch(&bad, &root).await,
@@ -1211,9 +1357,19 @@ mod tests {
         let good = write(
             &dir,
             "good.json",
-            &serde_json::json!({"root": dec, "participants": ps}).to_string(),
+            &serde_json::json!({"root": node_to_hex(&root), "participants": ps}).to_string(),
         );
         cs.fetch(&good, &root).await.unwrap();
+        // The pre-Keccak form, a decimal root, is not a census value.
+        let dec = write(
+            &dir,
+            "dec.json",
+            &serde_json::json!({"root": "5", "participants": ps}).to_string(),
+        );
+        assert!(matches!(
+            cs.fetch(&dec, &bump(&root)).await,
+            Err(CensusError::Format(_))
+        ));
     }
 
     // Two voters on one ballot slot refuse the census, naming the slot.
@@ -1248,7 +1404,7 @@ mod tests {
         );
         let uri = write(&dir, "sparse.json", &body);
         let t = Instant::now();
-        let err = cs.fetch(&uri, &Fr::from(1u64)).await.err().unwrap();
+        let err = cs.fetch(&uri, &node(1)).await.err().unwrap();
         assert!(matches!(err, CensusError::Format(_)), "{err}");
         assert!(
             t.elapsed() < Duration::from_millis(500),
@@ -1275,7 +1431,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (parts, root) = vector();
         let good = write(&dir, "census.json", &census_json(&parts));
-        let any = Fr::from(3u64);
+        let any = node(3);
         let procs = [
             "file:///proc/self/pagemap",
             "file:///proc/self/environ",
@@ -1388,7 +1544,7 @@ mod tests {
         // The error names the floor; the timeout only stops a hang.
         let e = tokio::time::timeout(
             Duration::from_secs(25),
-            cs.fetch(&format!("http://{addr}/c.json"), &Fr::from(1u64)),
+            cs.fetch(&format!("http://{addr}/c.json"), &node(1)),
         )
         .await
         .expect("cut off")
@@ -1397,32 +1553,29 @@ mod tests {
         assert!(e.to_string().contains("slower than"), "{e}");
     }
 
-    // A downloaded body waits for a build permit holding its download
-    // permit: with the builds busy, at most DOWNLOAD_PERMITS bodies sit in
-    // memory however many fetches are queued.
+    // A downloaded body waits for a build permit holding its byte budget:
+    // with the builds busy, two bodies over the budget serialize however
+    // many fetches are queued.
     #[tokio::test]
-    async fn bodies_waiting_for_a_build_keep_their_download_permit() {
+    async fn bodies_waiting_for_a_build_keep_their_byte_budget() {
         use axum::{Router, routing::get};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let (parts, root) = vector();
-        let body = census_json(&parts);
-        let served = Arc::new(AtomicUsize::new(0));
-        let n = served.clone();
+        // ~3 KiB of document (trailing blanks), against a 4 KiB budget.
+        let body = format!("{}{}", census_json(&parts), " ".repeat(1800));
         let app = Router::new().route(
             "/:k",
             get(move || {
-                let (body, n) = (body.clone(), n.clone());
-                async move {
-                    n.fetch_add(1, Ordering::SeqCst);
-                    body
-                }
+                let body = body.clone();
+                async move { body }
             }),
         );
         let addr = serve(app).await;
         let dir = tempfile::tempdir().unwrap();
-        let cs = Arc::new(private_store(&dir));
+        let mut cs = private_store(&dir);
+        cs.body_kib = Arc::new(Semaphore::new(4));
+        let cs = Arc::new(cs);
         let builds = cs.builds.acquire_many(BUILD_PERMITS as u32).await.unwrap();
-        let fetches: Vec<_> = (0..8u64)
+        let fetches: Vec<_> = (0..2u64)
             .map(|k| {
                 let cs = cs.clone();
                 tokio::spawn(
@@ -1430,26 +1583,126 @@ mod tests {
                 )
             })
             .collect();
-        // Wait for the permitted downloads, then check no other one follows.
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while served.load(Ordering::SeqCst) < DOWNLOAD_PERMITS {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the permitted downloads ran");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(served.load(Ordering::SeqCst), DOWNLOAD_PERMITS);
+        // One body holds 3 KiB; the other cannot get all of its bytes.
+        assert!(cs.body_kib.available_permits() <= 1);
+        assert!(fetches.iter().all(|f| !f.is_finished()));
         drop(builds);
         for f in fetches {
             f.await.unwrap().unwrap();
         }
-        assert_eq!(served.load(Ordering::SeqCst), 8);
+        assert_eq!(cs.body_kib.available_permits(), 4);
         assert!(cs.has(&root).unwrap());
     }
 
-    // Slow downloads hold download permits only: two of them do not hold up
-    // a third, honest one (builds had both permits for the whole download).
+    // Servers that never answer take sockets, not the byte budget: more of
+    // them than there ever were download permits do not delay an honest one.
+    #[tokio::test]
+    async fn silent_servers_do_not_hold_up_an_honest_download() {
+        use axum::{Router, routing::get};
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((c, _)) = silent.accept().await {
+                held.push(c);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cs = Arc::new(private_store(&dir));
+        for k in 0..5u64 {
+            let cs = cs.clone();
+            tokio::spawn(async move {
+                let _ = cs
+                    .fetch(&format!("http://{silent_addr}/{k}.json"), &node(k))
+                    .await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (parts, root) = vector();
+        let body = census_json(&parts);
+        let honest = serve(Router::new().route("/c.json", get(move || async move { body }))).await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cs.fetch(&format!("http://{honest}/c.json"), &root),
+        )
+        .await
+        .expect("the honest download waited behind silent servers")
+        .unwrap();
+        assert!(cs.has(&root).unwrap());
+    }
+
+    // Four servers that fill the budget and trickle on hold it; an honest
+    // download that cannot get its bytes is "not yet" (Backoff, no failure
+    // recorded), never a failure that counts against its process.
+    #[tokio::test]
+    async fn a_busy_budget_is_not_a_failure() {
+        use axum::{Router, routing::get};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 2048];
+                    let _ = s.read(&mut req).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-length: 100000000\r\n\r\n";
+                    let _ = s.write_all(head.as_bytes()).await;
+                    let _ = s.write_all(&[b' '; 2047]).await;
+                    while s.write_all(b" ").await.is_ok() {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut cs = private_store(&dir);
+        // 4 x 2 KiB fills it; a tiny window so the wait ends quickly.
+        cs.body_kib = Arc::new(Semaphore::new(8));
+        cs.min_rate = (0, Duration::from_millis(400));
+        let cs = Arc::new(cs);
+        let tasks: Vec<_> = (0..4u64)
+            .map(|k| {
+                let cs = cs.clone();
+                tokio::spawn(async move {
+                    let _ = cs.fetch(&format!("http://{slow}/{k}.json"), &node(k)).await;
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(cs.body_kib.available_permits(), 0);
+        let (parts, root) = vector();
+        let body = census_json(&parts);
+        let honest = serve(Router::new().route("/c.json", get(move || async move { body }))).await;
+        let uri = format!("http://{honest}/c.json");
+        for _ in 0..3 {
+            let e = cs.fetch(&uri, &root).await.unwrap_err();
+            assert!(matches!(e, CensusError::Backoff(_)), "{e}");
+            // Not remembered as a failure: the next call tries again.
+            assert!(cs.failures.lock().unwrap().is_empty());
+        }
+        for t in tasks {
+            t.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cs.fetch(&uri, &root).await.unwrap();
+    }
+
+    #[test]
+    fn byte_cap_above_the_budget_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = CensusOptions {
+            max_bytes: ((BODY_BUDGET_KIB as u64) << 10) + 1,
+            ..CensusOptions::default()
+        };
+        assert!(matches!(
+            CensusStore::with_options(db(&dir), opts),
+            Err(CensusError::Config(_))
+        ));
+    }
+
+    // Slow downloads hold sockets and a few KiB only: two of them do not hold
+    // up a third, honest one (builds had both permits for the whole download).
     #[tokio::test]
     async fn trickling_servers_do_not_block_an_honest_download() {
         use axum::{Router, routing::get};
@@ -1462,9 +1715,7 @@ mod tests {
         for k in 0..2u64 {
             let cs = cs.clone();
             tokio::spawn(async move {
-                let _ = cs
-                    .fetch(&format!("http://{slow}/{k}.json"), &Fr::from(k))
-                    .await;
+                let _ = cs.fetch(&format!("http://{slow}/{k}.json"), &node(k)).await;
             });
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1495,17 +1746,17 @@ mod tests {
             .rev()
             .collect();
         // Reversed indexes: the tree order follows addressIndex, not the array.
-        let reversed: Vec<Fr> = parts
+        let reversed: Vec<Node> = parts
             .iter()
             .rev()
             .map(|(a, w)| census_leaf(a, *w).unwrap())
             .collect();
         let rroot = LeanImt::from_leaves(reversed).root();
         assert_ne!(rroot, root);
-        let dec = davinci_zkvm_sdk::crypto::field::fr_to_dec(&rroot);
-        // big.Int root as a bare JSON number.
+        let hex_root = node_to_hex(&rroot);
+        // A dump root is `0x` and 64 hex digits.
         let body = format!(
-            r#"{{"root":{dec},"participants":{}}}"#,
+            r#"{{"root":"{hex_root}","participants":{}}}"#,
             serde_json::Value::from(ps)
         );
         // The same census as JSONL, found by its Content-Type.
@@ -1627,7 +1878,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cs = CensusStore::new(db(&dir)).unwrap();
         assert!(
-            cs.fetch("http://census.invalid/c.json", &Fr::from(1u64))
+            cs.fetch("http://census.invalid/c.json", &node(1))
                 .await
                 .is_err()
         );
@@ -1688,7 +1939,7 @@ mod tests {
     async fn failure_map_is_bounded_and_ignores_queries() {
         let dir = tempfile::tempdir().unwrap();
         let cs = CensusStore::new(db(&dir)).unwrap();
-        let root = Fr::from(9u64);
+        let root = node(9);
         // file:// is off here, so every fetch fails fast and is remembered.
         assert!(matches!(
             cs.fetch("file:///a.json?x=1", &root).await,
@@ -1806,7 +2057,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cs = store(&dir);
         let e = cs
-            .fetch("no scheme\nERROR forged line", &Fr::default())
+            .fetch("no scheme\nERROR forged line", &Node::default())
             .await
             .unwrap_err();
         assert!(!e.to_string().contains('\n'), "{e}");

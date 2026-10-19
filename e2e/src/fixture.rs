@@ -11,10 +11,10 @@ use davinci_client::organizer::{OnchainProcess, census_file, merkle_census, meta
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::{Voter, random_k};
 use davinci_zkvm_sdk::ballot::BallotMode;
+use davinci_zkvm_sdk::census::node_to_hex;
 use davinci_zkvm_sdk::census::{
     CensusWitness, LeanImt, census_leaf, csp_sign, eth_address, vote_id_sign,
 };
-use davinci_zkvm_sdk::crypto::field::{fr_from_be, fr_to_dec};
 use k256::ecdsa::SigningKey;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -116,11 +116,11 @@ pub fn csp_key() -> SigningKey {
     keys(4, 1).remove(0)
 }
 
-/// CSP census root: the CSP address as an integer.
-pub fn csp_root(csp: &SigningKey) -> Result<Fr> {
+/// CSP census root: the CSP address as an integer, big-endian.
+pub fn csp_root(csp: &SigningKey) -> Result<[u8; 32]> {
     let mut be = [0u8; 32];
     be[12..].copy_from_slice(&eth_address(csp.verifying_key()));
-    Ok(fr_from_be(&be)?)
+    Ok(be)
 }
 
 /// Round-robin node of a voter's first ballot.
@@ -195,10 +195,11 @@ pub fn tree_of(parts: &[([u8; 20], u128)]) -> Result<LeanImt> {
     Ok(merkle_census(&census_file(parts))?)
 }
 
-/// Writes lean-imt-go's `CensusDump` (numeric root and weights,
-/// `addressIndex`) into `dir`; returns its `file://` URI.
+/// Writes a census dump in lean-imt-go's `CensusDump` shape (the root as
+/// `0x` and 64 hex digits, numeric weights, `addressIndex`) into `dir`;
+/// returns its `file://` URI.
 pub fn write_census_dump(dir: &Path, name: &str, parts: &[([u8; 20], u128)]) -> Result<String> {
-    let root = fr_to_dec(&tree_of(parts)?.root());
+    let root = node_to_hex(&tree_of(parts)?.root());
     let total: u128 = parts.iter().map(|(_, w)| w).sum();
     let entries: Vec<String> = parts
         .iter()
@@ -211,7 +212,7 @@ pub fn write_census_dump(dir: &Path, name: &str, parts: &[([u8; 20], u128)]) -> 
         })
         .collect();
     let body = format!(
-        r#"{{"root":{root},"timestamp":"2026-09-27T00:00:00Z","totalEntries":{},"totalWeight":{total},"participants":[{}]}}"#,
+        r#"{{"root":"{root}","timestamp":"2026-09-27T00:00:00Z","totalEntries":{},"totalWeight":{total},"participants":[{}]}}"#,
         parts.len(),
         entries.join(",")
     );
@@ -461,7 +462,7 @@ pub fn build_ballots(
             vote_k(1, v, 3),
         ));
     }
-    // The inputs hash does not bind the census root, so the proof is valid
+    // The public signals do not bind the census root, so the proof is valid
     // for process 1; only census membership is wrong.
     let out = outsider();
     let mut fake = LeanImt::new();
@@ -555,10 +556,10 @@ mod tests {
         let uri = write_census_dump(dir.path(), "d.json", &parts).unwrap();
         let body = std::fs::read(uri.trim_start_matches("file://")).unwrap();
         let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let root = fr_to_dec(&tree_of(&parts).unwrap().root());
-        // A bare JSON number, as big.Int dumps it.
+        let root = node_to_hex(&tree_of(&parts).unwrap().root());
+        // A census value: `0x` and 64 hex digits.
         let raw = std::str::from_utf8(&body).unwrap();
-        assert!(raw.starts_with(&format!("{{\"root\":{root},")));
+        assert!(raw.starts_with(&format!("{{\"root\":\"{root}\",")));
         assert_eq!(j["participants"].as_array().unwrap().len(), N_DYN);
         assert_eq!(j["participants"][3]["addressIndex"], 3);
         let uri = write_census_jsonl(dir.path(), "d.jsonl", &parts).unwrap();

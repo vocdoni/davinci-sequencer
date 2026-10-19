@@ -1925,7 +1925,7 @@ pub fn census_tree(parts: &[([u8; 20], u128)]) -> Result<LeanImt> {
     Ok(merkle_census(&census_file(parts))?)
 }
 
-pub fn census_root(parts: &[([u8; 20], u128)]) -> Result<Fr> {
+pub fn census_root(parts: &[([u8; 20], u128)]) -> Result<[u8; 32]> {
     Ok(census_tree(parts)?.root())
 }
 

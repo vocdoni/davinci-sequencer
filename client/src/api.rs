@@ -1,6 +1,7 @@
 //! HTTP wire types of the sequencer API. Field names are camelCase
 //! like davinci-node. Field elements are decimal strings, bytes are `0x` hex,
-//! vote ids are `0x` + 16 hex (the BE8 integer), points are TE `{x, y}`.
+//! vote ids are `0x` + 16 hex (the BE8 integer), census values (roots,
+//! leaves, siblings) are `0x` + exactly 64 hex, points are TE `{x, y}`.
 //! Decoding only accepts canonical values: field elements below p, points on
 //! the curve, exact byte lengths.
 
@@ -8,7 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use davinci_zkvm_sdk::ballot::{Ballot, BallotMode};
-use davinci_zkvm_sdk::census::{CensusProof, CensusWitness, CspProof, EcdsaSignature};
+use davinci_zkvm_sdk::census::{CensusProof, CensusWitness, CspProof, EcdsaSignature, Node};
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::limits::{SMT_LEVELS, VOTE_ID_MIN};
 use davinci_zkvm_sdk::types::SnarkJsProof;
@@ -189,6 +190,37 @@ pub mod enc {
         }
     }
 
+    /// A census value (root, leaf, sibling): `0x` and exactly 64 hex digits,
+    /// written lowercase, read in either case. A 256-bit integer, never a
+    /// field element.
+    pub mod node {
+        use davinci_zkvm_sdk::census::{node_from_hex, node_to_hex};
+
+        use super::*;
+        pub fn serialize<S: Serializer>(x: &Node, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&node_to_hex(x))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Node, D::Error> {
+            node_from_hex(&String::deserialize(d)?).map_err(D::Error::custom)
+        }
+    }
+
+    /// A list of census values, each as [`node`].
+    pub mod node_vec {
+        use davinci_zkvm_sdk::census::{node_from_hex, node_to_hex};
+
+        use super::*;
+        pub fn serialize<S: Serializer>(x: &[Node], s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(x.iter().map(node_to_hex))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Node>, D::Error> {
+            Vec::<String>::deserialize(d)?
+                .iter()
+                .map(|s| node_from_hex(s).map_err(D::Error::custom))
+                .collect()
+        }
+    }
+
     /// A list of 32-byte values as `0x` hex.
     pub mod hex32_vec {
         use super::*;
@@ -228,6 +260,45 @@ pub mod enc {
         }
         pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
             parse_vote_id(&String::deserialize(d)?).map_err(D::Error::custom)
+        }
+    }
+
+    // The sdk type tolerates unknown keys; a vote body must not.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProofStrict {
+        pi_a: [String; 3],
+        pi_b: [[String; 2]; 3],
+        pi_c: [String; 3],
+        #[serde(default = "groth16")]
+        protocol: String,
+        #[serde(default = "bn128")]
+        curve: String,
+    }
+
+    fn groth16() -> String {
+        "groth16".into()
+    }
+
+    fn bn128() -> String {
+        "bn128".into()
+    }
+
+    /// snarkjs proof, refusing unknown keys.
+    pub mod snark_proof {
+        use super::*;
+        pub fn serialize<S: Serializer>(p: &SnarkJsProof, s: S) -> Result<S::Ok, S::Error> {
+            p.serialize(s)
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SnarkJsProof, D::Error> {
+            let p = ProofStrict::deserialize(d)?;
+            Ok(SnarkJsProof {
+                pi_a: p.pi_a,
+                pi_b: p.pi_b,
+                pi_c: p.pi_c,
+                protocol: p.protocol,
+                curve: p.curve,
+            })
         }
     }
 
@@ -351,17 +422,18 @@ pub mod enc {
     }
 }
 
-/// Merkle (lean-IMT) census proof; `pathBits` are the compact path bits.
+/// Merkle (Keccak lean-IMT) census proof; `pathBits` are the compact path
+/// bits. Values are 256-bit, `0x` + 64 hex ([`enc::node`]).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MerkleProof {
-    #[serde(with = "enc::fr_dec")]
-    pub root: Fr,
-    #[serde(with = "enc::fr_dec")]
-    pub leaf: Fr,
+    #[serde(with = "enc::node")]
+    pub root: Node,
+    #[serde(with = "enc::node")]
+    pub leaf: Node,
     pub path_bits: u64,
-    #[serde(with = "enc::fr_dec_vec")]
-    pub siblings: Vec<Fr>,
+    #[serde(with = "enc::node_vec")]
+    pub siblings: Vec<Node>,
 }
 
 impl From<&CensusProof> for MerkleProof {
@@ -418,9 +490,10 @@ pub struct VoteRequest {
     pub vote_id: u64,
     #[serde(with = "enc::ballot")]
     pub ballot: Ballot,
+    /// Its 71 public signals are derived from the other fields and the
+    /// process, never sent.
+    #[serde(with = "enc::snark_proof")]
     pub ballot_proof: SnarkJsProof,
-    #[serde(with = "enc::fr_dec")]
-    pub ballot_inputs_hash: Fr,
     /// `r || s || v` over the vote id (personal-sign of `PadToSign(BE8(vid))`).
     #[serde(with = "enc::hex")]
     pub signature: [u8; 65],
@@ -679,14 +752,14 @@ impl ProcessStatus {
     }
 }
 
-/// Census of a process: origins 1 to 3 (Merkle, lean-IMT root) or 4 (CSP,
-/// root = CSP address as an integer).
+/// Census of a process: origins 1 to 3 (Merkle, Keccak lean-IMT root) or 4
+/// (CSP, root = CSP address as an integer); `0x` + 64 hex either way.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CensusView {
     pub census_origin: u8,
-    #[serde(with = "enc::fr_dec")]
-    pub census_root: Fr,
+    #[serde(with = "enc::node")]
+    pub census_root: Node,
     #[serde(rename = "censusURI")]
     pub census_uri: String,
 }

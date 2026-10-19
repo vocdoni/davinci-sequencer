@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use davinci_state::{CensusOrigin, ProcessConfig, genesis_root};
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be};
+use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
 use tokio::sync::RwLock;
@@ -27,7 +27,7 @@ use crate::web3::{EventKind, RegistryEvent};
 /// The monitor's cursor: every event up to this block was routed.
 pub(crate) const LAST_BLOCK_KEY: &str = "monitor_last_block";
 /// Hash of the cursor block, written with it: a change means a reorg.
-const LAST_HASH_KEY: &str = "monitor_last_hash";
+pub(crate) const LAST_HASH_KEY: &str = "monitor_last_hash";
 /// Rewind on a reorg at the cursor, in blocks. Not floored at the safe
 /// head: on OP the derivation behind an unsafe reorg makes the new branch
 /// safe at once, above the fork.
@@ -36,6 +36,43 @@ const REORG_REWIND: u64 = 128;
 /// rate-limited block read must not stall every election.
 const HASH_TRIES: u32 = 5;
 const BOOT_RETRIES_KEY: &str = "monitor_boot_retries";
+
+/// A block the monitor routed every event up to, with its hash: the one
+/// view of the chain actors make state decisions from (reads at the hash,
+/// EIP-1898). It only exists with a hash; a reorg is a new, lower anchor.
+/// `time` is the block's timestamp (0 when unknown: loaded at boot);
+/// `reorgs` counts the reorgs the monitor saw this run, so an actor learns
+/// of one even when the next anchor it sees is higher than the last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    pub block: u64,
+    pub hash: [u8; 32],
+    pub time: u64,
+    pub reorgs: u64,
+}
+
+impl Anchor {
+    /// The same block on the same branch, whatever time was read with it.
+    pub fn same(&self, o: &Anchor) -> bool {
+        self.block == o.block && self.hash == o.hash
+    }
+}
+
+/// The current anchor, shared with the heartbeat that hands it to actors.
+type AnchorCell = Arc<Mutex<Option<Anchor>>>;
+
+/// The anchor stored with the cursor, if the cursor has its hash.
+fn stored_anchor(db: &Db) -> Option<Anchor> {
+    let block = db.meta_u64(LAST_BLOCK_KEY).ok()??;
+    let hash = db.meta_bytes(LAST_HASH_KEY).ok()??.try_into().ok()?;
+    Some(Anchor {
+        block,
+        hash,
+        time: 0,
+        reorgs: 0,
+    })
+}
+
 /// Bootstrap attempts per process before it is recorded ignored.
 const BOOT_ATTEMPT_CAP: u32 = 10;
 
@@ -102,14 +139,17 @@ pub async fn spawn_node(
     let registry = cfg.registry.into_array();
     // Its own provider (connects lazily): census contracts are plain reads.
     let provider = crate::web3::rpc_provider(&cfg.rpc_url);
-    let onchain = Arc::new(OnchainIndex::new(
-        &deps.db,
-        chain_id,
-        provider,
-        cfg.poll_interval,
-        cfg.census_sync_every,
-        cfg.confirmations,
-    )?);
+    let onchain = Arc::new(
+        OnchainIndex::new(
+            &deps.db,
+            chain_id,
+            provider,
+            cfg.poll_interval,
+            cfg.census_sync_every,
+            cfg.confirmations,
+        )?
+        .with_max_members(cfg.census_max_participants as u64),
+    );
     let node = Node {
         processes: Arc::new(RwLock::new(HashMap::new())),
         metrics: Arc::new(Metrics::default()),
@@ -126,10 +166,12 @@ pub async fn spawn_node(
         },
         verifier,
     };
+    let anchor: AnchorCell = Arc::new(Mutex::new(stored_anchor(&deps.db)));
     let ctx = Ctx {
         cfg,
         deps,
         node: node.clone(),
+        anchor: anchor.clone(),
         vk_hash,
         queue: CensusQueue {
             store: node.census.clone(),
@@ -193,6 +235,7 @@ pub async fn spawn_node(
     tracker.spawn(heartbeat_loop(
         ctx.deps.contracts.clone(),
         node.processes.clone(),
+        anchor,
         ctx.cfg.confirmations,
         ctx.cfg.heartbeat(),
         shutdown.clone(),
@@ -204,14 +247,24 @@ pub async fn spawn_node(
 /// Census downloads by pid: origin-2 updates and bootstrap censuses. A newer
 /// root replaces uri and root; a running fetch finishes first, so each
 /// process has at most one fetch in flight and one pending.
+/// Failed fetches of one process before its next ones start waiting.
+const FREE_CENSUS_FAILURES: u32 = 3;
+
 type Updates = Arc<Mutex<HashMap<Fr, Update>>>;
 
 struct Update {
     uri: String,
-    root: Fr,
+    /// A Keccak census root, big-endian.
+    root: [u8; 32],
     job: Job,
     /// The last transient failure, until a bootstrap counts it.
     failed: Option<String>,
+    /// Consecutive fetches of this process that failed, whatever their root:
+    /// an organizer re-rooting with `setProcessCensus` cannot dodge the
+    /// per-(uri, root) backoff of the store by changing the root.
+    fails: u32,
+    /// No fetch starts before this.
+    not_before: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -225,6 +278,7 @@ struct Ctx {
     cfg: Config,
     deps: Deps,
     node: Node,
+    anchor: AnchorCell,
     vk_hash: [u8; 32],
     queue: CensusQueue,
     /// Set when an update loaded: the next tick drops unused censuses.
@@ -236,13 +290,10 @@ struct Ctx {
 async fn resume_census(ctx: &Ctx, rec: &ProcessRecord) {
     let c = &rec.onchain.census;
     match c.origin {
-        2 => {
-            if let Ok(root) = fr_from_be(&c.root)
-                && !ctx.node.census.has(&root).unwrap_or(false)
-                && ctx.node.census.bad_reason(&rec.pid, &root).is_none()
-            {
-                queue_census(ctx, rec.pid, c.uri.clone(), root);
-            }
+        2 if !ctx.node.census.has(&c.root).unwrap_or(false)
+            && ctx.node.census.bad_reason(&rec.pid, &c.root).is_none() =>
+        {
+            queue_census(ctx, rec.pid, c.uri.clone(), c.root);
         }
         3 => {
             // A failure here is transient: the actor re-registers on every
@@ -265,7 +316,7 @@ pub struct CensusQueue {
 
 impl CensusQueue {
     /// Queues `root` of `pid` for download; a newer root replaces it.
-    pub(crate) fn queue(&self, pid: Fr, uri: String, root: Fr) {
+    pub(crate) fn queue(&self, pid: Fr, uri: String, root: [u8; 32]) {
         if let Err(e) = self.store.clear_bad(&pid) {
             error!(pid = %pid_hex(&pid), %e, "clear census failure");
         }
@@ -275,6 +326,8 @@ impl CensusQueue {
                 root,
                 job: Job::Queued,
                 failed: None,
+                fails: 0,
+                not_before: None,
             });
             if e.root != root {
                 e.failed = None;
@@ -312,7 +365,7 @@ impl CensusQueue {
     }
 }
 
-fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
+fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: [u8; 32]) {
     ctx.queue.queue(pid, uri, root);
 }
 
@@ -322,7 +375,7 @@ fn queue_census(ctx: &Ctx, pid: Fr, uri: String, root: Fr) {
 /// Roots of finished processes are kept, so their proofs stay servable.
 async fn prune_censuses(ctx: &Ctx) {
     let mut keep: HashSet<[u8; 32]> = match ctx.queue.updates.lock() {
-        Ok(q) => q.values().map(|e| fr_to_be(&e.root)).collect(),
+        Ok(q) => q.values().map(|e| e.root).collect(),
         Err(_) => return,
     };
     match ctx.deps.db.processes() {
@@ -344,10 +397,12 @@ async fn prune_censuses(ctx: &Ctx) {
 /// monitor loop: `CensusStore::fetch` applies the usual SSRF, size and
 /// backoff rules, and a transient failure stays queued for the next tick.
 fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
-    let jobs: Vec<(Fr, String, Fr)> = match ctx.queue.updates.lock() {
+    let jobs: Vec<(Fr, String, [u8; 32])> = match ctx.queue.updates.lock() {
         Ok(mut q) => q
             .iter_mut()
-            .filter(|(_, e)| e.job == Job::Queued)
+            .filter(|(_, e)| {
+                e.job == Job::Queued && e.not_before.is_none_or(|t| std::time::Instant::now() >= t)
+            })
             .map(|(pid, e)| {
                 e.job = Job::Running;
                 (*pid, e.uri.clone(), e.root)
@@ -368,6 +423,10 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                 r = census.fetch(&uri, &root) => r,
             };
             let mut failed = None;
+            // Charged to the process: everything but success and the store's
+            // own "not yet".
+            let charged = !matches!(res, Ok(()) | Err(CensusError::Backoff(_)));
+            let ok = res.is_ok();
             let done = match res {
                 Ok(()) => {
                     prune.store(true, Ordering::Relaxed);
@@ -404,6 +463,18 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
             {
                 if e.root == root && failed.is_some() {
                     e.failed = failed;
+                }
+                if ok {
+                    (e.fails, e.not_before) = (0, None);
+                } else if charged {
+                    // The first few failures cost nothing, so an honest
+                    // organizer correcting a typo or two is never held back.
+                    e.fails = e.fails.saturating_add(1);
+                    if e.fails > FREE_CENSUS_FAILURES {
+                        let n = e.fails - FREE_CENSUS_FAILURES;
+                        e.not_before =
+                            Some(std::time::Instant::now() + crate::census::backoff(n));
+                    }
                 }
                 e.job = if done && e.root == root {
                     Job::Done
@@ -474,14 +545,13 @@ fn process_config(vk_hash: [u8; 32], rec: &ProcessRecord) -> Result<ProcessConfi
         4 => CensusOrigin::Csp,
         o => return Err(NodeError::Config(format!("unsupported census origin {o}"))),
     };
-    let census_root =
-        fr_from_be(&p.census.root).map_err(|e| NodeError::Config(format!("census root: {e}")))?;
     Ok(ProcessConfig {
         process_id: rec.pid,
         ballot_mode: p.ballot_mode,
         enc_key: p.enc_key,
         census_origin,
-        census_root,
+        // Any 256-bit value: a Keccak root is not a field element.
+        census_root: p.census.root,
         ballot_vk_hash: vk_hash,
     })
 }
@@ -605,18 +675,33 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
         // idle chain is checked too.
         let got = tokio::select! {
             _ = shutdown.cancelled() => return,
-            r = ctx.deps.contracts.block_hash(last) => r,
+            r = ctx.deps.contracts.block_ref(last) => r,
         };
+        let got = known(got, last);
         if got.is_ok() {
             hash_errors = 0;
         }
         match (got, last_hash) {
-            (Ok(Some(h)), None) => {
-                last_hash = Some(h);
-                save_cursor(&ctx.deps.db, last, last_hash);
+            (Ok(r), None) => {
+                last_hash = Some(r.0);
+                save_cursor(&ctx, last, Some(r));
             }
-            (Ok(Some(h)), Some(want)) if h != want => {
+            (Ok((h, _)), Some(want)) if h != want => {
+                // The rewound cursor is saved with its hash in one write, so
+                // the anchor never goes without one: a failed read retries
+                // the whole check at the next poll from the old cursor.
                 let to = last.saturating_sub(REORG_REWIND);
+                let got = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    r = ctx.deps.contracts.block_ref(to) => r,
+                };
+                let r = match known(got, to) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(%e, to, "block hash read at the reorg rewind; retrying");
+                        continue;
+                    }
+                };
                 error!(
                     depth = last - to,
                     cursor = last,
@@ -624,21 +709,13 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
                     "registry reorg below the event cursor; routing the range again"
                 );
                 ctx.node.metrics.reorgs.fetch_add(1, Ordering::Relaxed);
-                (last, last_hash) = (to, None);
-                save_cursor(&ctx.deps.db, last, None);
-                // Every actor re-reads its process: one whose transitions the
-                // reorg took may have no event in the range to wake it. Off
-                // the loop, so a full mailbox cannot stall routing.
-                let handles: Vec<ActorHandle> =
-                    ctx.node.processes.read().await.values().cloned().collect();
-                ctx.deps.tasks.spawn(async move {
-                    for h in handles {
-                        h.reread().await;
-                    }
-                });
+                // Actors see the lower anchor at the next Head and re-read
+                // their process at it.
+                (last, last_hash) = (to, Some(r.0));
+                save_cursor(&ctx, last, Some(r));
             }
-            // The same block, or an endpoint behind the cursor.
-            (Ok(_), _) => {}
+            // The same block: the anchor again (a boot one learns its time).
+            (Ok(r), Some(_)) => publish(&ctx, last, r),
             // Nothing to check yet: route on.
             (Err(e), None) => {
                 hash_failed(&mut hash_errors, &e, last);
@@ -669,14 +746,21 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
             // which the next poll catches.
             let hash = tokio::select! {
                 _ = shutdown.cancelled() => return,
-                r = ctx.deps.contracts.block_hash(to) => r,
+                r = ctx.deps.contracts.block_ref(to) => r,
             };
-            let hash = match hash {
-                Ok(h) => {
+            let hash = match known(hash, to) {
+                Ok(r) => {
                     hash_errors = 0;
-                    h
+                    Some(r)
                 }
-                Err(e) if hash_failed(&mut hash_errors, &e, to) => None,
+                Err(e) if hash_failed(&mut hash_errors, &e, to) => {
+                    // Routed, but the anchor stays where it was.
+                    ctx.node
+                        .metrics
+                        .anchor_stalls
+                        .fetch_add(1, Ordering::Relaxed);
+                    None
+                }
                 Err(_) => {
                     failed = true;
                     break;
@@ -694,17 +778,23 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
                     break;
                 }
             };
+            let queued = retries.len();
             for ev in events {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = route(&ctx, ev, &mut retries, &shutdown) => {}
                 }
             }
+            // Once per page, before the cursor passes it: a save per queued
+            // bootstrap rewrites the whole list, quadratic in a flood.
+            if retries.len() != queued {
+                save_retries(&ctx.deps.db, &retries);
+            }
             // last always advances: one unservable process must not stall
             // event routing for every other election. Failed bootstraps
             // live in the retry list instead.
-            (last, last_hash) = (to, hash);
-            save_cursor(&ctx.deps.db, last, hash);
+            (last, last_hash) = (to, hash.map(|r| r.0));
+            save_cursor(&ctx, last, hash);
         }
         if failed {
             continue;
@@ -771,12 +861,39 @@ async fn reap_dead_actors(ctx: &Ctx, retries: &mut Vec<BootRetry>, deaths: &mut 
     save_retries(&ctx.deps.db, retries);
 }
 
-/// Persists the cursor and its block hash in one write.
-fn save_cursor(db: &Db, last: u64, hash: Option<[u8; 32]>) {
-    let hash = hash.as_ref().map(|h| &h[..]);
-    if let Err(e) = db.set_meta_u64_and_bytes(LAST_BLOCK_KEY, last, LAST_HASH_KEY, hash) {
+/// Persists the cursor and its block hash in one write; with a hash, the
+/// cursor is the new anchor. Without one (fail-open) the anchor stays.
+fn save_cursor(ctx: &Ctx, last: u64, block: Option<([u8; 32], u64)>) {
+    let bytes = block.as_ref().map(|(h, _)| &h[..]);
+    if let Err(e) = ctx
+        .deps
+        .db
+        .set_meta_u64_and_bytes(LAST_BLOCK_KEY, last, LAST_HASH_KEY, bytes)
+    {
         error!(%e, "persist last block");
     }
+    if let Some(r) = block {
+        publish(ctx, last, r);
+    }
+}
+
+fn publish(ctx: &Ctx, block: u64, (hash, time): ([u8; 32], u64)) {
+    let reorgs = ctx.node.metrics.reorgs.load(Ordering::Relaxed);
+    *ctx.anchor.lock().unwrap_or_else(|e| e.into_inner()) = Some(Anchor {
+        block,
+        hash,
+        time,
+        reorgs,
+    });
+}
+
+/// A block the endpoint does not know (a backend behind the confirmed head)
+/// is a failed read: one such answer must not drop the cursor's hash.
+fn known(
+    r: Result<Option<([u8; 32], u64)>, crate::web3::Web3Error>,
+    block: u64,
+) -> Result<([u8; 32], u64), crate::web3::Web3Error> {
+    r?.ok_or_else(|| crate::web3::Web3Error::Rpc(format!("block {block} unknown to the endpoint")))
 }
 
 /// Counts a failed block-hash read; true once [`HASH_TRIES`] failed in a
@@ -800,6 +917,7 @@ fn hash_failed(errors: &mut u32, e: &crate::web3::Web3Error, block: u64) -> bool
 async fn heartbeat_loop(
     contracts: Arc<dyn crate::actor::Chain>,
     processes: Arc<RwLock<HashMap<Fr, ActorHandle>>>,
+    anchor: AnchorCell,
     confirmations: u64,
     every: std::time::Duration,
     shutdown: CancellationToken,
@@ -818,17 +936,19 @@ async fn heartbeat_loop(
         };
         let Ok((block, time)) = head else { continue };
         let confirmed_block = block.saturating_sub(confirmations);
+        let anchor = *anchor.lock().unwrap_or_else(|e| e.into_inner());
         // Not under the map lock: a full mailbox must not hold up a spawn.
         let hs: Vec<ActorHandle> = processes.read().await.values().cloned().collect();
         // Never waits: a full mailbox drops this Head, not the others'.
         for h in hs {
-            h.head(confirmed_block, time).await;
+            h.head(confirmed_block, time, anchor).await;
         }
     }
 }
 
-/// Routes one event. A failed bootstrap goes onto the retry list; routing
-/// itself never fails, so the monitor always advances past the block.
+/// Routes one event. A failed bootstrap goes onto the retry list, which the
+/// caller persists; routing itself never fails, so the monitor always
+/// advances past the block.
 async fn route(
     ctx: &Ctx,
     ev: RegistryEvent,
@@ -861,7 +981,6 @@ async fn route(
                 attempts,
                 due: tokio::time::Instant::now() + boot_backoff(ctx.cfg.poll_interval, attempts),
             });
-            save_retries(&ctx.deps.db, retries);
         }
         return;
     }
@@ -871,12 +990,7 @@ async fn route(
             && let Ok(Some(rec)) = ctx.deps.db.process(&pid)
             && rec.onchain.census.origin == 2
         {
-            match fr_from_be(root) {
-                Ok(r) => queue_census(ctx, pid, uri.clone(), r),
-                Err(e) => {
-                    warn!(pid = %hex::encode(pid31), %e, "census update with an out-of-field root")
-                }
-            }
+            queue_census(ctx, pid, uri.clone(), *root);
         }
         h.event(ev).await;
     }

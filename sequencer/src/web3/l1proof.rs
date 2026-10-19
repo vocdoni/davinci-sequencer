@@ -5,8 +5,8 @@
 //!
 //! `verify_local` is a pre-flight, not the oracle. On non-honest inputs it differs from the
 //! contract: a block number longer than 8 bytes is rejected (the contract truncates it), the last
-//! proof node must be a leaf, there is no 32-item RLP list cap, error kinds and their order
-//! differ, and there is no `MAX_AGE` check.
+//! proof node must be a leaf, in-place trie nodes and keys over 32 bytes are rejected, there is no
+//! 32-item RLP list cap, error kinds and their order differ, and there is no `MAX_AGE` check.
 
 use alloy::consensus::Header;
 use alloy::eips::eip2718::Encodable2718;
@@ -94,6 +94,44 @@ pub fn tx_trie_proof(envelopes: &[Bytes], index: usize) -> (B256, Vec<Bytes>) {
     (root, proof)
 }
 
+/// Refuses what the trie decoder and verifier panic on: a key over 32 bytes, paths that walk
+/// past the key, an in-place child. A transactions trie has none: keys are at most 9 bytes and
+/// every node is over 32 bytes, so each is referenced by its hash.
+fn trie_shape(key: &[u8], proof: &[Bytes]) -> Result<(), L1ProofError> {
+    let bad = |m: &str| L1ProofError::BadProof(m.to_string());
+    if key.len() > 32 {
+        return Err(bad("key over 32 bytes"));
+    }
+    let hash_ref = |c: &[u8]| c.len() == 33 && c[0] == 0xa0;
+    let mut walked = 0usize;
+    for node in proof {
+        let items = rlp_items(node).ok_or_else(|| bad("node is not an rlp list"))?;
+        match items.len() {
+            17 => {
+                if !items[..16].iter().all(|c| *c == [0x80] || hash_ref(c)) {
+                    return Err(bad("in-place branch child"));
+                }
+                walked += 1;
+            }
+            2 => {
+                let path = rlp_str(items[0])
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| bad("bad node path"))?;
+                // Compact path: the flag nibble, then one nibble more when odd.
+                walked += 2 * (path.len() - 1) + usize::from(path[0] & 0x10 != 0);
+                if path[0] & 0x20 == 0 && !hash_ref(items[1]) {
+                    return Err(bad("in-place extension child"));
+                }
+            }
+            _ => return Err(bad("node is neither a branch nor a leaf or extension")),
+        }
+        if walked > 2 * key.len() {
+            return Err(bad("node paths longer than the key"));
+        }
+    }
+    Ok(())
+}
+
 /// Checks that `value` sits at `key` under `root`.
 pub fn verify_tx(
     root: B256,
@@ -101,6 +139,7 @@ pub fn verify_tx(
     proof: &[Bytes],
     value: &Bytes,
 ) -> Result<(), L1ProofError> {
+    trie_shape(key, proof)?;
     verify_proof(
         root,
         Nibbles::unpack(key),
@@ -207,6 +246,7 @@ pub fn verify_local(p: &L1BlobProof, anchor: B256) -> Result<(Vec<B256>, Vec<u64
 
 /// The leaf value of a proof: the last node is the leaf; its value is the envelope.
 fn proven_value(root: B256, key: &Bytes, proof: &[Bytes]) -> Result<Bytes, L1ProofError> {
+    trie_shape(key, proof)?;
     let leaf = proof
         .last()
         .ok_or_else(|| L1ProofError::BadProof("empty proof".into()))?;
@@ -253,6 +293,14 @@ pub async fn build<P: Provider>(
     if top < oldest {
         return Err(L1ProofError::Rpc(format!(
             "top {top} is below block {oldest}"
+        )));
+    }
+    // The settle loop never anchors deeper: a receipt this far down is an
+    // endpoint lying or moving, not headers to read one by one.
+    let max = crate::l1da::MAX_L1_PROOF_HEADERS;
+    if top - oldest >= max {
+        return Err(L1ProofError::Rpc(format!(
+            "block {oldest} is more than {max} headers below top {top}"
         )));
     }
     let mut headers = vec![];

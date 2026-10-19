@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use crate::web3::OnchainProcess;
 
 /// Bump on any incompatible change to a table layout or record encoding.
-pub const SCHEMA_VERSION: u64 = 11;
+/// 12: stored votes carry no inputs hash and 256-bit census values.
+pub const SCHEMA_VERSION: u64 = 12;
+/// The first schema with the coverage history; older files cannot upgrade.
+const COVERAGE_HISTORY_SINCE: u64 = 11;
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The database file inside its directory.
 pub const DB_FILE: &str = "sequencer.redb";
@@ -232,9 +235,12 @@ pub struct Db {
     /// Every arbo handle handed out, so tests can see open snapshots.
     #[cfg(any(test, feature = "test-hooks"))]
     arbo_handles: Arc<std::sync::Mutex<Vec<arbo::RedbStorage>>>,
-    /// Scripted failures of the node's own write transactions (tests only).
+    /// Scripted failures of the node's own write transactions (tests only),
+    /// after `write_skip` more go through.
     #[cfg(any(test, feature = "test-hooks"))]
     write_faults: Arc<std::sync::atomic::AtomicU32>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    write_skip: Arc<std::sync::atomic::AtomicU32>,
     /// Scripted failures of process-record reads (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     process_read_faults: Arc<std::sync::atomic::AtomicU32>,
@@ -250,6 +256,9 @@ pub struct Db {
     /// While set, the write after a rebuild's check fails (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     check_faults: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, requeues and queue rewrites fail (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    queue_faults: Arc<std::sync::atomic::AtomicBool>,
     /// Armed: the next history write (a seal commit or a synced batch's
     /// entry) is followed by a crash (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
@@ -353,6 +362,8 @@ impl Db {
             #[cfg(any(test, feature = "test-hooks"))]
             write_faults: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
+            write_skip: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
             process_read_faults: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             meta_read_fault: Default::default(),
@@ -362,6 +373,8 @@ impl Db {
             transition_skip: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             check_faults: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            queue_faults: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             history_crash: Default::default(),
         };
@@ -422,7 +435,9 @@ impl Db {
                         .map_err(db_err)?;
                 }
                 Some(v) if v == SCHEMA_VERSION => {}
-                Some(v) if v < SCHEMA_VERSION => return Err(StorageError::PredatesHistory),
+                Some(v) if v < COVERAGE_HISTORY_SINCE => {
+                    return Err(StorageError::PredatesHistory);
+                }
                 Some(v) => {
                     return Err(StorageError::Schema {
                         found: v,
@@ -503,8 +518,16 @@ impl Db {
     /// a crash right after a tree commit. Test hook.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_writes(&self, n: u32) {
-        self.write_faults
-            .store(n, std::sync::atomic::Ordering::SeqCst);
+        self.fail_writes_after(0, n);
+    }
+
+    /// Lets the next `skip` record writes through, then fails `n` (`u32::MAX`:
+    /// a crash part way through a run of writes). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_writes_after(&self, skip: u32, n: u32) {
+        use std::sync::atomic::Ordering;
+        self.write_skip.store(skip, Ordering::SeqCst);
+        self.write_faults.store(n, Ordering::SeqCst);
     }
 
     /// While `on`, every transition-record write fails and every other write
@@ -514,6 +537,28 @@ impl Db {
         self.fail_transition_writes_after(0);
         self.transition_faults
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stores `value` as the process's rebuild-check marker as it is (an
+    /// older node's format). Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn put_rebuild_check_raw(&self, pid: &Fr, value: &[u8]) -> Result<()> {
+        self.put(REBUILD_CHECK, &pid_key(pid), value)
+    }
+
+    /// While `on`, [`Db::requeue`] and [`Db::set_queue`] fail. Test hook.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_queue_writes(&self, on: bool) {
+        self.queue_faults
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn queue_fault(&self) -> Result<()> {
+        match self.queue_faults.load(std::sync::atomic::Ordering::SeqCst) {
+            true => Err(StorageError::Db("scripted queue write failure".into())),
+            false => Ok(()),
+        }
     }
 
     /// While `on`, [`Db::finish_rebuild_check`] fails. Test hook.
@@ -699,9 +744,22 @@ impl Db {
         Ok(self.get(REBUILD_CHECK, &pid_key(pid))?.is_some())
     }
 
-    /// The check after a rebuild's replay: `vids` (settled, but not on the
-    /// chain the replay reached) go back to pending at the queue head and
-    /// the marker is dropped, in one commit.
+    /// Where each vote the pending check covers landed: `(vid, index, pos)`
+    /// in the chain's transition log, the marker's value. Empty when
+    /// unknown (a marker written before it held one). Any other value is an
+    /// error: the check must not go on without the order.
+    pub fn rebuild_check_order(&self, pid: &Fr) -> Result<Vec<(u64, u64, u64)>> {
+        match self.get(REBUILD_CHECK, &pid_key(pid))? {
+            Some(v) if !v.is_empty() => decode("rebuild_check", &v),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The check after a rebuild's replay: `vids`, the queue as the actor
+    /// holds it with the votes settled but not on the chain the replay
+    /// reached back in it, become pending at the queue head in this order
+    /// (the other queued votes after them) and the marker is dropped, in
+    /// one commit.
     pub fn finish_rebuild_check(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
         if self.check_faults.load(std::sync::atomic::Ordering::SeqCst) {
@@ -709,6 +767,7 @@ impl Db {
         }
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_remove(tx, pid, vids)?;
             tx_prepend(tx, pid, vids)?;
             tx.open_table(REBUILD_CHECK)
                 .map_err(db_err)?
@@ -773,14 +832,23 @@ impl Db {
     // it succeeds (dropping an uncommitted transaction aborts it).
     fn write(&self, f: impl FnOnce(&WriteTransaction) -> Result<()>) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
-        if self
-            .write_faults
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |n| n.checked_sub(1),
-            )
-            .is_ok()
+        if self.write_faults.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && self
+                .write_skip
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_err()
+            && self
+                .write_faults
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
         {
             return Err(StorageError::Db("scripted write failure".into()));
         }
@@ -803,6 +871,18 @@ impl Db {
             .collect()
     }
 
+    /// The queue as the actor holds it: `vids` pending, at the head in this
+    /// order, the other queued votes after them; one commit.
+    pub fn set_queue(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.queue_fault()?;
+        self.write(|tx| {
+            tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_remove(tx, pid, vids)?;
+            tx_prepend(tx, pid, vids)
+        })
+    }
+
     pub fn remove_pending(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
         self.write(|tx| tx_remove(tx, pid, vids))
     }
@@ -816,6 +896,21 @@ impl Db {
         err: Option<&str>,
     ) -> Result<()> {
         self.write(|tx| tx_status(tx, pid, vids, s, err))
+    }
+
+    /// Votes reach a final status and leave the queue in one commit: a vote
+    /// never reads pending outside the queue, where no restart finds it.
+    pub fn finish_votes(
+        &self,
+        pid: &Fr,
+        vids: &[u64],
+        s: VoteStatus,
+        err: Option<&str>,
+    ) -> Result<()> {
+        self.write(|tx| {
+            tx_status(tx, pid, vids, s, err)?;
+            tx_remove(tx, pid, vids)
+        })
     }
 
     /// Stores a new vote and queues it, in one commit. A vote id the
@@ -949,6 +1044,8 @@ impl Db {
     /// were sealed ahead of every queued vote of their slot, so the head
     /// keeps each slot's cast order. Votes still queued keep their place.
     pub fn requeue(&self, pid: &Fr, vids: &[u64]) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.queue_fault()?;
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
             tx_prepend(tx, pid, vids)
@@ -962,6 +1059,22 @@ impl Db {
         &self,
         pid: &Fr,
         vids: &[u64],
+        t: &TransitionRecord,
+        blobs: &[Blob],
+        process: &ProcessRecord,
+    ) -> Result<()> {
+        self.settle_superseding(pid, vids, &[], t, blobs, process)
+    }
+
+    /// [`Db::settle`], and in the same commit the queued votes the settled
+    /// ones supersede (cast earlier by their voters) end in error and leave
+    /// the queue: no crash can settle a vote and leave an earlier one of its
+    /// voter queued to seal over it.
+    pub fn settle_superseding(
+        &self,
+        pid: &Fr,
+        vids: &[u64],
+        superseded: &[u64],
         t: &TransitionRecord,
         blobs: &[Blob],
         process: &ProcessRecord,
@@ -981,15 +1094,29 @@ impl Db {
         self.write(|tx| {
             tx_status(tx, pid, vids, VoteStatus::Settled, None)?;
             tx_remove(tx, pid, vids)?;
+            tx_supersede(tx, pid, superseded)?;
             tx_put_transition(tx, pid, t, blobs)?;
             tx_put_process(tx, process)
         })
     }
 
+    /// Queued votes found in the tree settle, and the queued votes they
+    /// supersede end in error, all leaving the queue in one commit.
+    pub fn settle_votes(&self, pid: &Fr, settled: &[u64], superseded: &[u64]) -> Result<()> {
+        self.write(|tx| {
+            tx_status(tx, pid, settled, VoteStatus::Settled, None)?;
+            tx_remove(tx, pid, settled)?;
+            tx_supersede(tx, pid, superseded)
+        })
+    }
+
     /// A reorg took transitions the process committed: drops its tree
-    /// table, every transition and blob, puts `vids` back in the queue
-    /// (pending, at its head in this order), and stores the exposed set, the
-    /// kept-vote check marker (`check`) and the process record, in one
+    /// table, every transition and blob, makes `vids` (the queue as the
+    /// actor holds it, the lost transitions' votes back in it) the queue
+    /// head (pending, in this order), and stores the exposed set, the
+    /// kept-vote check marker (`check`: where each kept vote landed, its
+    /// value; an older marker's empty value reads as no order) and the
+    /// process record, in one
     /// commit. The coverage history stays. The tree is re-created at genesis
     /// after it; a crash in between reopens at genesis (no stored tree).
     pub fn reset_process(
@@ -997,18 +1124,19 @@ impl Db {
         pid: &Fr,
         vids: &[u64],
         exposed: &ExposedRecord,
-        check: bool,
+        check: Option<&[(u64, u64, u64)]>,
         process: &ProcessRecord,
     ) -> Result<()> {
+        let order = check.map(|c| encode(&c)).transpose()?;
         self.write(|tx| {
             let mut marker = tx.open_table(REBUILD_CHECK).map_err(db_err)?;
-            match check {
-                true => drop(
+            match &order {
+                Some(o) => drop(
                     marker
-                        .insert(pid_key(pid).as_slice(), &[][..])
+                        .insert(pid_key(pid).as_slice(), o.as_slice())
                         .map_err(db_err)?,
                 ),
-                false => drop(marker.remove(pid_key(pid).as_slice()).map_err(db_err)?),
+                None => drop(marker.remove(pid_key(pid).as_slice()).map_err(db_err)?),
             }
             drop(marker);
             let name = Self::arbo_table(pid);
@@ -1025,6 +1153,7 @@ impl Db {
                 .retain_in(lo.as_slice()..=hi.as_slice(), |_, _| false)
                 .map_err(db_err)?;
             tx_status(tx, pid, vids, VoteStatus::Pending, None)?;
+            tx_remove(tx, pid, vids)?;
             tx_prepend(tx, pid, vids)?;
             tx.open_table(EXPOSED)
                 .map_err(db_err)?
@@ -1277,6 +1406,17 @@ fn private_dir(dir: &Path) -> Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// The error of a queued vote a later settled vote of its voter supersedes.
+pub const SUPERSEDED: &str = "superseded by a later vote";
+
+fn tx_supersede(tx: &WriteTransaction, pid: &Fr, vids: &[u64]) -> Result<()> {
+    if vids.is_empty() {
+        return Ok(());
+    }
+    tx_status(tx, pid, vids, VoteStatus::Error, Some(SUPERSEDED))?;
+    tx_remove(tx, pid, vids)
 }
 
 // A history entry and its index rows.

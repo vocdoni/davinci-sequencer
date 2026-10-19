@@ -19,7 +19,7 @@ use davinci_client::organizer::{
 };
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
-use davinci_zkvm_sdk::crypto::field::{Fr, U256};
+use davinci_zkvm_sdk::crypto::field::U256;
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
 
@@ -54,6 +54,10 @@ fn bytecode(artifact: &str) -> Vec<u8> {
 const GRACE_ARGS: (u32, u32, u32, u32, u32) = (10, 2, 60, 60, 5);
 
 /// A metadata document nobody fetches: the tests only need its hash.
+/// Keccak census roots: 256-bit values, here both above the BN254 modulus.
+const ROOT: [u8; 32] = [0xc5; 32];
+const ROOT2: [u8; 32] = [0xd7; 32];
+
 const DOC: &[u8] = br#"{"title":{"default":"organizer test"}}"#;
 
 fn registry_bytecode() -> Vec<u8> {
@@ -248,7 +252,7 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
             min_value_sum: 0,
         },
         census_origin: 1,
-        census_root: Fr::from(123456789u64),
+        census_root: ROOT,
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
         metadata: "ipfs://metadata".into(),
@@ -264,7 +268,8 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
     assert_eq!(p.status, ProcessStatus::Ready);
     assert_eq!(p.encryption_key, pk);
     assert_eq!(p.ballot_mode, params.ballot_mode);
-    assert_eq!(p.census_root, params.census_root);
+    // Read back as the registry's bytes32, never as a field element.
+    assert_eq!(p.census_root, ROOT);
     assert_eq!(p.census_origin, 1);
     assert_eq!(p.max_voters, 24);
     assert_eq!(p.metadata_uri, "ipfs://metadata");
@@ -364,7 +369,7 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
 
     // An origin-1 census is fixed.
     let e = org
-        .set_process_census(&pid2, Fr::from(7u64), "file:///tmp/c2.jsonl")
+        .set_process_census(&pid2, ROOT2, "file:///tmp/c2.jsonl")
         .await
         .unwrap_err();
     assert!(
@@ -379,18 +384,18 @@ async fn create_end_and_read_a_process() -> anyhow::Result<()> {
     let pid3 = org.create_process(&dynamic).await?.pid;
     let other = Organizer::connect(&url, anvil.keys()[1].clone().into(), registry)?;
     let e = other
-        .set_process_census(&pid3, Fr::from(7u64), "file:///tmp/c2.jsonl")
+        .set_process_census(&pid3, ROOT2, "file:///tmp/c2.jsonl")
         .await
         .unwrap_err();
     assert!(
         matches!(&e, Error::Reverted(n) if n == "Unauthorized"),
         "{e}"
     );
-    org.set_process_census(&pid3, Fr::from(7u64), "file:///tmp/c2.jsonl")
+    org.set_process_census(&pid3, ROOT2, "file:///tmp/c2.jsonl")
         .await?;
     let p3 = reader.process(&pid3).await?;
     assert_eq!(p3.census_origin, 2);
-    assert_eq!(p3.census_root, Fr::from(7u64));
+    assert_eq!(p3.census_root, ROOT2);
     assert_eq!(p3.census_uri, "file:///tmp/c2.jsonl");
     assert_eq!(p3.census_contract, [0; 20]);
     org.cancel_process(&pid3).await?;
@@ -471,7 +476,7 @@ async fn process_metadata() -> anyhow::Result<()> {
             min_value_sum: 0,
         },
         census_origin: 1,
-        census_root: Fr::from(123456789u64),
+        census_root: ROOT,
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
         metadata: "ipfs://v1".into(),
@@ -636,7 +641,7 @@ async fn process_controls() -> anyhow::Result<()> {
             min_value_sum: 1,
         },
         census_origin: 1,
-        census_root: Fr::from(123456789u64),
+        census_root: ROOT,
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
         metadata: "ipfs://v1".into(),
@@ -804,7 +809,7 @@ async fn dkg_key_modes() -> anyhow::Result<()> {
             min_value_sum: 0,
         },
         census_origin: 1,
-        census_root: Fr::from(123456789u64),
+        census_root: ROOT,
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
         metadata: "ipfs://metadata".into(),
@@ -1057,7 +1062,7 @@ async fn resend_of_a_mined_transaction_is_ours() -> anyhow::Result<()> {
             min_value_sum: 0,
         },
         census_origin: 1,
-        census_root: Fr::from(123456789u64),
+        census_root: ROOT,
         census_contract: [0; 20],
         census_uri: "file:///tmp/census.json".into(),
         metadata: "ipfs://metadata".into(),

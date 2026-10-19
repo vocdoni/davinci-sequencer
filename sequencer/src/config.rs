@@ -421,6 +421,14 @@ pub struct Config {
     /// once nothing is left to settle, and submit them at its end.
     #[arg(long, env = "DAVINCI_EAGER_RESULTS", default_value = "true", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
     pub eager_results: bool,
+    /// An endpoint without EIP-1898 calls: once reads by block hash have
+    /// failed for 90 s, read the process at the anchor's block number,
+    /// between two checks of that block's hash, and decide on it. Only for
+    /// an endpoint with a single backend: behind a balancer the read can
+    /// come from another branch. Off, nothing is decided from the chain
+    /// until reads by hash answer again (sealing on events goes on).
+    #[arg(long, env = "DAVINCI_DEGRADED_NUMBER_READS", default_value = "false", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+    pub degraded_number_reads: bool,
     /// Blocks behind head the monitor treats as final (reorg margin).
     /// Default: the network's, else 2.
     #[arg(
@@ -511,6 +519,7 @@ impl fmt::Debug for Config {
             .field("slot_depth", &self.slot_depth)
             .field("prove_base", &self.prove_base)
             .field("eager_results", &self.eager_results)
+            .field("degraded_number_reads", &self.degraded_number_reads)
             .field("confirmations", &self.confirmations)
             .field("start_block", &self.start_block)
             .field("census_dir", &self.census_dir)

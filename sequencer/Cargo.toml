@@ -36,6 +36,10 @@ sha2.workspace = true
 num-bigint.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 tower = { workspace = true }
+# The accept loop (`api::serve`): axum 0.7's own has no read-head timeout.
+# HTTP/1 only, as axum's was.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-graceful", "service"] }
 # The node binary's allocator (`main.rs`): glibc keeps each thread arena's
 # high-water mark, jemalloc returns freed pages from background threads.
 tikv-jemallocator = { version = "0.7", features = ["background_threads"] }

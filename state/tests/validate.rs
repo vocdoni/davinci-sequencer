@@ -8,10 +8,11 @@ use davinci_state::{
     CensusOrigin, ProcessConfig, VoteError, ballot_from_be_coords, validate_vote, vote_still_valid,
 };
 use davinci_zkvm_sdk::census::{
-    CensusProof, CensusWitness, LeanImt, census_leaf, csp_sign, slot_key_address,
+    CensusProof, CensusWitness, LeanImt, census_leaf, csp_sign, hash2, slot_key_address,
 };
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::encrypt;
+use davinci_zkvm_sdk::crypto::elgamal::keygen;
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be, u256_from_be};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::limits::{BALLOT_COORDS, BALLOT_MIN};
@@ -29,7 +30,7 @@ fn csp_cfg(cfg: &ProcessConfig, csp_address: &[u8; 20]) -> ProcessConfig {
     be[12..].copy_from_slice(csp_address);
     let mut c = cfg.clone();
     c.census_origin = CensusOrigin::Csp;
-    c.census_root = fr_from_be(&be).unwrap();
+    c.census_root = be;
     c
 }
 
@@ -39,6 +40,76 @@ fn accepts_a_valid_merkle_vote() {
     let v = real_vote(&env, 0, &[1, 2], 5);
     let got = validate_vote(&env.cfg, &verifier(), v.pkg.clone()).unwrap();
     assert_eq!(got.slot, v.slot);
+}
+
+// Keccak roots are uniform 256-bit values, most above the BN254 modulus;
+// the node carries them as bytes, never as field elements.
+#[test]
+fn accepts_a_vote_under_a_root_above_the_modulus() {
+    let env = env(2, 4);
+    assert!(
+        fr_from_be(&env.cfg.census_root).is_err(),
+        "the 4-member root must be above the modulus"
+    );
+    let v = real_vote(&env, 2, &[0, 3], 8);
+    validate_vote(&env.cfg, &verifier(), v.pkg).unwrap();
+}
+
+// A single-member census has root = leaf (no hashing), as before.
+#[test]
+fn accepts_a_vote_in_a_single_member_census() {
+    let env = env(2, 1);
+    assert_eq!(
+        env.cfg.census_root,
+        census_leaf(&voter_address(0), 1).unwrap()
+    );
+    let v = real_vote(&env, 0, &[1, 2], 5);
+    let got = validate_vote(&env.cfg, &verifier(), v.pkg.clone()).unwrap();
+    assert!(got.pkg.census == v.pkg.census);
+}
+
+// Review Focus 1, node side: the proof is checked against the 71 inputs the
+// guest derives, so changing any of them (with every earlier check still
+// passing) fails the proof.
+#[test]
+fn the_proof_binds_every_public_input() {
+    let env = env(2, 4);
+    let vf = verifier();
+    let v = real_vote(&env, 0, &[1, 2], 5);
+    validate_vote(&env.cfg, &vf, v.pkg.clone()).unwrap();
+    let bad = |cfg: &ProcessConfig, p| {
+        assert_eq!(validate_vote(cfg, &vf, p).unwrap_err(), VoteError::BadProof);
+    };
+    // 1 vote id, signed again by the voter.
+    let mut p = v.pkg.clone();
+    p.vote_id += 1;
+    p.signature = davinci_zkvm_sdk::census::vote_id_sign(&voter_key(0), p.vote_id);
+    bad(&env.cfg, p);
+    // 3 packed ballot mode and 4, 5 the encryption key: the process's.
+    let mut c = env.cfg.clone();
+    c.ballot_mode.max_value += 1;
+    bad(&c, v.pkg.clone());
+    let mut c = env.cfg.clone();
+    c.enc_key = keygen(&mut <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(8)).1;
+    bad(&c, v.pkg.clone());
+    // 6 weight: a CSP attestation for weight 2 (a Merkle leaf pins it).
+    let csp = voter_key(99);
+    let cfg = csp_cfg(&env.cfg, &voter_address(99));
+    let mut p = v.pkg.clone();
+    p.weight = 2;
+    p.census = CensusWitness::Csp(csp_sign(&csp, &cfg.process_id, &p.address, 2, 3));
+    bad(&cfg, p);
+    // 7.. ciphertexts: two live fields swapped, and one field encrypted again.
+    let mut p = v.pkg.clone();
+    p.ballot.0.swap(0, 1);
+    bad(&env.cfg, p);
+    let mut p = v.pkg.clone();
+    p.ballot.0[1] = encrypt(
+        &env.cfg.enc_key,
+        2,
+        &u256_from_be(&fr_to_be(&Fr::from(7u64))),
+    );
+    bad(&env.cfg, p);
 }
 
 #[test]
@@ -66,8 +137,8 @@ fn merkle_slot_follows_the_address_not_the_leaf() {
 #[test]
 fn accepts_a_valid_csp_vote() {
     let env = env(2, 4);
-    // Same voter, key, ballot and weight: the inputs hash (and so the cached
-    // proof) is identical, only the census witness changes.
+    // Same voter, key, ballot and weight: the public signals (and so the
+    // cached proof) are identical, only the census witness changes.
     let mut v = real_vote(&env, 0, &[1, 2], 5);
     let csp = voter_key(99);
     let cfg = csp_cfg(&env.cfg, &voter_address(99));
@@ -95,7 +166,7 @@ fn dynamic_merkle_origins_validate_as_merkle() {
 
         // The census root is still pinned.
         let mut c = cfg.clone();
-        c.census_root += Fr::from(1u64);
+        c.census_root[31] ^= 1;
         assert_eq!(
             validate_vote(&c, &vf, fake.pkg.clone()).unwrap_err(),
             VoteError::CensusRootMismatch,
@@ -183,24 +254,23 @@ fn rejects_everything_the_guest_rejects() {
     p.weight = 1u128 << 88;
     check(p, VoteError::WeightRange);
 
-    // Inputs hash not matching the vote.
-    let mut p = ok.pkg.clone();
-    p.inputs_hash += Fr::from(1u64);
-    check(p, VoteError::InputsHashMismatch);
-
     // Signature by another key.
     let mut p = ok.pkg.clone();
     p.signature = davinci_zkvm_sdk::census::vote_id_sign(&voter_key(1), p.vote_id);
     check(p, VoteError::SignatureMismatch);
 
-    // High-S: same signature with s negated.
+    // s negated alone: another key's signature.
     let mut p = ok.pkg.clone();
     let s = Scalar::from_repr(p.signature.s.into()).unwrap();
     p.signature.s = (-s).to_bytes().into();
     assert!(matches!(
-        validate_vote(cfg, &vf, p).unwrap_err(),
-        VoteError::SignatureInvalid(_)
+        validate_vote(cfg, &vf, p.clone()).unwrap_err(),
+        VoteError::SignatureMismatch | VoteError::SignatureInvalid(_)
     ));
+    // High-S with the recid flipped is the same signature, which the guest
+    // takes: the next check (the proof) fails.
+    p.signature.v ^= 1;
+    check(p, VoteError::BadProof);
 
     // Flipped recovery id: some other key signed this.
     let mut p = ok.pkg.clone();
@@ -223,11 +293,13 @@ fn rejects_everything_the_guest_rejects() {
 
     // Deeper than 61 levels.
     let mut p = ok.pkg.clone();
+    let mut one = [0u8; 32];
+    one[31] = 1;
     p.census = CensusWitness::Merkle(CensusProof {
         root: cfg.census_root,
-        leaf: Fr::from(1u64),
+        leaf: one,
         path_bits: 0,
-        siblings: vec![Fr::from(0u64); 62],
+        siblings: vec![[0u8; 32]; 62],
     });
     check(p, VoteError::CensusDepth);
 
@@ -245,9 +317,23 @@ fn rejects_everything_the_guest_rejects() {
     });
     check(p, VoteError::CensusPathBits);
 
+    // Leaf at or above 2^248 (guest 3A.6): the internal node over leaves 0
+    // and 1 presented as a leaf one level up, on a valid path to the root.
+    let n0 = hash2(&leaf, &sibs[0]);
+    assert_ne!(n0[0], 0, "this level-1 Keccak node is above 2^248");
+    let mut p = ok.pkg.clone();
+    p.census = CensusWitness::Merkle(CensusProof {
+        root,
+        leaf: n0,
+        path_bits: 0,
+        siblings: vec![sibs[1]],
+    });
+    assert_eq!(hash2(&n0, &sibs[1]), root);
+    check(p, VoteError::CensusLeafRange);
+
     // Broken sibling.
     let mut bad = sibs.clone();
-    bad[0] += Fr::from(1u64);
+    bad[0][31] ^= 1;
     let mut p = ok.pkg.clone();
     p.census = CensusWitness::Merkle(CensusProof {
         root,
@@ -323,6 +409,15 @@ fn rejects_csp_forgeries() {
     assert_eq!(
         validate_vote(&cfg, &vf, p).unwrap_err(),
         VoteError::CspWeightMismatch
+    );
+
+    // A CSP weight of 2^88, signed by the CSP (guest 3B.2c).
+    let mut p = base.pkg.clone();
+    p.weight = 1u128 << 88;
+    p.census = CensusWitness::Csp(csp_sign(&csp, &cfg.process_id, &p.address, 1 << 88, 0));
+    assert_eq!(
+        validate_vote(&cfg, &vf, p).unwrap_err(),
+        VoteError::WeightRange
     );
 }
 

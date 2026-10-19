@@ -22,17 +22,15 @@ use alloy::transports::TransportError;
 use alloy::transports::http::{Http, reqwest};
 use alloy::transports::layers::{RateLimitRetryPolicy, RetryBackoffLayer, RetryPolicy};
 use davinci_zkvm_sdk::ballot::BallotMode;
-use davinci_zkvm_sdk::census::{LeanImt, census_leaf};
+use davinci_zkvm_sdk::census::{LeanImt, census_leaf, slot_key_address};
 use davinci_zkvm_sdk::crypto::babyjubjub::{Point, SUBGROUP_ORDER};
-use davinci_zkvm_sdk::crypto::field::{
-    U256 as SdkU256, fr_from_be, fr_to_be, u256_from_be, u256_to_be,
-};
+use davinci_zkvm_sdk::crypto::field::{U256 as SdkU256, fr_to_be, u256_from_be, u256_to_be};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::{dkg, release};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
-use crate::api::{CensusFile, CensusParticipant, Fr, ProcessId, ProcessStatus};
+use crate::api::{CensusFile, CensusParticipant, ProcessId, ProcessStatus};
 use crate::{Error, Result};
 
 sol!(
@@ -291,10 +289,32 @@ pub fn census_file(participants: &[([u8; 20], u128)]) -> CensusFile {
 }
 
 /// The lean-IMT a Merkle census file commits to (leaves in file order).
+///
+/// Refuses what the node refuses to serve: no members, an address listed
+/// twice, or two members on one ballot slot.
 pub fn merkle_census(file: &CensusFile) -> Result<LeanImt> {
+    if file.participants.is_empty() {
+        return Err(Error::Invalid("census has no participants".into()));
+    }
+    let mut slots = std::collections::HashMap::new();
     let mut t = LeanImt::new();
     for p in &file.participants {
         t.insert(census_leaf(&p.key, p.weight)?);
+        // The zero address is davinci-node's empty leaf, not a voter.
+        if p.key == [0u8; 20] {
+            continue;
+        }
+        if let Some(other) = slots.insert(slot_key_address(&p.key), p.key) {
+            return Err(Error::Invalid(if other == p.key {
+                format!("address 0x{} listed twice", hex::encode(p.key))
+            } else {
+                format!(
+                    "ballot slot shared by 0x{} and 0x{}",
+                    hex::encode(other),
+                    hex::encode(p.key)
+                )
+            }));
+        }
     }
     Ok(t)
 }
@@ -318,9 +338,10 @@ pub struct NewProcess {
     /// 1 (Merkle static), 2 (Merkle, organizer-updatable), 3 (on-chain
     /// census contract) or 4 (CSP).
     pub census_origin: u8,
-    /// lean-IMT root, or the CSP address as an integer. For origin 3 the
-    /// registry reads the root from the contract instead.
-    pub census_root: Fr,
+    /// Keccak lean-IMT root (256-bit, big-endian), or the CSP address as an
+    /// integer. For origin 3 the registry reads the root from the contract
+    /// instead.
+    pub census_root: [u8; 32],
     /// The census contract for origin 3; zero for every other origin (the
     /// registry reverts `InvalidCensusAddress` otherwise).
     pub census_contract: [u8; 20],
@@ -350,7 +371,8 @@ pub struct OnchainProcess {
     pub overwritten_votes_count: u64,
     pub ballot_mode: BallotMode,
     pub census_origin: u8,
-    pub census_root: Fr,
+    /// The registry's `bytes32 censusRoot`, big-endian.
+    pub census_root: [u8; 32],
     pub census_contract: [u8; 20],
     pub census_uri: String,
     pub metadata_uri: String,
@@ -366,10 +388,6 @@ pub struct OnchainProcess {
 
 fn u64_of(what: &str, v: U256) -> Result<u64> {
     u64::try_from(v).map_err(|_| Error::Chain(format!("{what} does not fit in u64")))
-}
-
-fn fr_of(what: &str, v: U256) -> Result<Fr> {
-    fr_from_be(&v.to_be_bytes::<32>()).map_err(|_| Error::Chain(format!("{what} is not below p")))
 }
 
 // First word of a decoded error's Debug: its ABI name.
@@ -685,7 +703,7 @@ impl Organizer {
         };
         let census = DAVINCITypes::Census {
             censusOrigin: p.census_origin,
-            censusRoot: B256::from(fr_to_be(&p.census_root)),
+            censusRoot: B256::from(p.census_root),
             contractAddress: Address::from(p.census_contract),
             censusURI: p.census_uri.clone(),
             onchainAllowAnyValidRoot: false,
@@ -899,10 +917,15 @@ impl Organizer {
 
     /// Replaces an origin-2 census (`setProcessCensus`, organizer only) and
     /// waits for the receipt. The sequencers pick it up from `CensusUpdated`.
-    pub async fn set_process_census(&self, pid: &[u8; 31], root: Fr, uri: &str) -> Result<()> {
+    pub async fn set_process_census(
+        &self,
+        pid: &[u8; 31],
+        root: [u8; 32],
+        uri: &str,
+    ) -> Result<()> {
         let census = DAVINCITypes::Census {
             censusOrigin: 2,
-            censusRoot: B256::from(fr_to_be(&root)),
+            censusRoot: B256::from(root),
             contractAddress: Address::ZERO,
             censusURI: uri.to_string(),
             onchainAllowAnyValidRoot: false,
@@ -1284,7 +1307,7 @@ async fn read_process(
         overwritten_votes_count: u64_of("overwrittenVotesCount", p.overwrittenVotesCount)?,
         ballot_mode,
         census_origin: p.census.censusOrigin,
-        census_root: fr_of("censusRoot", p.census.censusRoot.into())?,
+        census_root: p.census.censusRoot.0,
         census_contract: p.census.contractAddress.0.0,
         census_uri: p.census.censusURI.clone(),
         metadata_uri: p.metadataURI.clone(),

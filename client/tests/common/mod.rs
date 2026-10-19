@@ -7,7 +7,7 @@ use davinci_client::voter::Voter;
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::census::{LeanImt, census_leaf, eth_address};
 use davinci_zkvm_sdk::crypto::elgamal::keygen;
-use davinci_zkvm_sdk::crypto::field::{Fr, U256, fr_from_be};
+use davinci_zkvm_sdk::crypto::field::U256;
 use k256::ecdsa::SigningKey;
 use rand::rngs::StdRng;
 
@@ -30,7 +30,7 @@ pub struct Election {
     pub sk: U256,
 }
 
-pub fn election(nf: u8, origin: u8, census_root: Fr, rng: &mut StdRng) -> Election {
+pub fn election(nf: u8, origin: u8, census_root: [u8; 32], rng: &mut StdRng) -> Election {
     let (sk, pk) = keygen(rng);
     let mut pid = [0u8; 31];
     pid[..20].copy_from_slice(&[0x42; 20]);
@@ -68,10 +68,10 @@ pub fn voters(n: usize, rng: &mut StdRng) -> Vec<Voter> {
 }
 
 /// CSP census root: the CSP address as an integer.
-pub fn csp_root(csp: &SigningKey) -> Fr {
+pub fn csp_root(csp: &SigningKey) -> [u8; 32] {
     let mut be = [0u8; 32];
     be[12..].copy_from_slice(&eth_address(csp.verifying_key()));
-    fr_from_be(&be).unwrap()
+    be
 }
 
 pub fn merkle_census(vs: &[Voter], weight: u128) -> LeanImt {

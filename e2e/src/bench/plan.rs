@@ -17,9 +17,9 @@ use davinci_client::organizer::{
 use davinci_client::voter::random_k;
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::census::eth_address;
+use davinci_zkvm_sdk::census::{node_from_hex, node_to_hex};
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal;
-use davinci_zkvm_sdk::crypto::field::{fr_from_dec, fr_to_dec};
 use k256::ecdsa::SigningKey;
 use rand::rngs::{OsRng, StdRng};
 use rand::{RngCore, SeedableRng};
@@ -191,7 +191,7 @@ pub struct ProcSnap {
     pub encryption_key: String,
     pub ballot_mode: BallotMode,
     pub census_origin: u8,
-    /// Decimal.
+    /// `0x` and 64 hex digits (a 256-bit Keccak root, or the CSP address).
     pub census_root: String,
 }
 
@@ -202,7 +202,7 @@ impl ProcSnap {
             encryption_key: hex::encode(p.encryption_key.compress()),
             ballot_mode: p.ballot_mode,
             census_origin: p.census_origin,
-            census_root: fr_to_dec(&p.census_root),
+            census_root: node_to_hex(&p.census_root),
         }
     }
 
@@ -226,7 +226,8 @@ impl ProcSnap {
             overwritten_votes_count: 0,
             ballot_mode: self.ballot_mode,
             census_origin: self.census_origin,
-            census_root: fr_from_dec(&self.census_root).map_err(|e| anyhow!("census root: {e}"))?,
+            census_root: node_from_hex(&self.census_root)
+                .map_err(|e| anyhow!("census root: {e}"))?,
             census_contract: [0; 20],
             census_uri: String::new(),
             metadata_uri: String::new(),
@@ -404,7 +405,7 @@ impl Plan {
                 };
                 // The root the ballots will prove against, so they verify.
                 let root = crate::bench::r#gen::census_root(&e, seed, n)?;
-                e.snap.census_root = fr_to_dec(&root);
+                e.snap.census_root = node_to_hex(&root);
                 Ok(e)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -575,7 +576,7 @@ struct Draft {
     /// The snapshot lacks the pid and the key; the census URI of origin 3
     /// comes with its contract.
     e: Election,
-    root: Fr,
+    root: [u8; 32],
     /// `(address, weight)` of every voter, in voter order.
     parts: Vec<([u8; 20], u128)>,
     metadata: String,
@@ -644,7 +645,7 @@ impl Draft {
         let want = ProcSnap {
             pid: ProcessId(p.id),
             encryption_key: hex::encode(pk.compress()),
-            census_root: fr_to_dec(&self.root),
+            census_root: node_to_hex(&self.root),
             ..self.e.snap.clone()
         };
         let got = ProcSnap::of(p);
@@ -1068,11 +1069,12 @@ mod tests {
             encryption_key: hex::encode(pk.compress()),
             ballot_mode: ballot_mode_nf(8),
             census_origin: 2,
-            census_root: "12345".into(),
+            census_root: node_to_hex(&[0x12; 32]),
         }
         .onchain()
         .unwrap();
-        p.census_root = random_k(&mut rng);
+        // A Keccak root above the BN254 modulus survives the snapshot.
+        p.census_root = [0xe7; 32];
         let snap = ProcSnap::of(&p);
         let back = serde_json::from_str::<ProcSnap>(&serde_json::to_string(&snap).unwrap())
             .unwrap()
@@ -1223,7 +1225,7 @@ mod tests {
             encryption_key: hex::encode(pk.compress()),
             ballot_mode: ballot_mode_nf(2),
             census_origin: 1,
-            census_root: "1".into(),
+            census_root: node_to_hex(&[1; 32]),
         };
         let want = metadata_hash(b"wave 1 R1");
         let mut a = snap(1).onchain().unwrap();

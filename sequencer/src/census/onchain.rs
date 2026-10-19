@@ -1,4 +1,4 @@
-//! On-chain census index (origin 3): one lean-IMT per census contract, built
+//! On-chain census index (origin 3): one Keccak lean-IMT per census contract, built
 //! from its `CensusMemberAdded` logs, checked against the contract's root and
 //! size at the confirmed head, persisted in redb and shared by every process
 //! that points at the contract. Synced from the monitor tick.
@@ -10,7 +10,7 @@
 //! retried on a backoff.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -20,8 +20,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::{Filter, Log, TransactionRequest};
 use alloy::sol_types::{SolCall, SolEvent};
-use davinci_zkvm_sdk::census::{CensusProof, LeanImt, census_leaf, slot_key_address};
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be};
+use davinci_zkvm_sdk::census::{CensusProof, LeanImt, Node, census_leaf, slot_key_address};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
@@ -42,6 +41,8 @@ const META: Bytes = TableDefinition::new("census_onchain_meta");
 // being the contract's root right after this insert.
 const LEAF: Bytes = TableDefinition::new("census_onchain_leaf");
 const ROW: usize = 20 + 16 + 8 + 32;
+/// Full scans that still fall short of `treeSize` before a contract is refused.
+const MAX_SHORT_SCANS: u32 = 3;
 /// Widest `eth_getLogs` range; halved on provider limits.
 const MAX_SPAN: u64 = 5_000;
 
@@ -80,6 +81,11 @@ pub enum UsableError {
     /// The contract can never validate again.
     #[error("census contract unusable: {0}")]
     Unusable(String),
+    /// Three full scans fell short of `treeSize`. Not proof (a load-balanced
+    /// endpoint can do that): new votes are refused, queued ones wait, and
+    /// the next good sync clears it.
+    #[error("census contract unconfirmed: {0}")]
+    Suspect(String),
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -135,7 +141,7 @@ pub fn replay(
         let Ok(want) = census_leaf(user, weight) else {
             return mismatch(format!("{who}: weight {weight} above 88 bits"));
         };
-        if fr_from_be(leaf).ok() != Some(want) {
+        if *leaf != want {
             return mismatch(format!("{who}: leaf is not address << 88 | weight"));
         }
         let slot = slot_of(user);
@@ -148,7 +154,7 @@ pub fn replay(
         }
         new_slots.insert(slot, *user);
         tree.insert(want);
-        if fr_to_be(&tree.root()) != *new_root {
+        if tree.root() != *new_root {
             return mismatch(format!("{who}: newRoot differs from the local root"));
         }
         out.push(Member {
@@ -216,6 +222,13 @@ struct Entry {
     failed: Mutex<Option<Failure>>,
     /// Last successful sync, for the background cadence floor.
     last_ok: Mutex<Option<Instant>>,
+    /// Consecutive syncs whose scan reached the floor with fewer adds than
+    /// `treeSize` (in memory only; a restart may cost another few scans).
+    full_scans: AtomicU32,
+    /// A background sync of this contract is running or waiting for a slot.
+    in_flight: AtomicBool,
+    /// Why three full scans fell short; in memory, cleared by a good sync.
+    suspect: Mutex<Option<String>>,
     /// Trees at earlier roots.
     prefix: Mutex<TreeCache>,
 }
@@ -243,7 +256,7 @@ impl Entry {
 struct Target {
     block: u64,
     hash: [u8; 32],
-    root: Fr,
+    root: Node,
     size: u64,
 }
 
@@ -254,13 +267,19 @@ pub struct OnchainIndex {
     provider: DynProvider,
     entries: Mutex<HashMap<[u8; 20], Arc<Entry>>>,
     span: AtomicU64,
-    syncing: AtomicBool,
+    /// Background first scans and incremental syncs running at once, across
+    /// `sync_all` calls. The on-demand `ensure` path takes neither: it is one
+    /// contract, bound by that contract's gate and backoff.
+    scans: tokio::sync::Semaphore,
+    updates: tokio::sync::Semaphore,
     /// Retry delay when the target block is not served yet.
     poll: Duration,
     /// Least time between background syncs of one contract.
     every: Duration,
     /// Head depth an on-demand sync targets.
     confirmations: u64,
+    /// Most members a contract may have.
+    max_members: u64,
 }
 
 impl std::fmt::Debug for OnchainIndex {
@@ -355,11 +374,21 @@ impl OnchainIndex {
             provider,
             entries: Mutex::new(HashMap::new()),
             span: AtomicU64::new(MAX_SPAN),
-            syncing: AtomicBool::new(false),
+            scans: tokio::sync::Semaphore::new(4),
+            updates: tokio::sync::Semaphore::new(4),
             poll,
             every,
             confirmations,
+            max_members: 1 << 22,
         })
+    }
+
+    /// Refuses contracts with more members than `n` (default 2^22, as for
+    /// downloaded censuses): the index keeps every member in memory and the
+    /// contract is organizer-chosen.
+    pub fn with_max_members(mut self, n: u64) -> Self {
+        self.max_members = n;
+        self
     }
 
     fn key(&self, contract: &[u8; 20]) -> [u8; 28] {
@@ -398,6 +427,9 @@ impl OnchainIndex {
                 gate: tokio::sync::Mutex::new(()),
                 failed: Mutex::new(None),
                 last_ok: Mutex::new(None),
+                full_scans: AtomicU32::new(0),
+                in_flight: AtomicBool::new(false),
+                suspect: Mutex::new(None),
                 prefix: Mutex::new(TreeCache::default()),
             })
         });
@@ -406,7 +438,7 @@ impl OnchainIndex {
 
     /// Root, size and block of the last confirmed sync; `None` before the
     /// first one. Says nothing about [`OnchainIndex::usable`].
-    pub fn latest(&self, contract: &[u8; 20]) -> Option<(Fr, u64, u64)> {
+    pub fn latest(&self, contract: &[u8; 20]) -> Option<(Node, u64, u64)> {
         let s = self.entry(contract)?.snapshot();
         s.meta
             .synced
@@ -414,12 +446,44 @@ impl OnchainIndex {
     }
 
     /// Why votes on this contract must be refused, if they must.
-    /// `NotIndexed` is transient (register and retry); `Unusable` is final.
+    /// `NotIndexed` is transient (register and retry); `Unusable` is final;
+    /// `Suspect` lasts until a sync succeeds.
     pub fn usable(&self, contract: &[u8; 20]) -> Result<(), UsableError> {
         let e = self.entry(contract).ok_or(UsableError::NotIndexed)?;
-        match &e.snapshot().meta.unusable {
-            Some(r) => Err(UsableError::Unusable(r.clone())),
+        if let Some(r) = &e.snapshot().meta.unusable {
+            return Err(UsableError::Unusable(r.clone()));
+        }
+        match e.suspect.lock().ok().and_then(|s| s.clone()) {
+            Some(r) => Err(UsableError::Suspect(r)),
             None => Ok(()),
+        }
+    }
+
+    /// Test hook: the verdict of three short full scans, as a sync gives it.
+    #[doc(hidden)]
+    pub fn mark_short_scans_for_test(&self, contract: &[u8; 20]) {
+        if let Some(e) = self.entry(contract) {
+            if let Ok(mut m) = e.suspect.lock() {
+                *m = Some("treeSize says 9, logs show 0 after 3 full scans".into());
+            }
+            if let Ok(mut f) = e.failed.lock() {
+                *f = Some(Failure {
+                    at: Instant::now(),
+                    n: 32,
+                    why: "short scans".into(),
+                    charged: true,
+                });
+            }
+        }
+    }
+
+    /// Test hook: a terminal verdict (weight change, slot collision).
+    #[doc(hidden)]
+    pub fn mark_terminal_for_test(&self, contract: &[u8; 20]) {
+        if let Some(e) = self.entry(contract) {
+            let mut s = (*e.snapshot()).clone();
+            s.meta.unusable = Some("weight of 0x00 changed from 1 at block 1".into());
+            e.set(s);
         }
     }
 
@@ -456,14 +520,14 @@ impl OnchainIndex {
     pub async fn proof(
         &self,
         contract: &[u8; 20],
-        root: &Fr,
+        root: &Node,
         address: &[u8; 20],
     ) -> Result<Option<(CensusProof, u128)>> {
         let e = self
             .entry(contract)
             .ok_or_else(|| CensusError::Unknown(format!("contract 0x{}", hex::encode(contract))))?;
         let s = e.snapshot();
-        let key = fr_to_be(root);
+        let key = *root;
         // The empty tree's root is 0 and has no member.
         let size = match s.m.roots.get(&key) {
             Some(n) => *n,
@@ -504,36 +568,55 @@ impl OnchainIndex {
         Ok(Some((proof, m.weight)))
     }
 
-    /// Syncs every registered contract to the confirmed head `b`. One run
-    /// at a time; a tick that finds one running does nothing. A contract
-    /// that synced successfully within `every` is skipped.
+    /// Syncs every registered contract to the confirmed head `b`, a few at a
+    /// time. A contract already being synced by an earlier call (a slow or
+    /// hostile scan) is skipped, so it never holds up a later round for the
+    /// others. A contract that synced successfully within `every` is skipped.
     pub async fn sync_all(&self, b: u64) {
-        if self.syncing.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        struct Reset<'a>(&'a AtomicBool);
-        impl Drop for Reset<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _reset = Reset(&self.syncing);
         let contracts: Vec<[u8; 20]> = match self.entries.lock() {
             Ok(m) => m.keys().copied().collect(),
             Err(_) => return,
         };
-        for c in contracts {
-            // Within the background floor: nothing to do. A never-synced
-            // or backed-off contract is never skipped.
-            if let Some(e) = self.entry(&c)
-                && let Some(t) = e.last_ok.lock().ok().and_then(|t| *t)
-                && t.elapsed() < self.every
-            {
-                continue;
+        let queue = Mutex::new(contracts.into_iter());
+        let worker = || async {
+            loop {
+                let Some(c) = queue.lock().ok().and_then(|mut q| q.next()) else {
+                    return;
+                };
+                let Some(e) = self.entry(&c) else { continue };
+                // Within the background floor: nothing to do. A never-synced
+                // or backed-off contract is never skipped.
+                if let Some(t) = e.last_ok.lock().ok().and_then(|t| *t)
+                    && t.elapsed() < self.every
+                {
+                    continue;
+                }
+                if e.in_flight.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                struct Release<'a>(&'a AtomicBool);
+                impl Drop for Release<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _release = Release(&e.in_flight);
+                // First scans (organizer-chosen contracts can make them
+                // endless) have their own slots, so they never queue the
+                // incremental syncs of contracts already indexed.
+                let pool = if e.snapshot().meta.synced {
+                    &self.updates
+                } else {
+                    &self.scans
+                };
+                let Ok(_slot) = pool.acquire().await else {
+                    return;
+                };
+                // `sync` logs its own failures.
+                let _ = self.sync(c, b).await;
             }
-            // `sync` logs its own failures.
-            let _ = self.sync(c, b).await;
-        }
+        };
+        tokio::join!(worker(), worker(), worker(), worker());
     }
 
     /// Syncs `contract` to the confirmed head `b`. A failure backs the
@@ -560,11 +643,20 @@ impl OnchainIndex {
     fn note(&self, e: &Entry, contract: [u8; 20], res: &Result<()>) {
         if let Ok(mut f) = e.failed.lock() {
             match res {
-                Ok(()) => *f = None,
+                Ok(()) => {
+                    *f = None;
+                    if let Ok(mut m) = e.suspect.lock() {
+                        *m = None;
+                    }
+                }
                 // Unusable is terminal; Backoff is "not yet", not a failure.
                 Err(CensusError::Refused(_) | CensusError::Backoff(_)) => {}
                 Err(err) => {
-                    let n = f.as_ref().map_or(0, |x| x.n).saturating_add(1);
+                    let mut n = f.as_ref().map_or(0, |x| x.n).saturating_add(1);
+                    // A contract under suspicion is retried at the longest backoff.
+                    if e.suspect.lock().is_ok_and(|m| m.is_some()) {
+                        n = n.max(32);
+                    }
                     error!(contract = %format!("0x{}", hex::encode(contract)), ?err, failures = n, "census contract sync failed");
                     *f = Some(Failure {
                         at: Instant::now(),
@@ -613,7 +705,12 @@ impl OnchainIndex {
         let mut base = e.snapshot();
         if base.meta.synced {
             // A block the node no longer serves counts as reorged away.
-            if self.block_hash(base.meta.scanned_to).await? != Some(base.meta.scanned_hash) {
+            let seen = self.block_hash(base.meta.scanned_to).await?;
+            if seen.is_none() {
+                // Not served is not reorged away: the endpoint may be behind.
+                self.head_reaches(base.meta.scanned_to).await?;
+            }
+            if seen != Some(base.meta.scanned_hash) {
                 warn!(contract = %format!("0x{}", hex::encode(contract)), block = base.meta.scanned_to, "census contract reorged; rescanning");
                 // Full rescan on a deep reorg; truncate-and-replay if censuses get large.
                 let db = self.db.clone();
@@ -634,6 +731,14 @@ impl OnchainIndex {
             return Err(CensusError::Backoff(self.poll));
         };
         let (root, size) = self.state_at(contract, hash).await?;
+        if size > self.max_members {
+            // Before any scan: the size is the contract's word, the logs
+            // would be as many.
+            return Err(CensusError::Format(format!(
+                "census contract has {size} members, at most {}",
+                self.max_members
+            )));
+        }
         let target = Target {
             block: b,
             hash,
@@ -648,8 +753,16 @@ impl OnchainIndex {
             (0, Some(size))
         };
         let mut why = String::new();
+        let mut short = None;
         for _ in 0..2 {
             let logs = self.scan(contract, floor, b, need).await?;
+            // The scan went down to block 0 and the contract still claims
+            // more members than it ever logged.
+            let adds = logs
+                .iter()
+                .filter(|(_, l)| matches!(l, CensusLog::Added { .. }))
+                .count() as u64;
+            short = (floor == 0 && adds < size).then_some(adds);
             let changed = !logs.is_empty();
             let (db, base2) = (self.db.clone(), base.clone());
             let out = tokio::task::spawn_blocking(move || apply(&db, &key, &base2, &logs, &target))
@@ -664,6 +777,7 @@ impl OnchainIndex {
                     }
                     e.set(s);
                     e.mark_ok();
+                    e.full_scans.store(0, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err((s, r)) if s.meta.unusable.is_some() => {
@@ -674,10 +788,31 @@ impl OnchainIndex {
                 Err((_, r)) => why = r.to_string(),
             }
         }
+        if let Some(adds) = short {
+            // One flaky provider may drop logs once; a liar costs a few scans.
+            let n = e.full_scans.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= MAX_SHORT_SCANS {
+                let r = format!("treeSize says {size}, logs show {adds} after {n} full scans");
+                error!(contract = %format!("0x{}", hex::encode(contract)), reason = %r, "census contract unconfirmed; refusing new votes");
+                if let Ok(mut m) = e.suspect.lock() {
+                    *m = Some(r.clone());
+                }
+                return Err(CensusError::Format(r));
+            }
+        }
         Err(CensusError::Format(format!(
             "census contract 0x{}: {why}",
             hex::encode(contract)
         )))
+    }
+
+    /// "Not yet" unless the endpoint's head has reached `b`.
+    async fn head_reaches(&self, b: u64) -> Result<()> {
+        let head = self.provider.get_block_number().await.map_err(rpc)?;
+        if head < b {
+            return Err(CensusError::Backoff(self.poll));
+        }
+        Ok(())
     }
 
     async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>> {
@@ -690,7 +825,7 @@ impl OnchainIndex {
     }
 
     /// `getCensusRoot()` and `treeSize()` at block `hash`.
-    async fn state_at(&self, contract: [u8; 20], hash: [u8; 32]) -> Result<(Fr, u64)> {
+    async fn state_at(&self, contract: [u8; 20], hash: [u8; 32]) -> Result<(Node, u64)> {
         let to = Address::from(contract);
         let at = BlockId::hash(B256::from(hash));
         let call = |data: Vec<u8>| {
@@ -708,9 +843,9 @@ impl OnchainIndex {
             OnchainCensus::getCensusRootCall::abi_decode_returns(&root).map_err(|e| bad(&e))?;
         let size: U256 =
             OnchainCensus::treeSizeCall::abi_decode_returns(&size).map_err(|e| bad(&e))?;
-        let root = fr_from_be(&root.to_be_bytes()).map_err(|e| bad(&e))?;
+        // A Keccak root: any 256-bit value, most of them above the BN254 modulus.
         let size = u64::try_from(size).map_err(|e| bad(&e))?;
-        Ok((root, size))
+        Ok((root.to_be_bytes(), size))
     }
 
     /// Census logs in `[floor, b]`, scanned backwards in adaptive chunks and
@@ -727,6 +862,10 @@ impl OnchainIndex {
             OnchainCensus::CensusMemberAdded::SIGNATURE_HASH,
             OnchainCensus::WeightChanged::SIGNATURE_HASH,
         ];
+        // A backend behind `b` answers short without an error, and a short
+        // answer must not count against the contract: refuse such an
+        // endpoint before and after the pages.
+        self.head_reaches(b).await?;
         let mut out = Vec::new();
         let mut added = 0u64;
         let mut hi = b;
@@ -766,6 +905,7 @@ impl OnchainIndex {
                 Err(e) => return Err(rpc(e)),
             }
         }
+        self.head_reaches(b).await?;
         out.sort_by_key(|(b, i, _)| (*b, *i));
         Ok(out.into_iter().map(|(b, _, l)| (b, l)).collect())
     }
@@ -944,7 +1084,7 @@ fn load(db: &Database, key: &[u8; 28]) -> Result<Snapshot> {
     }
     let tree = LeanImt::from_leaves(leaves);
     if let Some(last) = ms.list.last()
-        && fr_to_be(&tree.root()) != last.root
+        && tree.root() != last.root
     {
         return Err(corrupt("stored leaves do not give the stored root".into()));
     }
@@ -999,8 +1139,8 @@ mod tests {
                 CensusLog::Added {
                     user: addr(i),
                     weight: u128::from(i),
-                    leaf: fr_to_be(&leaf),
-                    new_root: fr_to_be(&tree.root()),
+                    leaf,
+                    new_root: tree.root(),
                 },
             ));
         }
@@ -1026,7 +1166,7 @@ mod tests {
         let (logs, tree) = honest(5);
         let got = run(&logs).unwrap();
         assert_eq!(got.len(), 5);
-        assert_eq!(got[4].root, fr_to_be(&tree.root()));
+        assert_eq!(got[4].root, tree.root());
 
         let mut l = logs.clone();
         if let CensusLog::Added { new_root, .. } = added(&mut l, 2) {
@@ -1042,7 +1182,7 @@ mod tests {
 
         let mut l = logs.clone();
         if let CensusLog::Added { leaf, .. } = added(&mut l, 1) {
-            *leaf = fr_to_be(&census_leaf(&addr(2), 3).unwrap());
+            *leaf = census_leaf(&addr(2), 3).unwrap();
         }
         assert!(matches!(run(&l), Err(ReplayError::Mismatch(m)) if m.contains("88")));
 
@@ -1133,7 +1273,7 @@ mod tests {
         assert_eq!(w, 2);
         assert!(davinci_zkvm_sdk::census::verify_census_proof(&p));
         // An earlier root proves the members it had.
-        let r1 = fr_from_be(&ix.entry(&c).unwrap().snapshot().m.list[0].root).unwrap();
+        let r1 = ix.entry(&c).unwrap().snapshot().m.list[0].root;
         assert!(ix.proof(&c, &r1, &addr(1)).await.unwrap().is_some());
         assert!(ix.proof(&c, &r1, &addr(2)).await.unwrap().is_none());
 

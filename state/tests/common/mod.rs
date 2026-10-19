@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 use davinci_client::prover::BallotProver;
 use davinci_client::voter::CircomInputs;
 use davinci_state::{CensusOrigin, ProcessConfig, ProcessState, VerifiedVote, VotePackage};
-use davinci_zkvm_sdk::ballot::{BallotMode, address_to_fr, encrypt_ballot, inputs_hash, vote_id};
+use davinci_zkvm_sdk::ballot::{BallotMode, address_to_fr, encrypt_ballot, vote_id};
 use davinci_zkvm_sdk::census::{
-    CensusWitness, LeanImt, census_leaf, eth_address, slot_key_address, vote_id_sign,
+    CensusWitness, LeanImt, Node, census_leaf, eth_address, slot_key_address, vote_id_sign,
 };
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::keygen;
@@ -24,6 +24,7 @@ use davinci_zkvm_sdk::types::SnarkJsProof;
 use k256::ecdsa::SigningKey;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use sha2::{Digest, Sha256};
 
 /// vk_hash of the embedded protocol ballot VK (the 0x07 leaf).
 pub fn embedded_vk_hash() -> [u8; 32] {
@@ -78,7 +79,7 @@ pub struct Env {
 
 pub fn env(nf: u8, n_voters: usize) -> Env {
     let (sk, pk) = keygen(&mut StdRng::seed_from_u64(7));
-    let leaves: Vec<Fr> = (0..n_voters)
+    let leaves: Vec<Node> = (0..n_voters)
         .map(|i| census_leaf(&voter_address(i), 1).unwrap())
         .collect();
     let imt = LeanImt::from_leaves(leaves);
@@ -129,16 +130,6 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
     let k = Fr::from(kseed);
     let vid = vote_id(&cfg.process_id, &addr, &k);
     let ballot = encrypt_ballot(&cfg.enc_key, fields, &k, cfg.ballot_mode.num_fields);
-    let ih = inputs_hash(
-        &cfg.process_id,
-        &cfg.ballot_mode,
-        &cfg.enc_key,
-        &addr,
-        vid,
-        &ballot,
-        &Fr::from(1u64),
-    )
-    .unwrap();
     let census = env.imt.proof(idx).unwrap();
     let slot = slot_key_address(&address);
     VerifiedVote {
@@ -148,7 +139,6 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
             address,
             ballot,
             proof: dummy_proof(),
-            inputs_hash: ih,
             signature: vote_id_sign(&key, vid),
             census: CensusWitness::Merkle(census),
             weight: 1,
@@ -183,11 +173,20 @@ fn prover() -> &'static BallotProver {
     })
 }
 
-// The inputs hash binds everything the proof binds, so it keys the cache.
-fn cached_proof(inputs: &CircomInputs, ih: &Fr) -> SnarkJsProof {
+/// Proof-cache key: sha256 of the 71 public signals, big-endian and
+/// concatenated. The signals are everything the proof binds.
+pub fn signals_key(pubs: &[Fr]) -> String {
+    let mut h = Sha256::new();
+    for x in pubs {
+        h.update(fr_to_be(x));
+    }
+    hex::encode(h.finalize())
+}
+
+fn cached_proof(inputs: &CircomInputs) -> SnarkJsProof {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cache");
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{}.json", hex::encode(fr_to_be(ih))));
+    let path = dir.join(format!("{}.json", signals_key(&inputs.public_signals())));
     if let Ok(s) = std::fs::read_to_string(&path)
         && let Ok(p) = serde_json::from_str(&s)
     {
@@ -217,8 +216,7 @@ pub fn real_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
         encryption_pubkey: [cfg.enc_key.x, cfg.enc_key.y],
         k: Fr::from(kseed),
         cipherfields: v.pkg.ballot.coords(),
-        inputs_hash: v.pkg.inputs_hash,
     };
-    v.pkg.proof = cached_proof(&inputs, &v.pkg.inputs_hash);
+    v.pkg.proof = cached_proof(&inputs);
     v
 }

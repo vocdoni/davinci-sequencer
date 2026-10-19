@@ -5,8 +5,8 @@
 use davinci_sequencer::keys::KeyStore;
 use davinci_sequencer::storage::{
     DB_FILE, DEFAULT_CACHE_MB, Db, ExposedRecord, L1PostRecord, LocalStatus, ProcessRecord,
-    SCHEMA_VERSION_KEY, StorageError, StoredVote, TransitionRecord, VoteStatus, deployment_dir,
-    pid_prefix,
+    SCHEMA_VERSION, SCHEMA_VERSION_KEY, StorageError, StoredVote, TransitionRecord, VoteStatus,
+    deployment_dir, pid_prefix,
 };
 use davinci_sequencer::web3::L1Fees;
 use davinci_sequencer::web3::{DkgState, KeyMode, OnchainCensus, OnchainProcess, ProcessStatus};
@@ -227,6 +227,22 @@ fn pending_is_fifo() {
         vec![base + 8, base + 9, base + 5, base + 2, base + 7]
     );
     assert_eq!(db.pending(&pid(2)).unwrap(), vec![base + 100]);
+
+    // The actor's order at the head, queued or not; the rest after it.
+    for i in [2, 9] {
+        db.put_vote(&vote(1, base + i)).unwrap();
+    }
+    db.remove_pending(&pid(1), &[base + 9]).unwrap();
+    db.set_queue(&pid(1), &[base + 9, base + 7, base + 2])
+        .unwrap();
+    assert_eq!(
+        db.pending(&pid(1)).unwrap(),
+        vec![base + 9, base + 7, base + 2, base + 8, base + 5]
+    );
+    assert_eq!(
+        db.vote(&pid(1), base + 9).unwrap().unwrap().status,
+        VoteStatus::Pending
+    );
 }
 
 #[test]
@@ -315,6 +331,34 @@ fn schema_mismatch_is_refused() {
     let err = Db::open(&dir.path().join("sequencer.redb")).err().unwrap();
     assert!(
         matches!(err, StorageError::Schema { found: 999, .. }),
+        "{err}"
+    );
+}
+
+// Schema 12 (ballot public inputs, 256-bit census values): a schema-11
+// file holds stored votes in the old shape and is refused, not migrated.
+#[test]
+fn schema_11_files_are_refused() {
+    assert_eq!(SCHEMA_VERSION, 12);
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(&dir);
+        db.put_process(&process(3)).unwrap();
+        db.set_meta_u64(SCHEMA_VERSION_KEY, 11).unwrap();
+    }
+    let err = Db::open(&dir.path().join("sequencer.redb")).err().unwrap();
+    assert!(
+        matches!(
+            err,
+            StorageError::Schema {
+                found: 11,
+                expected: 12
+            }
+        ),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("records are not migrated"),
         "{err}"
     );
 }
@@ -792,4 +836,26 @@ fn seal_with_coverage_is_one_commit() {
     assert!(db.pending(&pid(1)).unwrap().is_empty());
     assert_eq!(db.exposed(&pid(1)).unwrap(), Some(exposed));
     assert_eq!(db.coverage_for(&pid(1), &[b]).unwrap().len(), 3);
+}
+
+#[test]
+fn rebuild_check_order_reads_only_its_own_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let p = pid(1);
+    db.put_rebuild_check_raw(&p, b"[[7,2,1],[5,1,0]]").unwrap();
+    assert_eq!(
+        db.rebuild_check_order(&p).unwrap(),
+        vec![(7, 2, 1), (5, 1, 0)]
+    );
+    // An empty marker has no order.
+    db.put_rebuild_check_raw(&p, b"").unwrap();
+    assert_eq!(db.rebuild_check_order(&p).unwrap(), vec![]);
+    // Anything else (the vote ids alone, which only unreleased builds
+    // wrote) is an error, never "no order".
+    db.put_rebuild_check_raw(&p, b"[9,4,6]").unwrap();
+    assert!(db.rebuild_check_order(&p).is_err());
+    db.put_rebuild_check_raw(&p, b"{\"x\":1}").unwrap();
+    assert!(db.rebuild_check_order(&p).is_err());
+    assert!(db.rebuild_check(&p).unwrap());
 }

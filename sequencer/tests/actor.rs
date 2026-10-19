@@ -1114,7 +1114,9 @@ async fn stale_root_revert_settles(fail_read: bool, lost: u64) {
     let v = fake_vote(&s.env, 0, &[1, 2], 5);
     let vid = v.pkg.vote_id;
     h.submit(v).await.unwrap();
+    // Each new block brings an anchored read the latch can clear on.
     wait_until("settled after the stale revert", async || {
+        s.chain.advance_time(0);
         all_settled(&h, &[vid]).await
     })
     .await;
@@ -2032,7 +2034,6 @@ async fn foreign_first_transition_is_ignored_immediately() {
 // ----------------------------------- dynamic census and the exposed set
 
 use davinci_zkvm_sdk::blob::decode_blobs;
-use davinci_zkvm_sdk::crypto::field::fr_to_le;
 
 /// Origin-2 setup: `n_voters` in the bootstrap `census.json`.
 fn offchain_setup(n_voters: usize) -> TestSetup {
@@ -2050,7 +2051,7 @@ fn offchain_setup(n_voters: usize) -> TestSetup {
     }
 }
 
-fn census_root_of(voters: impl IntoIterator<Item = usize>) -> Fr {
+fn census_root_of(voters: impl IntoIterator<Item = usize>) -> [u8; 32] {
     LeanImt::from_leaves(
         voters
             .into_iter()
@@ -2061,12 +2062,12 @@ fn census_root_of(voters: impl IntoIterator<Item = usize>) -> Fr {
 }
 
 /// Writes `voters` under `<census dir>/<sub>/` and announces the update.
-fn update_census(s: &TestSetup, sub: &str, voters: &[usize]) -> Fr {
+fn update_census(s: &TestSetup, sub: &str, voters: &[usize]) -> [u8; 32] {
     let root = census_root_of(voters.iter().copied());
     let dir = s.census_dir.join(sub);
     std::fs::create_dir(&dir).unwrap();
     let uri = write_census_of(&dir, voters.iter().copied());
-    s.chain.set_census(fr_to_be(&root), uri);
+    s.chain.set_census(root, uri);
     root
 }
 
@@ -2298,7 +2299,10 @@ async fn census_update_during_flight_reseals_at_new_root() {
     // The organizer re-roots the census while the batch is in the prover;
     // the contract now expects the new root.
     let root1 = update_census(&s, "v2", &[0, 1, 2, 3, 4]);
-    s.chain.set_census_root_check(Some(fr_to_le(&root1)));
+    // A Keccak root above the BN254 modulus: queued, loaded and committed
+    // to register 20 as bytes.
+    assert!(fr_from_be(&root1).is_err());
+    s.chain.set_census_root_check(Some(census_le(&root1)));
 
     // The actor aborts the flight and re-seals once the new tree loads.
     wait_until("re-seal at the new root", async || prover.calls() >= 2).await;
@@ -2306,7 +2310,7 @@ async fn census_update_during_flight_reseals_at_new_root() {
     wait_until("votes settled", async || all_settled(&h, &vids).await).await;
     // Only the re-sealed batch landed; the stale one never broadcast.
     assert_eq!(s.chain.submit_count(), 1);
-    assert_eq!(s.chain.last_census_root(), Some(fr_to_le(&root1)));
+    assert_eq!(s.chain.last_census_root(), Some(census_le(&root1)));
     assert_eq!(node.metrics.lost_races.load(Ordering::SeqCst), 0);
     shutdown.cancel();
 }
@@ -2413,7 +2417,7 @@ async fn onchain_census_growth_respects_max_voters() {
 
     let mut e = env(2, 4, None);
     e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
-    e.cfg.census_root = fr_from_be(&recorded).unwrap();
+    e.cfg.census_root = recorded;
     let census_dir = TempDir::new().unwrap();
     let chain = FakeChain::new(&e, String::new());
     let c = ch.census.into_array();
@@ -2464,7 +2468,7 @@ async fn onchain_census_growth_respects_max_voters() {
     h.submit(fake_vote(&s.env, 1, &[1, 2], 71)).await.unwrap();
     wait_until("voter 1 settled", async || s.chain.voters() == 2).await;
     let latest = node.onchain.latest(&c).unwrap().0;
-    assert_eq!(s.chain.last_census_root(), Some(fr_to_le(&latest)));
+    assert_eq!(s.chain.last_census_root(), Some(census_le(&latest)));
 
     // A third distinct voter exceeds max_voters.
     match h.submit(fake_vote(&s.env, 2, &[1, 2], 72)).await {
@@ -2505,7 +2509,7 @@ async fn a_hold_emptied_by_the_reproof_seals_the_queue_covered() {
     let (recorded, _) = ch.state().await;
     let mut e = env(2, 30, None);
     e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
-    e.cfg.census_root = fr_from_be(&recorded).unwrap();
+    e.cfg.census_root = recorded;
     let census_dir = TempDir::new().unwrap();
     let chain = FakeChain::new(&e, String::new());
     let c = ch.census.into_array();
@@ -2723,7 +2727,7 @@ async fn onchain_unindexed_census_is_transient() {
 
     let mut e = env(2, 4, None);
     e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
-    e.cfg.census_root = fr_from_be(&recorded).unwrap();
+    e.cfg.census_root = recorded;
     let census_dir = TempDir::new().unwrap();
     let chain = FakeChain::new(&e, String::new());
     let c = ch.census.into_array();
@@ -2771,6 +2775,128 @@ async fn onchain_unindexed_census_is_transient() {
     let vid1 = v1.pkg.vote_id;
     h.submit(v1).await.unwrap();
     wait_until("voter 1 settled", async || all_settled(&h, &[vid1]).await).await;
+    shutdown.cancel();
+}
+
+/// Origin 3 test node: a real census with two voters, one vote per batch.
+async fn onchain_node(
+    prover: Arc<FakeProver>,
+) -> (
+    common::anvil::CensusChain,
+    TestSetup,
+    Node,
+    CancellationToken,
+    TempDir,
+) {
+    let ch = common::anvil::CensusChain::start().await;
+    ch.add(&[
+        (voter_address(0), 1),
+        (voter_address(1), 1),
+        (voter_address(2), 1),
+    ])
+    .await;
+    let (recorded, _) = ch.state().await;
+    let mut e = env(2, 4, None);
+    e.cfg.census_origin = CensusOrigin::MerkleOnchainDynamic;
+    e.cfg.census_root = recorded;
+    let census_dir = TempDir::new().unwrap();
+    let chain = FakeChain::new(&e, String::new());
+    chain.set_census_contract(ch.census.into_array());
+    while chain.head_block() < ch.head().await {
+        chain.advance_time(0);
+    }
+    let dir = census_dir.path().to_path_buf();
+    let s = TestSetup {
+        env: e,
+        chain,
+        _census_dir: census_dir,
+        census_dir: dir,
+    };
+    let dbdir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let url = ch.anvil.endpoint();
+    let cfg = test_config_with(dbdir.path(), &s.census_dir, 1, "0s", &["--rpc-url", &url]);
+    let node = start_node_cfg(
+        Db::open_in(dbdir.path()).unwrap(),
+        s.chain.clone(),
+        prover,
+        cfg,
+        shutdown.clone(),
+    )
+    .await;
+    (ch, s, node, shutdown, dbdir)
+}
+
+/// Origin 3: the verdict of three short scans is not terminal (a load
+/// balancer can produce it). New votes are refused while it stands, queued
+/// ones stay pending, and a later good sync clears it and settles them.
+#[tokio::test]
+async fn onchain_short_scan_verdict_keeps_queued_votes() {
+    if !common::anvil::enabled() {
+        return;
+    }
+    let prover = FakeProver::gated();
+    let (ch, s, node, shutdown, _db) = onchain_node(prover.clone()).await;
+    let c = ch.census.into_array();
+    let h = handle(&node).await;
+    wait_until("indexed", async || node.onchain.latest(&c).is_some()).await;
+    // v0 is in flight (gated prover), v1 queued behind it.
+    let (v0, v1) = (
+        fake_vote(&s.env, 0, &[1, 2], 80),
+        fake_vote(&s.env, 1, &[1, 2], 81),
+    );
+    let (vid0, vid1) = (v0.pkg.vote_id, v1.pkg.vote_id);
+    h.submit(v0).await.unwrap();
+    h.submit(v1).await.unwrap();
+    // Let a background sync in flight finish: a good sync clears the mark.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    node.onchain.mark_short_scans_for_test(&c);
+    prover.release(100);
+    wait_until("v0 settled", async || all_settled(&h, &[vid0]).await).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // v1 is neither sealed nor errored; a new voter is refused for now.
+    let rec = h.status(vid1).await.unwrap().unwrap();
+    assert!(rec.error.is_none(), "queued vote errored: {:?}", rec.error);
+    assert!(!all_settled(&h, &[vid1]).await);
+    assert!(h.submit(fake_vote(&s.env, 2, &[1, 2], 82)).await.is_err());
+    // An honest sync clears the mark.
+    ch.add(&[(voter_address(3), 1)]).await;
+    node.onchain.expire_backoff(&c);
+    node.onchain.sync(c, ch.head().await).await.unwrap();
+    wait_until("v1 settled", async || all_settled(&h, &[vid1]).await).await;
+    let rec = h.status(vid1).await.unwrap().unwrap();
+    assert!(rec.error.is_none(), "{:?}", rec.error);
+    h.submit(fake_vote(&s.env, 2, &[1, 2], 82)).await.unwrap();
+    shutdown.cancel();
+}
+
+/// Origin 3: a persisted, evidence-backed verdict still closes out.
+#[tokio::test]
+async fn onchain_terminal_verdict_still_closes_out() {
+    if !common::anvil::enabled() {
+        return;
+    }
+    let prover = FakeProver::gated();
+    let (ch, s, node, shutdown, _db) = onchain_node(prover.clone()).await;
+    let c = ch.census.into_array();
+    let h = handle(&node).await;
+    wait_until("indexed", async || node.onchain.latest(&c).is_some()).await;
+    let (v0, v1) = (
+        fake_vote(&s.env, 0, &[1, 2], 80),
+        fake_vote(&s.env, 1, &[1, 2], 81),
+    );
+    let vid1 = v1.pkg.vote_id;
+    h.submit(v0).await.unwrap();
+    h.submit(v1).await.unwrap();
+    node.onchain.mark_terminal_for_test(&c);
+    prover.release(100);
+    wait_until("v1 errored", async || {
+        h.status(vid1).await.unwrap().unwrap().error.is_some()
+    })
+    .await;
+    let rec = h.status(vid1).await.unwrap().unwrap();
+    assert!(rec.error.unwrap().contains("census contract unusable"));
+    assert!(h.submit(fake_vote(&s.env, 2, &[1, 2], 82)).await.is_err());
     shutdown.cancel();
 }
 
@@ -4742,6 +4868,7 @@ async fn stalled_landing_read_holds_results_and_is_counted() {
         );
         s.chain.lag_process(0);
         s.chain.fail_process(0);
+        s.chain.advance_time(0);
         wait_until("results on chain", async || !s.chain.results().is_empty()).await;
         assert_eq!(s.chain.results(), key_tally(3, 5), "lag={lag}");
         shutdown.cancel();
@@ -4885,8 +5012,8 @@ async fn revert_with_failing_read_requeues() {
     s.chain.fail_process(u32::MAX);
     s.chain.advance_time(90);
     s.chain.settle_externally(&foreign_batch(&s, 3, 4));
+    // The aborted flight's job was dropped: no permit for it.
     wait_until("lost and resealed", async || prover.calls() == 2).await;
-    prover.release(1); // the aborted flight's job
     s.chain.advance_time(60); // end + 160: past the stale local grace end
     beats().await;
     s.chain.revert_simulates("InvalidTimeBounds", 1);
@@ -5928,7 +6055,7 @@ async fn lost_census_update_loads_after_a_restart() {
         drop((h, node));
 
         let root1 = update_census(&s, "v2", &[0, 1, 2, 3, 4]);
-        s.chain.set_census_root_check(Some(fr_to_le(&root1)));
+        s.chain.set_census_root_check(Some(census_le(&root1)));
         let db = reopen_db(dir.path()).await;
         db.set_meta_u64("monitor_last_block", s.chain.head_block())
             .unwrap();
@@ -5954,11 +6081,81 @@ async fn lost_census_update_loads_after_a_restart() {
         .await;
         assert_eq!(
             s.chain.last_census_root(),
-            Some(fr_to_le(&root1)),
+            Some(census_le(&root1)),
             "boot_read_fails={boot_read_fails}"
         );
         shutdown.cancel();
     }
+}
+
+/// Origin 2 (R36): a record whose stored census root (a Keccak value above
+/// the BN254 modulus) has no census in the store is re-queued for its
+/// download at respawn by `resume_census`. The record already names the
+/// root and the monitor's cursor sits at the head, so neither the restart's
+/// chain read (nothing moved) nor an event replay can queue it.
+#[tokio::test]
+async fn stored_census_root_above_the_modulus_is_requeued_at_respawn() {
+    let s = offchain_setup(4);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let v0 = fake_vote(&s.env, 0, &[1, 2], 1_400);
+    h.submit(v0.clone()).await.unwrap();
+    shutdown.cancel();
+    drop(h);
+
+    let root1 = update_census(&s, "v2", &[0, 1, 2, 3, 4]);
+    assert!(
+        fr_from_be(&root1).is_err(),
+        "the 5-member root is above the modulus"
+    );
+    s.chain.set_census_root_check(Some(census_le(&root1)));
+    // The stored record already carries the new census, as if the node had
+    // died right after routing `CensusUpdated` and before the download.
+    let onchain = s.chain.process(&pid31()).await.unwrap();
+    let mut rec = node.db.process(&pid_fr()).unwrap().unwrap();
+    rec.onchain.census = onchain.census.clone();
+    node.db.put_process(&rec).unwrap();
+    // The cursor sits at the head with no stored hash: a hash of an older
+    // block would read as a reorg and replay the event that queues the root.
+    node.db
+        .set_meta_u64_and_bytes(
+            "monitor_last_block",
+            s.chain.head_block(),
+            "monitor_last_hash",
+            None,
+        )
+        .unwrap();
+    drop(node);
+
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        reopen_db(dir.path()).await,
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    let v1 = fake_vote(&s.env, 1, &[2, 1], 1_401);
+    h.submit(v1.clone()).await.unwrap();
+    wait_until("settled at the re-queued census root", async || {
+        all_settled(&h, &[v0.pkg.vote_id, v1.pkg.vote_id]).await
+    })
+    .await;
+    assert_eq!(s.chain.last_census_root(), Some(census_le(&root1)));
+    shutdown.cancel();
 }
 
 /// A chain read from an endpoint behind the events (its head below the
@@ -6162,7 +6359,10 @@ async fn close_out_refuses_a_lagging_read() {
         Some(VoteStatus::Pending),
         "closed on a lagging read"
     );
+    // The endpoint catches up: the next block's read is right (one at a
+    // block already read is not asked again).
     s.chain.lag_process(0);
+    s.chain.advance_time(0);
     wait_until("closed out", async || {
         vote_status(&h, vid).await == Some(VoteStatus::Error)
     })
@@ -6727,13 +6927,12 @@ async fn results_read_at_the_head_does_not_finalize_until_confirmed() {
     )
     .await;
     let h = handle(&node).await;
-    wait_until("the head read merged the results", async || {
-        h.snapshot().await.unwrap().status == ProcessStatus::Results
-    })
-    .await;
+    // Nothing is merged from a depth-0 read: only the anchor decides.
     tokio::time::sleep(Duration::from_secs(10)).await;
+    let snap = h.snapshot().await.unwrap();
+    assert_ne!(snap.status, ProcessStatus::Results, "merged a depth-0 read");
     assert_eq!(
-        h.snapshot().await.unwrap().local,
+        snap.local,
         LocalStatus::Active,
         "finalized on a depth-0 read"
     );
@@ -6810,11 +7009,13 @@ async fn a_cancel_read_at_the_head_closes_out_only_when_confirmed() {
     )
     .await;
     let h = handle(&node).await;
-    wait_long("the head read merged the cancel", async || {
-        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
-    })
-    .await;
+    // Nothing is merged from a depth-0 read: only the anchor decides.
     tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_ne!(
+        h.snapshot().await.unwrap().status,
+        ProcessStatus::Canceled,
+        "merged a depth-0 cancel"
+    );
     assert_eq!(
         vote_status(&h, vid).await,
         Some(VoteStatus::Pending),
@@ -6874,11 +7075,13 @@ async fn unconfirmed_cancel(
     )
     .await;
     let h = handle(&node).await;
-    wait_long("the head read merged the cancel", async || {
-        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
-    })
-    .await;
+    // Nothing is merged from a depth-0 read: only the anchor decides.
     tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_ne!(
+        h.snapshot().await.unwrap().status,
+        ProcessStatus::Canceled,
+        "merged a depth-0 cancel"
+    );
     (node, h, vids, shutdown)
 }
 
@@ -6942,15 +7145,15 @@ async fn a_cancel_first_seen_by_the_close_out_read_waits_for_confirmation() {
     s.chain.advance_time(1);
     let h = handle(&node).await;
     let vids = submit_n(&h, &s, 1, 50).await;
-    // In one hidden block: the election is extended far ahead and canceled.
-    s.chain.checkpoint();
+    // In one hidden block, the newest (depth 0): the election is extended
+    // far ahead and canceled.
     s.chain.hide_block(Some(s.chain.head_block() + 1));
     s.chain.mutate_process(|p| {
         p.duration += 10 * DURATION;
         p.status = ProcessStatus::Canceled;
     });
-    // Heads move past the stored grace end.
-    s.chain.advance_time(DURATION + 2000);
+    // Heads move past the stored grace end, with no new block yet.
+    s.chain.set_time(s.chain.time() + DURATION + 2000);
     tokio::time::sleep(Duration::from_secs(20)).await;
     assert_eq!(
         vote_status(&h, vids[0]).await,
@@ -6958,8 +7161,7 @@ async fn a_cancel_first_seen_by_the_close_out_read_waits_for_confirmation() {
         "closed out on an unconfirmed cancel"
     );
     // The cancel's block is replaced; the extension stays.
-    s.chain.mutate_process(|p| p.status = ProcessStatus::Ready);
-    s.chain.drop_checkpoints();
+    s.chain.reorg_head(|p| p.status = ProcessStatus::Ready);
     wait_long("settled", async || {
         s.chain.advance_time(3700);
         all_settled(&h, &vids).await
@@ -7014,28 +7216,28 @@ async fn a_confirmation_does_not_outlive_its_cancel() {
     })
     .await;
     let vid = submit_n(&h, &s, 1, 92).await[0];
-    // A second cancel, at the newest block only; another peer landing
-    // makes the node read it.
-    s.chain.checkpoint();
-    s.chain.hide_block(Some(s.chain.head_block() + 1));
-    s.chain
-        .mutate_process(|p| p.status = ProcessStatus::Canceled);
+    // A peer landing, then a second cancel at the newest block only (its
+    // event hidden).
     let peer2 = fake_vote(&s.env, 5, &[1, 2], 93);
     s.chain
         .settle_externally(&peer_batch_of(&node.db, &s, std::slice::from_ref(&peer2)));
     s.chain.advance_time(1);
-    wait_long("the second cancel merged", async || {
-        h.snapshot().await.unwrap().status == ProcessStatus::Canceled
-    })
-    .await;
+    s.chain.hide_block(Some(s.chain.head_block() + 1));
+    s.chain
+        .mutate_process(|p| p.status = ProcessStatus::Canceled);
+    // Not merged from a depth-0 read: only the anchor decides.
     tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_ne!(
+        h.snapshot().await.unwrap().status,
+        ProcessStatus::Canceled,
+        "merged a depth-0 cancel"
+    );
     assert_eq!(
         vote_status(&h, vid).await,
         Some(VoteStatus::Pending),
         "closed out on an unconfirmed cancel"
     );
     // Confirmed: now it closes.
-    s.chain.drop_checkpoints();
     s.chain.advance_time(1);
     wait_long("closed out", async || {
         vote_status(&h, vid).await == Some(VoteStatus::Error)
@@ -8919,4 +9121,38 @@ async fn coverage_invariant_holds_under_random_reorgs() {
         checked > 0 && covered > 0,
         "the runs never re-sealed a vote"
     );
+}
+
+/// A read that leaves the check open (here a root the endpoint gets
+/// wrong) is not asked again at an unchanged anchor: a block's state at its
+/// hash does not change, so every process would re-read every 2 s for
+/// nothing (during a rewind, all of them).
+#[tokio::test(start_paused = true)]
+async fn an_open_check_does_not_reread_an_unchanged_anchor() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let shutdown = CancellationToken::new();
+    let (_node, h) = batching_node(
+        Db::open_in(dir.path()).unwrap(),
+        dir.path(),
+        &s,
+        FakeProver::open(),
+        2,
+        &[],
+        shutdown.clone(),
+    )
+    .await;
+    s.chain.lag_process(u32::MAX);
+    s.chain.settle_externally(&foreign_batch(&s, 0, 1));
+    wait_until("synced", async || {
+        h.snapshot().await.unwrap().root == s.chain.root()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let reads = s.chain.process_at_calls();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let more = s.chain.process_at_calls() - reads;
+    assert!(more <= 1, "{more} reads at one anchor in 60 s");
+    s.chain.lag_process(0);
+    shutdown.cancel();
 }

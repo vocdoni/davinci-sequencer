@@ -20,6 +20,9 @@ use crate::web3::{L1Chain, L1Fees, L1SendError, Web3Error};
 pub const REPLACE_AFTER: u64 = 3;
 /// Refused sends (underpriced, nonce trouble) one post tolerates.
 const MAX_REFUSALS: u32 = 6;
+/// Passes in which every receipt read answered "unknown" before a nonce
+/// past ours counts as taken by a transaction this post did not send.
+const CLEAN_PASSES: u32 = 3;
 
 /// A mined blob transaction of the node's account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,9 +283,12 @@ impl Poster {
                     }
                 }
                 let mut since: Option<u64> = None;
-                // Since when the account's nonce passed ours with no receipt of ours.
+                // Since when the account's nonce passed ours with no receipt
+                // of ours, and the clean passes (every read answered) since.
                 let mut taken: Option<Instant> = None;
+                let mut clean = 0u32;
                 loop {
+                    let mut unread = false;
                     for h in &hashes {
                         match self.l1.receipt(*h).await {
                             Ok(Some(r)) => {
@@ -299,10 +305,22 @@ impl Poster {
                             }
                             Ok(None) => {}
                             // A failed read says nothing about a tx already out.
-                            Err(e) => debug!(error = %e, "L1 receipt read failed; still waiting"),
+                            Err(e) => {
+                                unread = true;
+                                debug!(error = %e, "L1 receipt read failed; still waiting");
+                            }
                         }
                     }
-                    if taken.is_some_and(|t| t.elapsed() >= GONE_FOR) {
+                    // A pass with a failed read neither counts nor resets: the
+                    // failing hash may be the mined one. Taken only after
+                    // GONE_FOR, on a clean pass, with CLEAN_PASSES in the window.
+                    if taken.is_some() && !unread {
+                        clean = clean.saturating_add(1);
+                    }
+                    if !unread
+                        && clean >= CLEAN_PASSES
+                        && taken.is_some_and(|t| t.elapsed() >= GONE_FOR)
+                    {
                         // Re-checked for GONE_FOR: none of ours is mined at this nonce.
                         refusals += 1;
                         if refusals > MAX_REFUSALS {
@@ -326,13 +344,14 @@ impl Poster {
                         && let Ok(head) = self.l1.head().await
                     {
                         let start = *since.get_or_insert(head);
-                        if head >= start + REPLACE_AFTER
+                        if head >= start.saturating_add(REPLACE_AFTER)
                             && let (Ok(count), Ok(market)) =
                                 (self.l1.nonce().await, self.l1.fees().await)
                         {
                             if count > nonce {
                                 // Ours may have been mined since the receipt pass: look again first.
                                 taken = Some(Instant::now());
+                                clean = 0;
                                 continue;
                             }
                             let up = fees.doubled().max_each(L1Fees::offer(&market));

@@ -29,9 +29,10 @@ every transition from its blobs.
 
 ## Admission
 
-API handlers first run the stateless checks on a bounded blocking pool: the ballot proof, the
-signature, the census proof and the inputs hash. These repeat every per-vote check the circuit
-makes (`davinci_state::validate_vote`), so one bad ballot cannot sink a batch. The vote then goes
+API handlers first run the stateless checks on a bounded blocking pool: the ballot proof, against
+the 71 public inputs the circuit derives from the vote and the process, the signature and the
+census proof. These repeat every per-vote check the circuit makes (`davinci_state::validate_vote`),
+so one bad ballot cannot sink a batch. The vote then goes
 to the process actor, the single writer of that process's state, which checks that:
 
 - the vote id is not in the tree or the queue;
@@ -116,8 +117,9 @@ the backoff. Other failures:
   nothing about this node's prover. While it holds, a batch carries only the held votes, so
   their re-attempts do not grow with votes cast meanwhile (see [security.md](security.md)).
 - A proof the node's own checks refuse (public outputs, program key or `rootCVadcopFinal` other
-  than the pins), and in L1-blob mode an Ethereum proof that carries other blobs, would fail the
-  same way for every batch: the votes stay pending under the usual backoff, never bisected or
+  than the pins), and in L1-blob mode an Ethereum proof that keeps carrying other blobs for 60 s
+  (a single one is an inconsistent endpoint read, rebuilt each poll), would fail the same way for
+  every batch: the votes stay pending under the usual backoff, never bisected or
   errored, and the retries carry only the held votes. Votes still held at the close end in
   `process closed (held: <reason>)`.
 - A circuit failure (the guest's fail mask) errors the votes at once. Admission repeats every
@@ -135,29 +137,60 @@ votes wins. Each case logs an error and counts in `GET /info` (`bisections`, `is
 Settlement is permissionless. When another sequencer lands first, the node's simulation or
 transaction reverts with `InvalidStateRoot`. The node then rolls its tree back, counts a lost
 race, puts the votes back in the queue, syncs, and builds the next batch on the new root. A lost
-race costs only the gas of the reverted transaction.
+race costs only the gas of the reverted transaction. A transition that lands while the batch is
+still proving aborts it the same way, and the node cancels its prover job with a best-effort
+`DELETE /jobs/{id}` (a prover without the route answers 405, ignored), so the next batch does not
+queue behind it.
 
 For a transition another node sent, the node fetches the blobs, matches them against the
 transaction's versioned hashes, decodes the vote ids and slot updates, recomputes the Results
 accumulator from the ballots it already holds (the blobs do not carry it), applies them on its
-committed root, and requires the result to equal the event's `newRoot`. Queued votes whose
-id is now in the tree become `settled`. Gaps are replayed from the registry logs. Every node
+committed root, and requires the result to equal the event's `newRoot`. Every vote of the
+batch the node stored becomes `settled`, queued or not (one it errored may still land through
+another sequencer). A queued vote cast before one of its voter's votes the batch settled ends in
+`error` (`superseded by a later vote`): sealed now, it would overwrite the later one. Gaps are
+replayed from the registry logs. Every node
 stores the transitions and blobs it sees and serves them under `/processes/{pid}/transitions`.
 
 ### Reorgs
 
 Each poll the monitor reads the hash of the block at its event cursor and compares it with the
 hash it stored with the cursor. A different hash is a reorg: the node logs an error, rewinds the
-cursor 128 blocks and routes that range again. Routing an event twice changes nothing, and a
+cursor 128 blocks and routes that range again. The rewound cursor is stored with its own block
+hash in one write; if that hash cannot be read, the cursor stays and the check runs again at the
+next poll, so there is never a window without one. Routing an event twice changes nothing, and a
 transition the new branch re-included in a later block is recognised by its old and new roots.
-After 5 failed block reads in a row the monitor routes on without the check, and re-arms it at
+After 5 failed block reads in a row (a block the endpoint does not know yet counts as failed) the
+monitor routes on without the check (each such page counts in `anchor_stalls`), and re-arms it at
 the first read that succeeds.
+
+**The anchor.** The cursor block with its hash and timestamp is the monitor's *anchor*: every
+event up to it was routed and its hash was verified. Every Head carries it to every actor. A
+reorg is a new, lower anchor (and the Head carries the monitor's reorg count, so an actor learns
+of one even when the next anchor it sees is higher). Pages routed without a hash do not move it.
+
+Every state decision of an actor comes from a routed event or from one read of its process at
+the current anchor (`eth_call` at the anchor's block hash, EIP-1898 with `requireCanonical`), and
+decides only what lies at or below that block. Reads by number give only time and hints, and can
+only delay a step. The anchored read runs at most once per anchor, and only while something waits
+on the chain (an event or landing it has not covered, a sync latch, a divergence, a suspended
+confirmation, pending votes, a landed flight waiting for its event). It:
+
+- merges every field the events move (duration, grace, `maxVoters`, census, status, results),
+  with the events' side effects, unless the anchor is below the newest block an applied event or
+  own landing came from; such a read merges nothing and the record waits for the next one;
+- finds a divergence: the chain at a root the transition log left at or below the anchor block;
+- confirms results and cancels, and undoes them (below);
+- clears the "needs a check" state once it is at or above every event and landing applied and
+  shows the pinned root. Until then nothing closes out and no results are sent.
 
 A reorg deeper than `--confirmations` can take a transition the node already committed: its own
 (committed at the receipt in blob mode, at the event in L1-blob mode) or one it synced. The node
-is then ahead of the chain: a chain read shows a root its transition log has passed, or an event
-shows a transition leaving such a root for another one. From then on it seals nothing and
-proves no results. If the chain does not come back within 90 s, the node rebuilds the process:
+is then ahead of the chain: an anchored read shows a root its transition log has passed, or an
+event shows a transition leaving such a root for another one. From then on it seals nothing and
+proves no results. Back on its root at or above the block the divergence was seen at, it clears.
+If it does not come back within 90 s, the read at the current anchor (never an older one)
+decides, and the node rebuilds the process:
 
 1. One write drops the state tree, the transition log and the stored blobs, puts the votes the
    lost transitions settled back in the queue and pins the chain's root. The coverage history
@@ -167,10 +200,72 @@ proves no results. If the chain does not come back within 90 s, the node rebuild
 3. The votes re-seal on the chain's root, or settle from the replay if the chain kept them in
    another transition; once the window has closed, the close-out errors what is left.
 
-The rebuild logs an error with its depth and leaves a note in the process record. The node
-notices a divergence at a chain read: after a landing, an event, a lost race or a failed results
-attempt, and in every process when the monitor sees a reorg at its cursor, so an idle process
-rebuilds too.
+The rebuild logs an error with its depth and leaves a note in the process record. Votes it keeps
+settled are checked once the replay converges; it stores where each landed (transition index and
+position) so a voter's votes of one second go back in cast order. A rebuild while an earlier one's
+check is pending keeps that check and merges its order with the current log's. A marker that does not
+decode (corrupt, or a format only unreleased builds wrote) holds the process: no rebuild, no
+check, no seal, an error logged at each retry, until the operator removes it. There is no command
+for that: stop the node and either delete the process's row from the `rebuild_check` table of the
+datadir's redb file (which skips the check: a kept vote the chain lost stays settled there), or
+move the database aside so the node bootstraps from the chain again (its
+queued votes not yet on chain are lost).
+
+**Confirmations.** Results and a cancel are confirmed at the block of their event, or at the
+anchor of a read that shows them. A later anchored read at or above that block that lacks them
+undoes them: the results go in again, a cancel reopens admission. A read below that block (the
+anchor rewound) suspends them instead: close-out and results wait, and the record keeps them,
+until a read at or above that block decides.
+
+**Close-out** errors the pending votes only at the current anchor's read, with nothing applied
+above it, and when the anchor block's own timestamp is past the record's grace end (a later block
+can neither land a transition nor extend the window), or when the process is canceled or has
+results.
+
+**Reads by hash failing.** If reads by hash fail for 90 s (an endpoint without EIP-1898 calls),
+the node logs a warning, counts it, and decides nothing from the chain until they answer again:
+sealing on events goes on, close-out and results wait. With `--degraded-number-reads` (for an
+endpoint with a single backend only: behind a balancer a read by number can come from another
+branch) it reads instead at the anchor's block number, between two checks that the endpoint's
+block there has the anchor's hash, probes by hash again every 10 heads, and leaves degraded mode
+at the first read that succeeds.
+
+Rulings where the design left a choice (for review):
+
+- The anchor lives in memory and is stored as the cursor and its hash; at boot it is loaded with
+  time 0 (no close-out until the first poll re-reads its timestamp). A page routed without a hash
+  still stores the cursor without one, as before, but does not move the anchor.
+- A failed anchored read retries after 2 s at the same anchor. A read made is never asked again
+  at that anchor (a block's state at its hash does not change): when something here moves with no
+  new anchor (the roots, the floor, the sync latch, the check flag), that read is applied again,
+  once the anchor's block hash still reads. Close-out and rebuild check that hash too right before they act, and a sync latch clears
+  only on a read made after it was set.
+- Field events routed again after a rewind are skipped at or below the newest (block, log index)
+  the fields came from: replaying them would rewind the record transiently (an older cap erroring
+  new-slot votes). The anchored read at or above the newest event merges the branch's values.
+- A lost race needs an anchored read at or above the reverted transaction's block (or the head,
+  for a refused simulation) before its sync latch can clear, and so does the boot hint at its
+  head block; only a block the endpoint can return raises that floor, so a bogus `latest` holds
+  nothing.
+- The results and DKG tasks read the process at the anchor current when they start. Before a send
+  they also read the head block by its hash: results or a request another node landed there only
+  skip the send (the anchored read records them later).
+- At boot one read by number at the head may latch the sync (a transition whose event was lost)
+  so the node does not seal on a root the chain left; only an event or an anchored read clears it.
+- In L1-blob mode a landed flight whose event is late waits while the anchored read shows its
+  root, or until the anchor passes the block where one read by number showed it; then it rolls
+  back.
+- A stored finalized or canceled record counts as confirmed at block 0 after a restart.
+- A depth-0 cancel no longer closes admission before it is confirmed; votes admitted meanwhile
+  are errored by the close-out once it is.
+- Every anchored decision logs a debug line (target `davinci_sequencer::decision`) with the
+  anchor's block and hash; the chaos harness checks each was canonical and read by hash. An
+  endpoint that lags behind a reorg serves the monitor and the reads the same old branch: the node
+  decides at that branch's anchor until the endpoint catches up (nothing the node can check).
+- The anchored-read floor (the newest block an applied event or own landing came from, and the
+  block of the snapshot the record's fields came from, at least the stored cursor after a restart)
+  only grows, rebuilds included: a read below it merges nothing and undoes nothing, which after a reorg to a shorter branch can hold close-out and results until the new
+  branch passes the old one's newest event.
 
 ## L1-blob mode (OP Stack)
 
@@ -259,20 +354,19 @@ by round, and `graceMaxTotal` caps the extension.
 - The node is in flush mode from `--flush-horizon` before the end until the grace end, while the
   process is ready, ended, or paused past its end. A process paused before its end seals nothing.
 - At the grace end the node errors whatever is still queued (`process closed`), once its tree is
-  at the on-chain root, nothing is in flight, and a fresh read (the head first, then the process)
-  confirms the window closed. A landing the events have not shown yet moves the grace end in that
-  read, and a vote another sequencer settled settles from the sync instead of erroring. A cancel
-  or the results close out the same way, without waiting for the grace end, once confirmed: by
-  their event, or by a read at the confirmed head (a read at the newest block alone may be
-  reorged). Until then the node keeps checking: when the confirmed head does not show the cancel, a
-  fresh read of the newest block decides, so a cancel whose block is reorged out reopens the process
-  (admission and sealing resume, queued votes stay). While those reads fail or settle nothing, they
-  are retried on a new block or after 2 s, not on every vote or status request.
+  at the on-chain root, nothing is in flight, and the read at the monitor's anchor (see
+  [Reorgs](#reorgs)) shows the window closed at the anchor block's own time. A landing the events
+  have not shown yet moves the grace end in that read, and a vote another sequencer settled
+  settles from the sync instead of erroring. A cancel or the results close out the same way,
+  without waiting for the grace end; both are known only from their event or an anchored read, so
+  a cancel at the newest block, not yet confirmed, closes nothing and does not close admission.
+  One the chain loses again reopens the process at the next anchored read at or above it
+  (admission and sealing resume, queued votes stay).
 - A settlement that reverts `InvalidStatus` or `InvalidTimeBounds` while the window is open puts
   its votes back to pending, and so does `MaxVotersReached` (the organizer lowered `maxVoters`):
   only the votes for a new slot that the new cap can never fit end in `error`.
-- The node reads the grace parameters from the registry at boot, and re-reads the process after
-  every landing to learn `lastVoteAt`.
+- The node reads the grace parameters from the registry at boot, and reads the process at the
+  anchor after every landing to learn `lastVoteAt`.
 
 The organizer can shorten a running election with `setProcessDuration`, to no less than
 `noticeMin` from now. Nodes see the new end within a poll or two, flush if it is within the
@@ -418,7 +512,12 @@ The per-batch seed and refresh selection exist only in memory for one batch, by 
 restart, votes that were in a batch (`aggregated` or `processed`) go back to `pending` and the
 node syncs from the chain. If its own transaction landed before the crash, those votes settle
 through that sync without being proved again. A bisection in progress is forgotten: the next
-batch is full size.
+batch is full size. Those votes go back ahead of the stored queue, so a requeue whose write
+failed (a batch's votes left out of the stored queue while the node holds them pending) is
+written again from the node's own queue order before anything seals, and the writes that put
+votes back at the head (a rebuild, its kept-vote check) rewrite the whole stored queue to the
+node's order in the same commit, so no crash leaves such a vote ahead of an earlier vote its
+voter cast in the same second.
 
 A landing is two writes: the state tree with its committed record, then the votes, the
 transition record and the process record together. The tree's record is authoritative, so a
@@ -439,12 +538,11 @@ log, and the replay goes on.
 Events the monitor routed into an actor's queue die with the process, and the event cursor has
 already moved past them. At boot, and whenever a landing makes the actor re-read the process,
 the node therefore merges `getProcess` into its record: status, duration, grace, max voters,
-census, metadata, the DKG request and results, with the same effects as their events. A read
-whose chain head is behind the newest block the node has seen (the cursor, at boot) is not used,
-and the process is read at that head's block, so a backend behind it (a load-balanced URL) fails
-the read instead of answering from an older state. An event from a block the read already covers
-(a backlog routed after it) changes nothing, so an older end cannot replace a newer one. A chain
-root the node has not seen makes it sync before it seals again.
+census, metadata, the DKG request and results, with the same effects as their events. The read is
+at the monitor's anchor (the cursor block's hash, stored with the cursor, so a backend behind or
+on another branch fails it), and is not merged while it is below a block the node already acted
+on. At boot one read by number at the head may also hold sealing until the sync, when it shows a
+root the log does not know (a transition whose event was lost).
 
 A canceled or finalized process keeps following the chain: a read after the cancel or the
 results makes the process's final root the target, and the node replays the transitions it

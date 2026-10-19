@@ -7,7 +7,7 @@
 //! `b"committed" -> root || voters || overwrites || compressed accumulator`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arbo::{Sha256, Storage, Tree, WriteBatch};
 use davinci_zkvm_sdk::ballot::Ballot;
@@ -199,23 +199,37 @@ pub struct ProcessState<S: Storage> {
     pub(crate) committed: Committed,
     /// Sorted occupied ballot slots.
     pub(crate) occupied: Vec<u64>,
-    /// The process ballot VK, hash-checked against the 0x07 leaf.
-    pub(crate) vk: SnarkJsVk,
+    /// The process ballot VK, hash-checked against the 0x07 leaf; shared.
+    pub(crate) vk: Arc<SnarkJsVk>,
     /// Most blobs one transition may use: the chain's per-tx limit, or the
     /// guest's `MAX_BLOBS` when the blobs go out in several transactions.
     pub(crate) blob_cap: usize,
 }
 
-fn load_vk(cfg: &ProcessConfig) -> Result<SnarkJsVk, Error> {
+/// The embedded ballot vk and its hash, or why it does not parse.
+type EmbeddedVk = Result<(Arc<SnarkJsVk>, [u8; 32]), String>;
+
+/// [`EmbeddedVk`], parsed once: every process shares the one protocol key,
+/// and a parse per actor cost ~5 ms and a copy each.
+static EMBEDDED_VK: LazyLock<EmbeddedVk> = LazyLock::new(|| {
     let vk: SnarkJsVk = serde_json::from_str(release::ballot_vk_json())
-        .map_err(|e| Error::Invalid(format!("embedded ballot vk: {e}")))?;
-    let hash = BallotVerifier::from_snarkjs(&vk)?.vk_hash();
-    if hash != cfg.ballot_vk_hash {
+        .map_err(|e| format!("embedded ballot vk: {e}"))?;
+    let hash = BallotVerifier::from_snarkjs(&vk)
+        .map_err(|e| format!("embedded ballot vk: {e}"))?
+        .vk_hash();
+    Ok((Arc::new(vk), hash))
+});
+
+fn load_vk(cfg: &ProcessConfig) -> Result<Arc<SnarkJsVk>, Error> {
+    let (vk, hash) = EMBEDDED_VK
+        .as_ref()
+        .map_err(|e| Error::Invalid(e.clone()))?;
+    if *hash != cfg.ballot_vk_hash {
         return Err(Error::Invalid(
             "process ballot vk hash differs from the protocol vk".into(),
         ));
     }
-    Ok(vk)
+    Ok(vk.clone())
 }
 
 impl<S: Storage> ProcessState<S> {
@@ -325,7 +339,7 @@ impl<S: Storage> ProcessState<S> {
     /// register 20). Dynamic censuses (origins 2/3) re-root between
     /// batches; the caller re-proves the batch's votes at this root first.
     /// The root is not a genesis leaf, so the tree does not move.
-    pub fn set_census_root(&mut self, root: davinci_zkvm_sdk::crypto::field::Fr) {
+    pub fn set_census_root(&mut self, root: [u8; 32]) {
         self.cfg.census_root = root;
     }
 
@@ -378,9 +392,9 @@ impl<S: Storage> ProcessState<S> {
         Ok(p)
     }
 
-    /// FIFO batch selection: at most one vote per slot, no reused vote id,
-    /// the on-chain `max_voters` cap on distinct voters, at most `max_votes`
-    /// (and `MAX_BATCH_SIZE`) votes, and the whole transition (refreshes
+    /// FIFO batch selection: at most one vote per slot and per address, no
+    /// reused vote id, the on-chain `max_voters` cap on distinct voters, at
+    /// most `max_votes` (and `MAX_BATCH_SIZE`) votes, and the whole transition (refreshes
     /// included) within the blob cap ([`Self::set_blob_cap`]). Votes that
     /// don't fit are left for a later batch; the flag is true when the blob
     /// or refresh cap turned one away (the allowed blobs are full).
@@ -464,6 +478,9 @@ impl<S: Storage> ProcessState<S> {
         // Slots of votes turned away: later votes of the slot wait too.
         let mut held: HashSet<u64> = HashSet::new();
         let mut vids: HashSet<u64> = HashSet::new();
+        // The guest refuses one voter address twice in a batch (3B.3). Only
+        // CSP can trip it: there the slot is the index, not the address.
+        let mut addrs: HashSet<[u8; 20]> = HashSet::new();
         let mut cover: BTreeSet<u64> = base.clone();
         let mut used: HashSet<usize> = HashSet::new();
         let mut new_distinct = 0u64;
@@ -478,6 +495,11 @@ impl<S: Storage> ProcessState<S> {
                 break;
             }
             if slots.contains(&v.slot) || held.contains(&v.slot) || vids.contains(&v.pkg.vote_id) {
+                continue;
+            }
+            // Waits for a later batch; later votes of its slot wait too.
+            if addrs.contains(&v.pkg.address) {
+                held.insert(v.slot);
                 continue;
             }
             // A vote whose history was not read would be charged nothing.
@@ -548,6 +570,7 @@ impl<S: Storage> ProcessState<S> {
             }
             slots.insert(v.slot);
             vids.insert(v.pkg.vote_id);
+            addrs.insert(v.pkg.address);
             out.push(v);
         }
         Ok(Selection {

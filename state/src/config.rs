@@ -42,8 +42,9 @@ pub struct ProcessConfig {
     pub ballot_mode: BallotMode,
     pub enc_key: Point,
     pub census_origin: CensusOrigin,
-    /// Merkle census root, or the CSP address as uint160.
-    pub census_root: Fr,
+    /// Merkle census root (a 256-bit Keccak lean-IMT value, never reduced
+    /// mod p), or the CSP address as uint160; big-endian.
+    pub census_root: [u8; 32],
     /// `sha256` of the ballot VK wire bytes (the 0x07 leaf digest).
     pub ballot_vk_hash: [u8; 32],
 }

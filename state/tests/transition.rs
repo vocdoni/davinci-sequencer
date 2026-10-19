@@ -10,10 +10,10 @@ use davinci_state::{
     CensusOrigin, Coverage, Error, ProcessConfig, ProcessState, VerifiedVote, genesis_root,
 };
 use davinci_zkvm_sdk::ballot::BallotMode;
-use davinci_zkvm_sdk::blob::blob_count;
-use davinci_zkvm_sdk::census::slot_key_address;
+use davinci_zkvm_sdk::blob::{blob_count, compute_z};
+use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, census_leaf, slot_key_address};
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_from_dec, fr_to_le};
+use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_from_dec};
 use davinci_zkvm_sdk::limits::{MAX_BLOBS, MAX_REFRESH, TX_BLOB_CAP, required_refresh};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -48,7 +48,7 @@ fn cfg_from_case(v: &Value) -> ProcessConfig {
         },
         census_origin: origin,
         // Not part of the genesis tree.
-        census_root: Fr::from(0u64),
+        census_root: [0u8; 32],
         ballot_vk_hash: hex32(v["ballot_vk_hash"].as_str().unwrap()),
     }
 }
@@ -128,20 +128,63 @@ fn set_census_root_moves_register_20() {
     let mut rng = StdRng::seed_from_u64(1);
 
     let b = st.prepare(&votes, &mut rng, &none()).unwrap();
-    assert_eq!(b.expected.census_root, fr_to_le(&env.cfg.census_root));
+    assert_eq!(b.expected.census_root, le(&env.cfg.census_root));
     st.rollback(&b).unwrap();
 
     // A dynamic census re-roots between batches: the next prepare commits
     // to the new root, and the tree (whose 0x06 leaf holds only the
     // origin) does not move.
     let g = st.root();
-    let new_root = Fr::from(4242u64);
+    let grown = grown_census(&env);
+    let new_root = grown.root();
     st.set_census_root(new_root);
     assert_eq!(st.config().census_root, new_root);
     assert_eq!(st.root(), g);
+    let mut votes = votes;
+    votes[0].pkg.census = CensusWitness::Merkle(grown.proof(0).unwrap());
     let b = st.prepare(&votes, &mut rng, &none()).unwrap();
-    assert_eq!(b.expected.census_root, fr_to_le(&new_root));
+    assert_eq!(b.expected.census_root, le(&new_root));
     b.check_publics(&b.expected).unwrap();
+    st.commit(&b).unwrap();
+}
+
+// Register 20 is the root's little-endian bytes: the 256-bit value reversed,
+// never reduced mod p.
+fn le(be: &[u8; 32]) -> [u8; 32] {
+    let mut r = *be;
+    r.reverse();
+    r
+}
+
+// `env`'s census with one more member: same leaves, another root.
+fn grown_census(env: &Env) -> LeanImt {
+    let mut imt = LeanImt::from_leaves(
+        (0..env.n_voters)
+            .map(|i| census_leaf(&voter_address(i), 1).unwrap())
+            .collect(),
+    );
+    imt.insert(census_leaf(&voter_address(env.n_voters), 1).unwrap());
+    imt
+}
+
+/// A witness left at the old root after a re-root would fail the whole
+/// batch in the guest (FAIL_CENSUS): prepare refuses it, the tree unmoved.
+#[test]
+fn prepare_refuses_a_witness_at_another_census_root() {
+    let env = env(2, 8);
+    let mut st = new_state(&env);
+    let mut rng = StdRng::seed_from_u64(2);
+    let grown = grown_census(&env);
+    st.set_census_root(grown.root());
+    let mut fresh = fake_vote(&env, 1, &[1, 2], 8);
+    fresh.pkg.census = CensusWitness::Merkle(grown.proof(1).unwrap());
+    let stale = fake_vote(&env, 0, &[1, 2], 7);
+    let e = st
+        .prepare(&[fresh.clone(), stale], &mut rng, &none())
+        .unwrap_err();
+    assert!(e.to_string().contains("census root"), "{e}");
+    assert_eq!(st.root(), st.committed().root);
+    let b = st.prepare(&[fresh], &mut rng, &none()).unwrap();
     st.commit(&b).unwrap();
 }
 
@@ -346,6 +389,47 @@ fn check_publics_bites_on_tampering() {
     let mut bad = b.expected;
     bad.occupied_before += 1;
     assert!(b.check_publics(&bad).is_err());
+    // A proof over other cells: its points were not the node's openings.
+    let mut bad = b.expected;
+    bad.cells_digest[31] ^= 1;
+    assert!(matches!(b.check_publics(&bad), Err(Error::PublicsMismatch(f)) if f == "cells_digest"));
+}
+
+#[test]
+fn refresh_selection_moves_every_evaluation_point() {
+    // One state, one vote, two refresh selections: the node expects a
+    // different cell digest, so the same sequencer-chosen commitment gets a
+    // different point for each. Under sha256(pid || root || C) both were
+    // equal, which let content be fitted to a point known in advance.
+    let env = env(2, 40);
+    let mut st = committed_state(&env, 30);
+    let votes = vec![fake_vote(&env, 30, &[1], 501)];
+    let a = st
+        .prepare(&votes, &mut StdRng::seed_from_u64(1), &none())
+        .unwrap();
+    st.rollback(&a).unwrap();
+    let b = (2..)
+        .find_map(|seed| {
+            let b = st
+                .prepare(&votes, &mut StdRng::seed_from_u64(seed), &none())
+                .unwrap();
+            st.rollback(&b).unwrap();
+            (b.refresh_slots() != a.refresh_slots()).then_some(b)
+        })
+        .unwrap();
+    assert_eq!(a.old_root, b.old_root);
+    assert_eq!(a.blobs.blobs.len(), b.blobs.blobs.len());
+    assert_eq!(a.expected.cells_digest, a.blobs.cells_digest);
+    assert_ne!(a.expected.cells_digest, b.expected.cells_digest);
+    let (pid, n, c) = (
+        &env.cfg.process_id,
+        a.blobs.blobs.len(),
+        &a.blobs.commitments[0],
+    );
+    let za = compute_z(pid, &a.old_root, &a.expected.cells_digest, n, 0, c);
+    let zb = compute_z(pid, &a.old_root, &b.expected.cells_digest, n, 0, c);
+    assert_ne!(za, zb);
+    assert_eq!(a.blobs.zs[0], za);
 }
 
 #[test]

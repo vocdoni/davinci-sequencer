@@ -10,7 +10,7 @@ use davinci_sequencer::census::CensusError;
 use davinci_sequencer::census::onchain::OnchainIndex;
 use davinci_sequencer::storage::Db;
 use davinci_zkvm_sdk::census::verify_census_proof;
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_to_be};
+use davinci_zkvm_sdk::crypto::field::fr_from_be;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
@@ -31,15 +31,15 @@ fn members(r: std::ops::Range<u32>) -> Vec<([u8; 20], u128)> {
     r.map(member).collect()
 }
 
-async fn assert_matches(ix: &OnchainIndex, ch: &CensusChain, c: &[u8; 20], n: u64) -> Fr {
+async fn assert_matches(ix: &OnchainIndex, ch: &CensusChain, c: &[u8; 20], n: u64) -> [u8; 32] {
     let (root, size, block) = ix.latest(c).expect("synced");
-    assert_eq!((fr_to_be(&root), size), ch.state().await);
+    assert_eq!((root, size), ch.state().await);
     assert_eq!(size, n);
     assert_eq!(block, ch.head().await);
     root
 }
 
-async fn assert_proof(ix: &OnchainIndex, c: &[u8; 20], root: &Fr, i: u32) {
+async fn assert_proof(ix: &OnchainIndex, c: &[u8; 20], root: &[u8; 32], i: u32) {
     let (a, w) = member(i);
     let (p, weight) = ix.proof(c, root, &a).await.unwrap().expect("member");
     assert_eq!(weight, w);
@@ -78,6 +78,8 @@ async fn onchain_index_follows_the_contract() {
     assert!(ix.latest(&c).is_none());
     ix.sync(c, ch.head().await).await.unwrap();
     let early = assert_matches(&ix, &ch, &c, 16).await;
+    // The KeccakLeanIMT root is a 256-bit value, here above the BN254
+    // modulus: the index carries it unreduced, as the registry does.
     for i in 0..16 {
         assert_proof(&ix, &c, &early, i).await;
     }
@@ -89,6 +91,12 @@ async fn onchain_index_follows_the_contract() {
     ch.add(&members(20..21)).await;
     ix.sync(c, ch.head().await).await.unwrap();
     let root = assert_matches(&ix, &ch, &c, 21).await;
+    // The KeccakLeanIMT root is a 256-bit value, this one above the BN254
+    // modulus: the index carries it unreduced, as the registry does.
+    assert!(
+        fr_from_be(&root).is_err(),
+        "the 21-member root is above the modulus"
+    );
     assert_proof(&ix, &c, &root, 20).await;
     // The earlier root still serves the members it had, and only those.
     assert_proof(&ix, &c, &early, 2).await;
@@ -279,7 +287,7 @@ async fn onchain_index_serves_an_empty_contract() {
     ix.register(c).await.unwrap();
     ix.sync(c, ch.head().await).await.unwrap();
     let root = assert_matches(&ix, &ch, &c, 0).await;
-    assert_eq!(root, Fr::from(0u64));
+    assert_eq!(root, [0u8; 32]);
     assert!(ix.proof(&c, &root, &member(0).0).await.unwrap().is_none());
 
     // A block past the head is not an error, just not yet.

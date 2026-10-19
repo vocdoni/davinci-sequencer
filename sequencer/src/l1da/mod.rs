@@ -135,6 +135,7 @@ pub fn chunks(blobs: &TransitionBlobs, per_tx: usize) -> Vec<TransitionBlobs> {
                 proofs: blobs.proofs[a..b].to_vec(),
                 versioned_hashes: blobs.versioned_hashes[a..b].to_vec(),
                 digest: blobs.digest,
+                cells_digest: blobs.cells_digest,
             }
         })
         .collect()
@@ -251,7 +252,8 @@ pub enum Settled {
     Landed(TxReceipt),
     /// The registry's error name (`Error(<message>)` for a string revert).
     Reverted(String),
-    Lost(String),
+    /// Reverted in this block with no named reason: a race.
+    Lost(String, u64),
     Transient(String),
     Failed(String),
 }
@@ -414,6 +416,7 @@ mod tests {
             proofs: (0..n).map(|i| [i as u8 ^ 0x30; 48]).collect(),
             versioned_hashes: (0..n).map(|i| [i as u8 ^ 0x40; 32]).collect(),
             digest: [7; 32],
+            cells_digest: [8; 32],
         }
     }
 
@@ -449,6 +452,7 @@ mod tests {
                 assert_eq!(c.versioned_hashes[j], t.versioned_hashes[i]);
             }
             assert_eq!(c.digest, t.digest);
+            assert_eq!(c.cells_digest, t.cells_digest);
         }
         // Concatenated in chunk order: the transition's versioned hashes.
         let vhs: Vec<[u8; 32]> = c.iter().flat_map(|c| c.versioned_hashes.clone()).collect();

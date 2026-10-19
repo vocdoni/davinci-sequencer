@@ -1,18 +1,17 @@
 //! Vote routes: submit, status, tracker proof, stored ballot.
 
 use axum::Json;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::State;
 use davinci_client::api::{
     BallotResponse, TrackerProof, VoteRequest, VoteResponse, VoteStatus, VoteStatusResponse,
     parse_vote_id,
 };
 use davinci_state::validate_vote;
 use davinci_zkvm_sdk::census::{CensusProof, CensusWitness, slot_key_address};
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be};
+use davinci_zkvm_sdk::crypto::field::Fr;
 
 use super::AppState;
+use super::extract::{Path, StrictJson};
 use super::processes::{parse_pid, pid_wire};
 use crate::api::error::ApiError;
 use crate::api::parse_addr;
@@ -54,18 +53,17 @@ pub(super) async fn current_proof(
     let c = &rec.onchain.census;
     let res = match c.origin {
         1 | 2 => {
-            let root =
-                fr_from_be(&c.root).map_err(|e| ApiError::Internal(format!("census root: {e}")))?;
-            if let Some(why) = st.node.census.bad_reason(&rec.pid, &root) {
+            // Any bytes32 is a Keccak root: the census store decides.
+            if let Some(why) = st.node.census.bad_reason(&rec.pid, &c.root) {
                 return Err(ApiError::NotAccepting(format!("census: {why}")));
             }
-            st.node.census.proof_async(&root, addr).await
+            st.node.census.proof_async(&c.root, addr).await
         }
         3 => {
             let ix = &st.node.onchain;
             // `None` = the contract is not indexed or no confirmed sync has
             // landed yet; an unusable contract is refused for good.
-            let read = || -> Result<Option<(Fr, u64, u64)>, ApiError> {
+            let read = || -> Result<Option<([u8; 32], u64, u64)>, ApiError> {
                 match ix.usable(&c.contract_address) {
                     // A failed register at resume: the actor re-registers.
                     Err(crate::census::onchain::UsableError::NotIndexed) => Ok(None),
@@ -97,22 +95,21 @@ pub(super) async fn current_proof(
 /// start time with 41204.
 pub async fn submit(
     State(st): State<AppState>,
-    payload: Result<Json<VoteRequest>, JsonRejection>,
+    payload: Result<StrictJson<VoteRequest>, ApiError>,
 ) -> Result<Json<VoteResponse>, ApiError> {
     // Observers relay nothing: refuse before doing any work.
     if st.node.statics.sequencer_address.is_none() {
         return Err(ApiError::Observer("this node does not accept votes"));
     }
-    let Json(req) = payload.map_err(|r| {
-        if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::TooLarge
-        } else {
-            ApiError::Invalid(r.body_text())
-        }
-    })?;
+    let StrictJson(req) = payload?;
     let pid = req.process_id.to_fr();
     let handle = handle_of(&st, &pid).await?;
     let rec = st.node.db.process(&pid)?.ok_or(ApiError::UnknownProcess)?;
+    // Closed by status or clock: refused as the actor would, before the
+    // vote costs a pairing check.
+    if let Some(e) = handle.admission_error(&rec) {
+        return Err(e.into());
+    }
     let mut cfg = st
         .node
         .process_config(&rec)
@@ -132,13 +129,16 @@ pub async fn submit(
             _ => return Err(ApiError::Invalid("CSP census proof required".into())),
         }
     };
+    // A replayed vote id is a duplicate without paying for its validation.
+    if st.node.db.vote(&pid, req.vote_id)?.is_some() {
+        return Err(ApiError::Duplicate(req.vote_id));
+    }
     let pkg = davinci_state::VotePackage {
         process_id: pid,
         vote_id: req.vote_id,
         address: req.address,
         ballot: req.ballot,
         proof: req.ballot_proof.clone(),
-        inputs_hash: req.ballot_inputs_hash,
         signature: req.signature(),
         census,
         weight: req.weight,
@@ -146,7 +146,7 @@ pub async fn submit(
     let verifier = st.node.verifier.clone();
     // Groth16 + ECDSA are CPU-heavy: keep them off the runtime threads
     // and bound how many run at once.
-    let _permit = st
+    let permit = st
         .validate
         .clone()
         .try_acquire_owned()
@@ -155,7 +155,9 @@ pub async fn submit(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .map_err(ApiError::Vote)?;
-    handle.submit(vv).await?;
+    // The permit bounds validations only: a stuck actor must not hold it.
+    drop(permit);
+    handle.submit_nowait(vv).await?;
     Ok(Json(VoteResponse {
         vote_id: req.vote_id,
     }))

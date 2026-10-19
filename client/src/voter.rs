@@ -1,21 +1,22 @@
-//! Voter side: encrypt a ballot, derive the vote id and inputs hash, build the
-//! circom inputs, prove them and sign the vote id. The inputs follow
-//! davinci-circom `ballot_proof.circom` and go-sdk `GenerateBallotProofInputs`.
+//! Voter side: encrypt a ballot, derive the vote id, build the circom inputs,
+//! prove them and sign the vote id. The inputs follow davinci-circom
+//! `ballot_proof.circom` and go-sdk `GenerateBallotProofInputs`.
 
 use ark_ff::PrimeField;
-use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, encrypt_ballot, inputs_hash, vote_id};
+use davinci_zkvm_sdk::ballot::{Ballot, BallotMode, address_to_fr, encrypt_ballot, vote_id};
 use davinci_zkvm_sdk::census::{
     CensusWitness, census_leaf, csp_recover, eth_address, slot_key_csp, verify_census_proof,
     vote_id_sign,
 };
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
-use davinci_zkvm_sdk::crypto::field::{fr_to_be, fr_to_dec};
+use davinci_zkvm_sdk::crypto::field::fr_to_dec;
 use davinci_zkvm_sdk::groth16::N_PUBLIC;
 use davinci_zkvm_sdk::limits::{
     BALLOT_COORDS, CENSUS_ORIGIN_CSP, CENSUS_ORIGIN_MERKLE, NUM_FIELDS,
 };
 use davinci_zkvm_sdk::types::SnarkJsProof;
 use k256::ecdsa::SigningKey;
+use num_bigint::{BigInt, BigUint};
 use rand::{CryptoRng, RngCore};
 
 use crate::api::{CensusProofWire, CspWire, Fr, MerkleProof, ProcessId, VoteRequest};
@@ -36,7 +37,6 @@ pub struct CircomInputs {
     pub k: Fr,
     /// `cipherfields[16][2][2]` flattened: `c1.x, c1.y, c2.x, c2.y` per field.
     pub cipherfields: [Fr; BALLOT_COORDS],
-    pub inputs_hash: Fr,
 }
 
 impl CircomInputs {
@@ -52,8 +52,25 @@ impl CircomInputs {
             ("encryption_pubkey", self.encryption_pubkey.to_vec()),
             ("k", vec![self.k]),
             ("cipherfields", self.cipherfields.to_vec()),
-            ("inputs_hash", vec![self.inputs_hash]),
         ]
+    }
+
+    /// The public signals, in the circuit's declaration order: address,
+    /// vote id, process id, packed ballot mode, key x and y, weight, then the
+    /// 64 cipherfield coordinates.
+    pub fn public_signals(&self) -> [Fr; N_PUBLIC] {
+        let mut out = [Fr::from(0u64); N_PUBLIC];
+        out[..7].copy_from_slice(&[
+            self.address,
+            self.vote_id,
+            self.process_id,
+            self.packed_ballot_mode,
+            self.encryption_pubkey[0],
+            self.encryption_pubkey[1],
+            self.weight,
+        ]);
+        out[7..].copy_from_slice(&self.cipherfields);
+        out
     }
 
     /// snarkjs `input.json` (decimal strings). Contains the secret `k`.
@@ -78,7 +95,6 @@ pub struct PreparedVote {
     pub address: [u8; 20],
     pub vote_id: u64,
     pub ballot: Ballot,
-    pub inputs_hash: Fr,
     pub weight: u128,
     /// The voter's secret: it opens the ballot and links the vote id.
     pub k: Fr,
@@ -87,13 +103,9 @@ pub struct PreparedVote {
 }
 
 impl PreparedVote {
-    /// `[address, vote_id, inputs_hash]`, the circuit's public signals.
+    /// The circuit's 71 public signals for this vote.
     pub fn public_signals(&self) -> [Fr; N_PUBLIC] {
-        [
-            self.inputs.address,
-            Fr::from(self.vote_id),
-            self.inputs_hash,
-        ]
+        self.inputs.public_signals()
     }
 }
 
@@ -105,7 +117,6 @@ impl std::fmt::Debug for CircomInputs {
             .field("process_id", &fr_to_dec(&self.process_id))
             .field("address", &fr_to_dec(&self.address))
             .field("vote_id", &fr_to_dec(&self.vote_id))
-            .field("inputs_hash", &fr_to_dec(&self.inputs_hash))
             .field("k", &REDACTED)
             .finish_non_exhaustive()
     }
@@ -117,7 +128,6 @@ impl std::fmt::Debug for PreparedVote {
             .field("process_id", &self.process_id)
             .field("address", &hex::encode(self.address))
             .field("vote_id", &crate::api::vote_id_hex(self.vote_id))
-            .field("inputs_hash", &fr_to_dec(&self.inputs_hash))
             .field("weight", &self.weight)
             .field("k", &REDACTED)
             .finish_non_exhaustive()
@@ -177,6 +187,76 @@ fn check_key(pk: &Point) -> Result<()> {
     Ok(())
 }
 
+fn bad_ballot(why: impl std::fmt::Display) -> Error {
+    Error::Invalid(format!("ballot does not fit the ballot mode: {why}"))
+}
+
+// The circuit's `LessEqThan(n)`: `a <= b`, or `None` where it has no witness
+// (`a + 2^n - b - 1` outside `n + 1` bits).
+fn circuit_less_eq(n: u32, a: &BigUint, b: &BigUint) -> Option<bool> {
+    let t: BigInt =
+        BigInt::from(a.clone()) + (BigInt::from(1u8) << n) - BigInt::from(b.clone()) - 1u8;
+    let bits = t.to_biguint()?.bits();
+    (bits <= u64::from(n) + 1).then_some(bits <= u64::from(n))
+}
+
+/// Refuses a ballot the circuit's `CheckBallotMode` would reject, so no proof
+/// is spent on it and the error names the rule. `fields` are the first
+/// values, the rest of the `num_fields` are zero; the circuit checks those
+/// too.
+pub fn check_ballot(mode: &BallotMode, fields: &[u64], weight: u128) -> Result<()> {
+    let nf = mode.num_fields as usize;
+    if fields.len() > nf {
+        return Err(bad_ballot(format!(
+            "{} values for {nf} fields",
+            fields.len()
+        )));
+    }
+    mode.pack()?;
+    let at = |i: usize| fields.get(i).copied().unwrap_or(0);
+    let mut sum = BigUint::from(0u8);
+    for i in 0..nf {
+        let v = at(i);
+        if v > mode.max_value || v < mode.min_value {
+            return Err(bad_ballot(format!(
+                "field {i} is {v}, outside [{}, {}]",
+                mode.min_value, mode.max_value
+            )));
+        }
+        if mode.unique_values && (0..i).any(|j| at(j) == v) {
+            return Err(bad_ballot(format!("field {i} repeats the value {v}")));
+        }
+        // 0^0 is 1 in the circuit, so exponent 0 counts every field once.
+        sum += BigUint::from(v).pow(u32::from(mode.cost_exponent));
+    }
+    let cap = if mode.max_value_sum == 0 {
+        BigUint::from(weight)
+    } else {
+        BigUint::from(mode.max_value_sum)
+    };
+    match circuit_less_eq(63, &sum, &cap) {
+        Some(true) => {}
+        Some(false) => {
+            return Err(bad_ballot(format!(
+                "cost {} above the limit {cap}",
+                if sum.bits() > 128 {
+                    "(huge)".into()
+                } else {
+                    sum.to_string()
+                }
+            )));
+        }
+        None => return Err(bad_ballot("cost and weight are out of the circuit's range")),
+    }
+    if circuit_less_eq(63, &BigUint::from(mode.min_value_sum), &sum) != Some(true) {
+        return Err(bad_ballot(format!(
+            "cost is below the minimum {}",
+            mode.min_value_sum
+        )));
+    }
+    Ok(())
+}
+
 impl Voter {
     pub fn new(key: SigningKey) -> Self {
         Voter { key }
@@ -216,7 +296,7 @@ impl Voter {
                 Ok(CensusProofWire::Merkle(MerkleProof::from(&proof)))
             }
             CensusWitness::Csp(att) if origin == CENSUS_ORIGIN_CSP => {
-                let root = fr_to_be(&p.census_root);
+                let root = &p.census_root;
                 let signer = csp_recover(&ProcessId(p.id).to_fr(), &att)?;
                 if att.address != addr
                     || att.weight != weight
@@ -269,6 +349,7 @@ impl Voter {
         let pk = p.encryption_key;
         check_key(&pk)?;
         let census = self.census_wire(p, census, weight)?;
+        check_ballot(mode, fields, weight)?;
 
         let address = self.address();
         let addr = address_to_fr(&address);
@@ -276,7 +357,6 @@ impl Voter {
         let vid = vote_id(&pid, &addr, &k);
         let ballot = encrypt_ballot(&pk, fields, &k, nf);
         let w = Fr::from(weight);
-        let ih = inputs_hash(&pid, mode, &pk, &addr, vid, &ballot, &w)?;
 
         let mut padded = [Fr::from(0u64); NUM_FIELDS];
         for (o, v) in padded.iter_mut().zip(fields) {
@@ -292,14 +372,12 @@ impl Voter {
             encryption_pubkey: [pk.x, pk.y],
             k,
             cipherfields: ballot.coords(),
-            inputs_hash: ih,
         };
         Ok(PreparedVote {
             process_id: ProcessId(p.id),
             address,
             vote_id: vid,
             ballot,
-            inputs_hash: ih,
             weight,
             k,
             census,
@@ -325,7 +403,6 @@ impl Voter {
             vote_id: prep.vote_id,
             ballot: prep.ballot,
             ballot_proof: proof,
-            ballot_inputs_hash: prep.inputs_hash,
             signature,
             weight: prep.weight,
             census_proof: Some(prep.census),

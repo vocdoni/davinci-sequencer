@@ -90,29 +90,16 @@ impl CensusChain {
             .connect_http(anvil.endpoint_url())
             .erased();
 
-        let poseidon = artifact("PoseidonT3.sol/PoseidonT3.json");
-        let lib = deploy(&owner, poseidon["bytecode"]["object"].as_str().unwrap()).await;
+        // KeccakLeanIMT is an internal library: the bytecode has no link
+        // references and deploys as is (no PoseidonT3).
         let owned = artifact("OwnedCensus.sol/OwnedCensus.json");
-        let mut code = owned["bytecode"]["object"]
-            .as_str()
-            .unwrap()
-            .trim_start_matches("0x")
-            .to_string();
-        let lib_hex = hex::encode(lib);
-        let mut linked = 0;
-        for file in owned["bytecode"]["linkReferences"]
-            .as_object()
-            .unwrap()
-            .values()
-        {
-            for r in file["PoseidonT3"].as_array().unwrap() {
-                let at = 2 * r["start"].as_u64().unwrap() as usize;
-                code.replace_range(at..at + 40, &lib_hex);
-                linked += 1;
-            }
-        }
-        assert!(linked > 0, "OwnedCensus has no PoseidonT3 link reference");
-        let census = deploy(&owner, &code).await;
+        let code = owned["bytecode"]["object"].as_str().unwrap();
+        assert_eq!(
+            owned["bytecode"]["linkReferences"],
+            serde_json::json!({}),
+            "OwnedCensus must not link a library"
+        );
+        let census = deploy(&owner, code).await;
         CensusChain {
             anvil,
             owner,
@@ -165,6 +152,9 @@ pub struct ProxyKnobs {
     pub get_logs: std::sync::atomic::AtomicU64,
     /// Lowest `fromBlock` served.
     pub min_from: std::sync::atomic::AtomicU64,
+    /// A backend `lag` blocks behind: `eth_blockNumber` answers head - lag
+    /// and `eth_getLogs` is answered as if the chain ended there.
+    pub lag: std::sync::atomic::AtomicU64,
 }
 
 /// A JSON-RPC proxy in front of anvil that can go down or cap the
@@ -190,7 +180,24 @@ impl RpcProxy {
                     if k.down.load(Relaxed) {
                         return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
                     }
-                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let mut req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let lag = k.lag.load(Relaxed);
+                    let hex = |v: u64| format!("0x{v:x}");
+                    let num = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok();
+                    let mut body = body;
+                    if lag > 0 && req["method"] == "eth_getLogs" {
+                        let to = req["params"][0]["toBlock"].as_str().and_then(num);
+                        let from = req["params"][0]["fromBlock"].as_str().and_then(num);
+                        if let (Some(to), Some(from)) = (to, from) {
+                            let to = to.saturating_sub(lag);
+                            if to < from {
+                                let r = serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": []});
+                                return axum::Json(r).into_response();
+                            }
+                            req["params"][0]["toBlock"] = hex(to).into();
+                            body = serde_json::to_vec(&req).unwrap().into();
+                        }
+                    }
                     if req["method"] == "eth_getLogs" {
                         let block = |f: &str| {
                             let s = req["params"][0][f].as_str().unwrap();
@@ -216,7 +223,14 @@ impl RpcProxy {
                         .send()
                         .await
                         .unwrap();
-                    let body = r.bytes().await.unwrap();
+                    let mut body = r.bytes().await.unwrap();
+                    if lag > 0 && req["method"] == "eth_blockNumber" {
+                        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        if let Some(n) = v["result"].as_str().and_then(num) {
+                            v["result"] = hex(n.saturating_sub(lag)).into();
+                            body = serde_json::to_vec(&v).unwrap().into();
+                        }
+                    }
                     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
                 }
             }),

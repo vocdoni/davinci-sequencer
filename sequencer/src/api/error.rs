@@ -25,6 +25,9 @@ pub enum ApiError {
     /// 404 40402: the process is unknown to this node.
     #[error("unknown process")]
     UnknownProcess,
+    /// 405 40501: the route exists, the method does not.
+    #[error("method not allowed")]
+    MethodNotAllowed,
     /// 409 40901.
     #[error("vote {0:#x} already submitted")]
     Duplicate(u64),
@@ -69,6 +72,7 @@ impl ApiError {
             ApiError::Vote(_) => (StatusCode::BAD_REQUEST, 40002),
             ApiError::NotFound => (StatusCode::NOT_FOUND, 40401),
             ApiError::UnknownProcess => (StatusCode::NOT_FOUND, 40402),
+            ApiError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, 40501),
             ApiError::Duplicate(_) => (StatusCode::CONFLICT, 40901),
             ApiError::SlotBusy(_) => (StatusCode::CONFLICT, 40902),
             ApiError::Timeout => (StatusCode::REQUEST_TIMEOUT, 40801),

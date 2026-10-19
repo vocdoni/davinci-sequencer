@@ -67,13 +67,26 @@ fn gen_two_hosts_offline() {
         let p = ballots::shard_path(camp, 1, s);
         assert!(ballots::done(&p), "{s:?}");
         let (_, recs) = ballots::read_shard(&p).unwrap();
+        let p = wave
+            .elections
+            .iter()
+            .find(|e| e.spec.tag == s.tag)
+            .unwrap()
+            .snap
+            .onchain()
+            .unwrap();
         for r in recs {
             let q = &r.req;
-            let pubs = [
-                address_to_fr(&q.address),
-                davinci_client::api::Fr::from(q.vote_id),
-                q.ballot_inputs_hash,
-            ];
+            let pubs = davinci_zkvm_sdk::ballot::public_signals(
+                &q.process_id.to_fr(),
+                &p.ballot_mode,
+                &p.encryption_key,
+                &address_to_fr(&q.address),
+                q.vote_id,
+                &q.ballot,
+                &davinci_client::api::Fr::from(q.weight),
+            )
+            .unwrap();
             assert!(v.verify(&q.ballot_proof, &pubs), "{} v{}", r.tag, r.voter);
             let want = eth_address(seed.voter_key(&r.tag, r.voter).verifying_key());
             assert_eq!(vote_id_recover(q.vote_id, &q.signature()).unwrap(), want);

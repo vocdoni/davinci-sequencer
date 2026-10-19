@@ -769,6 +769,27 @@ impl Contracts {
         process_checked(&p, pid)
     }
 
+    /// `getProcess` at the block with this hash (EIP-1898 `blockHash`).
+    pub async fn process_at_hash(&self, pid: &[u8; 31], hash: [u8; 32]) -> Result<OnchainProcess> {
+        let call = PR::getProcessCall {
+            processId: FixedBytes(*pid),
+        };
+        let tx = TransactionRequest::default()
+            .with_to(self.registry)
+            .with_input(call.abi_encode());
+        let out = self
+            .provider
+            .call(tx)
+            // The canonical block only: a node still holding a reorged-out
+            // block would otherwise answer from it.
+            .block(alloy::eips::BlockId::hash_canonical(hash.into()))
+            .await
+            .map_err(|e| Web3Error::Rpc(format!("{}: {e}", PR::getProcessCall::SIGNATURE)))?;
+        let p = PR::getProcessCall::abi_decode_returns(&out)
+            .map_err(|e| Web3Error::Data(format!("{}: {e}", PR::getProcessCall::SIGNATURE)))?;
+        process_checked(&p, pid)
+    }
+
     /// `getProcessGraceEnd`, saturating.
     pub async fn grace_end(&self, pid: &[u8; 31]) -> Result<u64> {
         let call = PR::getProcessGraceEndCall {
@@ -827,6 +848,13 @@ impl Contracts {
                 if log.address() != self.registry {
                     continue;
                 }
+                // Not this page's: its own page delivers it if it is real.
+                // Routed, a block past the head would make every later read
+                // of the process look stale.
+                if log.block_number.is_some_and(|b| b < start || b > end) {
+                    tracing::warn!(block = ?log.block_number, start, end, "log outside the asked range dropped");
+                    continue;
+                }
                 if log.topic0() == Some(&PR::ProcessStateTransitionedL1::SIGNATURE_HASH) {
                     l1s.extend(l1_event_from_log(&log)?);
                 } else if let Some(ev) = event_from_log(&log)? {
@@ -848,7 +876,12 @@ impl Contracts {
                 "RPC head {head} is behind the log range {from}..={to}: page retried"
             )));
         }
-        out.sort_by_key(|e| (e.block, e.log_index));
+        // An endpoint may answer a log twice: a second L1 copy would find its
+        // transition paired and fail the page for good.
+        out.sort_by_key(|e| (e.block, e.log_index, e.tx_hash));
+        out.dedup_by_key(|e| (e.block, e.log_index, e.tx_hash));
+        l1s.sort_by_key(|e| (e.block, e.log_index, e.tx_hash));
+        l1s.dedup_by_key(|e| (e.block, e.log_index, e.tx_hash));
         let strict = matches!(self.da.get(), Some(RegistryDa::L1Blobs { .. }));
         pair_l1(&mut out, l1s, strict)?;
         Ok(out)
@@ -871,13 +904,14 @@ impl Contracts {
     }
 
     /// Hash of block `n`; `None` past the endpoint's head.
-    pub async fn block_hash(&self, n: u64) -> Result<Option<[u8; 32]>> {
+    /// Hash and timestamp of block `n`.
+    pub async fn block_ref(&self, n: u64) -> Result<Option<([u8; 32], u64)>> {
         let b = self
             .provider
             .get_block_by_number(BlockNumberOrTag::Number(n))
             .await
             .map_err(rpc_err)?;
-        Ok(b.map(|b| b.header.hash.0))
+        Ok(b.map(|b| (b.header.hash.0, b.header.timestamp)))
     }
 
     /// The highest block `confirmations` behind head.

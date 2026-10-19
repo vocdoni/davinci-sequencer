@@ -26,7 +26,7 @@ pub use davinci_sequencer::actor::{
 pub use davinci_sequencer::census::{CensusOptions, CensusStore};
 pub use davinci_sequencer::config::Config;
 pub use davinci_sequencer::keys::KeyStore;
-pub use davinci_sequencer::monitor::{Node, spawn_node};
+pub use davinci_sequencer::monitor::{Node, NodeError, spawn_node};
 pub use davinci_sequencer::storage::{Db, LocalStatus, VoteStatus};
 pub use davinci_sequencer::web3::{
     BlobSource, DkgState, EventKind, GraceParams, KeyMode, L1Blobs, L1Fees, L1Market, L1Origin,
@@ -34,9 +34,7 @@ pub use davinci_sequencer::web3::{
     Web3Error,
 };
 pub use davinci_state::{CensusOrigin, ProcessConfig, VerifiedVote, VotePackage, genesis_root};
-pub use davinci_zkvm_sdk::ballot::{
-    BallotMode, address_to_fr, encrypt_ballot, inputs_hash, vote_id,
-};
+pub use davinci_zkvm_sdk::ballot::{BallotMode, address_to_fr, encrypt_ballot, vote_id};
 pub use davinci_zkvm_sdk::blob::{Blob, TransitionBlobs};
 pub use davinci_zkvm_sdk::census::{
     CensusWitness, LeanImt, census_leaf, eth_address, slot_key_address, vote_id_sign,
@@ -136,7 +134,7 @@ pub struct Env {
 pub fn env(nf: u8, n_voters: usize, pk: Option<Point>) -> Env {
     logs();
     let (_, gen_pk) = keygen(&mut StdRng::seed_from_u64(7));
-    let leaves: Vec<Fr> = (0..n_voters)
+    let leaves: Vec<[u8; 32]> = (0..n_voters)
         .map(|i| census_leaf(&voter_address(i), 1).unwrap())
         .collect();
     let imt = LeanImt::from_leaves(leaves);
@@ -186,16 +184,6 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
     let k = Fr::from(kseed);
     let vid = vote_id(&cfg.process_id, &addr, &k);
     let ballot = encrypt_ballot(&cfg.enc_key, fields, &k, cfg.ballot_mode.num_fields);
-    let ih = inputs_hash(
-        &cfg.process_id,
-        &cfg.ballot_mode,
-        &cfg.enc_key,
-        &addr,
-        vid,
-        &ballot,
-        &Fr::from(1u64),
-    )
-    .unwrap();
     let census = env.imt.proof(idx).unwrap();
     let slot = slot_key_address(&address);
     VerifiedVote {
@@ -205,13 +193,31 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
             address,
             ballot,
             proof: dummy_proof(),
-            inputs_hash: ih,
             signature: vote_id_sign(&key, vid),
             census: CensusWitness::Merkle(census),
             weight: 1,
         },
         slot,
     }
+}
+
+/// Register 20 of a census root: its little-endian bytes (the 256-bit
+/// value reversed, never reduced mod p).
+pub fn census_le(root: &[u8; 32]) -> [u8; 32] {
+    let mut r = *root;
+    r.reverse();
+    r
+}
+
+/// Proof-cache key (`tests/cache`): sha256 of the 71 public signals,
+/// big-endian and concatenated. The signals are everything a proof binds.
+pub fn signals_key(pubs: &[Fr]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for x in pubs {
+        h.update(fr_to_be(x));
+    }
+    hex::encode(h.finalize())
 }
 
 /// Writes the census document and returns its `file://` URI.
@@ -287,6 +293,10 @@ pub struct Inner {
     /// `(block, proc)` snapshots from `checkpoint`: `process_at` a block
     /// below the head answers the newest one at or below it.
     history: Vec<(u64, OnchainProcess)>,
+    /// The process as it stood at the end of each lock section, by head
+    /// block: for reads at that block once the head moved on. Cleared with
+    /// the checkpoints.
+    seen: std::collections::BTreeMap<u64, OnchainProcess>,
     /// `process_at` reads of the process.
     process_at_calls: u64,
     /// Next N blob fetches fail.
@@ -360,6 +370,12 @@ pub struct Inner {
     council_gate_view: Option<bool>,
     /// `council_decryption_open` reads.
     council_gate_reads: u64,
+    /// Bumped by every scripted reorg: each block hash changes with it, so
+    /// the monitor sees the reorg at its cursor.
+    hash_gen: u32,
+    /// The head time last seen at each block (by `head` and `block_ref`):
+    /// a block's timestamp once the head moved past it.
+    block_times: std::collections::BTreeMap<u64, u64>,
     /// L1-blob mode: the Ethereum the verifier reads its origin from.
     l1: Option<FakeL1>,
     /// Origins stored with `record()`: number -> hash.
@@ -383,7 +399,65 @@ pub struct FakeChain {
     signer: Option<Address>,
 }
 
+/// The chain under its lock. On release the process as it stands is
+/// recorded for the head block: a read at a block below the head sees it
+/// as it was when the head moved on.
+struct Locked<'a>(std::sync::MutexGuard<'a, Inner>);
+
+impl std::ops::Deref for Locked<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.0
+    }
+}
+
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        let (b, p) = (self.0.block, self.0.proc.clone());
+        self.0.seen.insert(b, p);
+    }
+}
+
 impl FakeChain {
+    fn lock(&self) -> Locked<'_> {
+        Locked(self.inner.lock().unwrap())
+    }
+
+    /// `getProcess` at `block` below the head (the current state at or
+    /// above it), by hash or by number.
+    async fn read_block(
+        &self,
+        pid: &[u8; 31],
+        block: u64,
+        by_hash: bool,
+    ) -> Result<OnchainProcess, Web3Error> {
+        if *pid == pid31() {
+            let mut i = self.lock();
+            i.process_at_calls += 1;
+            if let Some((p, at)) = &i.split {
+                return if block <= *at {
+                    Ok(p.clone())
+                } else {
+                    Err(Web3Error::Rpc(format!("header not found: {block}")))
+                };
+            }
+            if block < i.block
+                && i.fail_process == 0
+                && i.lag_process == 0
+                && let Some(p) = past_state(&i, block, by_hash)
+            {
+                return Ok(p);
+            }
+        }
+        self.process(pid).await
+    }
+
     pub fn new(env: &Env, census_uri: String) -> Self {
         let proc = OnchainProcess {
             status: ProcessStatus::Ready,
@@ -403,7 +477,7 @@ impl FakeChain {
             ballot_mode: env.cfg.ballot_mode,
             census: OnchainCensus {
                 origin: env.cfg.census_origin as u8,
-                root: fr_to_be(&env.cfg.census_root),
+                root: env.cfg.census_root,
                 uri: census_uri,
                 contract_address: [0u8; 20],
             },
@@ -433,6 +507,7 @@ impl FakeChain {
             frozen: None,
             split: None,
             history: Vec::new(),
+            seen: Default::default(),
             process_at_calls: 0,
             fail_blobs: 0,
             withheld: None,
@@ -468,6 +543,8 @@ impl FakeChain {
             council_gate: true,
             council_gate_view: None,
             council_gate_reads: 0,
+            hash_gen: 0,
+            block_times: Default::default(),
             l1: None,
             l1_recorded: HashMap::new(),
             l1_records: 0,
@@ -485,39 +562,48 @@ impl FakeChain {
 
     /// Puts the registry in L1-blob mode over `l1`.
     pub fn attach_l1(&self, l1: &FakeL1) {
-        self.inner.lock().unwrap().l1 = Some(l1.clone());
+        self.lock().l1 = Some(l1.clone());
     }
 
     pub fn l1_records(&self) -> u64 {
-        self.inner.lock().unwrap().l1_records
+        self.lock().l1_records
     }
 
     pub fn l1_simulates(&self) -> u64 {
-        self.inner.lock().unwrap().l1_simulates
+        self.lock().l1_simulates
     }
 
     pub fn l1_last_headers(&self) -> usize {
-        self.inner.lock().unwrap().l1_last_headers
+        self.lock().l1_last_headers
     }
 
     pub fn l1_last(&self) -> Option<L1Blobs> {
-        self.inner.lock().unwrap().l1_last.clone()
+        self.lock().l1_last.clone()
     }
 
     /// The next L1 settlement returns a receipt but never lands.
     pub fn vanish_next_l1_submit(&self) {
-        self.inner.lock().unwrap().vanish_l1_submit = true;
+        self.lock().vanish_l1_submit = true;
     }
 
     /// Holds the receipts of landed L1 settlements until called with false.
     pub fn gate_l1_submits(&self, on: bool) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         if let Some(g) = i.l1_submit_gate.take() {
             g.close();
         }
         if on {
             i.l1_submit_gate = Some(Arc::new(Semaphore::new(0)));
         }
+    }
+
+    /// The blob source and clock that follow this chain, for a test that
+    /// builds its own `Deps` (a wrapped chain or prover).
+    pub fn sources(&self) -> (Arc<dyn BlobSource>, Arc<dyn Clock>) {
+        (
+            Arc::new(FakeBlobs(self.inner.clone())),
+            Arc::new(FakeClock(self.inner.clone())),
+        )
     }
 
     pub fn with_signer(&self, byte: u8) -> FakeChain {
@@ -536,13 +622,13 @@ impl FakeChain {
     }
 
     pub fn root(&self) -> [u8; 32] {
-        self.inner.lock().unwrap().proc.state_root
+        self.lock().proc.state_root
     }
 
     /// The appended-blob attack: append a junk blob to every settled transition's
     /// stored sidecar, past the `n_blobs` the registry checked.
     pub fn append_junk_blob(&self) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         for b in i.blobs.values_mut() {
             let junk: Blob = vec![0u8; 131072].into_boxed_slice().try_into().unwrap();
             b.push(junk);
@@ -551,22 +637,22 @@ impl FakeChain {
 
     /// Script the next `submit_results` to revert with `name`.
     pub fn revert_results_once(&self, name: &str) {
-        self.inner.lock().unwrap().revert_results = Some(name.to_string());
+        self.lock().revert_results = Some(name.to_string());
     }
 
     /// The next valid `submit_results` returns a receipt but never lands.
     pub fn vanish_next_results(&self) {
-        self.inner.lock().unwrap().vanish_results = true;
+        self.lock().vanish_results = true;
     }
 
     /// How many times any node called `submit_results` on this chain.
     pub fn results_submits(&self) -> u64 {
-        self.inner.lock().unwrap().results_submits
+        self.lock().results_submits
     }
 
     /// The organizer extends the voting window (emits `DurationChanged`).
     pub fn extend_duration(&self, extra: u64) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.duration += extra;
         i.block += 1;
         let ev = RegistryEvent {
@@ -583,14 +669,14 @@ impl FakeChain {
 
     /// The organizer moves the end to `new_end` (a shorten or an extension).
     pub fn set_end(&self, new_end: u64) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.duration = new_end - i.proc.start_time;
         push_duration(&mut i);
     }
 
     /// The organizer sets the process grace (`ProcessGraceChanged`).
     pub fn set_grace(&self, grace: u64) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.grace = grace;
         i.block += 1;
         let block = i.block;
@@ -607,7 +693,7 @@ impl FakeChain {
 
     /// The census moves (`CensusUpdated`), in getProcess too.
     pub fn set_census(&self, root: [u8; 32], uri: String) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.census.root = root;
         i.proc.census.uri.clone_from(&uri);
         i.block += 1;
@@ -627,7 +713,7 @@ impl FakeChain {
 
     /// The organizer updates the metadata (`ProcessMetadataUpdated`).
     pub fn set_metadata(&self, uri: &str, hash: [u8; 32]) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.metadata_uri = uri.into();
         i.proc.metadata_hash = hash;
         i.block += 1;
@@ -645,41 +731,41 @@ impl FakeChain {
     }
 
     pub fn grace_params(&self) -> GraceParams {
-        self.inner.lock().unwrap().grace
+        self.lock().grace
     }
 
     /// `getProcessGraceEnd`.
     pub fn grace_end(&self) -> u64 {
-        grace_end(&self.inner.lock().unwrap())
+        grace_end(&self.lock())
     }
 
     pub fn end_time(&self) -> u64 {
-        self.inner.lock().unwrap().proc.end_time()
+        self.lock().proc.end_time()
     }
 
     pub fn last_vote_at(&self) -> u64 {
-        self.inner.lock().unwrap().proc.last_vote_at
+        self.lock().proc.last_vote_at
     }
 
     /// Moves the head to the grace end: the window just closed.
     pub fn pass_grace(&self) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.time = i.time.max(grace_end(&i));
         i.block += 1;
     }
 
     pub fn voters(&self) -> u64 {
-        self.inner.lock().unwrap().proc.voters_count
+        self.lock().proc.voters_count
     }
 
     pub fn results(&self) -> Vec<u64> {
-        self.inner.lock().unwrap().proc.results.clone()
+        self.lock().proc.results.clone()
     }
 
     /// Like `setProcessStatus`: ENDED before the end collapses it to now
     /// (`DurationChanged` first).
     pub fn set_status(&self, s: ProcessStatus) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let old = i.proc.status;
         i.proc.status = s;
         if s == ProcessStatus::Ended && i.time < i.proc.end_time() {
@@ -704,7 +790,7 @@ impl FakeChain {
     /// time, which no head read shows yet: the node gets the new end
     /// (`DurationChanged`, then `StatusChanged`) before a fresh head.
     pub fn end_ahead_of_head(&self, dt: u64) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let old = i.proc.status;
         i.proc.status = ProcessStatus::Ended;
         i.proc.duration = (i.time + dt).saturating_sub(i.proc.start_time);
@@ -724,52 +810,57 @@ impl FakeChain {
     }
 
     pub fn advance_time(&self, dt: u64) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.time += dt;
         i.block += 1;
     }
 
     /// The head time.
     pub fn time(&self) -> u64 {
-        self.inner.lock().unwrap().time
+        self.lock().time
     }
 
     /// Sets the head time, backwards too (a lagging endpoint's head).
+    /// The node-side clock over this chain's time.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::new(FakeClock(self.inner.clone()))
+    }
+
     pub fn set_time(&self, t: u64) {
-        self.inner.lock().unwrap().time = t;
+        self.lock().time = t;
     }
 
     /// The process opens for votes at `t` (before the node boots).
     pub fn set_start_time(&self, t: u64) {
-        self.inner.lock().unwrap().proc.start_time = t;
+        self.lock().proc.start_time = t;
     }
 
     pub fn fail_process(&self, n: u32) {
-        self.inner.lock().unwrap().fail_process = n;
+        self.lock().fail_process = n;
     }
 
     pub fn lag_process(&self, n: u32) {
-        self.inner.lock().unwrap().lag_process = n;
+        self.lock().lag_process = n;
     }
 
     /// From now on `head()` and `process()` answer as of this moment, until
     /// called with false.
     pub fn freeze_view(&self, on: bool) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.frozen = on.then(|| (i.proc.clone(), i.block, i.time));
     }
 
     /// From now on `process()` answers as of this block while `head()`
     /// moves on (the inverse of `freeze_view`), until called with false.
     pub fn split_view(&self, on: bool) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.split = on.then(|| (i.proc.clone(), i.block));
     }
 
     /// Records the process as of the current block, for `process_at` reads
     /// of later blocks that stay below the head.
     pub fn checkpoint(&self) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let snap = (i.block, i.proc.clone());
         i.history.push(snap);
     }
@@ -777,35 +868,49 @@ impl FakeChain {
     /// Changes the process in a new block with no event: a reorg that
     /// replaced the block of an earlier change, or one whose event is hidden.
     pub fn mutate_process(&self, f: impl FnOnce(&mut OnchainProcess)) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         f(&mut i.proc);
         i.block += 1;
     }
 
+    /// A reorg replaces the head block with one where `f` changed the
+    /// process (no event, no new height); the monitor sees the new hashes.
+    pub fn reorg_head(&self, f: impl FnOnce(&mut OnchainProcess)) {
+        let mut i = self.lock();
+        f(&mut i.proc);
+        i.hash_gen += 1;
+    }
+
     /// Forgets the checkpoints: reads at any block see the current state.
     pub fn drop_checkpoints(&self) {
-        self.inner.lock().unwrap().history.clear();
+        {
+            let mut i = self.lock();
+            i.history.clear();
+            i.seen.clear();
+        }
     }
 
     /// How many times any node read the process with `process_at`.
     pub fn process_at_calls(&self) -> u64 {
-        self.inner.lock().unwrap().process_at_calls
+        self.lock().process_at_calls
     }
 
     /// The block carrying the results reorged out: the process is Ended
     /// again with no results, and their events never route.
     pub fn reorg_results(&self) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.status = ProcessStatus::Ended;
         i.proc.results = Vec::new();
         i.history.clear();
+        i.seen.clear();
+        i.hash_gen += 1;
     }
 
     /// A reorg takes the transition at the tip: its event is gone and the root,
     /// counters and batch number are back where it found them. Returns the
     /// event, for `restore_transition`.
     pub fn reorg_out_last_transition(&self) -> RegistryEvent {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         // The transition that reached the tip (not a re-included copy).
         let tip = i.proc.state_root;
         let is_t = |e: &RegistryEvent| matches!(e.kind, EventKind::StateTransitioned { new_root, .. } if new_root == tip);
@@ -830,12 +935,14 @@ impl FakeChain {
         i.proc.overwritten_count = overwrites;
         i.proc.batch_number -= 1;
         i.history.clear();
+        i.seen.clear();
+        i.hash_gen += 1;
         ev
     }
 
     /// The new branch re-includes a transition a reorg took, in a new block.
     pub fn restore_transition(&self, mut ev: RegistryEvent) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let EventKind::StateTransitioned {
             old_root,
             new_root,
@@ -859,7 +966,7 @@ impl FakeChain {
     /// The `n`-th transition event (from 0) again, in a new block: a reorg
     /// branch that re-included the same transaction higher up.
     pub fn reinclude_transition(&self, n: usize) -> u64 {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let mut ev = i
             .events
             .iter()
@@ -874,23 +981,23 @@ impl FakeChain {
     }
 
     pub fn fail_blobs(&self, n: u32) {
-        self.inner.lock().unwrap().fail_blobs = n;
+        self.lock().fail_blobs = n;
     }
 
     /// Every batch published so far, in order: (tx, blobs, ours).
     pub fn sent_batches(&self) -> Vec<(B256, Vec<Blob>, bool)> {
-        self.inner.lock().unwrap().sent.clone()
+        self.lock().sent.clone()
     }
 
     /// Transactions whose blobs a node fetched.
     pub fn fetched_txs(&self) -> std::collections::HashSet<B256> {
-        self.inner.lock().unwrap().fetched.clone()
+        self.lock().fetched.clone()
     }
 
     /// The `(old_root, new_root)` of the transition `tx` landed, if its
     /// event is still on the chain.
     pub fn transition_roots(&self, tx: &B256) -> Option<([u8; 32], [u8; 32])> {
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         i.events.iter().find_map(|e| match e.kind {
             EventKind::StateTransitioned {
                 old_root, new_root, ..
@@ -906,7 +1013,7 @@ impl FakeChain {
             davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new())
                 .unwrap();
         let nf = s.env.cfg.ballot_mode.num_fields;
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         for e in &i.events {
             if st.committed().root == *root {
                 break;
@@ -939,7 +1046,7 @@ impl FakeChain {
 
     /// Drops a race armed with `race_next_submit` that no submit took.
     pub fn clear_race(&self) {
-        self.inner.lock().unwrap().race_submit = None;
+        self.lock().race_submit = None;
     }
 
     /// [`Self::peer_batch`], or `None` when the votes cannot go on top of
@@ -953,7 +1060,7 @@ impl FakeChain {
             davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new())
                 .unwrap();
         let nf = s.env.cfg.ballot_mode.num_fields;
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         for e in &i.events {
             let EventKind::StateTransitioned {
                 old_root,
@@ -982,12 +1089,12 @@ impl FakeChain {
 
     /// Fetches of `tx`'s blobs fail until called with `None`.
     pub fn withhold_blobs(&self, tx: Option<B256>) {
-        self.inner.lock().unwrap().withheld = tx;
+        self.lock().withheld = tx;
     }
 
     /// The transaction of the newest transition event.
     pub fn last_transition_tx(&self) -> B256 {
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         i.events
             .iter()
             .rev()
@@ -1008,7 +1115,7 @@ impl FakeChain {
             davinci_state::ProcessState::create(s.env.cfg.clone(), arbo::MemoryStorage::new())
                 .unwrap();
         let nf = s.env.cfg.ballot_mode.num_fields;
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         for e in &i.events {
             let EventKind::StateTransitioned {
                 old_root,
@@ -1034,64 +1141,69 @@ impl FakeChain {
     }
 
     pub fn fail_blobs_left(&self) -> u32 {
-        self.inner.lock().unwrap().fail_blobs
+        self.lock().fail_blobs
     }
 
     pub fn fail_submits(&self, n: u32) {
-        self.inner.lock().unwrap().fail_submits = n;
+        self.lock().fail_submits = n;
     }
 
     pub fn timeout_submits(&self, n: u32) {
-        self.inner.lock().unwrap().timeout_submits = n;
+        self.lock().timeout_submits = n;
     }
 
     pub fn hide_block(&self, b: Option<u64>) {
-        self.inner.lock().unwrap().hide_block = b;
+        self.lock().hide_block = b;
     }
 
     /// Jumps the head to `block` (a long catch-up).
     pub fn set_head_block(&self, block: u64) {
-        self.inner.lock().unwrap().block = block;
+        self.lock().block = block;
     }
 
     pub fn event_calls(&self) -> Vec<(u64, u64)> {
-        self.inner.lock().unwrap().event_calls.clone()
+        self.lock().event_calls.clone()
     }
 
     pub fn fail_events_at(&self, from: u64) {
-        self.inner.lock().unwrap().fail_events_at = Some(from);
+        self.lock().fail_events_at = Some(from);
     }
 
     pub fn events_delay(&self, d: Duration) {
-        self.inner.lock().unwrap().events_delay = Some(d);
+        self.lock().events_delay = Some(d);
     }
 
     pub fn revert_simulates(&self, name: &str, n: u32) {
-        self.inner.lock().unwrap().revert_simulate = Some((name.into(), n));
+        self.lock().revert_simulate = Some((name.into(), n));
     }
 
     /// Another sequencer's `b` lands in the next submit's block, ahead of
     /// it: ours reverts on-chain, and a lagging endpoint's replay of it
     /// passes, so the node sees `Lost`.
     pub fn race_next_submit(&self, b: davinci_state::PreparedBatch) {
-        self.inner.lock().unwrap().race_submit = Some(b);
+        self.lock().race_submit = Some(b);
     }
 
     pub fn head_block(&self) -> u64 {
-        self.inner.lock().unwrap().block
+        self.lock().block
+    }
+
+    /// The timestamp `block_ref` gives block `n`.
+    pub fn block_time(&self, n: u64) -> u64 {
+        block_time(&mut self.lock(), n)
     }
 
     pub fn set_census_contract(&self, c: [u8; 20]) {
-        self.inner.lock().unwrap().proc.census.contract_address = c;
+        self.lock().proc.census.contract_address = c;
     }
 
     pub fn set_max_voters(&self, n: u64) {
-        self.inner.lock().unwrap().proc.max_voters = n;
+        self.lock().proc.max_voters = n;
     }
 
     /// `setProcessMaxVoters`: the cap moves and its event lands in a new block.
     pub fn change_max_voters(&self, n: u64) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.max_voters = n;
         i.block += 1;
         let block = i.block;
@@ -1107,13 +1219,13 @@ impl FakeChain {
     }
 
     pub fn submit_count(&self) -> u64 {
-        self.inner.lock().unwrap().submits
+        self.lock().submits
     }
 
     /// Registers the bad process, created in the same block as the good one
     /// and routed first (its failure must not shadow the good bootstrap).
     pub fn add_bad_process(&self, kind: BadKind) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.bad = Some(kind);
         let ev = RegistryEvent {
             block: 2,
@@ -1129,7 +1241,7 @@ impl FakeChain {
 
     /// Appends a raw registry event at the current head block.
     pub fn push_event(&self, kind: EventKind) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let block = i.block;
         let log_index = i.events.len() as u64;
         i.events.push(RegistryEvent {
@@ -1144,7 +1256,7 @@ impl FakeChain {
     /// and `ResultsSet` land in the same block/tx, in that order (the
     /// registry emits both from one transaction).
     pub fn set_results_externally(&self, results: Vec<u64>) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let old = i.proc.status;
         i.proc.status = ProcessStatus::Results;
         i.proc.results = results.clone();
@@ -1173,21 +1285,21 @@ impl FakeChain {
     }
 
     pub fn set_replay_all(&self, on: bool) {
-        self.inner.lock().unwrap().replay_all = on;
+        self.lock().replay_all = on;
     }
 
     /// Enforce the census root (register-20 LE bytes) on transitions.
     pub fn set_census_root_check(&self, root: Option<[u8; 32]>) {
-        self.inner.lock().unwrap().census_root_check = root;
+        self.lock().census_root_check = root;
     }
 
     pub fn last_census_root(&self) -> Option<[u8; 32]> {
-        self.inner.lock().unwrap().last_census_root
+        self.lock().last_census_root
     }
 
     /// Turns the process into a DKG-mode one (before the node boots).
     pub fn set_key_mode(&self, m: KeyMode) {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.proc.key_mode = m;
         i.proc.dkg.epoch_id = [0xe1; 12];
         i.proc.dkg.aid = [0xa1; 32];
@@ -1195,28 +1307,28 @@ impl FakeChain {
 
     /// Opens or closes the COUNCIL ceremony's decryption gate.
     pub fn set_council_gate(&self, open: bool) {
-        self.inner.lock().unwrap().council_gate = open;
+        self.lock().council_gate = open;
     }
 
     /// `council_decryption_open` answers `view` whatever the gate (`None`:
     /// the gate).
     pub fn set_council_gate_view(&self, view: Option<bool>) {
-        self.inner.lock().unwrap().council_gate_view = view;
+        self.lock().council_gate_view = view;
     }
 
     /// How many times the gate was read.
     pub fn council_gate_reads(&self) -> u64 {
-        self.inner.lock().unwrap().council_gate_reads
+        self.lock().council_gate_reads
     }
 
     /// The committee combined every submitted ciphertext into `results`.
     pub fn dkg_combine(&self, results: Vec<u64>) {
-        self.inner.lock().unwrap().dkg_plaintexts = Some(results);
+        self.lock().dkg_plaintexts = Some(results);
     }
 
     /// `(landed, called)` for the request and the finalize.
     pub fn dkg_calls(&self) -> ((u64, u64), (u64, u64)) {
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         (
             (i.dkg_requests, i.dkg_request_calls),
             (i.dkg_finalizes, i.dkg_finalize_calls),
@@ -1224,43 +1336,62 @@ impl FakeChain {
     }
 
     pub fn dkg_request(&self) -> Option<DkgRequest> {
-        self.inner.lock().unwrap().dkg_request.clone()
+        self.lock().dkg_request.clone()
     }
 
     pub fn dkg_state(&self) -> DkgState {
-        self.inner.lock().unwrap().proc.dkg
+        self.lock().proc.dkg
+    }
+
+    /// A reorg takes the landed `requestResultsDecryption` (and the
+    /// committee's combines of it): requested no more, the process ENDED.
+    pub fn reorg_dkg_request(&self) {
+        let mut i = self.lock();
+        i.proc.dkg.requested = false;
+        i.proc.dkg.first_index = 0;
+        i.proc.dkg.count = 0;
+        i.dkg_request = None;
+        i.dkg_plaintexts = None;
+        i.history.clear();
+        i.seen.clear();
+        i.hash_gen += 1;
     }
 
     /// Another node's request lands between our read and our send.
     pub fn race_dkg_request(&self) {
-        self.inner.lock().unwrap().dkg_request_race = true;
+        self.lock().dkg_request_race = true;
     }
 
     /// The next finalize loses a race the chain does not show yet.
     pub fn lose_dkg_finalize(&self) {
-        self.inner.lock().unwrap().dkg_finalize_lost = true;
+        self.lock().dkg_finalize_lost = true;
     }
 
     /// Another node's request (every field active) lands just before the
     /// `n`-th `process()` read from now.
     pub fn race_dkg_request_on_read(&self, n: u32) {
-        self.inner.lock().unwrap().dkg_request_on_read = Some(n);
+        self.lock().dkg_request_on_read = Some(n);
     }
 
     /// Another node's finalize lands between our readiness check and the
     /// next `process()` read.
     pub fn race_dkg_finalize_after_ready(&self) {
-        self.inner.lock().unwrap().dkg_finalize_after_ready = true;
+        self.lock().dkg_finalize_after_ready = true;
     }
 
     pub fn status(&self) -> ProcessStatus {
-        self.inner.lock().unwrap().proc.status
+        self.lock().proc.status
+    }
+
+    /// The process as the registry holds it now.
+    pub fn snapshot_process(&self) -> OnchainProcess {
+        self.lock().proc.clone()
     }
 
     /// Another sequencer settles `b` (built on this chain's root); returns
     /// the block its `StateTransitioned` lands in.
     pub fn settle_externally(&self, b: &davinci_state::PreparedBatch) -> u64 {
-        settle_foreign(&mut self.inner.lock().unwrap(), b)
+        settle_foreign(&mut self.lock(), b)
     }
 }
 
@@ -1562,6 +1693,36 @@ pub fn check_transition(i: &Inner, p: &BatchPublics) -> Result<(), RevertReason>
     Ok(())
 }
 
+/// The timestamp of block `n`: the head time while the head is at `n`, the
+/// last one seen there once it moved past (the current time if never seen).
+fn block_time(i: &mut Inner, n: u64) -> u64 {
+    if n >= i.block {
+        let (b, t) = (i.block, i.time);
+        i.block_times.insert(b, t);
+        return t;
+    }
+    i.block_times
+        .range(..=n)
+        .next_back()
+        .map_or(i.time, |(_, t)| *t)
+}
+
+/// The process at `block` below the head: by number, the newest checkpoint
+/// at or below it (a lagging backend); else as it stood when the head left
+/// that block (or the newest block before it, or the first one seen);
+/// `None` (the current state) when nothing was seen.
+fn past_state(i: &Inner, block: u64, by_hash: bool) -> Option<OnchainProcess> {
+    if !by_hash && let Some((_, p)) = i.history.iter().rev().find(|(b, _)| *b <= block) {
+        return Some(p.clone());
+    }
+    // Before the first block seen, as it was then.
+    i.seen
+        .range(..=block)
+        .next_back()
+        .or_else(|| i.seen.iter().next())
+        .map(|(_, p)| p.clone())
+}
+
 #[async_trait]
 impl Chain for FakeChain {
     fn signer(&self) -> Option<Address> {
@@ -1569,7 +1730,7 @@ impl Chain for FakeChain {
     }
 
     async fn process(&self, pid: &[u8; 31]) -> Result<OnchainProcess, Web3Error> {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         if *pid == bad_pid31() {
             return match &i.bad {
                 Some(BadKind::FetchFails) | None => {
@@ -1609,7 +1770,13 @@ impl Chain for FakeChain {
                 dkg_mark_requested(&mut i, other, count);
             }
         }
-        if std::mem::take(&mut i.dkg_finalize_armed) {
+        // Another node's finalize, which the registry takes only once, and
+        // only with every plaintext combined (none by then after a reorg).
+        if std::mem::take(&mut i.dkg_finalize_armed)
+            && i.proc.status != ProcessStatus::Results
+            && i.proc.dkg.requested
+            && (i.proc.dkg.count == 0 || i.dkg_plaintexts.is_some())
+        {
             let mut results = i.dkg_plaintexts.clone().unwrap_or_default();
             results.resize(i.proc.ballot_mode.num_fields as usize, 0);
             dkg_set_results(&mut i, other, results);
@@ -1618,28 +1785,53 @@ impl Chain for FakeChain {
     }
 
     async fn process_at(&self, pid: &[u8; 31], block: u64) -> Result<OnchainProcess, Web3Error> {
-        if *pid == pid31() {
-            let mut i = self.inner.lock().unwrap();
-            i.process_at_calls += 1;
-            if let Some((p, at)) = &i.split {
-                return if block <= *at {
-                    Ok(p.clone())
-                } else {
-                    Err(Web3Error::Rpc(format!("header not found: {block}")))
-                };
-            }
-            if block < i.block
-                && let Some((_, p)) = i.history.iter().rev().find(|(b, _)| *b <= block)
-            {
-                return Ok(p.clone());
-            }
-        }
-        self.process(pid).await
+        self.read_block(pid, block, false).await
     }
 
+    /// At the block the hash names, if canonical (the current reorg
+    /// generation), as it stood (checkpoints are a lagging backend's view by
+    /// number); the scripted read faults apply too, and a frozen view does
+    /// not know the blocks after it.
+    async fn process_at_hash(
+        &self,
+        pid: &[u8; 31],
+        hash: [u8; 32],
+    ) -> Result<OnchainProcess, Web3Error> {
+        let block = u64::from_be_bytes(hash[..8].try_into().unwrap());
+        {
+            let i = self.lock();
+            // A block of an older branch is not canonical; a frozen endpoint
+            // does not have the blocks after its view.
+            let epoch = u32::from_be_bytes(hash[8..12].try_into().unwrap());
+            if epoch != i.hash_gen
+                || hash[31] != 0xFA
+                || block > i.block
+                || i.frozen.as_ref().is_some_and(|(_, at, _)| block > *at)
+            {
+                return Err(Web3Error::Rpc(format!(
+                    "header not found: 0x{}",
+                    hex::encode(hash)
+                )));
+            }
+        }
+        self.read_block(pid, block, true).await
+    }
+
+    /// Block number, then the reorg generation.
+    async fn block_ref(&self, n: u64) -> Result<Option<([u8; 32], u64)>, Web3Error> {
+        let mut i = self.lock();
+        let time = block_time(&mut i, n);
+        Ok((n <= i.block).then(|| {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&n.to_be_bytes());
+            h[8..12].copy_from_slice(&i.hash_gen.to_be_bytes());
+            h[31] = 0xFA;
+            (h, time)
+        }))
+    }
     async fn events(&self, from: u64, to: u64) -> Result<Vec<RegistryEvent>, Web3Error> {
         let delay = {
-            let mut i = self.inner.lock().unwrap();
+            let mut i = self.lock();
             i.event_calls.push((from, to));
             if i.fail_events_at == Some(from) {
                 i.fail_events_at = None;
@@ -1650,7 +1842,7 @@ impl Chain for FakeChain {
         if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         let lo = if i.replay_all { 0 } else { from };
         Ok(i.events
             .iter()
@@ -1660,15 +1852,17 @@ impl Chain for FakeChain {
     }
 
     async fn head(&self) -> Result<(u64, u64), Web3Error> {
-        let i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         if let Some((_, block, time)) = i.frozen {
             return Ok((block, time));
         }
+        let b = i.block;
+        block_time(&mut i, b);
         Ok((i.block, i.time))
     }
 
     async fn confirmed_head(&self, confirmations: u64) -> Result<u64, Web3Error> {
-        let i = self.inner.lock().unwrap();
+        let i = self.lock();
         Ok(i.block.saturating_sub(confirmations))
     }
 
@@ -1680,7 +1874,7 @@ impl Chain for FakeChain {
     ) -> Result<(), RevertReason> {
         let p = BatchPublics::from_public_values(&snark.public_values)
             .map_err(|e| RevertReason::Rpc(e.to_string()))?;
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         if let Some((name, n)) = &mut i.revert_simulate
             && *n > 0
         {
@@ -1701,7 +1895,7 @@ impl Chain for FakeChain {
         };
         let p = BatchPublics::from_public_values(&snark.public_values)
             .map_err(|e| Web3Error::Data(e.to_string()))?;
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         if i.fail_submits > 0 {
             i.fail_submits -= 1;
             return Err(Web3Error::Rpc("scripted submit failure".into()));
@@ -1750,7 +1944,7 @@ impl Chain for FakeChain {
         };
         let p = ResultsPublics::from_public_values(&snark.public_values)
             .map_err(|e| Web3Error::Data(e.to_string()))?;
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.results_submits += 1;
         if let Some(name) = i.revert_results.take() {
             return Err(Web3Error::Revert(revert(&name)));
@@ -1814,7 +2008,7 @@ impl Chain for FakeChain {
         let Some(sender) = self.signer else {
             return Err(Web3Error::NoSigner);
         };
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.dkg_request_calls += 1;
         let r = |n: &str| Err(Web3Error::Revert(revert(n)));
         let identity =
@@ -1824,7 +2018,25 @@ impl Chain for FakeChain {
             .take(i.proc.ballot_mode.num_fields as usize)
             .filter(|c| !identity(&c[0], &c[1]))
             .count() as u8;
-        if std::mem::take(&mut i.dkg_request_race) {
+        let mut h = Sha256::new();
+        for c in accumulator {
+            h.update(c);
+        }
+        let value: [u8; 32] = h.finalize().into();
+        let included = registry_verify(&i.proc.state_root, 4, &value, siblings);
+        // The other node's request, which the registry takes only while
+        // nothing was requested and no results are set, and only for the
+        // accumulator under the current root.
+        if std::mem::take(&mut i.dkg_request_race)
+            && included
+            && !i.proc.dkg.requested
+            && !matches!(
+                i.proc.status,
+                ProcessStatus::Canceled | ProcessStatus::Results
+            )
+        {
+            // The other node requested the same committed accumulator.
+            i.dkg_request = Some((*accumulator, siblings.to_vec()));
             dkg_mark_requested(&mut i, Address::repeat_byte(0xEE), active);
         }
         if i.proc.key_mode == KeyMode::Sequencer {
@@ -1845,12 +2057,7 @@ impl Chain for FakeChain {
         if i.time < grace_end(&i) {
             return r("GraceOpen");
         }
-        let mut h = Sha256::new();
-        for c in accumulator {
-            h.update(c);
-        }
-        let value: [u8; 32] = h.finalize().into();
-        if !registry_verify(&i.proc.state_root, 4, &value, siblings) {
+        if !included {
             return r("InvalidInclusionProof");
         }
         i.dkg_requests += 1;
@@ -1865,7 +2072,7 @@ impl Chain for FakeChain {
     }
 
     async fn dkg_results_ready(&self, _pid: &[u8; 31]) -> Result<bool, Web3Error> {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         // Through the adapter's gate view, as `Contracts` reads it.
         let gate =
             i.proc.key_mode != KeyMode::Council || i.council_gate_view.unwrap_or(i.council_gate);
@@ -1881,7 +2088,7 @@ impl Chain for FakeChain {
         let Some(sender) = self.signer else {
             return Err(Web3Error::NoSigner);
         };
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.dkg_finalize_calls += 1;
         let r = |n: &str| Err(Web3Error::Revert(revert(n)));
         if i.proc.key_mode == KeyMode::Sequencer {
@@ -1924,20 +2131,20 @@ impl Chain for FakeChain {
     }
 
     async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error> {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         assert_eq!(*cid, i.proc.dkg.epoch_id, "the process's ceremony");
         i.council_gate_reads += 1;
         Ok(i.council_gate_view.unwrap_or(i.council_gate))
     }
 
     async fn l1_origin(&self) -> Result<L1Origin, Web3Error> {
-        let l1 = self.inner.lock().unwrap().l1.clone();
+        let l1 = self.lock().l1.clone();
         l1.map(|l| l.origin())
             .ok_or_else(|| Web3Error::Config("not an L1-blob registry".into()))
     }
 
     async fn record_l1_origin(&self) -> Result<L1Origin, Web3Error> {
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         let o =
             i.l1.as_ref()
                 .map(|l| l.origin())
@@ -1957,7 +2164,7 @@ impl Chain for FakeChain {
     ) -> Result<(), RevertReason> {
         let p = BatchPublics::from_public_values(&snark.public_values)
             .map_err(|e| RevertReason::Rpc(e.to_string()))?;
-        let mut i = self.inner.lock().unwrap();
+        let mut i = self.lock();
         i.l1_simulates += 1;
         if let Some((name, n)) = &mut i.revert_simulate
             && *n > 0
@@ -1982,7 +2189,7 @@ impl Chain for FakeChain {
         let p = BatchPublics::from_public_values(&snark.public_values)
             .map_err(|e| Web3Error::Data(e.to_string()))?;
         let (rc, gate) = {
-            let mut i = self.inner.lock().unwrap();
+            let mut i = self.lock();
             let rc = land_l1(&mut i, pid, sender, &p, blobs, proof)?;
             (rc, i.l1_submit_gate.clone())
         };
@@ -2141,6 +2348,7 @@ pub fn encode_batch(p: &BatchPublics) -> Vec<u8> {
     r[43] = p.nproofs;
     r[44] = p.n_public;
     r[45] = p.log_n;
+    put_reg32(&mut r, 46, &p.cells_digest);
     regs_to_pv(&r)
 }
 
@@ -2284,8 +2492,10 @@ impl Prover for FakeProver {
                 return Err(ProverError::permanent("prover returned 400: bad input"));
             }
         }
+        // The request carries no public inputs: the vote ids ride with the
+        // signatures.
         if let Some(x) = *self.fail_vid.lock().unwrap()
-            && request.public_inputs.iter().any(|p| p[1] == x.to_string())
+            && request.sigs.iter().any(|s| s.vote_id == x)
         {
             return Err(ProverError::permanent("job failed: guest panicked"));
         }
@@ -2538,7 +2748,7 @@ pub async fn start_node(
 pub async fn start_node_cfg(
     db: Db,
     chain: FakeChain,
-    prover: Arc<FakeProver>,
+    prover: Arc<dyn Prover>,
     cfg: Config,
     shutdown: CancellationToken,
 ) -> Node {
@@ -2549,10 +2759,22 @@ pub async fn start_node_cfg(
 pub async fn start_node_tracked(
     db: Db,
     chain: FakeChain,
-    prover: Arc<FakeProver>,
+    prover: Arc<dyn Prover>,
     cfg: Config,
     shutdown: CancellationToken,
 ) -> (Node, tokio_util::task::TaskTracker) {
+    let (node, tasks) = try_start_node(db, chain, prover, cfg, shutdown).await;
+    (node.unwrap(), tasks)
+}
+
+/// [`start_node_tracked`], returning the boot error instead of panicking.
+pub async fn try_start_node(
+    db: Db,
+    chain: FakeChain,
+    prover: Arc<dyn Prover>,
+    cfg: Config,
+    shutdown: CancellationToken,
+) -> (Result<Node, NodeError>, tokio_util::task::TaskTracker) {
     let tasks = tokio_util::task::TaskTracker::new();
     let deps = Deps {
         db,
@@ -2564,7 +2786,7 @@ pub async fn start_node_tracked(
         tasks: tasks.clone(),
         l1: None,
     };
-    (spawn_node(cfg, deps, shutdown).await.unwrap(), tasks)
+    (spawn_node(cfg, deps, shutdown).await, tasks)
 }
 
 /// [`start_node`] in L1-blob mode: `chain` reads OP's origin from `l1`, which

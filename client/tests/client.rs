@@ -92,7 +92,6 @@ fn vote(weight: u128) -> VoteRequest {
             protocol: "groth16".into(),
             curve: "bn128".into(),
         },
-        ballot_inputs_hash: Fr::from(1u64),
         signature: [0; 65],
         weight,
         census_proof: Some(CensusProofWire::Merkle(MerkleProof::from(

@@ -82,8 +82,9 @@ error: the circuit commits `ok = 0` or the contract reverts. Read the wire forma
 - Hashed leaf values are `int_be(sha256(..))` sent little-endian, so the wire bytes are the
   reversed digest.
 - Ballot coordinates, census values and the KZG block's process id and root are big-endian hex.
-- The contract `censusRoot` is the census root's little-endian bytes; the contract `processId` is
-  big-endian (the client's `ProcessId` is the 31-byte big-endian form).
+- The contract `censusRoot` is the census root as a big-endian integer (register 20 carries its
+  little-endian bytes, which the registry reverses); the contract `processId` is big-endian (the
+  client's `ProcessId` is the 31-byte big-endian form).
 
 The SDK wraps these in named newtypes. The emulator dry runs (`ZISKEMU=1`) are the byte-exactness
 oracle: run them after changing any wire struct.

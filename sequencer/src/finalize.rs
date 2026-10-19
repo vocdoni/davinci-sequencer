@@ -17,7 +17,41 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::actor::{Chain, FinalizeFail, Msg, Prover};
-use crate::web3::{KeyMode, ProcessStatus, Web3Error};
+use crate::web3::{KeyMode, OnchainProcess, ProcessStatus, Web3Error};
+
+/// Where a finalize task reads the process: the actor's anchor, by its hash
+/// (by its number in degraded mode, an endpoint without EIP-1898 calls).
+/// The task's checks only delay or skip a send; the registry guards the
+/// rest.
+#[derive(Clone, Copy)]
+pub(crate) enum At {
+    Hash([u8; 32]),
+    Number(u64),
+}
+
+async fn read(chain: &dyn Chain, pid31: &[u8; 31], at: At) -> Result<OnchainProcess, Web3Error> {
+    match at {
+        At::Hash(h) => chain.process_at_hash(pid31, h).await,
+        At::Number(n) => chain.process_at(pid31, n).await,
+    }
+}
+
+/// The process at the head, by the head block's hash (by number in
+/// degraded mode): only to skip a send another node's call made moot.
+async fn read_head(
+    chain: &dyn Chain,
+    pid31: &[u8; 31],
+    at: At,
+) -> Result<OnchainProcess, Web3Error> {
+    let (b, _) = chain.head().await?;
+    match at {
+        At::Hash(_) => match chain.block_ref(b).await? {
+            Some((h, _)) => chain.process_at_hash(pid31, h).await,
+            None => Err(Web3Error::Rpc(format!("block {b} unknown to the endpoint"))),
+        },
+        At::Number(_) => chain.process_at(pid31, b).await,
+    }
+}
 
 /// One finalize attempt: prove the results circuit, check the proof, submit.
 /// With `hold` (eager results, window still open) the checked snark goes back
@@ -34,18 +68,19 @@ pub(crate) async fn run_finalize(
     tally: [u64; NUM_FIELDS],
     max_total: u64,
     hold: bool,
+    at: At,
     generation: u64,
     tx: mpsc::Sender<Msg>,
 ) {
     let attempt = async {
         if !hold {
-            window_still_closed(&*chain, &pid31, max_total).await?;
+            window_still_closed(&*chain, &pid31, max_total, at).await?;
         }
         let snark = prove_checked(&*prover, &request, &expected_root, &tally).await?;
         if hold {
             return Ok(Some(snark));
         }
-        submit(&*chain, &pid31, &snark, max_total)
+        submit(&*chain, &pid31, &snark, max_total, at)
             .await
             .map(|()| None)
     };
@@ -79,10 +114,11 @@ pub(crate) async fn run_submit_held(
     pid31: [u8; 31],
     snark: PlonkSnark,
     max_total: u64,
+    at: At,
     generation: u64,
     tx: mpsc::Sender<Msg>,
 ) {
-    let result = match submit(&*chain, &pid31, &snark, max_total).await {
+    let result = match submit(&*chain, &pid31, &snark, max_total, at).await {
         Ok(()) => {
             info!(pid = %hex::encode(pid31), "held results settled on-chain");
             Ok(())
@@ -142,12 +178,14 @@ async fn jitter() {
 /// requested while its ceremony's decryption gate is closed (that ends it),
 /// but published only once the gate opens, all-zero results included.
 /// Reports through the mailbox.
+#[allow(clippy::too_many_arguments)] // a one-shot task, not an API
 pub(crate) async fn run_finalize_dkg(
     chain: Arc<dyn Chain>,
     pid31: [u8; 31],
     inputs: Option<DkgInputs>,
     expected_root: [u8; 32],
     max_total: u64,
+    at: At,
     generation: u64,
     tx: mpsc::Sender<Msg>,
 ) {
@@ -158,6 +196,7 @@ pub(crate) async fn run_finalize_dkg(
         inputs.as_ref(),
         &expected_root,
         max_total,
+        at,
         &mut seen,
     );
     let result = match attempt.await {
@@ -181,11 +220,12 @@ async fn dkg_attempt(
     inputs: Option<&DkgInputs>,
     expected_root: &[u8; 32],
     max_total: u64,
+    at: At,
     seen: &mut Option<bool>,
 ) -> Result<(), Fail> {
     let transient = |e: Web3Error| Fail::Transient(e.to_string());
     let (_, now) = chain.head().await.map_err(transient)?;
-    let p = chain.process(pid31).await.map_err(transient)?;
+    let p = read(chain, pid31, at).await.map_err(transient)?;
     match p.status {
         ProcessStatus::Results => return Ok(()),
         ProcessStatus::Canceled => {
@@ -211,28 +251,30 @@ async fn dkg_attempt(
                 "on-chain root is not the local committed root".into(),
             ));
         }
-        // Send only if another node's request has not landed meanwhile.
+        // Send only if another node's request has not landed meanwhile; one
+        // that did is recorded from the next anchored read, not this one.
         jitter().await;
-        let p = chain.process(pid31).await.map_err(transient)?;
+        let p = read_head(chain, pid31, at).await.map_err(transient)?;
         if p.status == ProcessStatus::Results {
             return Ok(());
         }
-        if !p.dkg.requested {
-            match chain
-                .request_results_decryption(pid31, accumulator, siblings)
-                .await
-            {
-                Ok(r) => {
-                    info!(pid = %hex::encode(pid31), tx = %r.tx_hash, "DKG decryption requested")
-                }
-                Err(Web3Error::Revert(r)) if r.name() == Some("ResultsAlreadyRequested") => {}
-                Err(e) => return dkg_fail(chain, pid31, e, "request").await,
+        if p.dkg.requested {
+            return Err(Fail::Wait("another node's request landed".into()));
+        }
+        match chain
+            .request_results_decryption(pid31, accumulator, siblings)
+            .await
+        {
+            Ok(r) => {
+                info!(pid = %hex::encode(pid31), tx = %r.tx_hash, "DKG decryption requested")
             }
+            Err(Web3Error::Revert(r)) if r.name() == Some("ResultsAlreadyRequested") => {}
+            Err(e) => return dkg_fail(chain, pid31, e, "request", at).await,
         }
         *seen = Some(true);
         // No active field: the request itself finalized (for COUNCIL only
         // with the gate already open).
-        if chain.process(pid31).await.map_err(transient)?.status == ProcessStatus::Results {
+        if read_head(chain, pid31, at).await.map_err(transient)?.status == ProcessStatus::Results {
             return Ok(());
         }
     }
@@ -255,7 +297,7 @@ async fn dkg_attempt(
     // The same for the finalize: pause, then send unless another node's
     // has landed.
     jitter().await;
-    if chain.process(pid31).await.map_err(transient)?.status == ProcessStatus::Results {
+    if read_head(chain, pid31, at).await.map_err(transient)?.status == ProcessStatus::Results {
         return Ok(());
     }
     match chain.finalize_results_from_dkg(pid31).await {
@@ -268,7 +310,7 @@ async fn dkg_attempt(
         Err(Web3Error::Revert(r)) if r.name() == Some("DecryptionNotOpen") => {
             Err(Fail::Gate(format!("finalize: {r}")))
         }
-        Err(e) => dkg_fail(chain, pid31, e, "finalize").await,
+        Err(e) => dkg_fail(chain, pid31, e, "finalize", at).await,
     }
 }
 
@@ -282,6 +324,7 @@ async fn dkg_fail(
     pid31: &[u8; 31],
     e: Web3Error,
     what: &str,
+    at: At,
 ) -> Result<(), Fail> {
     let (race, window) = match &e {
         Web3Error::Revert(r) => (
@@ -292,8 +335,7 @@ async fn dkg_fail(
         _ => (false, false),
     };
     if (race || window)
-        && chain
-            .process(pid31)
+        && read_head(chain, pid31, at)
             .await
             .is_ok_and(|p| p.status == ProcessStatus::Results)
     {
@@ -317,15 +359,21 @@ async fn window_still_closed(
     chain: &dyn Chain,
     pid31: &[u8; 31],
     max_total: u64,
+    at: At,
 ) -> Result<(), Fail> {
     let (_, now) = chain
         .head()
         .await
         .map_err(|e| Fail::Transient(e.to_string()))?;
-    let p = chain
-        .process(pid31)
+    let mut p = read(chain, pid31, at)
         .await
         .map_err(|e| Fail::Transient(e.to_string()))?;
+    // Results or a cancel at the head, not anchored yet: only waits.
+    if let Ok(h) = read_head(chain, pid31, at).await
+        && matches!(h.status, ProcessStatus::Results | ProcessStatus::Canceled)
+    {
+        p.status = h.status;
+    }
     match p.status {
         // Results landed (ours or another's) or the process died: nothing
         // to broadcast. Transient, the actor's own gates stop the retries.
@@ -393,9 +441,10 @@ async fn submit(
     pid31: &[u8; 31],
     snark: &PlonkSnark,
     max_total: u64,
+    at: At,
 ) -> Result<(), Fail> {
     // An extension or a late landing may have moved the window meanwhile.
-    window_still_closed(chain, pid31, max_total).await?;
+    window_still_closed(chain, pid31, max_total, at).await?;
     match chain.submit_results(pid31, snark).await {
         Ok(_) => Ok(()),
         // Window reverts mean an extension or a late landing raced the
