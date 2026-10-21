@@ -63,7 +63,7 @@ use davinci_e2e::demo::{
 use davinci_e2e::fixture as fx;
 use davinci_e2e::{chain, dkg, net, wait};
 use davinci_zkvm_sdk::ballot::{address_to_fr, vote_id};
-use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, csp_sign, eth_address, vote_id_sign};
+use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, csp_sign, eth_address, vote_sign};
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::keygen;
 use davinci_zkvm_sdk::release;
@@ -1835,13 +1835,26 @@ impl Run {
             }
             let batches = self.transitions(&pid).await.map_or(0, |t| t.len());
             let line = match step {
+                // The metadata is frozen from the start: the registry
+                // refuses the update.
                 "metadata" => {
                     let (path, hash) = demo::metadata_update(spec)?.context("no update")?;
-                    self.org
+                    match self
+                        .org
                         .set_process_metadata(&pid, &self.url(&path), hash)
                         .await
-                        .with_context(|| format!("election {n}: setProcessMetadata"))?;
-                    format!("metadata updated while open, after {batches} batches, to {path}")
+                    {
+                        Err(ClientError::Reverted(r)) if r == "InvalidTimeBounds" => {
+                            format!("metadata update refused while open, after {batches} batches")
+                        }
+                        Ok(_) => {
+                            bail!("election {n}: the registry took a metadata update while open")
+                        }
+                        Err(e) => {
+                            return Err(e)
+                                .with_context(|| format!("election {n}: setProcessMetadata"));
+                        }
+                    }
                 }
                 "reveal" => {
                     self.reveal_key(n).await?;
@@ -2005,7 +2018,7 @@ impl Run {
         .pop()
         .context("no proof")?;
         if let Some(key) = &rb.resign {
-            let sig = vote_id_sign(key, req.vote_id);
+            let sig = vote_sign(key, &req.process_id.to_fr(), req.vote_id, &req.ballot);
             req.signature[..32].copy_from_slice(&sig.r);
             req.signature[32..64].copy_from_slice(&sig.s);
             req.signature[64] = sig.v;

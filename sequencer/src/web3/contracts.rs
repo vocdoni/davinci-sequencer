@@ -903,6 +903,29 @@ impl Contracts {
         Ok((b.header.number, b.header.timestamp))
     }
 
+    /// Number of the `finalized` block. `None` when the endpoint answers the
+    /// tag with a JSON-RPC error (it has no finality to offer); a transport
+    /// error (a 429 included), a node-side or rate-limit error or a null block is an `Err`, retried later.
+    pub async fn finalized_block(&self) -> Result<Option<u64>> {
+        match self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Finalized)
+            .await
+        {
+            Ok(Some(b)) => Ok(Some(b.header.number)),
+            Ok(None) => Err(Web3Error::Data("no finalized block".into())),
+            Err(e) => match e.as_error_resp() {
+                Some(p)
+                    if !super::failover::is_node_side(p.code, &p.message)
+                        && !super::failover::is_rate_limit(p.code, &p.message) =>
+                {
+                    Ok(None)
+                }
+                _ => Err(rpc_err(e)),
+            },
+        }
+    }
+
     /// Hash of block `n`; `None` past the endpoint's head.
     /// Hash and timestamp of block `n`.
     pub async fn block_ref(&self, n: u64) -> Result<Option<([u8; 32], u64)>> {
@@ -1025,6 +1048,31 @@ impl Contracts {
                 Ok(self.view(self.council_adapter().await?, call).await?.ready)
             }
         }
+    }
+
+    /// How many of the requested ciphertexts the committee has combined:
+    /// `(combined, count)`, one adapter read per ciphertext. `None` for a
+    /// COUNCIL process (its adapter reads whole requests only) or before
+    /// the request.
+    pub async fn dkg_combined(&self, pid: &[u8; 31]) -> Result<Option<(u16, u16)>> {
+        let p = self.process(pid).await?;
+        if !p.dkg.requested || !matches!(p.key_mode, KeyMode::DkgAutomatic | KeyMode::DkgLocked) {
+            return Ok(None);
+        }
+        let (eid, aid) = (FixedBytes(p.dkg.epoch_id), FixedBytes(p.dkg.aid));
+        let count = u16::from(p.dkg.count);
+        let adapter = self.dkg_adapter().await?;
+        let mut combined = 0;
+        for i in 0..count {
+            let call = AD::plaintextsCall {
+                eid,
+                aid,
+                first: p.dkg.first_index.saturating_add(i),
+                count: 1,
+            };
+            combined += u16::from(self.view(adapter, call).await?.ready);
+        }
+        Ok(Some((combined, count)))
     }
 
     /// The decryption gate of Council ceremony `cid` (`isDecryptionOpen` on

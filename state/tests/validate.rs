@@ -5,15 +5,18 @@ mod common;
 
 use common::*;
 use davinci_state::{
-    CensusOrigin, ProcessConfig, VoteError, ballot_from_be_coords, validate_vote, vote_still_valid,
+    CensusOrigin, ProcessConfig, VoteError, ballot_from_be_coords, validate_vote, vote_signer,
+    vote_still_valid,
 };
+use davinci_zkvm_sdk::ballot::{Ballot, BallotMode};
 use davinci_zkvm_sdk::census::{
-    CensusProof, CensusWitness, LeanImt, census_leaf, csp_sign, hash2, slot_key_address,
+    CensusProof, CensusWitness, EcdsaSignature, LeanImt, census_leaf, csp_sign, eth_address, hash2,
+    slot_key_address, vote_sign,
 };
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::encrypt;
 use davinci_zkvm_sdk::crypto::elgamal::keygen;
-use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_to_be, u256_from_be};
+use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be, fr_from_dec, fr_to_be, u256_from_be};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::limits::{BALLOT_COORDS, BALLOT_MIN};
 use davinci_zkvm_sdk::release;
@@ -83,7 +86,7 @@ fn the_proof_binds_every_public_input() {
     // 1 vote id, signed again by the voter.
     let mut p = v.pkg.clone();
     p.vote_id += 1;
-    p.signature = davinci_zkvm_sdk::census::vote_id_sign(&voter_key(0), p.vote_id);
+    p.signature = vote_sign(&voter_key(0), &p.process_id, p.vote_id, &p.ballot);
     bad(&env.cfg, p);
     // 3 packed ballot mode and 4, 5 the encryption key: the process's.
     let mut c = env.cfg.clone();
@@ -99,9 +102,11 @@ fn the_proof_binds_every_public_input() {
     p.weight = 2;
     p.census = CensusWitness::Csp(csp_sign(&csp, &cfg.process_id, &p.address, 2, 3));
     bad(&cfg, p);
-    // 7.. ciphertexts: two live fields swapped, and one field encrypted again.
+    // 7.. ciphertexts: two live fields swapped, and one field encrypted
+    // again, each signed again by the voter.
     let mut p = v.pkg.clone();
     p.ballot.0.swap(0, 1);
+    p.signature = vote_sign(&voter_key(0), &p.process_id, p.vote_id, &p.ballot);
     bad(&env.cfg, p);
     let mut p = v.pkg.clone();
     p.ballot.0[1] = encrypt(
@@ -109,7 +114,120 @@ fn the_proof_binds_every_public_input() {
         2,
         &u256_from_be(&fr_to_be(&Fr::from(7u64))),
     );
+    p.signature = vote_sign(&voter_key(0), &p.process_id, p.vote_id, &p.ballot);
     bad(&env.cfg, p);
+}
+
+// The voter signs the vote envelope: a valid vote moved to another process,
+// another vote id or other ciphertexts no longer recovers its address, and
+// is refused before its proof is checked.
+#[test]
+fn the_signature_binds_process_vote_id_and_ballot() {
+    let env = env(2, 4);
+    let vf = verifier();
+    let v = real_vote(&env, 0, &[1, 2], 5);
+    validate_vote(&env.cfg, &vf, v.pkg.clone()).unwrap();
+    let mismatch = |cfg: &ProcessConfig, p| {
+        assert_eq!(
+            validate_vote(cfg, &vf, p).unwrap_err(),
+            VoteError::SignatureMismatch
+        );
+    };
+    // Sent to another process with the same census: the API takes the
+    // process from the body, so only the envelope tells them apart.
+    let mut other = env.cfg.clone();
+    other.process_id = env.cfg.process_id + Fr::from(1u64);
+    let mut p = v.pkg.clone();
+    p.process_id = other.process_id;
+    mismatch(&other, p);
+    // Another vote id.
+    let mut p = v.pkg.clone();
+    p.vote_id += 1;
+    mismatch(&env.cfg, p);
+    // Two live fields swapped.
+    let mut p = v.pkg.clone();
+    p.ballot.0.swap(0, 1);
+    mismatch(&env.cfg, p);
+}
+
+fn hex0x(v: &serde_json::Value) -> Vec<u8> {
+    hex::decode(v.as_str().unwrap().strip_prefix("0x").expect("0x prefix")).unwrap()
+}
+
+/// The shared vector (davinci-zkvm `rust-sdk/testdata/hashes.json`,
+/// `vote_envelope`, written by go-sdk `cmd/sdk-vectors`): the node recovers
+/// each signer as the guest does, with v as 0/1 or 27/28 and either S.
+#[test]
+fn vote_envelope_vectors_recover_their_signer() {
+    let p = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../davinci-zkvm/rust-sdk/testdata/hashes.json"
+    );
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+    let cases = v["vote_envelope"].as_array().unwrap();
+    assert_eq!(cases.len(), 5);
+    for (i, c) in cases.iter().enumerate() {
+        let pid = fr_from_be(&hex0x(&c["pid"]).try_into().unwrap()).unwrap();
+        let vid = u64::from_be_bytes(hex0x(&c["vote_id"]).try_into().unwrap());
+        let coords: Vec<Fr> = c["ballot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| fr_from_dec(x.as_str().unwrap()).unwrap())
+            .collect();
+        let ballot = Ballot::from_coords(&coords.try_into().unwrap()).unwrap();
+        let wire = hex0x(&c["signature"]);
+        let sig = EcdsaSignature {
+            r: wire[..32].try_into().unwrap(),
+            s: wire[32..64].try_into().unwrap(),
+            v: wire[64],
+        };
+        let addr: [u8; 20] = hex0x(&c["address"]).try_into().unwrap();
+        let key = k256::ecdsa::SigningKey::from_slice(&hex0x(&c["signer_key"])).unwrap();
+        assert_eq!(eth_address(key.verifying_key()), addr, "vector {i}");
+        // The client signs the same bytes (RFC 6979).
+        assert_eq!(vote_sign(&key, &pid, vid, &ballot), sig, "vector {i}");
+
+        assert_eq!(
+            vote_signer(&pid, vid, &ballot, &sig),
+            Ok(addr),
+            "vector {i}"
+        );
+        let v27 = EcdsaSignature {
+            v: sig.v + 27,
+            ..sig
+        };
+        assert_eq!(
+            vote_signer(&pid, vid, &ballot, &v27),
+            Ok(addr),
+            "vector {i}"
+        );
+        // The high-S twin, recid flipped: the same signature to the guest.
+        let s = Scalar::from_repr(sig.s.into()).unwrap();
+        let twin = EcdsaSignature {
+            s: (-s).to_bytes().into(),
+            v: sig.v ^ 1,
+            ..sig
+        };
+        assert_eq!(
+            vote_signer(&pid, vid, &ballot, &twin),
+            Ok(addr),
+            "vector {i}"
+        );
+
+        let mut swapped = ballot;
+        swapped.0.swap(0, 1);
+        for (what, got) in [
+            (
+                "pid",
+                vote_signer(&(pid + Fr::from(1u64)), vid, &ballot, &sig),
+            ),
+            ("vote id", vote_signer(&pid, vid ^ 1, &ballot, &sig)),
+            ("ballot", vote_signer(&pid, vid, &swapped, &sig)),
+        ] {
+            assert_ne!(got, Ok(addr), "vector {i}: another {what}");
+        }
+    }
 }
 
 #[test]
@@ -256,7 +374,7 @@ fn rejects_everything_the_guest_rejects() {
 
     // Signature by another key.
     let mut p = ok.pkg.clone();
-    p.signature = davinci_zkvm_sdk::census::vote_id_sign(&voter_key(1), p.vote_id);
+    p.signature = vote_sign(&voter_key(1), &p.process_id, p.vote_id, &p.ballot);
     check(p, VoteError::SignatureMismatch);
 
     // s negated alone: another key's signature.
@@ -448,4 +566,33 @@ fn census_change_keeps_only_unchanged_leaves() {
     // A CSP census has no leaves to change.
     let cfg = csp_cfg(&env.cfg, &voter_address(99));
     assert!(vote_still_valid(&cfg, &v.pkg, None));
+}
+
+/// The registry's ballot-mode cost rule (davinci-contracts
+/// `GenesisLib.ballotCostFits`), which the node checks before it serves a
+/// process: `costExponent >= 1` and `numFields * maxValue^costExponent`
+/// below 2^63, so the circuit's field cost is the integer cost.
+#[test]
+fn mode_rule_matches_the_registry() {
+    let mode = |num_fields: u8, max_value: u64, cost_exponent: u8| BallotMode {
+        num_fields,
+        group_size: 1,
+        cost_exponent,
+        max_value,
+        ..ballot_mode(2)
+    };
+    for (name, m, ok) in [
+        ("16 * (2^48-1)^1", mode(16, (1 << 48) - 1, 1), true),
+        ("16 * (2^15)^4 = 2^64", mode(16, 1 << 15, 4), false),
+        ("1 * (2^63-1)^1 = 2^63-1", mode(1, (1 << 63) - 1, 1), true),
+        ("1 * 2^63", mode(1, 1 << 63, 1), false),
+        ("2 * (2^31)^2 = 2^63", mode(2, 1 << 31, 2), false),
+        ("2 * (2^31-1)^2 < 2^63", mode(2, (1 << 31) - 1, 2), true),
+        ("16 * 5^255 overflows", mode(16, 5, 255), false),
+        ("16 * 1^255", mode(16, 1, 255), true),
+        ("costExponent 0", mode(16, 1, 0), false),
+        ("the test mode", ballot_mode(16), true),
+    ] {
+        assert_eq!(m.validate().is_ok(), ok, "{name}");
+    }
 }

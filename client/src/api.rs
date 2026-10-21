@@ -3,7 +3,9 @@
 //! vote ids are `0x` + 16 hex (the BE8 integer), census values (roots,
 //! leaves, siblings) are `0x` + exactly 64 hex, points are TE `{x, y}`.
 //! Decoding only accepts canonical values: field elements below p, points on
-//! the curve, exact byte lengths.
+//! the curve, exact byte lengths, `0x` (lowercase x) on every byte string.
+//! Census documents ([`CensusFile`]) are the exception: their member keys
+//! may come without `0x`, as the node's census loader reads them.
 
 use std::fmt;
 use std::str::FromStr;
@@ -64,8 +66,8 @@ pub fn vote_id_hex(v: u64) -> String {
     format!("0x{v:016x}")
 }
 
-/// Inverse of [`vote_id_hex`]; `0x` is optional, the 16 digits are not, and
-/// the value must be a vote id (`>= 2^63`).
+/// Inverse of [`vote_id_hex`]: `0x` and exactly 16 digits, and the value
+/// must be a vote id (`>= 2^63`).
 pub fn parse_vote_id(s: &str) -> Result<u64, Error> {
     let v = parse_hex::<8>(s)
         .map(u64::from_be_bytes)
@@ -81,9 +83,10 @@ fn to_hex(b: &[u8]) -> String {
 }
 
 fn parse_hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
-    let h = s.strip_prefix("0x").unwrap_or(s);
+    let want = || format!("want {N} bytes of hex");
+    let h = s.strip_prefix("0x").ok_or_else(want)?;
     let mut out = [0u8; N];
-    hex::decode_to_slice(h, &mut out).map_err(|_| format!("want {N} bytes of hex"))?;
+    hex::decode_to_slice(h, &mut out).map_err(|_| want())?;
     Ok(out)
 }
 
@@ -245,10 +248,29 @@ pub mod enc {
             Vec::<String>::deserialize(d)?
                 .iter()
                 .map(|s| {
-                    ::hex::decode(s.strip_prefix("0x").unwrap_or(s))
-                        .map_err(|_| D::Error::custom("bad hex"))
+                    let h = s
+                        .strip_prefix("0x")
+                        .ok_or_else(|| D::Error::custom("bad hex"))?;
+                    ::hex::decode(h).map_err(|_| D::Error::custom("bad hex"))
                 })
                 .collect()
+        }
+    }
+
+    /// A census document's member key: 20 bytes of hex, written with `0x`
+    /// and read with or without it, like the node's census loader (the
+    /// documents come from other producers).
+    pub mod census_key {
+        use super::*;
+        pub fn serialize<S: Serializer>(x: &[u8; 20], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&to_hex(x))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 20], D::Error> {
+            let s = String::deserialize(d)?;
+            let mut out = [0u8; 20];
+            ::hex::decode_to_slice(s.strip_prefix("0x").unwrap_or(&s), &mut out)
+                .map_err(|_| D::Error::custom("want 20 bytes of hex"))?;
+            Ok(out)
         }
     }
 
@@ -494,7 +516,9 @@ pub struct VoteRequest {
     /// process, never sent.
     #[serde(with = "enc::snark_proof")]
     pub ballot_proof: SnarkJsProof,
-    /// `r || s || v` over the vote id (personal-sign of `PadToSign(BE8(vid))`).
+    /// `r || s || v`: personal-sign of the vote envelope digest,
+    /// `keccak256("davinci-vote-v1" || pid BE32 || vote id BE8 ||
+    /// ballot_leaf_hash(ballot))` (`davinci_zkvm_sdk::census::vote_sign`).
     #[serde(with = "enc::hex")]
     pub signature: [u8; 65],
     #[serde(with = "enc::u128_dec")]
@@ -915,7 +939,7 @@ pub struct CensusFile {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct CensusParticipant {
     /// Voter address.
-    #[serde(with = "enc::hex")]
+    #[serde(with = "enc::census_key")]
     pub key: [u8; 20],
     #[serde(with = "enc::u128_dec")]
     pub weight: u128,

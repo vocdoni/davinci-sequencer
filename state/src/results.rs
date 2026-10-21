@@ -4,7 +4,7 @@
 use arbo::Storage;
 use davinci_zkvm_sdk::ballot::{ballot_leaf_hash, leaf_value_bytes};
 use davinci_zkvm_sdk::crypto::field::{U256, fr_to_u256};
-use davinci_zkvm_sdk::limits::{BALLOT_COORDS, NUM_FIELDS, SMT_LEVELS};
+use davinci_zkvm_sdk::limits::{BALLOT_COORDS, NUM_FIELDS, SMT_PROOF_LEVELS};
 use davinci_zkvm_sdk::limits::{KEY_ENC_KEY, KEY_RESULTS};
 use davinci_zkvm_sdk::results::build_results_request;
 use davinci_zkvm_sdk::types::ResultsRequest;
@@ -48,7 +48,8 @@ impl<S: Storage> ProcessState<S> {
     /// Arguments of the registry's `requestResultsDecryption` for the committed
     /// state: the accumulator's 64 coordinates (circomlib TE form, leaf-hash
     /// order) and the key-0x04 inclusion siblings, root to leaf, zero-padded
-    /// to 64 so the last one is zero (`Sha256SmtLib.verifyInclusion`).
+    /// to 65 so the last one is zero even for a leaf at depth 64
+    /// (`Sha256SmtLib.verifyInclusion`).
     pub fn dkg_results_inputs(&self) -> Result<([U256; BALLOT_COORDS], Vec<[u8; 32]>), Error> {
         let root = self.committed.root;
         let acc = &self.committed.accumulator;
@@ -59,13 +60,7 @@ impl<S: Storage> ProcessState<S> {
             ));
         }
         let mut siblings = proof.siblings;
-        if siblings.len() >= SMT_LEVELS {
-            return Err(Error::Invalid(format!(
-                "results leaf at depth {}: no room for the zero terminator",
-                siblings.len()
-            )));
-        }
-        siblings.resize(SMT_LEVELS, [0u8; 32]);
+        siblings.resize(SMT_PROOF_LEVELS, [0u8; 32]);
         Ok((acc.coords().map(|c| fr_to_u256(&c)), siblings))
     }
 }

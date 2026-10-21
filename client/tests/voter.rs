@@ -6,7 +6,7 @@ use common::{csp_root, election, merkle_census, voters};
 use davinci_client::Error;
 use davinci_client::api::ProcessId;
 use davinci_client::voter::{PreparedVote, random_k};
-use davinci_zkvm_sdk::census::{CensusWitness, csp_sign};
+use davinci_zkvm_sdk::census::{CensusWitness, EcdsaSignature, csp_sign};
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_to_dec};
 use k256::ecdsa::SigningKey;
@@ -123,4 +123,48 @@ fn debug_output_redacts_the_secret() {
     // The voter key is never printed either.
     let sk_hex = hex::encode(vs[0].key.to_bytes());
     assert!(!format!("{:?}", vs[0]).contains(&sk_hex));
+}
+
+// The request carries the voter's signature over the vote envelope, which
+// the node recovers; a signature over the bare vote id (the protocol v5
+// message) recovers some other address.
+#[test]
+fn finished_votes_sign_the_vote_envelope() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let vs = voters(2, &mut rng);
+    let census = merkle_census(&vs, 10);
+    let e = election(2, 1, census.root(), &mut rng);
+    let own = CensusWitness::Merkle(census.proof(0).unwrap());
+    let prep = vs[0]
+        .prepare_vote(&e.chain, &[1, 2], own, 10, Fr::from(77u64))
+        .unwrap();
+    let proof = davinci_zkvm_sdk::types::SnarkJsProof {
+        pi_a: ["0".into(), "1".into(), "1".into()],
+        pi_b: [
+            ["0".into(), "0".into()],
+            ["1".into(), "0".into()],
+            ["1".into(), "0".into()],
+        ],
+        pi_c: ["0".into(), "1".into(), "1".into()],
+        protocol: "groth16".into(),
+        curve: "bn128".into(),
+    };
+    let req = vs[0].finish_vote(prep, proof).unwrap();
+    let pid = req.process_id.to_fr();
+    let signer =
+        |sig: &EcdsaSignature| davinci_state::vote_signer(&pid, req.vote_id, &req.ballot, sig);
+    assert_eq!(signer(&req.signature()), Ok(vs[0].address()));
+
+    // personal_sign of PadToSign(BE8(vote id)), as SDK 5 voters signed.
+    let mut msg = [0u8; 32];
+    msg[24..].copy_from_slice(&req.vote_id.to_be_bytes());
+    let z =
+        alloy::primitives::keccak256([&b"\x19Ethereum Signed Message:\n32"[..], &msg[..]].concat());
+    let (sig, recid) = vs[0].key.sign_prehash_recoverable(z.as_slice()).unwrap();
+    let old = EcdsaSignature {
+        r: sig.r().to_bytes().into(),
+        s: sig.s().to_bytes().into(),
+        v: recid.to_byte(),
+    };
+    assert_ne!(signer(&old), Ok(vs[0].address()));
 }

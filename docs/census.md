@@ -82,7 +82,8 @@ root.
 
 - The node fetches the new census in the background, newest root only. Votes answer 42903 while
   it loads. An update that can never load (bad format, root mismatch, refused URI) answers 41201
-  with the reason until the next `CensusUpdated`.
+  with the reason until the next `CensusUpdated`. A newer URI or root supersedes a download
+  still running: that download's verdict is dropped and the newer one is fetched.
 - A batch in flight during an update is rolled back and sealed again at the new root.
 - A pending vote whose census entry changed (the member was removed or reweighted) ends in
   `error: census changed, recast`.
@@ -113,6 +114,9 @@ uniqueness on registration and never evicts old roots.
   syncs at a time, so a slow or endless first scan delays only its own contract.
 - A `WeightChanged` with a non-zero previous weight, or a slot collision, marks the census unusable
   and its votes are refused.
+- A scan keeps the additions and the earliest weight change only. A range that logs more
+  additions, or more zero-previous `WeightChanged` notices, than the members `treeSize` lets it
+  add is refused on the spot, like a mismatch, before the rest of the range is read.
 - The RPC must support `eth_call` at a block hash (EIP-1898). A provider that silently truncates
   `eth_getLogs` results fails closed: the replayed tree does not match the contract and the sync
   retries.

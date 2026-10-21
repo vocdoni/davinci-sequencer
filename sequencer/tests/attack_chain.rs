@@ -680,9 +680,32 @@ async fn hostile_process_parameters_never_reach_the_honest_election() {
             }),
             false,
         ),
+        // The registry's cost rule: numFields * maxValue^costExponent below
+        // 2^63, costExponent at least 1 (2 fields, max value 5 here).
         (
             "cost exponent 255",
             Box::new(|p| p.ballot_mode.cost_exponent = 255),
+            true,
+        ),
+        (
+            "cost exponent 0",
+            Box::new(|p| p.ballot_mode.cost_exponent = 0),
+            true,
+        ),
+        (
+            "cost 2^63",
+            Box::new(|p| {
+                p.ballot_mode.max_value = 1 << 31;
+                p.ballot_mode.cost_exponent = 2;
+            }),
+            true,
+        ),
+        (
+            "cost below 2^63",
+            Box::new(|p| {
+                p.ballot_mode.max_value = (1 << 31) - 1;
+                p.ballot_mode.cost_exponent = 2;
+            }),
             false,
         ),
         (

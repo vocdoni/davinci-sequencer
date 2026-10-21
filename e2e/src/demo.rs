@@ -233,7 +233,8 @@ pub enum MetaPlan {
     /// `metadata-2.json`, with the revised description, replaces it right
     /// after creation, before the start.
     BeforeStart(&'static Revision),
-    /// The same, once the first round settled, while voting is open.
+    /// The same, tried once the first round settled, while voting is
+    /// open: the registry refuses it (metadata is frozen from the start).
     WhileOpen(&'static Revision),
     /// The registry gets the hash of a draft (the document with the revised
     /// description), not of the document served.
@@ -247,7 +248,7 @@ pub enum Refusal {
     /// A key outside the census, with a ballot proved against a census of
     /// its own.
     NotInCensus,
-    /// The vote id signed by another member.
+    /// The vote envelope signed by another member.
     BadSignature,
     /// A settled vote's ballot secret, so its vote id, on another ballot.
     ReusedVoteId,
@@ -1058,7 +1059,7 @@ impl Spec {
         match self.metadata {
             MetaPlan::Fixed => {}
             MetaPlan::BeforeStart(_) => out.push("metadata updated before the start".into()),
-            MetaPlan::WhileOpen(_) => out.push("metadata updated while open".into()),
+            MetaPlan::WhileOpen(_) => out.push("metadata update refused while open".into()),
             MetaPlan::Mismatch(_) => out.push("metadata hash mismatch".into()),
         }
         out.join("; ")

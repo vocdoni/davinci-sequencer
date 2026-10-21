@@ -244,21 +244,22 @@ fn per_vote_mutations_named() {
         ("weight 2^88", Box::new(|p| p.weight = 1 << 88), |e| {
             *e == WeightRange
         }),
-        // The ciphertexts are public inputs: a changed one fails the proof.
+        // The ciphertexts are in the signed vote envelope (and are public
+        // inputs): a changed one no longer recovers the voter.
         (
             "field 0 c1 + B8",
             Box::new(|p| p.ballot.0[0].c1 = p.ballot.0[0].c1.add(&Point::generator())),
-            |e| *e == BadProof,
+            |e| *e == SignatureMismatch,
         ),
         (
             "field 0 identity",
             Box::new(|p| p.ballot.0[0] = Ciphertext::IDENTITY),
-            |e| *e == BadProof,
+            |e| *e == SignatureMismatch,
         ),
         (
             "fields 0 and 1 swapped",
             Box::new(|p| p.ballot.0.swap(0, 1)),
-            |e| *e == BadProof,
+            |e| *e == SignatureMismatch,
         ),
         (
             "field 0 off curve",
@@ -285,7 +286,7 @@ fn per_vote_mutations_named() {
                 );
                 p.ballot.0[1] = p.ballot.0[1].add(&z)
             }),
-            |e| *e == BadProof,
+            |e| *e == SignatureMismatch,
         ),
         (
             "signature r flip",

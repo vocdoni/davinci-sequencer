@@ -155,10 +155,23 @@ stores the transitions and blobs it sees and serves them under `/processes/{pid}
 ### Reorgs
 
 Each poll the monitor reads the hash of the block at its event cursor and compares it with the
-hash it stored with the cursor. A different hash is a reorg: the node logs an error, rewinds the
-cursor 128 blocks and routes that range again. The rewound cursor is stored with its own block
-hash in one write; if that hash cannot be read, the cursor stays and the check runs again at the
-next poll, so there is never a window without one. Routing an event twice changes nothing, and a
+hash it stored with the cursor. A different hash is a reorg: the node reads the number of the
+`finalized` block, logs an error and routes the range above it again, however deep the reorg was:
+
+- the finalized block is below the cursor: the cursor goes back to it (never below the start
+  block), since nothing at or below a finalized block can change;
+- the finalized block is at or past the cursor: the stored hash was never on the finalized chain
+  (an RPC fault, a datadir run against another chain, or a node down across a reorg that lasted
+  longer than finality). The cursor goes back to the block before `--start-block` and every event
+  is routed again, one saved page at a time, so a restart resumes where it stopped;
+- the endpoint refuses the `finalized` tag (a JSON-RPC error for it): the cursor goes back a fixed
+  128 blocks, with a warning the first time;
+- the read fails (a transport error, a node-side error, no block): the cursor stays and the check
+  runs again at the next poll.
+
+The rewound cursor is stored with its own block hash in one write; if that hash cannot be read,
+the cursor stays and the check runs again at the next poll, so there is never a window without
+one. Either rewind counts as a reorg. Routing an event twice changes nothing, and a
 transition the new branch re-included in a later block is recognised by its old and new roots.
 After 5 failed block reads in a row (a block the endpoint does not know yet counts as failed) the
 monitor routes on without the check (each such page counts in `anchor_stalls`), and re-arms it at
@@ -459,7 +472,7 @@ decrypts under as `dkgAid`. Every process bound to a ceremony shares its key.
 ### DKG results
 
 After the grace end, any signing node sends `requestResultsDecryption(pid, accumulator,
-siblings)` from its committed tree. The registry checks the accumulator's inclusion under the
+siblings)` from its committed tree, the siblings zero-padded to 65 entries. The registry checks the accumulator's inclusion under the
 latest state root, submits each active field's ciphertext to the committee, and moves the process
 to ended, which only the registry can leave. That matters because the decrypted values are public
 on the DKG before they reach the registry: a process left ready could be canceled by an organizer
@@ -483,6 +496,9 @@ request it reads the gate through the Council adapter (`isDecryptionOpen`), poll
 first and doubling up to every 5 minutes, and a `DecryptionNotOpen` revert counts the same. Once
 the gate reads open it publishes the zeros, or waits for the committee's combines at the usual
 15 s pace. The requested flag is persisted, so a restart resumes the wait without a new request.
+The wait for the combines is logged once at info when it starts, then at warn every 10 minutes
+with how many of the requested ciphertexts are combined (DKG modes; a Council request is read
+whole), so a committee stuck below its threshold shows in the log.
 
 ### Client example
 

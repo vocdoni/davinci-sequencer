@@ -676,6 +676,45 @@ async fn vote_id_wire_format_is_checked() {
     t.shutdown.cancel();
 }
 
+// Every byte string of the API needs its `0x` (lowercase), in path segments
+// and bodies alike: without it the request is a 40001.
+#[tokio::test]
+async fn hex_without_0x_is_refused() {
+    let t = serve(FakeProver::gated(), 100).await;
+    handle(&t.node).await;
+    let pid = ProcessId(pid31()).to_string();
+    let vid = vote_id_hex(1 << 63);
+    let addr = format!("0x{}", hex::encode(voter_address(0)));
+    for path in [
+        format!("/processes/{}", &pid[2..]),
+        format!("/processes/{pid}/participants/{}", &addr[2..]),
+        format!("/votes/{}/voteId/{vid}", &pid[2..]),
+        format!("/votes/{pid}/voteId/{}", &vid[2..]),
+        format!("/votes/{pid}/address/{}", &addr[2..]),
+        format!("/votes/{pid}/address/0X{}", &addr[2..]),
+    ] {
+        let resp = reqwest::get(format!("{}{path}", t.base)).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{path}");
+        let e = resp.json::<ErrorResponse>().await.unwrap();
+        assert_eq!(e.code, 40001, "{path}");
+    }
+    let v = fake_vote(&t.s.env, 0, &[1, 2], 9);
+    let good = serde_json::to_value(wire_vote(&v)).unwrap();
+    for (k, msg) in [
+        ("processId", "want 31 bytes of hex"),
+        ("address", "want 20 bytes of hex"),
+        ("signature", "want 65 bytes of hex"),
+        ("voteId", "want 8 bytes of hex"),
+    ] {
+        let mut j = good.clone();
+        j[k] = serde_json::json!(good[k].as_str().unwrap()[2..]);
+        let (status, e) = raw_post(&t.base, "/votes", j.to_string()).await;
+        assert_eq!((status, e.code), (400, 40001), "{k}");
+        assert!(e.error.contains(msg), "{k}: {}", e.error);
+    }
+    t.shutdown.cancel();
+}
+
 /// An observer node (no signing key) serves every read route,
 /// refuses writes with its own 412 code, and never proves or finalizes —
 /// even when its keystore holds the election key.

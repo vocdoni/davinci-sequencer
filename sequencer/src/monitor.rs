@@ -28,9 +28,9 @@ use crate::web3::{EventKind, RegistryEvent};
 pub(crate) const LAST_BLOCK_KEY: &str = "monitor_last_block";
 /// Hash of the cursor block, written with it: a change means a reorg.
 pub(crate) const LAST_HASH_KEY: &str = "monitor_last_hash";
-/// Rewind on a reorg at the cursor, in blocks. Not floored at the safe
-/// head: on OP the derivation behind an unsafe reorg makes the new branch
-/// safe at once, above the fork.
+/// Rewind on a reorg at the cursor, in blocks, when the endpoint refuses the
+/// `finalized` tag. Not floored at the safe head: on OP the derivation
+/// behind an unsafe reorg makes the new branch safe at once, above the fork.
 const REORG_REWIND: u64 = 128;
 /// Consecutive failed block-hash reads before routing goes on unchecked: a
 /// rate-limited block read must not stall every election.
@@ -256,6 +256,9 @@ struct Update {
     uri: String,
     /// A Keccak census root, big-endian.
     root: [u8; 32],
+    /// Bumped when `(uri, root)` changes: only a fetch of the current
+    /// generation may record a verdict (a bad mark, done, a failure).
+    generation: u64,
     job: Job,
     /// The last transient failure, until a bootstrap counts it.
     failed: Option<String>,
@@ -315,27 +318,32 @@ pub struct CensusQueue {
 }
 
 impl CensusQueue {
-    /// Queues `root` of `pid` for download; a newer root replaces it.
+    /// Queues `root` of `pid` for download; a newer root or URI replaces it,
+    /// and a fetch of the one it replaced no longer counts.
     pub(crate) fn queue(&self, pid: Fr, uri: String, root: [u8; 32]) {
-        if let Err(e) = self.store.clear_bad(&pid) {
-            error!(pid = %pid_hex(&pid), %e, "clear census failure");
-        }
         if let Ok(mut q) = self.updates.lock() {
             let e = q.entry(pid).or_insert(Update {
                 uri: String::new(),
                 root,
+                generation: 0,
                 job: Job::Queued,
                 failed: None,
                 fails: 0,
                 not_before: None,
             });
-            if e.root != root {
+            if (e.uri.as_str(), e.root) != (uri.as_str(), root) {
+                e.generation = e.generation.wrapping_add(1);
                 e.failed = None;
             }
             (e.uri, e.root) = (uri, root);
             if e.job == Job::Done {
                 e.job = Job::Queued;
             }
+        }
+        // After the switch: a stale fetch marks under the lock only while
+        // it is still current, so this clears any mark it left.
+        if let Err(e) = self.store.clear_bad(&pid) {
+            error!(pid = %pid_hex(&pid), %e, "clear census failure");
         }
     }
 
@@ -397,7 +405,7 @@ async fn prune_censuses(ctx: &Ctx) {
 /// monitor loop: `CensusStore::fetch` applies the usual SSRF, size and
 /// backoff rules, and a transient failure stays queued for the next tick.
 fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
-    let jobs: Vec<(Fr, String, [u8; 32])> = match ctx.queue.updates.lock() {
+    let jobs: Vec<(Fr, String, [u8; 32], u64)> = match ctx.queue.updates.lock() {
         Ok(mut q) => q
             .iter_mut()
             .filter(|(_, e)| {
@@ -405,12 +413,12 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
             })
             .map(|(pid, e)| {
                 e.job = Job::Running;
-                (*pid, e.uri.clone(), e.root)
+                (*pid, e.uri.clone(), e.root, e.generation)
             })
             .collect(),
         Err(_) => return,
     };
-    for (pid, uri, root) in jobs {
+    for (pid, uri, root, generation) in jobs {
         let (census, q, prune, sd) = (
             ctx.node.census.clone(),
             ctx.queue.updates.clone(),
@@ -422,11 +430,16 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                 _ = sd.cancelled() => return,
                 r = census.fetch(&uri, &root) => r,
             };
-            let mut failed = None;
             // Charged to the process: everything but success and the store's
             // own "not yet".
             let charged = !matches!(res, Ok(()) | Err(CensusError::Backoff(_)));
             let ok = res.is_ok();
+            let Ok(mut q) = q.lock() else { return };
+            let Some(e) = q.get_mut(&pid) else { return };
+            // A newer (uri, root) queued meanwhile runs on the next tick:
+            // this fetch's verdict is about a document nobody points at now.
+            let current = e.generation == generation;
+            let mut failed = None;
             let done = match res {
                 Ok(()) => {
                     prune.store(true, Ordering::Relaxed);
@@ -443,8 +456,12 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                     // servable, and its process may already run on it.
                     if census.has(&root).unwrap_or(false) {
                         warn!(pid = %pid_hex(&pid), ?e, "census document unusable; its root is stored");
+                    } else if !current {
+                        warn!(pid = %pid_hex(&pid), ?e, "superseded census document unusable");
                     } else {
                         error!(pid = %pid_hex(&pid), ?e, "census update can never load; votes are refused until the next one");
+                        // Under the queue lock: a correction queued now
+                        // clears the mark once it has switched.
                         if let Err(e) = census.mark_bad(&pid, &root, &e.to_string()) {
                             error!(pid = %pid_hex(&pid), %e, "persist census failure");
                         }
@@ -457,31 +474,25 @@ fn fetch_queued_censuses(ctx: &Ctx, shutdown: &CancellationToken) {
                     false
                 }
             };
-            // A newer root queued meanwhile runs on the next tick.
-            if let Ok(mut q) = q.lock()
-                && let Some(e) = q.get_mut(&pid)
-            {
-                if e.root == root && failed.is_some() {
-                    e.failed = failed;
-                }
-                if ok {
-                    (e.fails, e.not_before) = (0, None);
-                } else if charged {
-                    // The first few failures cost nothing, so an honest
-                    // organizer correcting a typo or two is never held back.
-                    e.fails = e.fails.saturating_add(1);
-                    if e.fails > FREE_CENSUS_FAILURES {
-                        let n = e.fails - FREE_CENSUS_FAILURES;
-                        e.not_before =
-                            Some(std::time::Instant::now() + crate::census::backoff(n));
-                    }
-                }
-                e.job = if done && e.root == root {
-                    Job::Done
-                } else {
-                    Job::Queued
-                };
+            if current && failed.is_some() {
+                e.failed = failed;
             }
+            if ok {
+                (e.fails, e.not_before) = (0, None);
+            } else if charged {
+                // The first few failures cost nothing, so an honest
+                // organizer correcting a typo or two is never held back.
+                e.fails = e.fails.saturating_add(1);
+                if e.fails > FREE_CENSUS_FAILURES {
+                    let n = e.fails - FREE_CENSUS_FAILURES;
+                    e.not_before = Some(std::time::Instant::now() + crate::census::backoff(n));
+                }
+            }
+            e.job = if done && current {
+                Job::Done
+            } else {
+                Job::Queued
+            };
         });
     }
 }
@@ -545,6 +556,11 @@ fn process_config(vk_hash: [u8; 32], rec: &ProcessRecord) -> Result<ProcessConfi
         4 => CensusOrigin::Csp,
         o => return Err(NodeError::Config(format!("unsupported census origin {o}"))),
     };
+    // The registry's creation rule: numFields * maxValue^costExponent below
+    // 2^63 and costExponent at least 1, so the circuit's cost is exact.
+    p.ballot_mode
+        .validate()
+        .map_err(|e| NodeError::Config(e.to_string()))?;
     Ok(ProcessConfig {
         process_id: rec.pid,
         ballot_mode: p.ballot_mode,
@@ -655,6 +671,9 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
         }
     };
     let mut hash_errors = 0u32;
+    // The registry's deployment block minus one: the lowest cursor.
+    let floor = ctx.cfg.start_block.map_or(0, |n| n.saturating_sub(1));
+    let mut no_finality_warned = false;
     // Actor task deaths per pid this run: each one doubles the respawn wait.
     let mut deaths: HashMap<Fr, u32> = HashMap::new();
     let mut poll = tokio::time::interval(ctx.cfg.poll_interval);
@@ -687,10 +706,46 @@ async fn monitor_loop(ctx: Ctx, shutdown: CancellationToken, mut retries: Vec<Bo
                 save_cursor(&ctx, last, Some(r));
             }
             (Ok((h, _)), Some(want)) if h != want => {
-                // The rewound cursor is saved with its hash in one write, so
-                // the anchor never goes without one: a failed read retries
-                // the whole check at the next poll from the old cursor.
-                let to = last.saturating_sub(REORG_REWIND);
+                // Rewind to the finalized block: nothing at or below it can
+                // have changed. The rewound cursor is saved with its hash in
+                // one write, so the anchor never goes without one: a failed
+                // read retries the whole check at the next poll from the old
+                // cursor.
+                let finalized = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    r = ctx.deps.contracts.finalized_block() => r,
+                };
+                let to = match finalized {
+                    Ok(Some(f)) if f < last => f.max(floor),
+                    // A finalized block at or past the cursor and another
+                    // hash there: the stored block was never canonical (an RPC
+                    // fault, another chain, or a node down across a reorg
+                    // longer than finality). Every event is routed again,
+                    // page by page from the start block.
+                    Ok(Some(f)) => {
+                        error!(
+                            cursor = last,
+                            finalized = f,
+                            "the event cursor is not on the finalized chain; routing every event again from the start block"
+                        );
+                        floor
+                    }
+                    Ok(None) => {
+                        if !no_finality_warned {
+                            warn!(
+                                rewind = REORG_REWIND,
+                                "the RPC refuses the finalized block tag; reorgs rewind a fixed number of blocks"
+                            );
+                            no_finality_warned = true;
+                        }
+                        last.saturating_sub(REORG_REWIND)
+                    }
+                    Err(e) => {
+                        warn!(%e, cursor = last, "finalized block read at a reorg; retrying");
+                        continue;
+                    }
+                }
+                .min(last);
                 let got = tokio::select! {
                     _ = shutdown.cancelled() => return,
                     r = ctx.deps.contracts.block_ref(to) => r,

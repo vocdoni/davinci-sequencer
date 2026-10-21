@@ -312,10 +312,10 @@ registry (a fresh, empty database) or refuse a registry whose pins it no longer 
 image and the registry in `.env`, no code change needed:
 
 ```bash
-DAVINCI_SEQUENCER_TAG=v0.7.1
-DAVINCI_REGISTRY=0x6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6
-DAVINCI_START_BLOCK=158414417
-DAVINCI_ZKVM_TAG=v0.4.1
+DAVINCI_SEQUENCER_TAG=v0.8.0
+DAVINCI_REGISTRY=0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97
+DAVINCI_START_BLOCK=158487281
+DAVINCI_ZKVM_TAG=v0.5.0
 ```
 
 Watchtower then only picks up a re-push of that same tag, and the explicit registry pins the

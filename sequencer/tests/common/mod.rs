@@ -37,7 +37,7 @@ pub use davinci_state::{CensusOrigin, ProcessConfig, VerifiedVote, VotePackage, 
 pub use davinci_zkvm_sdk::ballot::{BallotMode, address_to_fr, encrypt_ballot, vote_id};
 pub use davinci_zkvm_sdk::blob::{Blob, TransitionBlobs};
 pub use davinci_zkvm_sdk::census::{
-    CensusWitness, LeanImt, census_leaf, eth_address, slot_key_address, vote_id_sign,
+    CensusWitness, LeanImt, census_leaf, eth_address, slot_key_address, vote_sign,
 };
 pub use davinci_zkvm_sdk::client::PlonkSnark;
 pub use davinci_zkvm_sdk::crypto::babyjubjub::Point;
@@ -186,6 +186,7 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
     let ballot = encrypt_ballot(&cfg.enc_key, fields, &k, cfg.ballot_mode.num_fields);
     let census = env.imt.proof(idx).unwrap();
     let slot = slot_key_address(&address);
+    let signature = vote_sign(&key, &cfg.process_id, vid, &ballot);
     VerifiedVote {
         pkg: VotePackage {
             process_id: cfg.process_id,
@@ -193,7 +194,7 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
             address,
             ballot,
             proof: dummy_proof(),
-            signature: vote_id_sign(&key, vid),
+            signature,
             census: CensusWitness::Merkle(census),
             weight: 1,
         },
@@ -209,11 +210,15 @@ pub fn census_le(root: &[u8; 32]) -> [u8; 32] {
     r
 }
 
-/// Proof-cache key (`tests/cache`): sha256 of the 71 public signals,
-/// big-endian and concatenated. The signals are everything a proof binds.
+/// Proof-cache key (`tests/cache`): sha256 of the embedded ballot VK hash
+/// and the 71 public signals, big-endian and concatenated. The signals are
+/// everything a proof binds; the VK hash keeps a proof made under another
+/// ballot key from being read back.
 pub fn signals_key(pubs: &[Fr]) -> String {
     use sha2::{Digest, Sha256};
+    static VK: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     let mut h = Sha256::new();
+    h.update(VK.get_or_init(vk_hash));
     for x in pubs {
         h.update(fr_to_be(x));
     }
@@ -336,6 +341,8 @@ pub struct Inner {
     event_calls: Vec<(u64, u64)>,
     /// DKG modes: the committee's plaintexts, once it combined them all.
     dkg_plaintexts: Option<Vec<u64>>,
+    /// DKG modes: ciphertexts combined so far, until `dkg_plaintexts` is set.
+    dkg_combined: u16,
     /// Landed `requestResultsDecryption` calls, and every call made.
     dkg_requests: u64,
     dkg_request_calls: u64,
@@ -526,6 +533,7 @@ impl FakeChain {
             vanish_results: false,
             event_calls: Vec::new(),
             dkg_plaintexts: None,
+            dkg_combined: 0,
             dkg_requests: 0,
             dkg_request_calls: 0,
             dkg_finalizes: 0,
@@ -1326,6 +1334,11 @@ impl FakeChain {
         self.lock().dkg_plaintexts = Some(results);
     }
 
+    /// The committee combined `n` of the submitted ciphertexts so far.
+    pub fn dkg_combine_some(&self, n: u16) {
+        self.lock().dkg_combined = n;
+    }
+
     /// `(landed, called)` for the request and the finalize.
     pub fn dkg_calls(&self) -> ((u64, u64), (u64, u64)) {
         let i = self.lock();
@@ -1535,11 +1548,12 @@ fn check_l1_proof(
     Ok(blocks)
 }
 
-/// `Sha256SmtLib.verifyInclusion`, as the registry runs it.
+/// `Sha256SmtLib.verifyInclusion`, as the registry runs it: at most 65
+/// siblings, the last one zero.
 pub fn registry_verify(root: &[u8; 32], key: u64, value_be: &[u8; 32], sibs: &[[u8; 32]]) -> bool {
     use sha2::{Digest, Sha256};
     let n = sibs.len();
-    if n == 0 || n > 64 {
+    if n == 0 || n > 65 {
         return false;
     }
     let d = sibs
@@ -2082,6 +2096,17 @@ impl Chain for FakeChain {
             i.dkg_finalize_armed = true;
         }
         Ok(ready)
+    }
+
+    async fn dkg_combined(&self, _pid: &[u8; 31]) -> Result<Option<(u16, u16)>, Web3Error> {
+        let i = self.lock();
+        let count = u16::from(i.proc.dkg.count);
+        let combined = if i.dkg_plaintexts.is_some() {
+            count
+        } else {
+            i.dkg_combined.min(count)
+        };
+        Ok(i.proc.dkg.requested.then_some((combined, count)))
     }
 
     async fn finalize_results_from_dkg(&self, _pid: &[u8; 31]) -> Result<TxReceipt, Web3Error> {

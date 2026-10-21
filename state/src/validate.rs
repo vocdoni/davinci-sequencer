@@ -4,7 +4,7 @@
 use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, public_signals};
 use davinci_zkvm_sdk::census::{
     CensusWitness, CspProof, EcdsaSignature, Node, census_leaf, csp_recover, slot_key_address,
-    slot_key_csp, verify_census_proof,
+    slot_key_csp, verify_census_proof, vote_recover,
 };
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_from_be};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
@@ -133,8 +133,9 @@ pub fn validate_vote(
 
     let slot = check_census(cfg, &pkg)?;
 
-    // Vote id signature by the voter's own key.
-    let signer = vote_id_signer(pkg.vote_id, &pkg.signature)?;
+    // The voter's own key signed this vote envelope: this process, this
+    // vote id and these ciphertexts.
+    let signer = vote_signer(&pkg.process_id, pkg.vote_id, &pkg.ballot, &pkg.signature)?;
     if signer != pkg.address {
         return Err(VoteError::SignatureMismatch);
     }
@@ -173,11 +174,17 @@ fn low_s(r: &[u8; 32], s: &[u8; 32], v: u8) -> ([u8; 32], u8) {
     }
 }
 
-fn vote_id_signer(vote_id: u64, sig: &EcdsaSignature) -> Result<[u8; 20], VoteError> {
+/// Signer of a vote envelope signature as the guest recovers it: v in
+/// {0, 1, 27, 28} and either S (a high S is folded to its low twin).
+pub fn vote_signer(
+    pid: &Fr,
+    vote_id: u64,
+    ballot: &Ballot,
+    sig: &EcdsaSignature,
+) -> Result<[u8; 20], VoteError> {
     let (s, v) = low_s(&sig.r, &sig.s, sig.v);
     let sig = EcdsaSignature { r: sig.r, s, v };
-    davinci_zkvm_sdk::census::vote_id_recover(vote_id, &sig)
-        .map_err(|e| VoteError::SignatureInvalid(e.to_string()))
+    vote_recover(pid, vote_id, ballot, &sig).map_err(|e| VoteError::SignatureInvalid(e.to_string()))
 }
 
 /// Whether a pending vote survives a census update: for a Merkle

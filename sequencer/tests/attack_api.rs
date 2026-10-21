@@ -534,7 +534,7 @@ async fn id_spellings_resolve_to_the_same_resource_or_400() {
     let t = serve(FakeProver::gated(), &[]).await;
     let p = pid_str();
     let upper = format!("0x{}", hex::encode_upper(pid31()));
-    for ok in [p.clone(), upper, p.trim_start_matches("0x").to_string()] {
+    for ok in [p.clone(), upper] {
         let r = get_raw(&t.base, &format!("/processes/{ok}")).await;
         assert_eq!(r.status, 200, "{ok}");
         assert_eq!(r.json()["id"], json!(p));
@@ -548,6 +548,9 @@ async fn id_spellings_resolve_to_the_same_resource_or_400() {
         format!("0x{}", "da".repeat(30)),
         format!("{p}00"),
         format!(" {p}"),
+        // `0x` is required, lowercase.
+        p.trim_start_matches("0x").to_string(),
+        p.replacen("0x", "0X", 1),
     ] {
         let r = get_raw(&t.base, &format!("/processes/{}", bad.replace(' ', "%20"))).await;
         assert_eq!((r.status, r.code()), (400, 40001), "{bad}");
@@ -562,9 +565,12 @@ async fn id_spellings_resolve_to_the_same_resource_or_400() {
         let r = get_raw(&t.base, &format!("/votes/{p}/voteId/{v}")).await;
         assert_eq!((r.status, r.code()), (400, 40001), "{v}");
     }
-    // 0x-less 16 hex digits are accepted, upper case too; the vote is unknown.
-    let r = get_raw(&t.base, &format!("/votes/{p}/voteId/FFFFFFFFFFFFFFFF")).await;
+    // Upper-case digits after `0x` are accepted; the vote is unknown. Without
+    // the `0x` the id is refused.
+    let r = get_raw(&t.base, &format!("/votes/{p}/voteId/0xFFFFFFFFFFFFFFFF")).await;
     assert_eq!((r.status, r.code()), (404, 40401));
+    let r = get_raw(&t.base, &format!("/votes/{p}/voteId/FFFFFFFFFFFFFFFF")).await;
+    assert_eq!((r.status, r.code()), (400, 40001));
     t.shutdown.cancel();
 }
 

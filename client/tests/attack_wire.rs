@@ -290,6 +290,17 @@ fn hex_fields_are_strict() {
         let b: VoteRequest = serde_json::from_value(j).unwrap();
         assert_eq!(serde_json::to_value(&b).unwrap()[k], json!(ok));
     }
+    // Every byte string needs its `0x`.
+    let good = serde_json::to_value(good_vote(merkle())).unwrap();
+    for k in ["processId", "address", "voteId", "signature"] {
+        let bare = good[k]
+            .as_str()
+            .unwrap()
+            .strip_prefix("0x")
+            .unwrap()
+            .to_string();
+        assert!(!mutated(|j| j[k] = json!(bare)), "{k} without 0x");
+    }
     // Not strings.
     for v in [json!(1), json!([1, 2]), json!(null), json!({"0x": 1})] {
         assert!(!mutated(|j| j["address"] = v.clone()));

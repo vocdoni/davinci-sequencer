@@ -89,6 +89,13 @@ error: the circuit commits `ok = 0` or the contract reverts. Read the wire forma
 The SDK wraps these in named newtypes. The emulator dry runs (`ZISKEMU=1`) are the byte-exactness
 oracle: run them after changing any wire struct.
 
+**State-tree proofs carry 65 sibling slots.** arbo trees have 64 levels (`SMT_LEVELS`, pinned in
+storage: changing it fails every stored tree with `ParamsMismatch`), but two keys that share
+their 63 low bits put both leaves at depth 64, and the circuit and the registry need a zero
+sentinel below a leaf. Every sibling list the node sends (transition entries, the results
+request, `requestResultsDecryption`) is zero-padded to `SMT_PROOF_LEVELS` (65); the tracker
+proof the API serves is the raw arbo list.
+
 **Ingest mirrors the circuit.** `davinci_state::validate_vote` repeats every per-vote circuit
 check, so one ballot cannot sink a batch. When the circuit gains a check, add it there with a
 named `VoteError` and a test in `state/tests/validate.rs`. `select_batch` and actor admission also

@@ -15,7 +15,7 @@ use davinci_client::voter::CircomInputs;
 use davinci_state::{ProcessConfig, VerifiedVote, VotePackage};
 use davinci_zkvm_input_gen as ig;
 use davinci_zkvm_sdk::ballot::{address_to_fr, encrypt_ballot, vote_id};
-use davinci_zkvm_sdk::census::{CensusWitness, eth_address, slot_key_address, vote_id_sign};
+use davinci_zkvm_sdk::census::{CensusWitness, eth_address, slot_key_address, vote_sign};
 use davinci_zkvm_sdk::crypto::field::Fr;
 use davinci_zkvm_sdk::limits::NUM_FIELDS;
 use davinci_zkvm_sdk::publics::BatchPublics;
@@ -482,13 +482,14 @@ pub fn vote(
         CensusWitness::Csp(p) => davinci_zkvm_sdk::census::slot_key_csp(p.index).unwrap_or(0),
         CensusWitness::Merkle(_) => slot_key_address(&address),
     };
+    let signature = vote_sign(sk, &cfg.process_id, vid, &ballot);
     let pkg = VotePackage {
         process_id: cfg.process_id,
         vote_id: vid,
         address,
         ballot,
         proof: proof.unwrap_or_else(placeholder_proof),
-        signature: vote_id_sign(sk, vid),
+        signature,
         census,
         weight,
     };

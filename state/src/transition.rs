@@ -12,7 +12,7 @@ use davinci_zkvm_sdk::census::CensusWitness;
 use davinci_zkvm_sdk::crypto::field::{Fr, fr_to_dec};
 use davinci_zkvm_sdk::groth16::N_PUBLIC;
 use davinci_zkvm_sdk::limits::{
-    self, KEY_RESULTS, MAX_BATCH_SIZE, MAX_REFRESH, PROCESS_KEYS, SMT_LEVELS,
+    self, KEY_RESULTS, MAX_BATCH_SIZE, MAX_REFRESH, PROCESS_KEYS, SMT_PROOF_LEVELS,
 };
 use davinci_zkvm_sdk::publics::BatchPublics;
 use davinci_zkvm_sdk::reenc::{ReencChain, random_seed, reencrypt_ballot};
@@ -138,6 +138,14 @@ fn pad32(b: &[u8]) -> [u8; 32] {
     out
 }
 
+/// `siblings` (arbo pads them to its 64 levels) zero-padded to the
+/// guest's 65 slots: a leaf at depth 64 needs the zero sentinel below it.
+fn proof_siblings(siblings: &[arbo::Hash]) -> Vec<String> {
+    let mut out: Vec<String> = siblings.iter().map(enc::le_hex).collect();
+    out.resize(SMT_PROOF_LEVELS, ZERO_HEX.into());
+    out
+}
+
 fn smt_entry(p: &CircomProcessorProof) -> SmtEntryJson {
     SmtEntryJson {
         old_root: enc::le_hex(&p.old_root),
@@ -149,7 +157,7 @@ fn smt_entry(p: &CircomProcessorProof) -> SmtEntryJson {
         new_value: enc::le_hex(&pad32(&p.new_value)),
         fnc0: p.fnc0 as u8,
         fnc1: p.fnc1 as u8,
-        siblings: p.siblings.iter().map(enc::le_hex).collect(),
+        siblings: proof_siblings(&p.siblings),
     }
 }
 
@@ -158,8 +166,6 @@ fn read_entry(root: &[u8; 32], key: u64, p: &arbo::Proof) -> Result<SmtEntryJson
     if !p.exists {
         return Err(Error::Invalid(format!("config key {key:#x} not in tree")));
     }
-    let mut siblings = p.siblings.clone();
-    siblings.resize(SMT_LEVELS, arbo::EMPTY_HASH);
     let k = enc::key_hex(key);
     let v = enc::le_hex(&pad32(&p.value));
     Ok(SmtEntryJson {
@@ -172,7 +178,7 @@ fn read_entry(root: &[u8; 32], key: u64, p: &arbo::Proof) -> Result<SmtEntryJson
         new_value: v,
         fnc0: 0,
         fnc1: 0,
-        siblings: siblings.iter().map(enc::le_hex).collect(),
+        siblings: proof_siblings(&p.siblings),
     })
 }
 

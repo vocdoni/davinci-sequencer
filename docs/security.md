@@ -10,6 +10,17 @@ proofs that match what it computed itself.
   check the circuit makes (ballot proof against the 71 public inputs the circuit derives,
   signature, census binding with the leaf below 2^248, ballot encoding, weight below 2^88), and the
   actor applies the stateful rules (unused vote id, slot queue depth, `maxVoters`). The batch builder mirrors the contract's `maxVoters` check and the blob limit.
+- **The vote signature binds the whole vote.** The voter signs `keccak256("davinci-vote-v1" ‖
+  process id ‖ vote id ‖ sha256 of the ballot's ciphertexts)` with personal-sign, and the node
+  and the circuit recover it from the vote as cast: a signature does not carry over to another
+  process or to other ciphertexts, and a signature over the bare vote id is refused. It is a blind
+  32-byte personal-sign digest, so a wallet cannot display what it authorizes (as before this
+  change); EIP-712 is a later change.
+- **Leaves at depth 64 are ordinary leaves.** The state tree's path is a key's bits from bit 0,
+  so a vote id (2^63 plus 63 hash bits) and a ballot slot or config key with the same low 63
+  bits part at the tree's last level, and both leaves sit at depth 64. Every proof carries 65
+  sibling slots, the last one a zero sentinel, so the circuit and the registry read, overwrite and
+  refresh both leaves like any other: steering a vote id onto another key's path gains nothing.
 - **Proofs are checked against pins.** A batch settles only when the proof's program key and
   `rootCVadcopFinal` equal the SDK release pins and every public output equals what the node
   computed. The startup check refuses a registry or verifier that pins anything else. On-chain,
@@ -76,6 +87,12 @@ a DKG mode when no single node should hold the key.
   `X-Forwarded-For`). If key-generation abuse matters, terminate at a proxy with its own per-client
   limit, or expose the port directly and firewall IPv6 at /64 granularity.
 
+**CSP censuses.** The index the CSP signs is the voter's ballot slot, and the node checks only the
+attestation (process, address, weight, index). The CSP is trusted to give each member one index:
+a voter attested under two indexes counts twice, and an index attested for another address
+overwrites the first voter's ballot. Slots derived from the address would not help: a CSP census
+has no member list, so nothing could refuse a ground address whose slot is another member's.
+
 **DKG keys.**
 
 - A threshold of an epoch's committee can decrypt every ballot of the processes keyed on that
@@ -93,9 +110,10 @@ a DKG mode when no single node should hold the key.
   id from any other account. The id of a future process is public (it follows from the
   organizer's next process id), but only the registry's adapter can register it, so nobody can
   block a chosen organizer's DKG-mode processes by taking their ids first.
-- Between the end and the first `requestResultsDecryption`, the organizer can still cancel a ready
-  or paused process without having seen the tally, the same power it has in sequencer mode.
-  Sequencers request on their first heartbeat after the grace end to keep that window short.
+- The organizer can cancel a ready or paused process until its grace end without having seen the
+  tally, the same power it has in sequencer mode. The registry refuses a cancel from the grace end
+  on, and `requestResultsDecryption` is taken only from then, so the committee never decrypts a
+  process that can still be canceled.
 - `revealProcessKey` works at any time. A locked organizer that reveals during voting drops that
   process to the automatic trust model.
 - `registrationEpoch` looks back 8 epochs. If all 8 are spent or dead, automatic mode reverts
@@ -117,7 +135,9 @@ a DKG mode when no single node should hold the key.
   receipt. Deeper reorgs are detected and recovered (see
   [lifecycle.md](lifecycle.md#reorgs)):
   - the monitor compares the hash of the block at its event cursor each poll, and on a mismatch
-    rewinds 128 blocks and routes them again, storing the rewound cursor with its hash. The
+    rewinds to the `finalized` block and routes the range above it again, storing the rewound
+    cursor with its hash (an endpoint that refuses the tag gets a fixed 128-block rewind; a
+    finalized block past the cursor routes every event again from the start block). The
     cursor block and its hash are the *anchor*: every state decision a process makes comes from
     an event or from a read at the anchor's block hash (`requireCanonical`), which a backend on
     the old branch cannot answer, and decides only what is at or below that block. Reads by
@@ -136,8 +156,9 @@ a DKG mode when no single node should hold the key.
   Below that block they are suspended, never undone. An endpoint that refuses reads by block hash
   holds every chain-read decision (sealing goes on) until it answers again; only with
   `--degraded-number-reads`, for a single-backend endpoint, is it read by number between two
-  checks of the anchor's hash. A
-  reorg deeper than the 128-block rewind can leave events of the dropped range unrouted.
+  checks of the anchor's hash. Only
+  on an endpoint without the `finalized` tag can a reorg deeper than the 128-block rewind leave
+  events of the dropped range unrouted.
 - **Scalar bias.** Re-encryption scalars are SHA-256 digests reduced modulo the BN254 scalar
   field, which leaves them 2^-7.6 from uniform modulo the subgroup order. Closing the gap needs a
   512-bit reduction, which changes the batch circuit and its program key.

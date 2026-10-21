@@ -7,30 +7,30 @@ together.
 ## OP Mainnet
 
 Chain id 10, preset `optimism`, L1-blob mode: transitions settle on OP Mainnet and their blobs
-live in Ethereum blob transactions. This is the protocol v5 pre-production registry, deployed and
-verified on 2026-10-19 from davinci-contracts v0.0.52 (v0.0.53 adds only the deployment records),
-on the davinci-zkvm v0.4.1 pins and the pre-production ceremony ballot key, with the DKG and
-Council adapters. Process ids start with `3c3e0777`.
+live in Ethereum blob transactions. This is the protocol v5.1 pre-production registry, deployed and
+verified on 2026-10-21 from davinci-contracts v0.0.54, on the davinci-zkvm v0.5.0 pins and the
+pre-production ceremony ballot key of davinci-circom v1.3.0, with the DKG and Council adapters.
+Process ids start with `e8d4e286`.
 
 | Contract | Address | Block |
 |---|---|---|
-| ZiskVerifier | [`0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7`](https://optimistic.etherscan.io/address/0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7#code) (code hash `0xadab570d…cadcc1`) | |
+| ZiskVerifier | [`0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7`](https://optimistic.etherscan.io/address/0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7#code) (code hash `0xadab570d…cadcc1`, reused) | |
 | L1BlobVerifier | [`0x3B95BC14F43ed8Addb83F84D10A949De74eE7529`](https://optimistic.etherscan.io/address/0x3B95BC14F43ed8Addb83F84D10A949De74eE7529#code) (reused from the first OP registry) | 158125135 |
-| ProcessRegistry | [`0x6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6`](https://optimistic.etherscan.io/address/0x6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6#code) | 158414417 |
-| DKG adapter | [`0x51aB0BB6A455e7f027f3b09b8F1Ea0634806f390`](https://optimistic.etherscan.io/address/0x51aB0BB6A455e7f027f3b09b8F1Ea0634806f390#code) | |
+| ProcessRegistry | [`0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97`](https://optimistic.etherscan.io/address/0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97#code) | 158487281 |
+| DKG adapter | [`0xffAC853E7B93CE6148b1A551A40aFd88DE517863`](https://optimistic.etherscan.io/address/0xffAC853E7B93CE6148b1A551A40aFd88DE517863#code) | |
 | DKGManager | `0x9e799a1d22710056e62c849e3ffe19dd01db2d41` (unchanged) | 158245366 |
 | DKGAppManager | `0x1e7f0bec007828e2e0a1a469d9d3e148888fc39a` (unchanged) | |
-| Council adapter | [`0xC2f51d01E16b61d75eAD2e5b88d139739067af17`](https://optimistic.etherscan.io/address/0xC2f51d01E16b61d75eAD2e5b88d139739067af17#code) | |
+| Council adapter | [`0xe07BE522a8fE9d1cf85DCA5Eefbe663055D35127`](https://optimistic.etherscan.io/address/0xe07BE522a8fE9d1cf85DCA5Eefbe663055D35127#code) | |
 | CouncilManager | `0x281b84dee6305083cc719187e4a2737d61b4396e` (unchanged) | 158245395 |
 
-Pinned values, equal to the SDK release pins (davinci-zkvm v0.4.1):
+Pinned values, equal to the SDK release pins (davinci-zkvm v0.5.0):
 
 | Value | Where | Hash |
 |---|---|---|
-| batch program vk | registry `batchProgramVK` | `0x1e4a74a1c6fb1cd1874d80895e1e075930837955efb4a135539016f7cdead2a8` |
-| results program vk | registry `resultsProgramVK` | `0xde55d751582e510bf378d4eec0d98ee3fa5817a50b77bc0e5ce560035e29e4e9` |
+| batch program vk | registry `batchProgramVK` | `0x4b1a527e284af96fa0c3543e9e9b18746a6494edd99c309e58d96a804e3041dc` |
+| results program vk | registry `resultsProgramVK` | `0xce964acdd53329fc49ede57f5ea288f044950e136be119287fd0021390689dc4` |
 | `rootCVadcopFinal` | registry and verifier | `0x6b2490fba336fb00f0c8719a961de309a8db6f43a9bfb7575ca5f014d609b265` |
-| ballot VK hash | registry `ballotVKHash`, state leaf `0x07` | `0x7caffddcd7ea38439cbb45789b810d8eafceca65cff93dbeaae409b2bf64e219` |
+| ballot VK hash | registry `ballotVKHash`, state leaf `0x07` | `0x67e8e6b47ea32cf144d6e72886f02b95ed068b157f9d4ccc8e97f335858e4963` |
 | verifier code keccak256 | `ZiskVerifier` runtime code | `0xadab570d3e3a4c172d0c75e5aef5d06098b94d70a9c8ff76af239a90fdcadcc1` |
 
 The grace window fits the Ethereum leg: 300 s by default, floor 240 s, ceiling 600 s, at most
@@ -51,9 +51,20 @@ keeps full blobs.
 ## Retired deployments
 
 These registries stay on chain, but no preset follows them. They pin older
-program vks, so a node of this release, which proves under protocol v5, refuses
+program vks, so a node of this release, which proves under protocol v5.1, refuses
 them at boot.
 Their datadir directories stay untouched next to the current one.
+
+### OP Mainnet, protocol v5 pre-production registry
+
+`ProcessRegistry` `0x6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6` (block 158414417), deployed on
+2026-10-19 from davinci-contracts v0.0.52 with the DKG adapter
+`0x51aB0BB6A455e7f027f3b09b8F1Ea0634806f390` and Council adapter
+`0xC2f51d01E16b61d75eAD2e5b88d139739067af17`, followed by the `optimism` preset until the protocol
+v5.1 registry replaced it (process ids `3c3e0777…`). It pins the davinci-zkvm v0.4.1 programs
+(batch `0x1e4a74a1…d2a8`, results `0xde55d751…e4e9`, rootC as above) and the earlier ballot VK
+hash `0x7caffddcd7ea38439cbb45789b810d8eafceca65cff93dbeaae409b2bf64e219`; its record is
+davinci-contracts' `deployments/10-0x6f500a3e3a161ecb3c19a034bfb6a6ac3b71abe6.json`. A node of this release refuses it at boot.
 
 ### OP Mainnet, ZisK 1.3.2 registry with adapters
 
@@ -126,16 +137,16 @@ the commit in the deployment record) and reads back every pin, the grace setting
 (`--grace`) and, in L1-blob mode, the verifier's `L1Block`. Rebuilding a zkVM program changes its
 verification key, which needs a new registry.
 
-For the current OP registry, from davinci-contracts at `v0.0.52` after `forge build`:
+For the current OP registry, from davinci-contracts at `v0.0.54` after `forge build`:
 
 ```bash
 python3 script/verify_deployment.py --rpc "$RPC" --chain-id 10 \
-    --registry 0x6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6 \
+    --registry 0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97 \
     --verifier 0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7 \
-    --batch-vk 0x1e4a74a1c6fb1cd1874d80895e1e075930837955efb4a135539016f7cdead2a8 \
-    --results-vk 0xde55d751582e510bf378d4eec0d98ee3fa5817a50b77bc0e5ce560035e29e4e9 \
+    --batch-vk 0x4b1a527e284af96fa0c3543e9e9b18746a6494edd99c309e58d96a804e3041dc \
+    --results-vk 0xce964acdd53329fc49ede57f5ea288f044950e136be119287fd0021390689dc4 \
     --root-c 0x6b2490fba336fb00f0c8719a961de309a8db6f43a9bfb7575ca5f014d609b265 \
-    --ballot-vk-hash 0x7caffddcd7ea38439cbb45789b810d8eafceca65cff93dbeaae409b2bf64e219 \
+    --ballot-vk-hash 0x67e8e6b47ea32cf144d6e72886f02b95ed068b157f9d4ccc8e97f335858e4963 \
     --dkg-manager 0x9e799a1d22710056e62c849e3ffe19dd01db2d41 \
     --council-manager 0x281b84dee6305083cc719187e4a2737d61b4396e \
     --l1-block 0x4200000000000000000000000000000000000015 --grace 300,240,600,1800,60 \

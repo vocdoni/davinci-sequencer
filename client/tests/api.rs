@@ -271,7 +271,9 @@ fn ids_parse_and_print() {
     let s = pid.to_string();
     assert_eq!(s, format!("0x{}", "01".repeat(31)));
     assert_eq!(s.parse::<ProcessId>().unwrap(), pid);
-    assert_eq!(s[2..].parse::<ProcessId>().unwrap(), pid, "0x optional");
+    // `0x` is required, lowercase.
+    assert!(s[2..].parse::<ProcessId>().is_err());
+    assert!(s.replacen("0x", "0X", 1).parse::<ProcessId>().is_err());
     assert!("0x01".parse::<ProcessId>().is_err());
     // The pid as a field element is its big-endian integer.
     let mut be = [0u8; 32];
@@ -286,10 +288,8 @@ fn ids_parse_and_print() {
         api::parse_vote_id("0x80000000000000ff").unwrap(),
         0x8000_0000_0000_00ff
     );
-    assert_eq!(
-        api::parse_vote_id("80000000000000ff").unwrap(),
-        0x8000_0000_0000_00ff
-    );
+    assert!(api::parse_vote_id("80000000000000ff").is_err());
+    assert!(api::parse_vote_id("0X80000000000000ff").is_err());
     assert!(api::parse_vote_id("0x800000000000000").is_err());
     // Vote ids live at or above 2^63.
     assert_eq!(api::parse_vote_id("0x8000000000000000").unwrap(), 1 << 63);
@@ -459,6 +459,10 @@ fn info_and_census_file_roundtrip() {
         json!({"participants": [{"key": format!("0x{}", "aa".repeat(20)), "weight": "3"}]})
     );
     assert_eq!(serde_json::from_value::<CensusFile>(j).unwrap(), c);
+    // Census documents come from other producers: keys read with or
+    // without `0x`, as the node's census loader does.
+    let bare = json!({"participants": [{"key": "aa".repeat(20), "weight": "3"}]});
+    assert_eq!(serde_json::from_value::<CensusFile>(bare).unwrap(), c);
 }
 
 #[test]

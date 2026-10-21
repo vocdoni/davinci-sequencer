@@ -155,10 +155,16 @@ pub struct ProxyKnobs {
     /// A backend `lag` blocks behind: `eth_blockNumber` answers head - lag
     /// and `eth_getLogs` is answered as if the chain ended there.
     pub lag: std::sync::atomic::AtomicU64,
+    /// Answer the `finalized` block tag with a JSON-RPC error, as an
+    /// endpoint without finality does.
+    pub refuse_finalized: std::sync::atomic::AtomicBool,
+    /// Answer the `finalized` tag with a -32005 "limit exceeded" error.
+    pub limit_finalized: std::sync::atomic::AtomicBool,
 }
 
-/// A JSON-RPC proxy in front of anvil that can go down or cap the
-/// `eth_getLogs` range the way hosted providers do.
+/// A JSON-RPC proxy in front of anvil that can go down, cap the
+/// `eth_getLogs` range the way hosted providers do, or refuse the
+/// `finalized` tag.
 pub struct RpcProxy {
     pub url: String,
     pub knobs: std::sync::Arc<ProxyKnobs>,
@@ -181,6 +187,28 @@ impl RpcProxy {
                         return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
                     }
                     let mut req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    if k.limit_finalized.load(Relaxed)
+                        && req["method"] == "eth_getBlockByNumber"
+                        && req["params"][0] == "finalized"
+                    {
+                        let err = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req["id"],
+                            "error": {"code": -32005, "message": "daily request count exceeded"},
+                        });
+                        return axum::Json(err).into_response();
+                    }
+                    if k.refuse_finalized.load(Relaxed)
+                        && req["method"] == "eth_getBlockByNumber"
+                        && req["params"][0] == "finalized"
+                    {
+                        let err = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": req["id"],
+                            "error": {"code": -32602, "message": "invalid block tag: finalized"},
+                        });
+                        return axum::Json(err).into_response();
+                    }
                     let lag = k.lag.load(Relaxed);
                     let hex = |v: u64| format!("0x{v:x}");
                     let num = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok();

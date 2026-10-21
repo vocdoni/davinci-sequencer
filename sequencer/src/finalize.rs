@@ -152,6 +152,7 @@ impl From<Fail> for FinalizeFail {
             gate,
             msg,
             dkg_requested: None,
+            dkg_combined: None,
         }
     }
 }
@@ -177,6 +178,7 @@ async fn jitter() {
 /// the actor already saw the request on-chain. A COUNCIL process is
 /// requested while its ceremony's decryption gate is closed (that ends it),
 /// but published only once the gate opens, all-zero results included.
+/// With `count_combined`, a wait reports how many ciphertexts are combined.
 /// Reports through the mailbox.
 #[allow(clippy::too_many_arguments)] // a one-shot task, not an API
 pub(crate) async fn run_finalize_dkg(
@@ -186,6 +188,7 @@ pub(crate) async fn run_finalize_dkg(
     expected_root: [u8; 32],
     max_total: u64,
     at: At,
+    count_combined: bool,
     generation: u64,
     tx: mpsc::Sender<Msg>,
 ) {
@@ -205,8 +208,14 @@ pub(crate) async fn run_finalize_dkg(
             Ok(())
         }
         Err(f) => {
+            let wait = matches!(f, Fail::Wait(_));
             let mut f = FinalizeFail::from(f);
             f.dkg_requested = seen;
+            // Still waiting and the actor wants it for the log: how far the
+            // committee got.
+            if wait && count_combined {
+                f.dkg_combined = chain.dkg_combined(&pid31).await.ok().flatten();
+            }
             Err(f)
         }
     };

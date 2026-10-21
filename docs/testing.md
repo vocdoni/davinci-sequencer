@@ -23,8 +23,10 @@ cargo test -p davinci-state                 # one crate
 ```
 
 The state and API tests use real ballot proofs. They are cached under `state/tests/cache` and
-`sequencer/tests/cache` (gitignored), each file named by the sha256 of the proof's 71 public
-signals (big-endian, concatenated); a cold cache proves them from `CIRCOM_ARTIFACTS`.
+`sequencer/tests/cache` (gitignored), each file named by the sha256 of the embedded ballot VK hash
+and the proof's 71 public signals (big-endian, concatenated), so a new ballot key never reads an
+old proof; a cold cache proves them from `CIRCOM_ARTIFACTS`, which must hold the key the SDK
+embeds.
 
 Tests that need external tools are gated by an environment variable. When it is unset they print
 a skip line and pass, so check the output before assuming they ran.

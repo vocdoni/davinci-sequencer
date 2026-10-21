@@ -44,6 +44,9 @@ const PENDING_CAP: usize = 16 * 1024;
 
 /// How often a DKG-mode finalizer checks for the committee's plaintexts.
 const DKG_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How often a DKG wait that lasts is reported at warn, with how many
+/// ciphertexts the committee has combined.
+const DKG_WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Slowest pace of the check on a closed Council decryption gate, which can
 /// stay closed for months: from [`DKG_POLL`], doubling up to this.
 const GATE_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(300);
@@ -89,6 +92,11 @@ pub trait Chain: Send + Sync {
     /// endpoint's head). The monitor counts it as a failed read: after a few
     /// in a row it routes on without the reorg check.
     async fn block_ref(&self, n: u64) -> Result<Option<([u8; 32], u64)>, Web3Error>;
+    /// Number of the `finalized` block, the monitor's reorg anchor. `None`:
+    /// the endpoint refuses the tag, and a reorg rewinds a fixed 128 blocks.
+    async fn finalized_block(&self) -> Result<Option<u64>, Web3Error> {
+        Ok(None)
+    }
     async fn simulate_transition(
         &self,
         pid: &[u8; 31],
@@ -117,6 +125,11 @@ pub trait Chain: Send + Sync {
     /// DKG modes: every submitted ciphertext has a combined plaintext (and,
     /// for COUNCIL, the ceremony's decryption gate is open).
     async fn dkg_results_ready(&self, pid: &[u8; 31]) -> Result<bool, Web3Error>;
+    /// DKG modes: `(combined, count)` of the requested ciphertexts, for the
+    /// log of a long wait; `None` when it cannot be counted.
+    async fn dkg_combined(&self, _pid: &[u8; 31]) -> Result<Option<(u16, u16)>, Web3Error> {
+        Ok(None)
+    }
     /// COUNCIL: whether ceremony `cid` has opened decryption (the Council
     /// adapter's `isDecryptionOpen`).
     async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error>;
@@ -272,6 +285,9 @@ impl Chain for crate::web3::Contracts {
     async fn block_ref(&self, n: u64) -> Result<Option<([u8; 32], u64)>, Web3Error> {
         crate::web3::Contracts::block_ref(self, n).await
     }
+    async fn finalized_block(&self) -> Result<Option<u64>, Web3Error> {
+        crate::web3::Contracts::finalized_block(self).await
+    }
     async fn simulate_transition(
         &self,
         pid: &[u8; 31],
@@ -305,6 +321,9 @@ impl Chain for crate::web3::Contracts {
     }
     async fn dkg_results_ready(&self, pid: &[u8; 31]) -> Result<bool, Web3Error> {
         crate::web3::Contracts::dkg_results_ready(self, pid).await
+    }
+    async fn dkg_combined(&self, pid: &[u8; 31]) -> Result<Option<(u16, u16)>, Web3Error> {
+        crate::web3::Contracts::dkg_combined(self, pid).await
     }
     async fn council_decryption_open(&self, cid: &[u8; 12]) -> Result<bool, Web3Error> {
         crate::web3::Contracts::council_decryption_open(self, cid).await
@@ -607,6 +626,8 @@ pub(crate) struct FinalizeFail {
     pub gate: bool,
     pub msg: String,
     pub dkg_requested: Option<bool>,
+    /// `(combined, count)` when the attempt was asked to count them.
+    pub dkg_combined: Option<(u16, u16)>,
 }
 
 /// Client side of an actor's mailbox.
@@ -991,6 +1012,9 @@ struct Actor {
     finalize_attempts: u32,
     /// Consecutive attempts that found the Council decryption gate closed.
     gate_polls: u32,
+    /// DKG modes: since when the results wait for the committee, and when
+    /// that wait is next reported (with the combined count) at warn.
+    dkg_wait: Option<(tokio::time::Instant, tokio::time::Instant)>,
     /// Transient finalize cooldown: no new attempt before this instant.
     finalize_after: Option<tokio::time::Instant>,
     /// Prove the results during the grace (sequencer-key processes).
@@ -1290,6 +1314,7 @@ pub(crate) fn spawn_actor(
         results_failures: 0,
         finalize_attempts: 0,
         gate_polls: 0,
+        dkg_wait: None,
         finalize_after: None,
         eager: cfg.eager_results,
         foreign_key: false,
@@ -1586,6 +1611,7 @@ impl Actor {
                     Ok(()) => {
                         self.finalize_attempts = 0;
                         self.results_failures = 0;
+                        self.dkg_wait = None;
                         if self.record.local == LocalStatus::Active {
                             self.results_sent =
                                 Some(tokio::time::Instant::now() + LANDED_EVENT_WAIT);
@@ -1620,8 +1646,9 @@ impl Actor {
                         // at a fixed pace, not an error.
                         self.finalize_attempts = 0;
                         self.gate_polls = 0;
-                        self.finalize_after = Some(tokio::time::Instant::now() + DKG_POLL);
-                        debug!(pid = %hex::encode(self.pid31), e = ?f.msg, "waiting for the DKG");
+                        let now = tokio::time::Instant::now();
+                        self.finalize_after = Some(now + DKG_POLL);
+                        self.dkg_waited(now, &f);
                     }
                     Err(f) => {
                         // A moved root: drop the held proof. Re-read the chain
@@ -1649,6 +1676,40 @@ impl Actor {
             }
         }
         self.tick().await;
+    }
+
+    /// Logs a DKG wait: once at info when it starts, then at warn every
+    /// [`DKG_WAIT_REPORT`] with the combined count, so a committee stuck
+    /// below its threshold shows in the log instead of as silence.
+    fn dkg_waited(&mut self, now: tokio::time::Instant, f: &FinalizeFail) {
+        let pid = hex::encode(self.pid31);
+        match self.dkg_wait {
+            None => {
+                self.dkg_wait = Some((now, now + DKG_WAIT_REPORT));
+                info!(%pid, why = %f.msg, "results wait for the DKG committee to combine the decryption");
+            }
+            Some((since, due)) if now >= due => {
+                self.dkg_wait = Some((since, now + DKG_WAIT_REPORT));
+                let mins = now.saturating_duration_since(since).as_secs() / 60;
+                match f.dkg_combined {
+                    Some((combined, count)) => warn!(
+                        %pid,
+                        combined,
+                        count,
+                        minutes = mins,
+                        why = %f.msg,
+                        "DKG results still waiting for the committee"
+                    ),
+                    None => warn!(
+                        %pid,
+                        minutes = mins,
+                        why = %f.msg,
+                        "DKG results still waiting for the committee"
+                    ),
+                }
+            }
+            Some(_) => debug!(%pid, e = ?f.msg, "waiting for the DKG"),
+        }
     }
 
     fn end_time(&self) -> u64 {
@@ -5028,6 +5089,9 @@ impl Actor {
                 self.state.committed().root,
                 self.deps.grace.grace_max_total,
                 at,
+                // A wait report is due: count the combined ciphertexts.
+                self.dkg_wait
+                    .is_some_and(|(_, due)| tokio::time::Instant::now() >= due),
                 self.generation,
                 self.tx.clone(),
             ),
@@ -5111,6 +5175,7 @@ fn spawn_finalize(
                     gate: false,
                     msg: "finalize task ended without a result".into(),
                     dkg_requested: None,
+                    dkg_combined: None,
                 }),
             }),
             posted: None,

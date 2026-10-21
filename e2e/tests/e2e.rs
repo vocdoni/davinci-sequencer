@@ -81,7 +81,7 @@ use davinci_e2e::node::{self, Metrics, Node, NodeConfig, WorkDir};
 use davinci_e2e::proxy::Proxy;
 use davinci_e2e::wait;
 use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, public_signals};
-use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, vote_id_recover};
+use davinci_zkvm_sdk::census::{CensusWitness, LeanImt, vote_recover};
 use davinci_zkvm_sdk::client::ProverClient;
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::{decrypt, keygen};
@@ -336,8 +336,10 @@ async fn setup_checks(
         )
         .is_ok_and(|pubs| verifier.verify(&r.ballot_proof, &pubs))
     };
-    let sig_ok =
-        |r: &VoteRequest| vote_id_recover(r.vote_id, &r.signature()).ok() == Some(r.address);
+    let sig_ok = |r: &VoteRequest| {
+        vote_recover(&r.process_id.to_fr(), r.vote_id, &r.ballot, &r.signature()).ok()
+            == Some(r.address)
+    };
     let honest = b.round1.iter().chain(&b.round2).chain(&b.csp);
     for r in honest.chain([&b.reused, &b.outsider]) {
         ensure!(

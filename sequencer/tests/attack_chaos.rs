@@ -355,6 +355,7 @@ fn census_vote(
     let k = Fr::from(kseed);
     let vid = vote_id(&cfg.process_id, &addr, &k);
     let ballot = encrypt_ballot(&cfg.enc_key, fields, &k, cfg.ballot_mode.num_fields);
+    let signature = vote_sign(&key, &cfg.process_id, vid, &ballot);
     VerifiedVote {
         pkg: VotePackage {
             process_id: cfg.process_id,
@@ -362,7 +363,7 @@ fn census_vote(
             address,
             ballot,
             proof: dummy_proof(),
-            signature: vote_id_sign(&key, vid),
+            signature,
             census: CensusWitness::Merkle(imt.proof(leaf).unwrap()),
             weight: 1,
         },

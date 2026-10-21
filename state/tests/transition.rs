@@ -967,13 +967,13 @@ fn reseal_without_a_vote_keeps_its_overwrite_hidden() {
     assert!(exposed.intersection(&occupied).all(|s| u2.contains(s)));
 }
 
-// Sha256SmtLib.verifyInclusion, line for line: siblings root to leaf, leaf
-// depth one past the last non-zero sibling (which must not be the last
-// slot), key bits LSB first, leaf = sha256(key_le8 ‖ value_le32 ‖ 0x01).
+// Sha256SmtLib.verifyInclusion, line for line: at most 65 siblings, root to
+// leaf, leaf depth one past the last non-zero sibling (which must not be the
+// last slot), key bits LSB first, leaf = sha256(key_le8 ‖ value_le32 ‖ 0x01).
 fn registry_verify(root: &[u8; 32], key: u64, value_be: &[u8; 32], sibs: &[[u8; 32]]) -> bool {
     use sha2::{Digest, Sha256};
     let n = sibs.len();
-    if n == 0 || n > 64 {
+    if n == 0 || n > 65 {
         return false;
     }
     let d = sibs
@@ -1024,8 +1024,8 @@ fn dkg_results_inputs_verify_like_the_registry() {
     let check = |st: &ProcessState<arbo::MemoryStorage>| {
         let root = st.committed().root;
         let (acc, sibs) = st.dkg_results_inputs().unwrap();
-        assert_eq!(sibs.len(), 64);
-        assert_eq!(sibs[63], [0u8; 32]);
+        assert_eq!(sibs.len(), 65);
+        assert_eq!(sibs[64], [0u8; 32]);
         // Leaf-hash order: field i is coords 4i..4i+4 (c1x, c1y, c2x, c2y).
         let coords = st.committed().accumulator.coords();
         for (a, c) in acc.iter().zip(coords.iter()) {
@@ -1056,6 +1056,14 @@ fn dkg_results_inputs_verify_like_the_registry() {
         st.commit(&b).unwrap();
         check(&st);
     }
+    // A vote id twin of the results key: the leaf at depth 64, its twin the
+    // 64th sibling.
+    let mut twin = fake_vote(&env, 24, &[1, 0, 0], 600);
+    twin.pkg.vote_id = davinci_zkvm_sdk::limits::VOTE_ID_MIN | 4;
+    let b = st.prepare(&[twin], &mut rng, &none()).unwrap();
+    st.commit(&b).unwrap();
+    check(&st);
+    assert_ne!(st.dkg_results_inputs().unwrap().1[63], [0u8; 32]);
 }
 
 #[test]

@@ -85,10 +85,10 @@ impl AppState {
 
 /// A `0x` 20-byte hex address path segment.
 fn parse_addr(s: &str) -> Result<[u8; 20], ApiError> {
-    let h = s.strip_prefix("0x").unwrap_or(s);
+    let bad = || ApiError::Invalid("want a 20-byte hex address".into());
+    let h = s.strip_prefix("0x").ok_or_else(bad)?;
     let mut out = [0u8; 20];
-    hex::decode_to_slice(h, &mut out)
-        .map_err(|_| ApiError::Invalid("want a 20-byte hex address".into()))?;
+    hex::decode_to_slice(h, &mut out).map_err(|_| bad())?;
     Ok(out)
 }
 

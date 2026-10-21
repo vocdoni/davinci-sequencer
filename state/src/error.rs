@@ -43,9 +43,11 @@ pub enum VoteError {
     WeightRange,
     #[error("ballot proof does not verify")]
     BadProof,
-    #[error("vote id signature invalid: {0}")]
+    #[error("vote signature invalid: {0}")]
     SignatureInvalid(String),
-    #[error("vote id signed by another key")]
+    /// The envelope (process id, vote id, ciphertexts) does not recover to
+    /// the vote's address: another key, or a signature for another vote.
+    #[error("vote signed by another key")]
     SignatureMismatch,
     #[error("census witness does not match the census origin")]
     OriginMismatch,

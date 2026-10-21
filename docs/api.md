@@ -6,7 +6,9 @@ The node serves JSON over HTTP, by default on port 9090. The wire types live in
 ## Wire format
 
 - Field names are camelCase.
-- Field elements are decimal strings; bytes are `0x` hex.
+- Field elements are decimal strings; bytes are `0x` hex, with a lowercase `0x` on every byte
+  string (process ids, addresses, vote ids, signatures, roots, blobs), in bodies and path segments
+  alike. Without it, or with `0X`, the request is a 40001 (`want N bytes of hex`).
 - Census values (roots, leaves, siblings) are 256-bit big-endian integers, never field elements:
   `0x` followed by exactly 64 hex digits, written lowercase and read in either case.
 - A process id is `0x` followed by 62 hex digits (`bytes31`).
@@ -15,9 +17,10 @@ The node serves JSON over HTTP, by default on port 9090. The wire types live in
 - A ballot is exactly 16 `{c1: {x, y}, c2: {x, y}}` ciphertexts.
 
 Decoding is strict: field elements must be below the field modulus, points on the curve, byte
-lengths exact, census values exactly 64 hex digits after `0x` (a decimal or short value is a
-40001), vote bodies may carry no unknown fields, and nothing but whitespace may follow the JSON
-value. Bodies are capped at 256 KiB and
+lengths exact and `0x`-prefixed, census values exactly 64 hex digits after `0x` (a decimal or
+short value is a 40001), vote bodies may carry no unknown fields, and nothing but whitespace may
+follow the JSON value. Census documents served at a `censusURI` are not API bodies: their member
+keys may come without `0x` (see [census.md](census.md)). Bodies are capped at 256 KiB and
 requests time out after 60 s.
 
 ## Routes
@@ -63,7 +66,7 @@ the same key. Organizers ask for the registry's `getNextProcessId(organizer)`.
 | `voteId` | The vote id. |
 | `ballot` | 16 ciphertexts. |
 | `ballotProof` | snarkjs Groth16 proof. Its 71 public inputs are not sent: the node derives them from the vote and the process (address, vote id, process id, ballot mode, election key, weight, then the 64 ciphertext coordinates) and checks the proof against them. |
-| `signature` | 65 bytes `r‖s‖v`, a personal-sign over the vote id. |
+| `signature` | 65 bytes `r‖s‖v` (`v` 0, 1, 27 or 28): the voter's personal-sign over the vote envelope, `keccak256("davinci-vote-v1" ‖ processId ‖ voteId ‖ ballotHash)` over 87 bytes, with the process id as 32 bytes and the vote id as 8, both big-endian, and `ballotHash` the SHA-256 of the 64 ballot coordinates as 32-byte big-endian values in wire order. It binds the vote to its process and ciphertexts: a signature over anything else, the vote id alone included, is refused with 40002. |
 | `weight` | Decimal string. |
 | `censusProof` | Required for a CSP census: `{"type": "csp", "r", "s", "recid", "index"}`. The CSP signature covers the top-level `weight`. For a Merkle census it is optional (`{"type": "merkle", "root", "leaf", "pathBits", "siblings"}`, census values): the node derives the proof from its own copy and ignores this one. |
 
@@ -108,8 +111,8 @@ plus a discriminator. A 500 body says only `internal error`; the detail goes to 
 
 | Status | Code | Meaning |
 |---|---|---|
-| 400 | 40001 | Malformed request or field, an unknown field included. For votes also: address not in the census, missing CSP proof, or a vote for another process. |
-| 400 | 40002 | The vote failed a protocol check: ballot proof, signature, census binding (a leaf at or above 2^248 included), ballot encoding or weight. |
+| 400 | 40001 | Malformed request or field, an unknown field included. For votes also: address not in the census, or a missing CSP proof. |
+| 400 | 40002 | The vote failed a protocol check: ballot proof, signature (one made for another process, vote id or ballot included, so a vote sent to another process gets 40002), census binding (the CSP attestation, or the weight against the leaf of the node's own Merkle proof; a client's Merkle proof is never read), ballot encoding or weight. |
 | 404 | 40401 | Not found, including an unknown route. |
 | 404 | 40402 | Unknown process, or one this node does not serve. |
 | 405 | 40501 | The route exists, the method does not. |

@@ -12,7 +12,7 @@ and voters who cast ballots.
 - `organizer`: the process lifecycle on the registry (`Organizer`), read-only access
   (`RegistryReader`), and `verify_registry`, which checks that a registry pins what this release
   proves.
-- `voter`: ballot encryption, vote id, inputs hash, circuit inputs and the vote-id signature.
+- `voter`: ballot encryption, vote id, inputs hash, circuit inputs and the vote-envelope signature.
 - `prover` (feature `prover`, on by default): the Groth16 ballot prover over the davinci-circom
   `ballot_proof.wasm` and `ballot_proof_pkey.zkey`. It pulls in ark-circom (arkworks 0.6) and
   wasmer; build with `default-features = false` when only the wire types and the client are

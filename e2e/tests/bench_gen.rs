@@ -7,7 +7,7 @@ use davinci_e2e::bench::merge::{Verify, merge_wave};
 use davinci_e2e::bench::plan::{ElectionSpec, NodeId, Plan, Seed};
 use davinci_e2e::fixture as fx;
 use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr};
-use davinci_zkvm_sdk::census::{eth_address, vote_id_recover};
+use davinci_zkvm_sdk::census::{eth_address, vote_recover, vote_sign};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
 
@@ -89,7 +89,11 @@ fn gen_two_hosts_offline() {
             .unwrap();
             assert!(v.verify(&q.ballot_proof, &pubs), "{} v{}", r.tag, r.voter);
             let want = eth_address(seed.voter_key(&r.tag, r.voter).verifying_key());
-            assert_eq!(vote_id_recover(q.vote_id, &q.signature()).unwrap(), want);
+            let pid = q.process_id.to_fr();
+            assert_eq!(
+                vote_recover(&pid, q.vote_id, &q.ballot, &q.signature()).unwrap(),
+                want
+            );
             assert_eq!(q.address, want);
             seen += 1;
         }
@@ -113,9 +117,24 @@ fn gen_two_hosts_offline() {
     let err = merge_wave(camp, &plan, 1, &seed, Verify::Full).unwrap_err();
     assert!(format!("{err:#}").contains("proof"), "{err:#}");
 
-    // A tampered ballot under an intact proof is caught offline too.
+    // A tampered ballot under an intact proof is caught offline too: the
+    // envelope no longer recovers the voter, and signed again by the voter
+    // it is still not the seed's ballot.
     let mut recs = good;
     recs[0].req.ballot = Ballot::identity();
+    ballots::write_shard(&path, &recs, meta.clone()).unwrap();
+    let err = merge_wave(camp, &plan, 1, &seed, Verify::Full).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("signed by another key"),
+        "{err:#}"
+    );
+    let r = &mut recs[0];
+    let q = &mut r.req;
+    let key = seed.voter_key(&r.tag, r.voter);
+    let sig = vote_sign(&key, &q.process_id.to_fr(), q.vote_id, &q.ballot);
+    q.signature[..32].copy_from_slice(&sig.r);
+    q.signature[32..64].copy_from_slice(&sig.s);
+    q.signature[64] = sig.v;
     ballots::write_shard(&path, &recs, meta).unwrap();
     let err = merge_wave(camp, &plan, 1, &seed, Verify::Full).unwrap_err();
     assert!(format!("{err:#}").contains("ballot"), "{err:#}");

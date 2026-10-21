@@ -20,6 +20,8 @@ struct Net {
     reorg_in_page: Arc<Mutex<Option<(u64, u64, u8)>>>,
     /// While set, every `block_hash` read fails (a rate-limited RPC).
     fail_hashes: Arc<AtomicBool>,
+    /// What `finalized_block` answers.
+    finalized: Arc<Mutex<Finalized>>,
     /// The next `n` process reads of the main process panic in the caller
     /// (an actor bug unwinding its task); `reads` counts those reads.
     panics: Arc<AtomicU64>,
@@ -35,6 +37,7 @@ impl Net {
             fork: Arc::new(Mutex::new((u64::MAX, 0))),
             reorg_in_page: Arc::default(),
             fail_hashes: Arc::default(),
+            finalized: Arc::new(Mutex::new(Finalized::Refused)),
             panics: Arc::default(),
             reads: Arc::default(),
         }
@@ -64,6 +67,17 @@ impl Net {
         h[31] = if n >= from { tag } else { 0 };
         h
     }
+}
+
+/// The double's answer to a `finalized` block read.
+#[derive(Clone, Copy, Debug)]
+enum Finalized {
+    /// The endpoint refuses the tag: the fixed 128-block rewind.
+    Refused,
+    /// This many blocks behind the head.
+    Behind(u64),
+    /// The read fails (a transport error).
+    Fails,
 }
 
 fn bad_census_root() -> [u8; 32] {
@@ -125,6 +139,13 @@ impl Chain for Net {
             return Err(Web3Error::Rpc("scripted block read failure".into()));
         }
         Ok((n <= self.chain.head_block()).then(|| (self.hash_of(n), self.chain.block_time(n))))
+    }
+    async fn finalized_block(&self) -> Result<Option<u64>, Web3Error> {
+        match *self.finalized.lock().unwrap() {
+            Finalized::Refused => Ok(None),
+            Finalized::Behind(n) => Ok(Some(self.chain.head_block().saturating_sub(n))),
+            Finalized::Fails => Err(Web3Error::Rpc("scripted finalized read failure".into())),
+        }
     }
     async fn simulate_transition(
         &self,
@@ -674,7 +695,8 @@ async fn reorg_at_the_cursor_reroutes_the_replaced_range() {
     sd.cancel();
 }
 
-/// The rewind goes back 128 blocks, wherever the fork is.
+/// On an endpoint that refuses the `finalized` tag the rewind goes back 128
+/// blocks, wherever the fork is.
 #[tokio::test]
 async fn reorg_rewinds_128_blocks() {
     let s = setup(2, 8, None);
@@ -711,6 +733,133 @@ async fn reorg_rewinds_128_blocks() {
             "case {i}: {after:?}"
         );
     }
+    sd.cancel();
+}
+
+/// With finality, a reorg rewinds to the finalized block, however deep it
+/// is: a process creation on the new branch 170 blocks below the cursor,
+/// which the fixed 128-block rewind missed, is routed.
+#[tokio::test]
+async fn reorg_rewinds_to_the_finalized_block() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    *net.finalized.lock().unwrap() = Finalized::Behind(200);
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    s.chain.set_head_block(500);
+    settled_at_head(&db, &net).await;
+
+    // The new branch from 320 on carries a process creation at 330.
+    bad_process_on_file(&s);
+    s.chain.set_head_block(330);
+    s.chain.push_event(EventKind::ProcessCreated {
+        pid: bad_pid31(),
+        creator: Address::ZERO,
+    });
+    s.chain.set_head_block(500);
+    let calls = s.chain.event_calls().len();
+    net.reorg(320, 1);
+    wait_until("creation at 330 routed", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
+    // Rescanned from the finalized block, 300.
+    assert_eq!(s.chain.event_calls()[calls].0, 301);
+    settled_at_head(&db, &net).await;
+    sd.cancel();
+}
+
+/// A finalized block at the cursor disagrees with the stored hash: the
+/// stored block was never canonical, so the monitor routes every event again
+/// from the start block (and counts it as a reorg, so actors re-read).
+#[tokio::test]
+async fn a_cursor_off_the_finalized_chain_routes_everything_again() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    *net.finalized.lock().unwrap() = Finalized::Behind(0);
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    s.chain.set_head_block(500);
+    settled_at_head(&db, &net).await;
+
+    bad_process_on_file(&s);
+    s.chain.set_head_block(10);
+    s.chain.push_event(EventKind::ProcessCreated {
+        pid: bad_pid31(),
+        creator: Address::ZERO,
+    });
+    s.chain.set_head_block(500);
+    let calls = s.chain.event_calls().len();
+    net.reorg(5, 1);
+    wait_until("creation at 10 routed", async || {
+        node.processes.read().await.contains_key(&bad_pid_fr())
+    })
+    .await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 1);
+    // No start block: from block 1, through the paged path.
+    assert_eq!(s.chain.event_calls()[calls].0, 1);
+    settled_at_head(&db, &net).await;
+    sd.cancel();
+}
+
+/// A failed `finalized` read on a hash mismatch keeps the cursor and its
+/// hash: the check runs again at the next poll, and rewinds once it reads.
+#[tokio::test]
+async fn a_failed_finalized_read_keeps_the_cursor() {
+    let s = setup(2, 8, None);
+    let dir = TempDir::new().unwrap();
+    let db = Db::open_in(dir.path()).unwrap();
+    let sd = CancellationToken::new();
+    let net = Net::new(s.chain.clone());
+    let node = start(
+        db.clone(),
+        &net,
+        FakeProver::open(),
+        cfg(dir.path(), &s.census_dir, 1),
+        &sd,
+    )
+    .await;
+    let _h = handle(&node).await;
+    s.chain.set_head_block(500);
+    settled_at_head(&db, &net).await;
+    let stored = db.meta_bytes(HASH_KEY).unwrap();
+
+    *net.finalized.lock().unwrap() = Finalized::Fails;
+    net.reorg(450, 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(node.metrics.reorgs.load(Ordering::SeqCst), 0);
+    assert_eq!(cursor(&db), Some(500));
+    assert_eq!(db.meta_bytes(HASH_KEY).unwrap(), stored);
+
+    let calls = s.chain.event_calls().len();
+    *net.finalized.lock().unwrap() = Finalized::Behind(64);
+    wait_until("reorg seen", async || {
+        node.metrics.reorgs.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    settled_at_head(&db, &net).await;
+    assert_eq!(s.chain.event_calls()[calls].0, 437);
     sd.cancel();
 }
 

@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alloy::eips::BlockId;
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, FixedBytes, U256, keccak256};
 use alloy::providers::fillers::{FillProvider, JoinFill, WalletFiller};
@@ -611,7 +611,9 @@ impl Organizer {
     }
 
     /// Creates a READY process; returns its id from the `ProcessCreated` event.
-    /// Fails unless the registry assigns `p.process_id` next.
+    /// Fails unless the registry assigns `p.process_id` next, and before any
+    /// call when the ballot mode breaks the registry's cost rule
+    /// (`BallotMode::validate`).
     ///
     /// `KeyMode::Sequencer`: a key issued for another id is not one the
     /// sequencer will decrypt with, so if another `newProcess` from this
@@ -630,6 +632,8 @@ impl Organizer {
     /// (`NotAuthorizedCreator`, `NotAllowedAdapter`, `WrongPhase`,
     /// `UnknownCeremony`, `CouncilDisabled`).
     pub async fn create_process(&self, p: &NewProcess) -> Result<CreatedProcess> {
+        // The registry's cost rule, before anything goes to the chain.
+        p.ballot_mode.validate()?;
         let next = self.next_process_id().await?;
         if next != p.process_id {
             return Err(Error::Invalid(format!(
@@ -890,13 +894,19 @@ impl Organizer {
     }
 
     /// Cancels every created process still READY or PAUSED; returns those
-    /// canceled. Tries them all; the first error is returned after.
+    /// canceled. One past its grace end is left alone: the registry refuses
+    /// that cancel, as its results may be on their way. Tries them all; the
+    /// first error is returned after.
     pub async fn cancel_open(&self) -> Result<Vec<[u8; 31]>> {
         let (mut done, mut first_err) = (Vec::new(), None);
         for pid in self.created() {
             let r = match self.process(&pid).await {
                 Ok(p) if matches!(p.status, ProcessStatus::Ready | ProcessStatus::Paused) => {
-                    self.cancel_process(&pid).await.map(|()| done.push(pid))
+                    match self.grace_closed(&pid).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => self.cancel_process(&pid).await.map(|()| done.push(pid)),
+                        Err(e) => Err(e),
+                    }
                 }
                 Ok(_) => Ok(()),
                 Err(e) => Err(e),
@@ -906,6 +916,18 @@ impl Organizer {
             }
         }
         first_err.map_or(Ok(done), Err)
+    }
+
+    // Whether the head is at or past the process's grace end.
+    async fn grace_closed(&self, pid: &[u8; 31]) -> Result<bool> {
+        let end = self.grace_end(pid).await?;
+        let head = self
+            .signing
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| Error::Chain(e.to_string()))?
+            .ok_or_else(|| Error::Chain("no latest block".into()))?;
+        Ok(head.header.timestamp >= end)
     }
 
     async fn set_status(&self, pid: &[u8; 31], status: u8) -> Result<()> {

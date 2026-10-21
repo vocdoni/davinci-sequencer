@@ -16,7 +16,7 @@ use davinci_client::voter::Voter;
 use davinci_state::{CensusOrigin, ProcessConfig, VoteError, VotePackage, validate_vote};
 use davinci_zkvm_sdk::ballot::{address_to_fr, encrypt_ballot, public_signals, vote_id};
 use davinci_zkvm_sdk::census::{
-    CensusWitness, csp_sign, slot_key_address, slot_key_csp, vote_id_recover,
+    CensusWitness, csp_sign, slot_key_address, slot_key_csp, vote_recover, vote_sign,
 };
 use davinci_zkvm_sdk::crypto::elgamal::decrypt;
 use davinci_zkvm_sdk::crypto::field::Fr;
@@ -83,19 +83,33 @@ fn package(req: &VoteRequest, census: CensusWitness) -> VotePackage {
     }
 }
 
-// davinci-state accepts the vote; one changed ballot coordinate fails the
-// proof, whose public inputs the node derives.
-fn check_state_accepts(e: &Election, req: &VoteRequest, census: CensusWitness, slot: u64) {
+// davinci-state accepts the vote. One changed ballot coordinate no longer
+// recovers the voter (the ciphertexts are in the signed envelope); signed
+// again by the voter, it fails the proof, whose public inputs the node
+// derives.
+fn check_state_accepts(
+    e: &Election,
+    v: &Voter,
+    req: &VoteRequest,
+    census: CensusWitness,
+    slot: u64,
+) {
     let cfg = config(e);
     let vf = verifier();
     let ok = validate_vote(&cfg, &vf, package(req, census.clone())).unwrap();
     assert_eq!(ok.slot, slot);
     assert_eq!(ok.pkg.vote_id, req.vote_id);
 
-    // Negating x keeps the point on the curve: only the proof can notice.
+    // Negating x keeps the point on the curve: only the signature and the
+    // proof can notice.
     let mut bad = package(req, census);
     bad.ballot.0[0].c1.x = -bad.ballot.0[0].c1.x;
     assert!(bad.ballot.0[0].c1.is_on_curve());
+    assert_eq!(
+        validate_vote(&cfg, &vf, bad.clone()).unwrap_err(),
+        VoteError::SignatureMismatch
+    );
+    bad.signature = vote_sign(&v.key, &bad.process_id, bad.vote_id, &bad.ballot);
     match validate_vote(&cfg, &vf, bad) {
         Err(VoteError::BadProof) => {}
         other => panic!("want BadProof, got {other:?}"),
@@ -146,7 +160,13 @@ fn check_vote(e: &Election, v: &Voter, req: &VoteRequest, k: &Fr, fields: &[u64]
         assert!(!vf.verify(&req.ballot_proof, &bad), "tampered public {i}");
     }
     assert_eq!(
-        vote_id_recover(req.vote_id, &req.signature()).unwrap(),
+        vote_recover(
+            &req.process_id.to_fr(),
+            req.vote_id,
+            &req.ballot,
+            &req.signature()
+        )
+        .unwrap(),
         v.address()
     );
     // What goes over the wire comes back identical.
@@ -179,7 +199,7 @@ fn merkle_vote(nf: u8, fields: &[u64], seed: u64) {
     let idx = vs.iter().position(|x| x.address() == req.address).unwrap();
     let rederived = census.proof(idx).unwrap();
     let slot = slot_key_address(&req.address);
-    check_state_accepts(&e, &req, CensusWitness::Merkle(rederived), slot);
+    check_state_accepts(&e, v, &req, CensusWitness::Merkle(rederived), slot);
     match &req.census_proof {
         Some(CensusProofWire::Merkle(m)) => {
             assert_eq!(m.to_census_proof(), census.proof(3).unwrap())
@@ -224,7 +244,13 @@ fn vote_csp() {
     eprintln!("nf=4 csp: vote built and proved in {:?}", t.elapsed());
     check_vote(&e, &v, &req, &k, &[1, 0, 2], 3);
     assert_eq!(req.census_witness(), Some(CensusWitness::Csp(att.clone())));
-    check_state_accepts(&e, &req, CensusWitness::Csp(att), slot_key_csp(17).unwrap());
+    check_state_accepts(
+        &e,
+        &v,
+        &req,
+        CensusWitness::Csp(att),
+        slot_key_csp(17).unwrap(),
+    );
 }
 
 // A ballot outside the mode never gets a proof: the voter refuses it before

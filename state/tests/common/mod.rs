@@ -12,7 +12,7 @@ use davinci_client::voter::CircomInputs;
 use davinci_state::{CensusOrigin, ProcessConfig, ProcessState, VerifiedVote, VotePackage};
 use davinci_zkvm_sdk::ballot::{BallotMode, address_to_fr, encrypt_ballot, vote_id};
 use davinci_zkvm_sdk::census::{
-    CensusWitness, LeanImt, Node, census_leaf, eth_address, slot_key_address, vote_id_sign,
+    CensusWitness, LeanImt, Node, census_leaf, eth_address, slot_key_address, vote_sign,
 };
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::elgamal::keygen;
@@ -132,6 +132,7 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
     let ballot = encrypt_ballot(&cfg.enc_key, fields, &k, cfg.ballot_mode.num_fields);
     let census = env.imt.proof(idx).unwrap();
     let slot = slot_key_address(&address);
+    let signature = vote_sign(&key, &cfg.process_id, vid, &ballot);
     VerifiedVote {
         pkg: VotePackage {
             process_id: cfg.process_id,
@@ -139,7 +140,7 @@ pub fn fake_vote(env: &Env, idx: usize, fields: &[u64], kseed: u64) -> VerifiedV
             address,
             ballot,
             proof: dummy_proof(),
-            signature: vote_id_sign(&key, vid),
+            signature,
             census: CensusWitness::Merkle(census),
             weight: 1,
         },
@@ -173,10 +174,13 @@ fn prover() -> &'static BallotProver {
     })
 }
 
-/// Proof-cache key: sha256 of the 71 public signals, big-endian and
-/// concatenated. The signals are everything the proof binds.
+/// Proof-cache key: sha256 of the embedded ballot VK hash and the 71 public
+/// signals, big-endian and concatenated. The signals are everything the
+/// proof binds; the VK hash keeps a proof made under another ballot key from
+/// being read back.
 pub fn signals_key(pubs: &[Fr]) -> String {
     let mut h = Sha256::new();
+    h.update(embedded_vk_hash());
     for x in pubs {
         h.update(fr_to_be(x));
     }

@@ -53,14 +53,14 @@ impl Network {
 }
 
 /// OP Mainnet in L1-blob mode: transitions settle on OP, their blobs live on
-/// Ethereum (protocol v5 pre-production registry deployed 2026-10-19, see docs/deployments.md). Blob sends need an
+/// Ethereum (protocol v5.1 pre-production registry deployed 2026-10-21, see docs/deployments.md). Blob sends need an
 /// Ethereum RPC that takes 1.5 MB bodies: publicnode refuses them, dRPC takes
 /// them, and the node sends to every L1 endpoint at once.
 pub const OPTIMISM: Network = Network {
     name: "optimism",
     chain_id: 10,
-    registry: address!("6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6"),
-    start_block: 158_414_417,
+    registry: address!("02D6c284234B4CE75faB3085cF3f1ba4b7262B97"),
+    start_block: 158_487_281,
     rpc_urls: &[
         "https://optimism-rpc.publicnode.com",
         "https://mainnet.optimism.io",
@@ -118,7 +118,7 @@ mod tests {
         }
     }
 
-    // The preset's registry verifies the protocol v5 programs: a build
+    // The preset's registry verifies the protocol v5.1 programs: a build
     // against another davinci-zkvm release would settle nothing there.
     #[test]
     fn optimism_pins_equal_the_zkvm_release() {
@@ -126,12 +126,12 @@ mod tests {
         use davinci_zkvm_sdk::release;
         assert_eq!(
             release::BATCH_PROGRAM_VK,
-            hex!("1e4a74a1c6fb1cd1874d80895e1e075930837955efb4a135539016f7cdead2a8"),
+            hex!("4b1a527e284af96fa0c3543e9e9b18746a6494edd99c309e58d96a804e3041dc"),
             "batch program vk"
         );
         assert_eq!(
             release::RESULTS_PROGRAM_VK,
-            hex!("de55d751582e510bf378d4eec0d98ee3fa5817a50b77bc0e5ce560035e29e4e9"),
+            hex!("ce964acdd53329fc49ede57f5ea288f044950e136be119287fd0021390689dc4"),
             "results program vk"
         );
         assert_eq!(
@@ -141,15 +141,15 @@ mod tests {
         );
     }
 
-    // The protocol v5 pre-production registry with the DKG and Council
+    // The protocol v5.1 pre-production registry with the DKG and Council
     // adapters, whose pins equal the ones above.
     #[test]
     fn optimism_preset_is_deployed() {
         assert_eq!(
             OPTIMISM.registry,
-            address!("6F500A3e3A161EcB3C19A034bFB6a6Ac3b71abE6")
+            address!("02D6c284234B4CE75faB3085cF3f1ba4b7262B97")
         );
-        assert_eq!(OPTIMISM.start_block, 158_414_417);
+        assert_eq!(OPTIMISM.start_block, 158_487_281);
     }
 
     #[test]

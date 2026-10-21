@@ -10,9 +10,7 @@ use davinci_client::api::Fr;
 use davinci_client::organizer::OnchainProcess;
 use davinci_client::organizer::RegistryReader;
 use davinci_zkvm_sdk::ballot::{Ballot, address_to_fr, encrypt_ballot, public_signals, vote_id};
-use davinci_zkvm_sdk::census::{
-    CspProof, csp_recover, eth_address, node_from_hex, vote_id_recover,
-};
+use davinci_zkvm_sdk::census::{CspProof, csp_recover, eth_address, node_from_hex, vote_recover};
 use davinci_zkvm_sdk::groth16::BallotVerifier;
 use davinci_zkvm_sdk::release;
 use serde::{Deserialize, Serialize};
@@ -102,9 +100,9 @@ pub fn check_record(
         "{who}: weight {} is not {WEIGHT}",
         q.weight
     );
-    let got = vote_id_recover(q.vote_id, &q.signature())
-        .map_err(|e| anyhow!("{who}: vote id signature: {e}"))?;
-    ensure!(got == want, "{who}: vote id signed by another key");
+    let got = vote_recover(&q.process_id.to_fr(), q.vote_id, &q.ballot, &q.signature())
+        .map_err(|e| anyhow!("{who}: vote signature: {e}"))?;
+    ensure!(got == want, "{who}: vote signed by another key");
     let (ballot, vid) = binding(e, seed, r.round, r.voter)?;
     ensure!(
         q.ballot == ballot,
@@ -324,7 +322,7 @@ mod tests {
     use crate::bench::ballots::{ShardMeta, fake_req, write_shard};
     use crate::bench::plan::{ElectionSpec, NodeId};
     use davinci_zkvm_sdk::ballot::Ballot;
-    use davinci_zkvm_sdk::census::vote_id_sign;
+    use davinci_zkvm_sdk::census::vote_sign;
 
     fn plan(seed: &Seed) -> Plan {
         let spec = |tag: &str, voters, rounds, pm| ElectionSpec {
@@ -341,16 +339,21 @@ mod tests {
         Plan::stand_in(seed, 1, &[spec("A", 4, 2, 1000), spec("B", 3, 1, 0)]).unwrap()
     }
 
+    // The voter's envelope signature over the request as it stands.
+    fn sign(req: &mut davinci_client::api::VoteRequest, key: &k256::ecdsa::SigningKey) {
+        let sig = vote_sign(key, &req.process_id.to_fr(), req.vote_id, &req.ballot);
+        req.signature[..32].copy_from_slice(&sig.r);
+        req.signature[32..64].copy_from_slice(&sig.s);
+        req.signature[64] = sig.v;
+    }
+
     fn rec(e: &Election, seed: &Seed, round: u8, voter: u32, vid: u64) -> BallotRecord {
         let key = seed.voter_key(&e.spec.tag, voter);
         let mut req = fake_req(vid, eth_address(key.verifying_key()));
         req.process_id = e.snap.pid;
         let (ballot, vid) = binding(e, seed, round, voter).unwrap();
         (req.ballot, req.vote_id) = (ballot, vid);
-        let sig = vote_id_sign(&key, vid);
-        req.signature[..32].copy_from_slice(&sig.r);
-        req.signature[32..64].copy_from_slice(&sig.s);
-        req.signature[64] = sig.v;
+        sign(&mut req, &key);
         BallotRecord {
             tag: e.spec.tag.clone(),
             voter,
@@ -458,8 +461,13 @@ mod tests {
         let mut bad = good.clone();
         bad.req.signature = rec(e, &seed, 1, 1, 0).req.signature;
         assert!(check_record(e, &seed, &bad, None).is_err());
+        // Another ballot: the envelope no longer recovers the voter, and
+        // signed again it is still not the seed's.
         let mut bad = good.clone();
         bad.req.ballot = Ballot::identity();
+        let err = check_record(e, &seed, &bad, None).unwrap_err().to_string();
+        assert!(err.contains("signed by another key"), "{err}");
+        sign(&mut bad.req, &seed.voter_key(&e.spec.tag, 0));
         let err = check_record(e, &seed, &bad, None).unwrap_err().to_string();
         assert!(err.contains("ballot"), "{err}");
         let mut bad = good;

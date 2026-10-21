@@ -1,12 +1,12 @@
 //! Voter side: encrypt a ballot, derive the vote id, build the circom inputs,
-//! prove them and sign the vote id. The inputs follow davinci-circom
+//! prove them and sign the vote envelope. The inputs follow davinci-circom
 //! `ballot_proof.circom` and go-sdk `GenerateBallotProofInputs`.
 
 use ark_ff::PrimeField;
 use davinci_zkvm_sdk::ballot::{Ballot, BallotMode, address_to_fr, encrypt_ballot, vote_id};
 use davinci_zkvm_sdk::census::{
     CensusWitness, census_leaf, csp_recover, eth_address, slot_key_csp, verify_census_proof,
-    vote_id_sign,
+    vote_sign,
 };
 use davinci_zkvm_sdk::crypto::babyjubjub::Point;
 use davinci_zkvm_sdk::crypto::field::fr_to_dec;
@@ -385,14 +385,20 @@ impl Voter {
         })
     }
 
-    /// Signs the vote id and wraps a proof of `prep.inputs` into the request.
+    /// Signs the vote envelope (process id, vote id, ciphertexts) and wraps a
+    /// proof of `prep.inputs` into the request.
     pub fn finish_vote(&self, prep: PreparedVote, proof: SnarkJsProof) -> Result<VoteRequest> {
         if prep.address != self.address() {
             return Err(Error::Invalid(
                 "prepared vote belongs to another voter".into(),
             ));
         }
-        let sig = vote_id_sign(&self.key, prep.vote_id);
+        let sig = vote_sign(
+            &self.key,
+            &prep.process_id.to_fr(),
+            prep.vote_id,
+            &prep.ballot,
+        );
         let mut signature = [0u8; 65];
         signature[..32].copy_from_slice(&sig.r);
         signature[32..64].copy_from_slice(&sig.s);

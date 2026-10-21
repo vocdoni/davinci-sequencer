@@ -756,10 +756,12 @@ impl OnchainIndex {
         } else {
             (0, Some(size))
         };
+        // Members the scanned range can add: an append-only census grows.
+        let cap = size.saturating_sub(base.m.list.len() as u64);
         let mut why = String::new();
         let mut short = None;
         for _ in 0..2 {
-            let logs = self.scan(contract, floor, b, need).await?;
+            let logs = self.scan(contract, floor, b, need, cap).await?;
             // The scan went down to block 0 and the contract still claims
             // more members than it ever logged.
             let adds = logs
@@ -853,13 +855,17 @@ impl OnchainIndex {
     }
 
     /// Census logs in `[floor, b]`, scanned backwards in adaptive chunks and
-    /// stopping early once `need` adds were seen. Chain order.
+    /// stopping early once `need` adds were seen. Chain order. Kept: the
+    /// additions and the earliest weight change; the zero-previous notices
+    /// every add emits are only counted. More additions or notices than the
+    /// `cap` members the range can hold is no census: refused at once.
     async fn scan(
         &self,
         contract: [u8; 20],
         floor: u64,
         b: u64,
         need: Option<u64>,
+        cap: u64,
     ) -> Result<Vec<(u64, CensusLog)>> {
         let addr = Address::from(contract);
         let sigs = vec![
@@ -872,6 +878,10 @@ impl OnchainIndex {
         self.head_reaches(b).await?;
         let mut out = Vec::new();
         let mut added = 0u64;
+        let mut notices = 0u64;
+        // One change makes the contract unusable; the replay stops at the
+        // earliest, so the rest are never kept.
+        let mut change: Option<(u64, u64, CensusLog)> = None;
         let mut hi = b;
         let mut streak = 0;
         while hi >= floor && need.is_none_or(|n| added < n) {
@@ -885,10 +895,25 @@ impl OnchainIndex {
             match self.provider.get_logs(&filter).await {
                 Ok(logs) => {
                     for log in logs.iter().filter(|l| l.address() == addr) {
-                        if let Some(l) = decode(log)? {
-                            added += u64::from(matches!(l.2, CensusLog::Added { .. }));
-                            out.push(l);
+                        let Some(l) = decode(log)? else { continue };
+                        match l.2 {
+                            CensusLog::Added { .. } => {
+                                added += 1;
+                                out.push(l);
+                            }
+                            CensusLog::WeightChanged { previous: 0, .. } => notices += 1,
+                            CensusLog::WeightChanged { .. } => {
+                                if change.as_ref().is_none_or(|c| (l.0, l.1) < (c.0, c.1)) {
+                                    change = Some(l);
+                                }
+                            }
                         }
+                    }
+                    if added > cap || notices > cap {
+                        return Err(CensusError::Format(format!(
+                            "census contract logs {added} additions and {notices} weight notices \
+                             in blocks {lo}..={b}, more than the {cap} members it can add there"
+                        )));
                     }
                     streak += 1;
                     if streak == 2 {
@@ -910,6 +935,7 @@ impl OnchainIndex {
             }
         }
         self.head_reaches(b).await?;
+        out.extend(change);
         out.sort_by_key(|(b, i, _)| (*b, *i));
         Ok(out.into_iter().map(|(b, _, l)| (b, l)).collect())
     }

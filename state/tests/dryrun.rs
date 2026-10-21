@@ -20,7 +20,7 @@ use davinci_zkvm_input_gen as ig;
 use std::collections::BTreeSet;
 
 use davinci_zkvm_sdk::census::{CensusWitness, csp_sign, slot_key_address, slot_key_csp};
-use davinci_zkvm_sdk::limits::{MAX_BLOBS, required_refresh};
+use davinci_zkvm_sdk::limits::{MAX_BLOBS, SMT_LEVELS, VOTE_ID_MIN, required_refresh};
 use davinci_zkvm_sdk::publics::BatchPublics;
 use davinci_zkvm_sdk::types::ProveRequest;
 use rand::SeedableRng;
@@ -549,6 +549,49 @@ fn results_request_accepted_by_the_results_guest() {
         .results_request(&env.sk, &mut StdRng::seed_from_u64(32))
         .unwrap();
     assert_eq!(tally[..3], [6, 6, 0]);
+    let input = ig::results::build_results_input(&reser(&req)).unwrap();
+    let got =
+        davinci_zkvm_sdk::publics::ResultsPublics::parse(&run_elf(&results_elf_path(), &input))
+            .unwrap();
+    assert!(
+        got.passed(),
+        "results guest rejected: mask {:#x}",
+        got.fail_mask
+    );
+    assert_eq!(got.state_root, st.committed().root);
+    assert_eq!(got.results, tally);
+}
+
+/// Vote ids twin to the two keys the results guest proves (0x03, the
+/// election key, and 0x04, the accumulator) put both leaves at depth 64:
+/// the request carries 65 sibling slots, the 64th the twin, and the results
+/// guest accepts it. Fake ballot proofs: the batches are never proved.
+#[test]
+fn results_of_depth64_leaves_accepted_by_the_results_guest() {
+    if !gated() {
+        return;
+    }
+    let env = env(2, 4);
+    let mut st = new_state(&env);
+    let mut votes: Vec<_> = (0..3)
+        .map(|i| fake_vote(&env, i, &[i as u64 + 1, 2], 140 + i as u64))
+        .collect();
+    votes[0].pkg.vote_id = VOTE_ID_MIN | 3;
+    votes[1].pkg.vote_id = VOTE_ID_MIN | 4;
+    let b = st
+        .prepare(&votes, &mut StdRng::seed_from_u64(33), &none())
+        .unwrap();
+    st.commit(&b).unwrap();
+    let (req, tally) = st
+        .results_request(&env.sk, &mut StdRng::seed_from_u64(34))
+        .unwrap();
+    assert_eq!(tally[..3], [6, 6, 0]);
+    let zero = "00".repeat(32);
+    for sibs in [&req.key_siblings, &req.acc_siblings] {
+        assert_eq!(sibs.len(), SMT_LEVELS + 1);
+        assert_ne!(sibs[SMT_LEVELS - 1].trim_start_matches("0x"), zero);
+        assert_eq!(sibs[SMT_LEVELS].trim_start_matches("0x"), zero);
+    }
     let input = ig::results::build_results_input(&reser(&req)).unwrap();
     let got =
         davinci_zkvm_sdk::publics::ResultsPublics::parse(&run_elf(&results_elf_path(), &input))

@@ -3140,7 +3140,7 @@ async fn dkg_finalizes_after_the_committee(mode: KeyMode) {
     // The request carries the committed accumulator (the fake registry has
     // already checked its inclusion under the root).
     let (acc, sibs) = s.chain.dkg_request().unwrap();
-    assert_eq!(sibs.len(), 64);
+    assert_eq!(sibs.len(), 65);
     let d = s.chain.dkg_state();
     assert!(d.requested);
     assert_eq!((d.first_index, d.count), (1, 2));

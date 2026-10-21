@@ -437,8 +437,8 @@ async fn metadata_log(
     Ok(out)
 }
 
-// setProcessMetadata: the organizer replaces the metadata while the process
-// is open, getProcess and the event log agree, and it is frozen after the end.
+// setProcessMetadata: the organizer replaces the metadata before the start,
+// getProcess and the event log agree, and it is frozen from the start on.
 #[tokio::test]
 async fn process_metadata() -> anyhow::Result<()> {
     if std::env::var("ANVIL").as_deref() != Ok("1") {
@@ -460,9 +460,17 @@ async fn process_metadata() -> anyhow::Result<()> {
     let doc2 = br#"{"title":{"default":"organizer test, v2"}}"#;
     let doc3 = br#"{"title":{"default":"organizer test, v3"}}"#;
     let (h1, h2, h3) = (metadata_hash(DOC), metadata_hash(doc2), metadata_hash(doc3));
+    let rpc = ProviderBuilder::new().connect_http(url.parse()?);
+    let now = rpc
+        .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+        .await?
+        .expect("head")
+        .header
+        .timestamp;
+    let start = now + 100;
     let mut params = NewProcess {
         process_id: org.next_process_id().await?,
-        start_time: 0,
+        start_time: start,
         duration: 600,
         max_voters: 24,
         ballot_mode: BallotMode {
@@ -508,7 +516,7 @@ async fn process_metadata() -> anyhow::Result<()> {
         [("ipfs://v1".into(), h1)]
     );
 
-    // READY, then PAUSED: the organizer replaces it.
+    // READY, then PAUSED, before the start: the organizer replaces it.
     org.set_process_metadata(&pid, "ipfs://v2", h2).await?;
     assert_eq!(got(reader.process(&pid).await?), ("ipfs://v2".into(), h2));
     ProcessRegistry::new(registry, org.provider())
@@ -543,18 +551,26 @@ async fn process_metadata() -> anyhow::Result<()> {
         );
     }
 
-    // Past the end the metadata is frozen.
-    let rpc = ProviderBuilder::new().connect_http(url.parse()?);
-    let _: serde_json::Value = rpc.raw_request("evm_increaseTime".into(), (601,)).await?;
+    // From the start (the node opens admission then) and past the end the
+    // metadata is frozen.
+    let _: serde_json::Value = rpc
+        .raw_request("evm_setNextBlockTimestamp".into(), (start,))
+        .await?;
     let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await?;
-    let e = org
-        .set_process_metadata(&pid, "ipfs://late", h1)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&e, Error::Reverted(n) if n == "InvalidTimeBounds"),
-        "{e}"
-    );
+    for secs in [0u64, 601] {
+        if secs > 0 {
+            let _: serde_json::Value = rpc.raw_request("evm_increaseTime".into(), (secs,)).await?;
+            let _: serde_json::Value = rpc.raw_request("evm_mine".into(), ()).await?;
+        }
+        let e = org
+            .set_process_metadata(&pid, "ipfs://late", h1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Reverted(n) if n == "InvalidTimeBounds"),
+            "{e}"
+        );
+    }
 
     // The log alone is the history, and its last entry is what getProcess says.
     let log = metadata_log(&p, registry, &pid).await?;
@@ -570,6 +586,7 @@ async fn process_metadata() -> anyhow::Result<()> {
 
     // A second process: an ended one is frozen too.
     params.process_id = org.next_process_id().await?;
+    params.start_time = 0;
     let pid2 = org.create_process(&params).await?.pid;
     org.end_process(&pid2).await?;
     let e = org
@@ -1096,4 +1113,46 @@ async fn resend_of_a_mined_transaction_is_ours() -> anyhow::Result<()> {
     assert_eq!(org.receipts().len(), 1);
     assert_eq!(org.process(&pid).await?.status, ProcessStatus::Ready);
     Ok(())
+}
+
+// The registry's cost rule (BallotMode::validate) is checked before any
+// call: nothing listens at this endpoint.
+#[tokio::test]
+async fn create_process_checks_the_cost_rule_first() {
+    let org = Organizer::connect(
+        "http://127.0.0.1:9",
+        PrivateKeySigner::random(),
+        Address::repeat_byte(0x11),
+    )
+    .unwrap();
+    for (cost_exponent, max_value) in [(0u8, 5u64), (2, 1 << 31)] {
+        let p = NewProcess {
+            process_id: [0x42; 31],
+            start_time: 0,
+            duration: 600,
+            max_voters: 24,
+            ballot_mode: BallotMode {
+                num_fields: 2,
+                group_size: 1,
+                unique_values: false,
+                cost_exponent,
+                max_value,
+                min_value: 0,
+                max_value_sum: 0,
+                min_value_sum: 0,
+            },
+            census_origin: 1,
+            census_root: ROOT,
+            census_contract: [0; 20],
+            census_uri: "file:///tmp/census.json".into(),
+            metadata: "ipfs://v1".into(),
+            metadata_hash: metadata_hash(DOC),
+            key_mode: KeyMode::Sequencer(Point::generator().mul(&U256::from(4242u64))),
+        };
+        let e = org.create_process(&p).await.unwrap_err();
+        assert!(
+            matches!(&e, Error::Sdk(davinci_zkvm_sdk::Error::Input(m)) if m.starts_with("ballot mode")),
+            "{e}"
+        );
+    }
 }

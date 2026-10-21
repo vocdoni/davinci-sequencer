@@ -97,6 +97,20 @@ pub(crate) fn describe(e: &dyn std::error::Error) -> String {
     s
 }
 
+/// Longest excerpt of an error body kept in an error: a proxy's HTML error
+/// page is kilobytes over many lines.
+const BODY_EXCERPT: usize = 160;
+
+/// `body` on one line (whitespace runs folded to one space), cut to
+/// [`BODY_EXCERPT`] characters with a trailing `…` when longer.
+pub(crate) fn excerpt(body: &str) -> String {
+    let line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(BODY_EXCERPT) {
+        Some((i, _)) => format!("{}…", &line[..i]),
+        None => line,
+    }
+}
+
 /// Host of an endpoint for logs: URLs may carry API keys in the path or query.
 pub(crate) fn host(u: &Url) -> String {
     match (u.host_str(), u.port()) {
@@ -135,6 +149,16 @@ fn deterministic(p: &ResponsePacket) -> bool {
 pub(super) fn is_node_side(code: i64, message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     !is_deterministic(&m) && (code == -32603 || NODE_SIDE.iter().any(|s| m.contains(s)))
+}
+
+/// A JSON-RPC error that says the endpoint is limiting us (never a refusal
+/// of what was asked).
+pub(super) fn is_rate_limit(code: i64, message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    matches!(code, -32005 | -32016 | -32029)
+        || ["rate limit", "limit exceeded", "too many requests"]
+            .iter()
+            .any(|s| m.contains(s))
 }
 
 /// Why a JSON-RPC answer should fail over, if it should.
@@ -256,10 +280,13 @@ async fn post(client: &reqwest::Client, url: &Url, req: &RequestPacket) -> Poste
     let res = match serde_json::from_slice::<ResponsePacket>(&body) {
         // As alloy: a non-2xx body holding a JSON-RPC error is an answer.
         Ok(p) if ok || p.first_error_code().is_some() => Ok(p),
-        Err(e) if ok => Err(TransportError::deser_err(e, String::from_utf8_lossy(&body))),
+        Err(e) if ok => Err(TransportError::deser_err(
+            e,
+            excerpt(&String::from_utf8_lossy(&body)),
+        )),
         _ => Err(TransportErrorKind::http_error(
             status,
-            String::from_utf8_lossy(&body).into_owned(),
+            excerpt(&String::from_utf8_lossy(&body)),
         )),
     };
     Posted {
@@ -311,7 +338,7 @@ impl Failover {
             tracing::warn!(
                 from = %self.endpoints[from].host,
                 to = %self.endpoints[to].host,
-                error = %why,
+                error = %excerpt(why),
                 "RPC failover"
             );
         }
@@ -565,6 +592,40 @@ mod tests {
         );
         assert_eq!((n(&hung_calls), n(&good_calls)), (1, 1));
         assert_eq!(f.current(), 1);
+    }
+
+    // A gateway's HTML error page reaches the error (and the failover log
+    // line) as one short line.
+    #[tokio::test]
+    async fn an_http_error_page_becomes_a_one_line_excerpt() {
+        let page = format!(
+            "<!DOCTYPE html>\n<html>\n  <head><title>504 Gateway Time-out</title></head>\n  <body>\n{}\n  </body>\n</html>\n",
+            "    <p>cloudflare</p>\n".repeat(200)
+        );
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let page = page.clone();
+                async move { (StatusCode::GATEWAY_TIMEOUT, page) }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: Url = format!("http://{}/", l.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await });
+        let (_, p) = provider(&[url]);
+        let e = p.get_block_number().await.unwrap_err().to_string();
+        assert!(
+            e.starts_with("HTTP error 504 with body: <!DOCTYPE html> <html> <head>"),
+            "{e}"
+        );
+        assert!(!e.contains('\n'), "{e}");
+        assert!(e.ends_with('…') && e.chars().count() < 220, "{e}");
+
+        assert_eq!(excerpt("  a\n\tb  c "), "a b c");
+        let long = "é".repeat(200);
+        assert_eq!(excerpt(&long), format!("{}…", "é".repeat(BODY_EXCERPT)));
     }
 
     #[tokio::test]

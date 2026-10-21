@@ -1387,6 +1387,22 @@ mod chain {
                 "max sum over 63 bits",
                 Box::new(|p| p.ballot_mode.max_value_sum = 1 << 63),
             ),
+            (
+                "cost exponent 0",
+                Box::new(|p| p.ballot_mode.cost_exponent = 0),
+            ),
+            (
+                "cost 2^63",
+                Box::new(|p| {
+                    p.ballot_mode.num_fields = 2;
+                    p.ballot_mode.max_value = 1 << 31;
+                    p.ballot_mode.cost_exponent = 2;
+                }),
+            ),
+            (
+                "cost overflow",
+                Box::new(|p| p.ballot_mode.cost_exponent = 255),
+            ),
             ("no voters", Box::new(|p| p.max_voters = 0)),
             (
                 "voters x value overflow",
@@ -1499,21 +1515,24 @@ mod chain {
         let e = org.create_process(&p).await.unwrap_err();
         assert!(matches!(e, Error::Invalid(_)), "{e}");
 
-        // Bounds that must be accepted: the widest legal mode.
-        let mut wide = valid(org.next_process_id().await?, key);
-        wide.ballot_mode = BallotMode {
-            num_fields: 16,
-            group_size: 16,
-            unique_values: true,
-            cost_exponent: 255,
-            max_value: 100,
-            min_value: 0,
-            max_value_sum: (1 << 63) - 1,
-            min_value_sum: 0,
-        };
-        wide.max_voters = 1000;
-        wide.duration = u64::MAX / 2;
-        org.create_process(&wide).await?;
+        // Bounds that must be accepted: the widest legal modes under the
+        // registry's cost rule (16 * maxValue^costExponent below 2^63).
+        for (cost_exponent, max_value) in [(255, 1), (8, 100)] {
+            let mut wide = valid(org.next_process_id().await?, key);
+            wide.ballot_mode = BallotMode {
+                num_fields: 16,
+                group_size: 16,
+                unique_values: true,
+                cost_exponent,
+                max_value,
+                min_value: 0,
+                max_value_sum: (1 << 63) - 1,
+                min_value_sum: 0,
+            };
+            wide.max_voters = 1000;
+            wide.duration = u64::MAX / 2;
+            org.create_process(&wide).await?;
+        }
         Ok(())
     }
 

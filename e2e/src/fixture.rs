@@ -13,7 +13,7 @@ use davinci_client::voter::{Voter, random_k};
 use davinci_zkvm_sdk::ballot::BallotMode;
 use davinci_zkvm_sdk::census::node_to_hex;
 use davinci_zkvm_sdk::census::{
-    CensusWitness, LeanImt, census_leaf, csp_sign, eth_address, vote_id_sign,
+    CensusWitness, LeanImt, census_leaf, csp_sign, eth_address, vote_sign,
 };
 use k256::ecdsa::SigningKey;
 use rand::SeedableRng;
@@ -393,7 +393,7 @@ pub struct Ballots {
     pub reused: VoteRequest,
     /// `pi_a` replaced by `pi_c`.
     pub bad_proof: VoteRequest,
-    /// Vote id signed by the previous voter's key.
+    /// Vote envelope signed by the previous voter's key.
     pub bad_sig: VoteRequest,
     /// A voter proved against a census of its own.
     pub outsider: VoteRequest,
@@ -489,7 +489,12 @@ pub fn build_ballots(
         .map_err(|_| anyhow::anyhow!("missing ballots"))?;
     let pr = &mut bad_proof.ballot_proof;
     pr.pi_a = pr.pi_c.clone();
-    let sig = vote_id_sign(&voters[BAD_SIG - 1].key, bad_sig.vote_id);
+    let sig = vote_sign(
+        &voters[BAD_SIG - 1].key,
+        &bad_sig.process_id.to_fr(),
+        bad_sig.vote_id,
+        &bad_sig.ballot,
+    );
     bad_sig.signature[..32].copy_from_slice(&sig.r);
     bad_sig.signature[32..64].copy_from_slice(&sig.s);
     bad_sig.signature[64] = sig.v;

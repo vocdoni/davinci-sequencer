@@ -274,6 +274,17 @@ async fn registry_on_anvil() {
     };
     let err = observer.create_process(&np).await.err().unwrap();
     assert!(matches!(err, Web3Error::NoSigner), "{err}");
+    // The registry's cost rule, refused by name (the vendored ABI has it).
+    for (cost_exponent, max_value) in [(0u8, 5u64), (2, 1 << 31)] {
+        let mut bad = np.clone();
+        bad.ballot_mode.num_fields = 2;
+        bad.ballot_mode.cost_exponent = cost_exponent;
+        bad.ballot_mode.max_value = max_value;
+        match c.create_process(&bad).await {
+            Err(Web3Error::Revert(r)) => assert_eq!(r.name(), Some("InvalidBallotCost")),
+            other => panic!("cost rule: {other:?}"),
+        }
+    }
     let (pid, created) = c.create_process(&np).await.unwrap();
     // The id prefix the datadir migration matches processes on.
     assert_eq!(
@@ -791,13 +802,15 @@ async fn metadata_updates_on_anvil() {
         .await
         .unwrap();
 
-    // Account 1 organizes through the client.
+    // Account 1 organizes through the client. The metadata changes only
+    // before the start.
     let org = Organizer::connect(url.as_str(), anvil.keys()[1].clone().into(), registry).unwrap();
     let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+    let (_, now) = node.head().await.unwrap();
     let pid = org
         .create_process(&OrgProcess {
             process_id: org.next_process_id().await.unwrap(),
-            start_time: 0,
+            start_time: now + 120,
             duration: 3600,
             max_voters: 100,
             ballot_mode: BallotMode {
@@ -1734,6 +1747,11 @@ async fn dkg_results_on_anvil() {
     let tally = [3u64, 6, 0, 9];
     for (i, v) in tally.iter().enumerate() {
         assert!(!c.dkg_results_ready(&pid).await.unwrap());
+        // The wait log's count, one adapter read per ciphertext.
+        assert_eq!(
+            c.dkg_combined(&pid).await.unwrap(),
+            Some((i as u16, u16::from(NF)))
+        );
         dkg.setPlaintext(eid, FixedBytes(p.dkg.aid), 1 + i as u16, AU256::from(*v))
             .send()
             .await
@@ -1743,6 +1761,10 @@ async fn dkg_results_on_anvil() {
             .unwrap();
     }
     assert!(c.dkg_results_ready(&pid).await.unwrap());
+    assert_eq!(
+        c.dkg_combined(&pid).await.unwrap(),
+        Some((u16::from(NF), u16::from(NF)))
+    );
     let r = c.finalize_results_from_dkg(&pid).await.unwrap();
     let want = tally.to_vec();
     let evs = c.events(r.block, r.block).await.unwrap();
@@ -2932,4 +2954,260 @@ mod l1_blob_mode {
                 .is_none()
         );
     }
+}
+
+// `finalized_block` as the monitor reads it: anvil's `finalized` (the head
+// minus two 32-slot epochs), `None` from an endpoint that refuses the tag,
+// and an error when the endpoint is down.
+#[tokio::test(flavor = "multi_thread")]
+async fn finalized_block_on_anvil() {
+    use common::anvil::RpcProxy;
+    use std::sync::atomic::Ordering::Relaxed;
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    // Any contract does: only the code at the address is checked.
+    let target = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let _: serde_json::Value = deployer
+        .raw_request("anvil_mine".into(), (100u64,))
+        .await
+        .unwrap();
+    let head = deployer.get_block_number().await.unwrap();
+    let proxy = RpcProxy::start(anvil.endpoint()).await;
+    let purl: url::Url = proxy.url.parse().unwrap();
+    let c = Contracts::open(std::slice::from_ref(&purl), target, None, false)
+        .await
+        .unwrap();
+    assert_eq!(c.finalized_block().await.unwrap(), Some(head - 64));
+    proxy.knobs.refuse_finalized.store(true, Relaxed);
+    assert_eq!(c.finalized_block().await.unwrap(), None);
+    // A rate limit is no refusal of the tag: an error, retried later.
+    proxy.knobs.refuse_finalized.store(false, Relaxed);
+    proxy.knobs.limit_finalized.store(true, Relaxed);
+    assert!(c.finalized_block().await.is_err());
+    proxy.knobs.limit_finalized.store(false, Relaxed);
+    assert_eq!(c.finalized_block().await.unwrap(), Some(head - 64));
+    proxy.knobs.down.store(true, Relaxed);
+    assert!(c.finalized_block().await.is_err());
+}
+
+// A reorg deeper than the old fixed 128-block rewind, whose new branch
+// creates a process right after the fork: the monitor rewinds to the
+// finalized block and routes the creation, and after a restart resumes at
+// the saved cursor. Anvil's `finalized` is the head minus two epochs; with
+// 100-slot epochs it stays below the fork, as finality does on OP.
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_reorg_rewinds_to_the_finalized_block() {
+    use alloy::primitives::U256 as AU256;
+    use davinci_sequencer::actor::{Deps, SystemClock};
+    use davinci_sequencer::config::Config;
+    use davinci_sequencer::monitor::spawn_node;
+    use davinci_sequencer::storage::Db;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    if !enabled() {
+        eprintln!("skipped: set ANVIL=1");
+        return;
+    }
+    let anvil = Anvil::at(anvil_bin())
+        .args(["--hardfork", "osaka", "--slots-in-an-epoch", "100"])
+        .try_spawn()
+        .expect("spawn anvil");
+    let url = anvil.endpoint_url();
+    let key: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let secret = SecretString::new(hex::encode(key.to_bytes()));
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(url.clone());
+    let verifier = deploy(
+        &deployer,
+        bytecode("MockZiskVerifier.sol/MockZiskVerifier.json"),
+    )
+    .await;
+    let mut code = bytecode("ProcessRegistry.sol/ProcessRegistry.json");
+    code.extend(
+        (
+            anvil.chain_id() as u32,
+            verifier,
+            B256::from(BATCH_VK),
+            B256::from(RESULTS_VK),
+            B256::from(ROOT_C),
+            B256::from(common::vk_hash()),
+            Address::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    code.extend(ctor_tail(Address::ZERO));
+    let registry = deploy(&deployer, code).await;
+    let start_block = deployer.get_block_number().await.unwrap();
+    let mine = async |n: u64| {
+        let _: serde_json::Value = deployer
+            .raw_request("anvil_mine".into(), (n,))
+            .await
+            .unwrap();
+    };
+    // Enough history that the finalized block sits above the start block.
+    mine(250).await;
+    // CSP processes: nothing to download.
+    let create = async || {
+        let c = Contracts::new(std::slice::from_ref(&url), registry, Some(&secret))
+            .await
+            .unwrap();
+        let (_sk, pk) = keygen(&mut rand::rngs::OsRng);
+        let mut root = [0u8; 32];
+        root[12..].copy_from_slice(&[0x77; 20]);
+        let np = NewProcess {
+            status: ProcessStatus::Ready,
+            start_time: 0,
+            duration: 3600,
+            max_voters: 1000,
+            ballot_mode: common::ballot_mode(NF),
+            census: OnchainCensus {
+                origin: 4,
+                root,
+                uri: "https://csp.invalid".into(),
+                contract_address: [0u8; 20],
+            },
+            metadata: "ipfs://meta".into(),
+            metadata_hash: metadata_hash(META_DOC),
+            enc_key: pk,
+        };
+        c.create_process(&np).await.unwrap().0
+    };
+    let datadir = tempfile::TempDir::new().unwrap();
+    let census_dir = tempfile::TempDir::new().unwrap();
+    let start = async |sd: &CancellationToken| {
+        let sb = start_block.to_string();
+        let reg = registry.to_string();
+        let cfg = Config::parse_args([
+            "davinci-sequencer",
+            "--datadir",
+            datadir.path().to_str().unwrap(),
+            "--network",
+            "custom",
+            "--rpc-url",
+            url.as_str(),
+            "--registry",
+            &reg,
+            "--start-block",
+            &sb,
+            "--blob-source",
+            "anvil",
+            "--confirmations",
+            "0",
+            "--poll-interval",
+            "50ms",
+            "--census-dir",
+            census_dir.path().to_str().unwrap(),
+            "--census-sync-every",
+            "0s",
+        ])
+        .unwrap();
+        let contracts = Contracts::new(std::slice::from_ref(&url), registry, None)
+            .await
+            .unwrap();
+        let grace = contracts.grace_params().await.unwrap();
+        let mut db = None;
+        for _ in 0..50 {
+            match Db::open_in(datadir.path()) {
+                Ok(d) => {
+                    db = Some(d);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let deps = Deps {
+            db: db.expect("datadir lock"),
+            contracts: Arc::new(contracts),
+            prover: common::FakeProver::open(),
+            blobs: Arc::new(AnvilBlobs::new(std::slice::from_ref(&url))),
+            clock: Arc::new(SystemClock),
+            grace,
+            tasks: tokio_util::task::TaskTracker::new(),
+            l1: None,
+        };
+        spawn_node(cfg, deps, sd.clone()).await.unwrap()
+    };
+    let served = async |node: &davinci_sequencer::monitor::Node, pid: &[u8; 31]| {
+        node.processes.read().await.contains_key(&pid_fr(pid))
+    };
+    let cursor =
+        |node: &davinci_sequencer::monitor::Node| node.db.meta_u64("monitor_last_block").unwrap();
+
+    let a = create().await;
+    let sd = CancellationToken::new();
+    let node = start(&sd).await;
+    common::wait_until("A served", async || served(&node, &a).await).await;
+    // The old branch: 150 blocks the node routes.
+    let snap: AU256 = deployer
+        .raw_request("evm_snapshot".into(), ())
+        .await
+        .unwrap();
+    let fork = deployer.get_block_number().await.unwrap();
+    mine(150).await;
+    let old_head = deployer.get_block_number().await.unwrap();
+    common::wait_until("cursor at the old head", async || {
+        cursor(&node) == Some(old_head)
+    })
+    .await;
+    // The new branch: B right after the fork, 128 + 21 blocks below the
+    // cursor, then past the old head.
+    let reverted: bool = deployer
+        .raw_request("evm_revert".into(), (snap,))
+        .await
+        .unwrap();
+    assert!(reverted);
+    let b = create().await;
+    mine(old_head - fork).await;
+    let new_head = deployer.get_block_number().await.unwrap();
+    // Finalized: 49 blocks below the fork, far above the start block.
+    assert!(new_head > old_head && new_head - 200 < fork && new_head - 200 > start_block);
+    common::wait_until("B served", async || served(&node, &b).await).await;
+    assert_eq!(
+        node.metrics
+            .reorgs
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    common::wait_until("cursor at the new head", async || {
+        cursor(&node) == Some(new_head)
+    })
+    .await;
+    sd.cancel();
+    drop(node);
+
+    // A restart resumes at the saved cursor: both served, no reorg.
+    let sd = CancellationToken::new();
+    let node = start(&sd).await;
+    common::wait_until("A and B served", async || {
+        served(&node, &a).await && served(&node, &b).await
+    })
+    .await;
+    mine(3).await;
+    common::wait_until("cursor at the head", async || {
+        cursor(&node) == Some(new_head + 3)
+    })
+    .await;
+    assert_eq!(
+        node.metrics
+            .reorgs
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    sd.cancel();
 }
