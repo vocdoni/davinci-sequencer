@@ -191,6 +191,10 @@ fn bad_ballot(why: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("ballot does not fit the ballot mode: {why}"))
 }
 
+// Width of the circuit's two budget comparators (davinci-circom v1.3.0
+// `ValueSumCmpBits`): exact for weights below 2^88.
+const VALUE_SUM_CMP_BITS: u32 = 89;
+
 // The circuit's `LessEqThan(n)`: `a <= b`, or `None` where it has no witness
 // (`a + 2^n - b - 1` outside `n + 1` bits).
 fn circuit_less_eq(n: u32, a: &BigUint, b: &BigUint) -> Option<bool> {
@@ -234,7 +238,7 @@ pub fn check_ballot(mode: &BallotMode, fields: &[u64], weight: u128) -> Result<(
     } else {
         BigUint::from(mode.max_value_sum)
     };
-    match circuit_less_eq(63, &sum, &cap) {
+    match circuit_less_eq(VALUE_SUM_CMP_BITS, &sum, &cap) {
         Some(true) => {}
         Some(false) => {
             return Err(bad_ballot(format!(
@@ -248,7 +252,7 @@ pub fn check_ballot(mode: &BallotMode, fields: &[u64], weight: u128) -> Result<(
         }
         None => return Err(bad_ballot("cost and weight are out of the circuit's range")),
     }
-    if circuit_less_eq(63, &BigUint::from(mode.min_value_sum), &sum) != Some(true) {
+    if circuit_less_eq(VALUE_SUM_CMP_BITS, &BigUint::from(mode.min_value_sum), &sum) != Some(true) {
         return Err(bad_ballot(format!(
             "cost is below the minimum {}",
             mode.min_value_sum

@@ -877,10 +877,10 @@ fn field_counts_and_weights_are_bounded() {
         assert!(try_prepare(BASE, &[1], w).is_err(), "weight {w:#x}");
     }
     // With max_value_sum zero the circuit compares the cost with the weight
-    // in 63 bits: heavier weights cannot vote at all.
+    // in 89 bits: every weight below 2^88 can vote.
     accepts(BASE, &[1], 1 << 63);
-    refuses(BASE, &[1], (1 << 63) + 1);
-    refuses(BASE, &[1], (1 << 88) - 1);
+    accepts(BASE, &[1], (1 << 63) + 1);
+    accepts(BASE, &[1], (1 << 88) - 1);
     accepts(M { max_sum: 9, ..BASE }, &[1], (1 << 88) - 1);
     // A min above max leaves no valid ballot.
     refuses(
@@ -1107,8 +1107,8 @@ fn voter_key_never_prints() {
 // The local ballot check agrees with the real circuit (needs CIRCOM_ARTIFACTS)
 
 // Every case: the client refuses exactly when the circuit has no proof.
-// Weights above 2^63 + cost cannot vote while max_value_sum is 0, because
-// the circuit compares the cost with the weight in 63 bits.
+// The circuit compares the cost with the budget in 89 bits, so with
+// max_value_sum 0 every weight below 2^88 can spend up to its weight.
 #[test]
 fn local_ballot_check_matches_the_circuit() {
     use davinci_client::prover::BallotProver;
