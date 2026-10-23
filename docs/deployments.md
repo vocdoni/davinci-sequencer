@@ -8,19 +8,19 @@ together.
 
 Chain id 10, preset `optimism`, L1-blob mode: transitions settle on OP Mainnet and their blobs
 live in Ethereum blob transactions. This is the protocol v5.1 pre-production registry, deployed and
-verified on 2026-10-21 from davinci-contracts v0.0.54, on the davinci-zkvm v0.5.0 pins and the
+verified on 2026-10-23 from the davinci-contracts v0.0.54 sources (record in v0.0.55), on the davinci-zkvm v0.5.0 pins and the
 pre-production ceremony ballot key of davinci-circom v1.3.0, with the DKG and Council adapters.
-Process ids start with `e8d4e286`.
+Process ids start with `e1b56c76`.
 
 | Contract | Address | Block |
 |---|---|---|
 | ZiskVerifier | [`0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7`](https://optimistic.etherscan.io/address/0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7#code) (code hash `0xadab570d…cadcc1`, reused) | |
 | L1BlobVerifier | [`0x3B95BC14F43ed8Addb83F84D10A949De74eE7529`](https://optimistic.etherscan.io/address/0x3B95BC14F43ed8Addb83F84D10A949De74eE7529#code) (reused from the first OP registry) | 158125135 |
-| ProcessRegistry | [`0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97`](https://optimistic.etherscan.io/address/0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97#code) | 158487281 |
-| DKG adapter | [`0xffAC853E7B93CE6148b1A551A40aFd88DE517863`](https://optimistic.etherscan.io/address/0xffAC853E7B93CE6148b1A551A40aFd88DE517863#code) | |
-| DKGManager | `0x9e799a1d22710056e62c849e3ffe19dd01db2d41` (unchanged) | 158245366 |
-| DKGAppManager | `0x1e7f0bec007828e2e0a1a469d9d3e148888fc39a` (unchanged) | |
-| Council adapter | [`0xe07BE522a8fE9d1cf85DCA5Eefbe663055D35127`](https://optimistic.etherscan.io/address/0xe07BE522a8fE9d1cf85DCA5Eefbe663055D35127#code) | |
+| ProcessRegistry | [`0xc916F985CbCdbEb25A0EE6950361cf7Dd9Fbe35a`](https://optimistic.etherscan.io/address/0xc916F985CbCdbEb25A0EE6950361cf7Dd9Fbe35a#code) | 158592889 |
+| DKG adapter | [`0xdb2C3653d59e9693ea3186AE4d4A34b3379A68f7`](https://optimistic.etherscan.io/address/0xdb2C3653d59e9693ea3186AE4d4A34b3379A68f7#code) | |
+| DKGManager | [`0x401381a9711b473baf8757404b5514537a5216d7`](https://optimistic.etherscan.io/address/0x401381a9711b473baf8757404b5514537a5216d7#code) | 158592323 |
+| DKGAppManager | `0x94bead76b89f33e4168940ac7cefbb5cc75f69f0` | |
+| Council adapter | [`0x798dD4fE9DE224ffD7bF1081FD8D0C273a6e8860`](https://optimistic.etherscan.io/address/0x798dD4fE9DE224ffD7bF1081FD8D0C273a6e8860#code) | |
 | CouncilManager | `0x281b84dee6305083cc719187e4a2737d61b4396e` (unchanged) | 158245395 |
 
 Pinned values, equal to the SDK release pins (davinci-zkvm v0.5.0):
@@ -50,10 +50,21 @@ keeps full blobs.
 
 ## Retired deployments
 
-These registries stay on chain, but no preset follows them. They pin older
-program vks, so a node of this release, which proves under protocol v5.1, refuses
+These registries stay on chain, but no preset follows them. Except the first one, they pin
+older program vks, so a node of this release, which proves under protocol v5.1, refuses
 them at boot.
 Their datadir directories stay untouched next to the current one.
+
+### OP Mainnet, protocol v5.1 registry of 2026-10-21
+
+`ProcessRegistry` `0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97` (block 158487281), deployed on
+2026-10-21 from davinci-contracts v0.0.54 with the DKG adapter
+`0xffAC853E7B93CE6148b1A551A40aFd88DE517863` (DKGManager `0x9e799a1d22710056e62c849e3ffe19dd01db2d41`,
+retired with it) and Council adapter `0xe07BE522a8fE9d1cf85DCA5Eefbe663055D35127`, followed by the
+`optimism` preset of release v0.8.0 (process ids `e8d4e286…`). It pins the same programs and ballot
+key as the current registry, so a node of this release still runs it with
+`--registry 0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97 --start-block 158487281`. Its record is davinci-contracts'
+`deployments/10-0x02d6c284234b4ce75fab3085cf3f1ba4b7262b97.json`.
 
 ### OP Mainnet, protocol v5 pre-production registry
 
@@ -137,17 +148,17 @@ the commit in the deployment record) and reads back every pin, the grace setting
 (`--grace`) and, in L1-blob mode, the verifier's `L1Block`. Rebuilding a zkVM program changes its
 verification key, which needs a new registry.
 
-For the current OP registry, from davinci-contracts at `v0.0.54` after `forge build`:
+For the current OP registry, from davinci-contracts at `v0.0.55` after `forge build`:
 
 ```bash
 python3 script/verify_deployment.py --rpc "$RPC" --chain-id 10 \
-    --registry 0x02D6c284234B4CE75faB3085cF3f1ba4b7262B97 \
+    --registry 0xc916F985CbCdbEb25A0EE6950361cf7Dd9Fbe35a \
     --verifier 0x35Ad4cBc4C77a2Bc69B07e68f2535Da5C6d07AB7 \
     --batch-vk 0x4b1a527e284af96fa0c3543e9e9b18746a6494edd99c309e58d96a804e3041dc \
     --results-vk 0xce964acdd53329fc49ede57f5ea288f044950e136be119287fd0021390689dc4 \
     --root-c 0x6b2490fba336fb00f0c8719a961de309a8db6f43a9bfb7575ca5f014d609b265 \
     --ballot-vk-hash 0x67e8e6b47ea32cf144d6e72886f02b95ed068b157f9d4ccc8e97f335858e4963 \
-    --dkg-manager 0x9e799a1d22710056e62c849e3ffe19dd01db2d41 \
+    --dkg-manager 0x401381a9711b473baf8757404b5514537a5216d7 \
     --council-manager 0x281b84dee6305083cc719187e4a2737d61b4396e \
     --l1-block 0x4200000000000000000000000000000000000015 --grace 300,240,600,1800,60 \
     --l1-blob-verifier 0x3B95BC14F43ed8Addb83F84D10A949De74eE7529
